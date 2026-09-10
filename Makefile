@@ -1214,7 +1214,7 @@ endif
 help:
 	$(call log_info,Available make useflags:$(foreach useflag, $(USEFLAGS),$(NEWLINE) $(useflag)=$($(useflag))))
 	$(call println,$(RESET))
-	$(call log_info,Available make targets:$(subst #,$(TEXT),$(subst .PHONY:,$(NEWLINE)$(GREEN),$(shell grep '^.PHONY:' Makefile $(NULL_STDERR)))))
+	$(call log_info,Available make targets:$(subst #,$(TEXT),$(subst .PHONY:,$(NEWLINE)$(GREEN),$(shell grep -h '^.PHONY:' Makefile project.mk $(NULL_STDERR)))))
 	$(call println,$(RESET))
 	@:
 

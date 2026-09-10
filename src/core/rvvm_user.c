@@ -117,6 +117,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <unistd.h>
 #endif
 
+#include "rvvm_user.h" // rvvm_user_io_callback typedef (this file's own public header)
 #include "rvvmlib.h"
 #include "elf_load.h"
 #include "mem_ops.h"
@@ -127,6 +128,32 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "spinlock.h"
 #include "rvtimer.h"
 #include "stacktrace.h"
+
+/* Android NDK API Proxy - vp_cmdpost integration (single copy lives in src/virtpass) */
+#include "virtpass/vp_cmdpost.h"
+
+#if defined(ANDROID)
+#include <android/log.h>
+
+// Android-specific I/O callback using logcat
+ssize_t android_io_callback(int fd, const void* buf, size_t count)
+{
+    if (fd == 1 || fd == 2) { // stdout or stderr
+        const char* data = (const char*)buf;
+        if (data && count) {
+            char sbuf[1024];
+            size_t copy = count < sizeof(sbuf) - 1 ? count : sizeof(sbuf) - 1;
+            memcpy(sbuf, data, copy);
+            sbuf[copy] = '\0';
+            __android_log_print(ANDROID_LOG_INFO, "RVVM-GUEST", "%s", sbuf);
+        }
+        return count;
+    } else {
+        // For other file descriptors, use default write
+        return write(fd, buf, count);
+    }
+}
+#endif
 
 #define RVVM_USER_RISCV64
 
@@ -323,6 +350,7 @@ static void uapi_sigaction_convert(struct uapi_sigaction* dst, const struct siga
 */
 
 static rvvm_machine_t* userland; // Emulated RVVM process context
+static rvvm_user_io_callback io_callback = NULL; // Custom I/O callback
 
 // Short cast rvvm_addr_t -> void*
 static void* to_ptr(rvvm_addr_t addr)
@@ -351,6 +379,11 @@ static rvvm_addr_t errno_ret(int64_t val)
     } else {
         return val;
     }
+}
+
+PUBLIC void rvvm_user_set_io_callback(rvvm_user_io_callback callback)
+{
+    io_callback = callback;
 }
 
 // This is for debugging sake
@@ -464,6 +497,16 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
         const char* pch = "guest PC: ";
         while (*pch) *p++ = *pch++;
         user_fault_hex(&p, rvvm_read_cpu_reg(cpu, RVVM_REGID_PC));
+        /* Dump the faulting instruction bytes (guest mem == host mem) */
+        {
+            size_t pc = rvvm_read_cpu_reg(cpu, RVVM_REGID_PC);
+            uint8_t* ip = (uint8_t*)to_ptr(pc);
+            const char* ih = "guest insn bytes: ";
+            while (*ih) *p++ = *ih++;
+            for (int i = 0; i < 8; ++i) {
+                user_fault_hex(&p, ip[i]);
+            }
+        }
         for (uint32_t i = 0; i < 32; ++i) {
             *p++ = 'x';
             user_fault_hex(&p, i);
@@ -493,7 +536,62 @@ typedef struct {
     uint32_t tid;
 } rvvm_user_thread_t;
 
-// Main execution loop (Run the user CPU, handle syscalls)
+/* ============================================================
+ * Memory read/write helpers for Guest↔Host data transfer
+ * ============================================================ */
+
+/*
+ * Read data from Guest memory into Host buffer.
+ * @param cpu      Hart context (for guest memory access)
+ * @param guest_addr  Guest virtual address to read from
+ * @param host_buf Host buffer to write into
+ * @param size     Number of bytes to read
+ * @return         0 on success, -1 on failure
+ */
+static int guest_read_mem(rvvm_hart_t* cpu, uint64_t guest_addr, void* host_buf, size_t size)
+{
+    (void)cpu;
+    memcpy(host_buf, to_ptr(guest_addr), size);
+    return 0;
+}
+
+/*
+ * Write data from Host buffer into Guest memory.
+ * @param cpu      Hart context (for guest memory access)
+ * @param guest_addr  Guest virtual address to write to
+ * @param host_buf Host buffer to read from
+ * @param size     Number of bytes to write
+ * @return         0 on success, -1 on failure
+ */
+static int guest_write_mem(rvvm_hart_t* cpu, uint64_t guest_addr, const void* host_buf, size_t size)
+{
+    (void)cpu;
+    memcpy(to_ptr(guest_addr), host_buf, size);
+    return 0;
+}
+
+/*
+ * Read a NUL-terminated string from Guest memory.
+ * @param cpu      Hart context
+ * @param guest_addr  Guest virtual address of string
+ * @param host_buf Host buffer to store string
+ * @param max_len  Maximum length of string (including NUL)
+ * @return         Number of bytes copied, or -1 on failure
+ */
+static int guest_read_str(rvvm_hart_t* cpu, uint64_t guest_addr, char* host_buf, size_t max_len)
+{
+    (void)cpu;
+    const char* src = (const char*)to_ptr(guest_addr);
+    size_t i;
+    for (i = 0; i < max_len - 1; i++) {
+        host_buf[i] = src[i];
+        if (src[i] == 0) break;
+    }
+    host_buf[i] = 0;
+    return (int)i;
+}
+
+/* Main execution loop (Run the user CPU, handle syscalls) */
 static void* rvvm_user_thread_wrap(void* arg);
 
 #define BRK_HEAP_SIZE 0x40000000
@@ -722,12 +820,32 @@ static inline int rvvm_sys_prot(int prot)
 static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, int fd, uint64_t offset)
 {
     rvvm_info("sys_mmap(%lx, %lx, %x, %x, %d, %lx)", (size_t)addr, size, prot, flags, fd, offset);
-    int mmap_flags = 0;
     if (flags & UAPI_MAP_ILLEGAL) {
         return -UAPI_EINVAL;
     }
 
     spin_lock(&mmap_lock);
+
+    /* Route anonymous mappings through the portable VMA layer, which handles
+     * non-granular fixed addresses (ptr_diff centering) that raw POSIX mmap /
+     * VirtualAlloc cannot express. File-backed mappings keep using raw fd. */
+    if ((flags & UAPI_MAP_ANON) || fd < 0) {
+        // Permission bits are mandatory: VMA_NONE maps to PROT_NONE / PAGE_NOACCESS
+        uint32_t vma_flags = 0;
+        if (prot & UAPI_PROT_READ)  vma_flags |= VMA_READ;
+        if (prot & UAPI_PROT_WRITE) vma_flags |= VMA_WRITE;
+        if (prot & UAPI_PROT_EXEC)  vma_flags |= VMA_EXEC;
+        if (flags & UAPI_MAP_FIXED) vma_flags |= VMA_FIXED;
+        void* vret = vma_mmap(addr, size, vma_flags, NULL, 0);
+        if (!vret) {
+            spin_unlock(&mmap_lock);
+            return -UAPI_ENOMEM;
+        }
+        spin_unlock(&mmap_lock);
+        return (rvvm_addr_t)(size_t)vret;
+    }
+
+    int mmap_flags = 0;
     if (flags & UAPI_MAP_SHARED) mmap_flags |= MAP_SHARED;
     if (flags & UAPI_MAP_PRIVATE) mmap_flags |= MAP_PRIVATE;
     if (flags & UAPI_MAP_ANON) mmap_flags |= MAP_ANON;
@@ -756,9 +874,11 @@ static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, i
 static int rvvm_sys_munmap(void* addr, size_t size)
 {
     spin_lock(&mmap_lock);
-    rvvm_addr_t ret = errno_ret(munmap(addr, size));
+    /* Free anonymous VMAs through the portable layer too. vma_free() is a
+     * no-op / tiny on unrecognized pointers, so this is safe for both. */
+    bool freed = vma_free(addr, size);
     spin_unlock(&mmap_lock);
-    return ret;
+    return freed ? 0 : errno_ret(munmap(addr, size));
 }
 
 extern uint64_t __thread_selfid(void);
@@ -839,9 +959,9 @@ static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* bu
     return unwrap_path(buffer, tmp, size);
 }
 
+// DEBUG: re-enable syscall trace (upstream had this compiled out)
 #undef rvvm_info
-//#define rvvm_info(...) rvvm_warn(__VA_ARGS__);
-#define rvvm_info(...)
+#define rvvm_info(...) rvvm_warn(__VA_ARGS__);
 
 static void* rvvm_user_thread_wrap(void* arg)
 {
@@ -862,6 +982,7 @@ static void* rvvm_user_thread_wrap(void* arg)
 
     while (running) {
         rvvm_addr_t cause = rvvm_run_user_thread(cpu);
+        fprintf(stderr, "[dbg] rvvm_run_user_thread -> cause=0x%lx\n", (unsigned long)cause);
         if (cause == 8) {
             // Handle syscall trap
             rvvm_addr_t a0 = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 10);
@@ -1054,9 +1175,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 63: // read
                     a0 = errno_ret(read(a0, to_ptr(a1), a2));
                     break;
-                case 64: // write
-                    a0 = errno_ret(write(a0, to_ptr(a1), a2));
+                case 64: { // write
+                    if (io_callback) {
+                        ssize_t ret = io_callback(a0, to_ptr(a1), a2);
+                        a0 = errno_ret(ret);
+                    } else {
+                        a0 = errno_ret(write(a0, to_ptr(a1), a2));
+                    }
                     break;
+                }
                 case 65: // readv
                     // TODO: struct conversion(?)
                     a0 = errno_ret(readv(a0, to_ptr(a1), a2));
@@ -1115,9 +1242,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = 0;
                     break;
                 case 93: // exit
+                    rvvm_warn("sys_exit(%ld) @ PC %lx", (long)a0, rvvm_read_cpu_reg(cpu, RVVM_REGID_PC));
                     running = false;
                     break;
                 case 94: // exit_group
+                    rvvm_warn("sys_exit_group(%ld)", (long)a0);
                     _Exit(a0);
                     break;
                 case 96: // set_tid_address
@@ -1579,6 +1708,23 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_faccessat2(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
                     a0 = errno_ret(faccessat(a0, wrap_path(path_buf, to_str(a1)), a2, a3));
                     break;
+                /*
+                 * Android NDK API Proxy syscalls (0x10000+)
+                 * These are custom syscalls used by vp_ndk_stub to forward
+                 * NDK API calls from the Guest to the Host side.
+                 *
+                 * Dispatch to vp_cmdpost which handles the actual Android API calls.
+                 */
+                case SYS_ANDROID_CALL: {
+                    rvvm_info("cmdpost_dispatch a0=%lx a1=%lx a2=%lx", a0, a1, a2);
+                    a0 = cmdpost_dispatch(SYS_ANDROID_CALL, a0, a1, a2, a3, a4, a5, NULL);
+                    break;
+                }
+                case 0x10020: // SYS_GL_CALL
+                case 0x10021: // SYS_EGL_CALL
+                    rvvm_info("cmdpost_dispatch nr=%lx a0=%lx a1=%lx", a7, a0, a1);
+                    a0 = cmdpost_dispatch(a7, a0, a1, a2, a3, a4, a5, NULL);
+                    break;
                 default:
 #ifndef __riscv
                     rvvm_error("Unknown syscall %ld!", a7);
@@ -1863,6 +2009,15 @@ int rvvm_user_linux(int argc, char** argv, char** envp)
     }
     stacktrace_init();
     user_fault_handler_install();
+    
+#if defined(ANDROID)
+    /* Set Android I/O callback before initializing cmdpost */
+    extern ssize_t android_io_callback(int fd, const void* buf, size_t count);
+    rvvm_user_set_io_callback(android_io_callback);
+#endif
+    
+    /* Initialize Android NDK API proxy */
+    cmdpost_init();
     /*elf_desc_t elf = {
         .base = NULL,
     };
@@ -1948,6 +2103,9 @@ int rvvm_user_linux(int argc, char** argv, char** envp)
     } else {
         jump_start((void*)elf.entry, stack_top);
     }
+
+    /* Cleanup Android NDK API proxy */
+    cmdpost_cleanup();
 
     free(stack_buffer);
     return 0;

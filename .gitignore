@@ -21,12 +21,20 @@
 # Explicitly track source directories
 !/include
 !/src
+!/rvvm-on-android
+!/rvvm-on-windows
+!/tools
 
 # Explicitly track build system
 !/Makefile
 !/project.mk
 !/CMakeLists.txt
 !/Doxyfile
+
+# Explicitly track build scripts
+!/build_virtpass-win32.ps1
+!/build_virtpass-android.ps1
+!/building_usermode-host.md
 
 # Explicitly track CI infrastructure
 !/.github

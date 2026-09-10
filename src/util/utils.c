@@ -24,6 +24,10 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <stdio.h>
 #include <string.h>
 
+#if defined(ANDROID)
+#include <android/log.h>
+#endif
+
 PUSH_OPTIMIZATION_SIZE
 
 /*
@@ -792,6 +796,15 @@ static void log_print(const char* prefix, const char* fmt, const void* argv)
     }
     rvvm_strlcpy(buffer + pos, log_has_colors() ? "\033[0m\n" : "\n", sizeof(buffer) - pos);
     fputs(buffer, stderr);
+#if defined(ANDROID)
+    {
+        char* log_body = buffer;
+        while (*log_body == ' ') {
+            log_body++;
+        }
+        __android_log_print(ANDROID_LOG_WARN, "RVVM", "%s", log_body);
+    }
+#endif
 }
 
 #if defined(USE_DEBUG)

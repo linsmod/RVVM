@@ -1,0 +1,15 @@
+# Android / Gradle build outputs
+.gradle/
+build/
+app/build/
+app/.cxx/
+.cxx/
+*.apk
+*.aab
+# Machine-specific SDK path
+local.properties
+# Native intermediates
+obj/
+libs/
+# Guest programs cross-compiled from src/virtpass/guest-samples (see project.mk)
+app/src/main/assets/*.exe

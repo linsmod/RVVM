@@ -459,7 +459,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // Portable zero-initializer that doesn't violate __designated_init__
 #undef ZERO_INIT
-#if defined(GNU_EXTS)
+#if defined(GNU_EXTS) && !defined(__clang__) && !defined(ANDROID)
 #undef ZERO_INIT_EMPTY_TOKEN
 #define ZERO_INIT_EMPTY_TOKEN
 #define ZERO_INIT {ZERO_INIT_EMPTY_TOKEN}

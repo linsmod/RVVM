@@ -1,0 +1,21 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "mingw",
+      "displayName": "MinGW (Windows)",
+      "description": "MinGW build with mingw32-make",
+      "generator": "MinGW Makefiles",
+      "cacheVariables": {
+        "CMAKE_MAKE_PROGRAM": "C:/msys64/mingw64/bin/mingw32-make.exe"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "mingw",
+      "configurePreset": "mingw",
+      "configuration": "Release"
+    }
+  ]
+}

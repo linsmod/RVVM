@@ -26,7 +26,9 @@ ifneq (,$(filter linux %bsd sunos,$(OS)))
 USE_X11 ?= 1
 endif
 ifneq (,$(filter windows,$(OS)))
-USE_WIN32_GUI ?= 1
+USE_WIN32_GUI    ?= 1
+# POSIX-on-Win32 compatibility layer: include/mingw_compat headers + src/win/posix_shim.c
+USE_WIN32_COMPAT ?= 1
 endif
 ifneq (,$(filter haiku,$(OS)))
 USE_HAIKU_GUI ?= 1
@@ -143,7 +145,10 @@ override SRC_USE_JIT       := $(SRCDIR)/rvjit/rvjit.c $(SRCDIR)/rvjit/rvjit_emit
 override SRC_USE_RV32      := $(SRCDIR)/cpu/riscv32_interpreter.c
 override SRC_USE_RV64      := $(SRCDIR)/cpu/riscv64_interpreter.c
 override SRC_USE_LIBRETRO  := $(SRCDIR)/bindings/libretro/libretro.c
+override SRC_USE_VERTPASS  := $(SRCDIR)/virtpass/vp_cmdpost.c
 override SRC_USE_JNI       := $(SRCDIR)/bindings/jni/rvvm_jni.c
+# Win32 implementations of the POSIX API declared in include/mingw_compat
+override SRC_USE_WIN32_COMPAT := $(SRCDIR)/win/posix_shim.c
 
 # Useflag dependencies
 override RVJIT_SUPPORTS_ARCH := $(if $(filter i386 x86_64 arm% riscv% loongarch64,$(ARCH)),1)
@@ -171,6 +176,17 @@ override LIBS_USE_WAYLAND := wayland-client xkbcommon
 
 override CPPFLAGS := $(CPPFLAGS) -I$(SRCDIR)/util
 
+# MinGW POSIX compatibility layer: include/mingw_compat provides the POSIX
+# headers (sys/uio.h, pipe2/pread/pwrite, ...), src/win/posix_shim.c provides
+# the Win32 implementations. These headers shadow the real system headers
+# (some via #include_next, some by redefining types like struct iovec), so
+# they must only be on the include path when the compat layer is enabled
+# (USE_WIN32_COMPAT, on by default for windows targets) - on POSIX hosts the
+# native headers must win.
+ifneq (,$(call var_use,USE_WIN32_COMPAT))
+override CPPFLAGS := $(CPPFLAGS) -I$(INCDIR)/mingw_compat
+endif
+
 #
 # Prepare build targets
 #
@@ -182,9 +198,28 @@ override bin_src_rvvm          := $(SRCDIR)/main.c
 override bin_src_rvvm_user     := $(SRCDIR)/rvvm_user_main.c
 override lib_src_rvvm_libretro := $(SRCDIR)/bindings/libretro/libretro.c
 
-# The userland emulator is Linux-only and assumes a 64-bit host address space,
-# build it solely on non-i386 Linux targets
-ifneq (,$(filter linux,$(OS)))
+# Guest-side stubs under src/virtpass are RISC-V (ecall trampolines),
+# they are cross-compiled by the guest builds - never build them for the host
+override lib_src_virtpass_guest := $(SRCDIR)/virtpass/vp_ndk_stub.c $(SRCDIR)/virtpass/vp_gl_stub.c
+
+# Other non-host subtrees under src/virtpass: the guest programs and the
+# Android JNI pass are cross-built for RISC-V / Android, win32-host provides
+# its own binary - none of them may end up in librvvm
+override lib_src_virtpass_nonhost := $(SRCDIR)/virtpass/guest-samples/% $(SRCDIR)/virtpass/android-host/% $(SRCDIR)/virtpass/win32-host/%
+
+# virtpass_stub bundles those guest-side stubs so guest programs can link them
+# against the virtpass passthrough. It is only buildable on a native riscv64
+# Linux target, where the guest ISA/ABI matches the host one
+ifeq ($(OS),linux)
+ifeq ($(ARCH),riscv64)
+override LIB_TARGETS           := $(LIB_TARGETS) virtpass_stub
+override lib_src_virtpass_stub := $(lib_src_virtpass_guest)
+endif
+endif
+
+# The userland emulator assumes a 64-bit host address space,
+# build it solely on non-i386 targets
+ifneq (,$(filter linux windows mingw mingw32 msys cygwin,$(OS)))
 ifeq (,$(filter i386,$(ARCH)))
 override BIN_TARGETS        := $(BIN_TARGETS) rvvm_user
 override CPPFLAGS           := $(CPPFLAGS) -DRVVM_USER_TEST
@@ -192,7 +227,23 @@ override bin_libs_rvvm_user := rvvm
 endif
 endif
 
-override lib_src_rvvm          := $(filter-out $(bin_src_rvvm) $(bin_src_rvvm_user) $(lib_src_rvvm_libretro),$(call recursive_match,$(SRCDIR),*.c *.cpp *.cc *.cxx))
+# Win32 virtpass host: a windowed host which boots a Linux guest ELF through
+# core/rvvm_user.c and services the virtpass hypercalls with GDI + OpenGL.
+# Only a handful of sources, so it is built straight from here - no nested CMake
+ifneq (,$(filter windows mingw mingw32 msys cygwin,$(OS)))
+ifeq (,$(filter i386,$(ARCH)))
+# vp_cmdpost.c bridges the guest syscalls to the host window, so it is required
+USE_VERTPASS                   ?= 1
+override BIN_TARGETS           := $(BIN_TARGETS) rvvm_winhost
+override bin_src_rvvm_winhost  := $(SRCDIR)/virtpass/win32-host/win32_main.c \
+                                  $(SRCDIR)/virtpass/win32-host/win32_cmdpost_bridge.c \
+                                  $(SRCDIR)/virtpass/win32-host/win32_gl_backend.c \
+                                  $(SRCDIR)/virtpass/win32-host/win32_gl_dispatch.c
+override bin_libs_rvvm_winhost := rvvm
+endif
+endif
+
+override lib_src_rvvm          := $(filter-out $(bin_src_rvvm) $(bin_src_rvvm_user) $(bin_src_rvvm_winhost) $(lib_src_rvvm_libretro) $(lib_src_virtpass_guest) $(lib_src_virtpass_nonhost),$(call recursive_match,$(SRCDIR),*.c *.cpp *.cc *.cxx))
 
 override bin_libs_rvvm := rvvm
 override lib_libs_rvvm := $(if $(call var_use,USE_LIBS_PROBE),,$(LIBS_USE_SDL) $(LIBS_USE_X11) $(LIBS_USE_WAYLAND))
@@ -225,3 +276,87 @@ ifneq (,$(call var_use,USE_RV64))
 	@$(if $(strip $(foreach test,$(call filter_test,rv64,$(if $(call var_use,USE_FPU),,rv64uf rv64ud rv64uzfh)),$(call invoke_rvvm,$(test) -rv64))),exit 1)
 endif
 	@:
+
+#
+# Android host application (Gradle + NDK CMake)
+#
+# The Android app is a Gradle project: Gradle drives the NDK CMake pass that
+# produces librvvm_jni.so (app/src/main/cpp/CMakeLists.txt) and then packages
+# it together with the Java UI into an APK. It cannot be expressed with this
+# Makefile's compile/link rules, so it is cascaded through the Gradle wrapper.
+#
+
+override ANDROID_HOST := $(CURDIR)/src/virtpass/android-host
+
+ANDROID_VARIANT     ?= debug
+ANDROID_GRADLE_OPTS ?=
+
+# HOST_POSIX is set for POSIX-like shells (incl. MSYS), empty for stock Windows CMD
+override ANDROID_GRADLE := $(if $(HOST_POSIX),./gradlew,gradlew.bat)
+
+# Gradle capitalizes build type names (debug -> Debug)
+override android_build_type := $(call capitalize,$(ANDROID_VARIANT))
+
+#
+# Guest programs bundled into the APK assets
+#
+# These ELFs execute inside the emulated RISC-V machine, not on the Android
+# host, so they are cross-compiled for riscv64-linux-musl and linked against the
+# virtpass guest stubs. musl is used in place of the NDK's bionic because scudo
+# reserves address space in a way the Win32 mmap shim does not support yet.
+#
+
+# Samples to bundle (Space-separated, each must match guest-samples/<name>.c)
+ANDROID_GUEST_SAMPLES ?= test_game_activity test_render
+
+override ANDROID_ASSETS_DIR  := $(ANDROID_HOST)/app/src/main/assets
+override ANDROID_GUEST_DIR   := $(BUILDDIR)/android-guest
+override ANDROID_GUEST_ZIG   := zig cc
+override ANDROID_GUEST_AR    := zig ar
+override ANDROID_GUEST_FLAGS := -target riscv64-linux-musl -I$(INCDIR) -fno-sanitize=undefined
+override ANDROID_GUEST_HEADS := $(INCDIR)/virtpass/vp_android.h $(INCDIR)/virtpass/vp_gl.h
+override ANDROID_GUEST_LIBS  := $(ANDROID_GUEST_DIR)/libandroid_stubs.a $(ANDROID_GUEST_DIR)/libgles_stubs.a
+override android_guest_assets := $(addprefix $(ANDROID_ASSETS_DIR)/,$(addsuffix .exe,$(ANDROID_GUEST_SAMPLES)))
+
+# Guest-side syscall stubs, shared by every sample
+$(ANDROID_GUEST_DIR)/vp_ndk_stub.o: $(SRCDIR)/virtpass/vp_ndk_stub.c $(ANDROID_GUEST_HEADS)
+	$(call create_dirs,$(dir $@))
+	$(call println,$(TEXT)[$(GREEN)CC$(TEXT)] $@ $(RESET))
+	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -c -o $@ $<)
+
+$(ANDROID_GUEST_DIR)/vp_gl_stub.o: $(SRCDIR)/virtpass/vp_gl_stub.c $(ANDROID_GUEST_HEADS)
+	$(call create_dirs,$(dir $@))
+	$(call println,$(TEXT)[$(GREEN)CC$(TEXT)] $@ $(RESET))
+	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -c -o $@ $<)
+
+$(ANDROID_GUEST_DIR)/libandroid_stubs.a: $(ANDROID_GUEST_DIR)/vp_ndk_stub.o
+	$(call println,$(TEXT)[$(GREEN)AR$(TEXT)] $@ $(RESET))
+	@$(call shell_esc,$(ANDROID_GUEST_AR) rcs $@ $<)
+
+$(ANDROID_GUEST_DIR)/libgles_stubs.a: $(ANDROID_GUEST_DIR)/vp_gl_stub.o
+	$(call println,$(TEXT)[$(GREEN)AR$(TEXT)] $@ $(RESET))
+	@$(call shell_esc,$(ANDROID_GUEST_AR) rcs $@ $<)
+
+# Each sample is linked straight into the APK assets tree
+$(ANDROID_ASSETS_DIR)/%.exe: $(SRCDIR)/virtpass/guest-samples/%.c $(ANDROID_GUEST_LIBS) $(ANDROID_GUEST_HEADS)
+	$(call create_dirs,$(dir $@))
+	$(call println,$(TEXT)[$(GREEN)LD$(TEXT)] $@ $(RESET))
+	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -static -L$(ANDROID_GUEST_DIR) -landroid_stubs -lgles_stubs -o $@ $<)
+
+.PHONY: android-assets # Cross-compile the guest samples into the APK assets
+android-assets: $(android_guest_assets)
+
+.PHONY: android       # Build the Android APK (Java + librvvm_jni.so + guest assets)
+android: android-assets
+	$(call log_info,Building Android $(ANDROID_VARIANT) APK)
+	$(call shell_esc,cd $(ANDROID_HOST) && $(ANDROID_GRADLE) $(ANDROID_GRADLE_OPTS) :app:assemble$(android_build_type))
+
+.PHONY: android-jni   # Build only librvvm_jni.so (native pass of the Gradle build)
+android-jni:
+	$(call log_info,Building Android $(ANDROID_VARIANT) JNI library)
+	$(call shell_esc,cd $(ANDROID_HOST) && $(ANDROID_GRADLE) $(ANDROID_GRADLE_OPTS) :app:externalNativeBuild$(android_build_type))
+
+.PHONY: android-clean # Clean the Android build outputs
+android-clean:
+	$(call log_info,Cleaning Android builds)
+	$(call shell_esc,cd $(ANDROID_HOST) && $(ANDROID_GRADLE) $(ANDROID_GRADLE_OPTS) clean)

@@ -19,16 +19,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #ifndef RVVM_USER_H
 #define RVVM_USER_H
 
-#include <stddef.h>
-
-// Callback type for guest I/O redirection
-// Returns number of bytes written, or -1 on error
-typedef ssize_t (*rvvm_user_io_callback)(int fd, const void* buf, size_t count);
-
-// Set custom I/O callback for guest write syscalls
-// If callback returns -1, the syscall will fail with errno
-void rvvm_user_set_io_callback(rvvm_user_io_callback callback);
-
 // Just call this like main(), envp may be NULL
 int rvvm_user_linux(int argc, char** argv, char** envp);
 
