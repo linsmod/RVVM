@@ -39,12 +39,15 @@
 .EXAMPLE
     pwsh ./build_virtpass-win32.ps1 -RegenGlAbi
 #>
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$Target = 'bin',
-    [switch]$Clean,
     [int]$Jobs = 0,
+    [switch]$Clean,
     [switch]$RegenGlAbi,
+
+    # Anything not recognised as a named parameter is forwarded to make,
+    # e.g. 'USE_RVJIT=0' or 'BUILD_TYPE=debug'
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$MakeArgs
 )
@@ -125,13 +128,5 @@ if ($exitCode -ne 0) {
     exit $exitCode
 }
 
-$hostExe = Get-ChildItem -Path $RVVM_ROOT -Recurse -Depth 1 -Filter 'rvvm_winhost_*.exe' -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
-
 Write-Host "`nWin32 virtpass host build complete." -ForegroundColor Green
-if ($hostExe) {
-    Write-Host "  $($hostExe.FullName)" -ForegroundColor Green
-    Write-Host "Run: $($hostExe.FullName) src\virtpass\android-host\app\src\main\assets\test_render.exe" -ForegroundColor Yellow
-    Write-Host "(guest ELFs are produced by build_virtpass-android.ps1 -Target assets)" -ForegroundColor DarkGray
-}
 exit 0

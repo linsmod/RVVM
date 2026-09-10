@@ -31,6 +31,23 @@ public class RvvmNative {
     public static native void nativeSetWindow(Surface surface);
 
     /**
+     * Push the real device configuration (AConfiguration values) to native.
+     * Every metric is read from the Java Configuration object, which is the
+     * only place the exact dp/density figures are available.
+     *
+     * @param widthDp     Current screen width in dp
+     * @param heightDp    Current screen height in dp
+     * @param densityDpi  Density bucket in dpi (e.g. 160, 320)
+     * @param orientation Screen orientation (Configuration.ORIENTATION_*)
+     * @param screenSize  Screen size class (Configuration.SCREENLAYOUT_SIZE_*)
+     * @param screenLong  Long-screen flag (ACONFIGURATION_SCREENLONG_*)
+     * @param screenRound Round-screen flag (ACONFIGURATION_SCREENROUND_*)
+     */
+    public static native void nativeSetDisplayConfig(int widthDp, int heightDp, int densityDpi,
+                                                     int orientation, int screenSize,
+                                                     int screenLong, int screenRound);
+
+    /**
      * Enable a specific sensor.
      * @param sensorType The sensor type (e.g., Sensor.TYPE_ACCELEROMETER)
      */

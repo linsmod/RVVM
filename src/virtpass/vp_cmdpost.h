@@ -47,6 +47,22 @@ typedef int32_t (*window_unlock_callback)(void* window, void* guestPixels);
 typedef void (*window_size_callback)(int64_t* width, int64_t* height);
 typedef int32_t (*window_set_buf_callback)(int32_t width, int32_t height, int32_t format);
 
+/* Field selectors for SYS_ANDROID_CONFIG (passed in a1).
+ * Internal transport encoding; mirrored in virtpass/vp_android.h. */
+#ifndef VP_ACONFIG_QUERY_ORIENTATION
+#define VP_ACONFIG_QUERY_ORIENTATION      0
+#define VP_ACONFIG_QUERY_DENSITY          1
+#define VP_ACONFIG_QUERY_SCREEN_SIZE      2
+#define VP_ACONFIG_QUERY_SCREEN_LONG      3
+#define VP_ACONFIG_QUERY_SCREEN_ROUND     4
+#define VP_ACONFIG_QUERY_SCREEN_WIDTH_DP  5
+#define VP_ACONFIG_QUERY_SCREEN_HEIGHT_DP 6
+#endif
+
+/* Configuration callback: host fills *outValue for the requested field
+ * (VP_ACONFIG_QUERY_* selector) and returns 0 on success. */
+typedef int32_t (*config_get_callback)(int32_t field, int32_t* outValue);
+
 /* GameActivity callbacks */
 typedef void (*game_lifecycle_callback)(int32_t cmd);
 typedef void (*game_input_callback)(void* motionEvent);
@@ -136,6 +152,9 @@ void cmdpost_set_window_callbacks(window_lock_callback lock,
 void cmdpost_set_window_size_callback(window_size_callback size_cb);
 
 void cmdpost_set_window_set_buf_callback(window_set_buf_callback set_buf_cb);
+
+/* Register the host-side device configuration provider (AConfiguration_*). */
+void cmdpost_set_config_callback(config_get_callback get_cb);
 
 void cmdpost_set_game_callbacks(game_lifecycle_callback lifecycle,
                                  game_input_callback input);

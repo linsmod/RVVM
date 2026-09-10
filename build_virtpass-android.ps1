@@ -43,15 +43,18 @@
 .EXAMPLE
     pwsh ./build_virtpass-android.ps1 -Variant release -Clean
 #>
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [ValidateSet('apk', 'assets', 'jni', 'clean')]
     [string]$Target = 'apk',
     [ValidateSet('debug', 'release')]
     [string]$Variant = 'debug',
-    [switch]$Clean,
     [int]$Jobs = 0,
+    [switch]$Clean,
     [switch]$RegenGlAbi,
+
+    # Anything not recognised as a named parameter is forwarded to make,
+    # e.g. 'ANDROID_GUEST_SAMPLES=test_render test_render_gles'
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$MakeArgs
 )
@@ -65,7 +68,6 @@ if (-not (Test-Path -LiteralPath (Join-Path $RVVM_ROOT 'Makefile'))) {
 }
 
 $ANDROID_HOST = Join-Path $RVVM_ROOT 'src\virtpass\android-host'
-$ASSETS_DIR = Join-Path $ANDROID_HOST 'app\src\main\assets'
 
 # --- Toolchain lookup: prefer PATH, then the usual MSYS2 locations ---
 function Resolve-Make {
@@ -146,18 +148,4 @@ if ($exitCode -ne 0) {
 }
 
 Write-Host "`nAndroid virtpass build complete." -ForegroundColor Green
-
-if ($makeTarget -eq 'android-assets' -or $makeTarget -eq 'android') {
-    $guestExes = Get-ChildItem -Path $ASSETS_DIR -Filter '*.exe' -ErrorAction SilentlyContinue
-    if ($guestExes) {
-        Write-Host "  guest ELFs ($($guestExes.Count)): $ASSETS_DIR" -ForegroundColor Green
-        $guestExes | ForEach-Object { Write-Host "    $($_.Name)" -ForegroundColor DarkGray }
-    }
-}
-
-if ($makeTarget -eq 'android') {
-    $apk = Get-ChildItem -Path (Join-Path $ANDROID_HOST "app\build\outputs\apk\$Variant") -Filter '*.apk' -Recurse -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($apk) { Write-Host "  APK: $($apk.FullName)" -ForegroundColor Green }
-}
 exit 0

@@ -335,6 +335,86 @@ int32_t ANativeWindow_lock(ANativeWindow* window, ANativeWindow_Buffer* outBuffe
 int32_t ANativeWindow_unlockAndPost(ANativeWindow* window);
 
 /* ============================================================
+ * Configuration API (android/configuration.h)
+ *
+ * Mirrors the public NDK surface. The device configuration is owned
+ * by the host; every getter proxies to it through SYS_ANDROID_CONFIG
+ * (field selector passed in a1). Exact PPI is intentionally absent:
+ * the public NDK only exposes quantised density buckets.
+ * ============================================================ */
+
+typedef struct AConfiguration AConfiguration;
+
+/* Screen size classification */
+enum {
+    ACONFIGURATION_SCREENSIZE_ANY    = 0x00,
+    ACONFIGURATION_SCREENSIZE_SMALL  = 0x01,
+    ACONFIGURATION_SCREENSIZE_NORMAL = 0x02,
+    ACONFIGURATION_SCREENSIZE_LARGE  = 0x03,
+    ACONFIGURATION_SCREENSIZE_XLARGE = 0x04,
+};
+
+/* Density buckets (quantised, not exact PPI) */
+enum {
+    ACONFIGURATION_DENSITY_DEFAULT = 0,
+    ACONFIGURATION_DENSITY_LOW     = 120,
+    ACONFIGURATION_DENSITY_MEDIUM  = 160,
+    ACONFIGURATION_DENSITY_TV      = 213,
+    ACONFIGURATION_DENSITY_HIGH    = 240,
+    ACONFIGURATION_DENSITY_XHIGH   = 320,
+    ACONFIGURATION_DENSITY_XXHIGH  = 480,
+    ACONFIGURATION_DENSITY_XXXHIGH = 640,
+    ACONFIGURATION_DENSITY_ANY     = 0xfffe,
+    ACONFIGURATION_DENSITY_NONE    = 0xffff,
+};
+
+/* Screen aspect (long / not long) */
+enum {
+    ACONFIGURATION_SCREENLONG_ANY = 0x00,
+    ACONFIGURATION_SCREENLONG_NO  = 0x1,
+    ACONFIGURATION_SCREENLONG_YES = 0x2,
+};
+
+/* Screen shape (round / not round) */
+enum {
+    ACONFIGURATION_SCREENROUND_ANY = 0x00,
+    ACONFIGURATION_SCREENROUND_NO  = 0x1,
+    ACONFIGURATION_SCREENROUND_YES = 0x2,
+};
+
+/* Screen orientation */
+enum {
+    ACONFIGURATION_ORIENTATION_ANY    = 0x0000,
+    ACONFIGURATION_ORIENTATION_PORT   = 0x0001,
+    ACONFIGURATION_ORIENTATION_LAND   = 0x0002,
+    ACONFIGURATION_ORIENTATION_SQUARE = 0x0003,
+};
+
+/* Field selectors for SYS_ANDROID_CONFIG (passed in a1).
+ * Internal transport encoding; mirrored in vp_cmdpost.h. */
+#ifndef VP_ACONFIG_QUERY_ORIENTATION
+#define VP_ACONFIG_QUERY_ORIENTATION      0
+#define VP_ACONFIG_QUERY_DENSITY          1
+#define VP_ACONFIG_QUERY_SCREEN_SIZE      2
+#define VP_ACONFIG_QUERY_SCREEN_LONG      3
+#define VP_ACONFIG_QUERY_SCREEN_ROUND     4
+#define VP_ACONFIG_QUERY_SCREEN_WIDTH_DP  5
+#define VP_ACONFIG_QUERY_SCREEN_HEIGHT_DP 6
+#endif
+
+AConfiguration* AConfiguration_new(void);
+void AConfiguration_delete(AConfiguration* config);
+void AConfiguration_copy(AConfiguration* dest, AConfiguration* src);
+
+int32_t AConfiguration_getScreenSize(AConfiguration* config);
+int32_t AConfiguration_getScreenWidthDp(AConfiguration* config);
+int32_t AConfiguration_getScreenHeightDp(AConfiguration* config);
+int32_t AConfiguration_getDensity(AConfiguration* config);
+int32_t AConfiguration_getScreenLong(AConfiguration* config);
+int32_t AConfiguration_getScreenRound(AConfiguration* config);
+int32_t AConfiguration_getOrientation(AConfiguration* config);
+
+/* ============================================================
  * Input API (android/input.h)
  * ============================================================ */
 

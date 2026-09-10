@@ -21,8 +21,6 @@
 # Explicitly track source directories
 !/include
 !/src
-!/rvvm-on-android
-!/rvvm-on-windows
 !/tools
 
 # Explicitly track build system
@@ -34,7 +32,7 @@
 # Explicitly track build scripts
 !/build_virtpass-win32.ps1
 !/build_virtpass-android.ps1
-!/building_usermode-host.md
+!/building_userland-host.md
 
 # Explicitly track CI infrastructure
 !/.github

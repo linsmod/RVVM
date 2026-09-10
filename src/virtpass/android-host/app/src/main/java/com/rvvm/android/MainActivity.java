@@ -2,6 +2,7 @@ package com.rvvm.android;
 
 import android.app.Activity;
 import android.content.res.AssetManager;
+import android.content.res.Configuration;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -86,6 +87,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             RvvmNative.nativeInit();
             isInitialized = true;
 
+            // Push the real screen metrics (the AConfiguration source of truth)
+            pushDisplayConfig();
+
             // Enable sensors
             if (accelerometer != null) {
                 RvvmNative.nativeEnableSensor(Sensor.TYPE_ACCELEROMETER);
@@ -108,6 +112,40 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         } catch (Exception e) {
             statusText.setText("Failed to initialize RVVM: " + e.getMessage());
             Log.e(TAG, "Failed to initialize RVVM", e);
+        }
+    }
+
+    /**
+     * Push the real device configuration to native.
+     *
+     * The exact dp/density figures only exist on the Java side, so the guest
+     * learns them through the AConfiguration_* proxies. screenLong and
+     * screenRound are mapped to the ACONFIGURATION_* values the NDK uses.
+     */
+    private void pushDisplayConfig() {
+        Configuration config = getResources().getConfiguration();
+        int screenLayout = config.screenLayout;
+
+        int longMode = (screenLayout & Configuration.SCREENLAYOUT_LONG_MASK) == Configuration.SCREENLAYOUT_LONG_YES ? 2
+                     : (screenLayout & Configuration.SCREENLAYOUT_LONG_MASK) == Configuration.SCREENLAYOUT_LONG_NO ? 1
+                     : 0;
+        int roundMode = config.isScreenRound() ? 2 : 1;
+
+        RvvmNative.nativeSetDisplayConfig(
+                config.screenWidthDp,
+                config.screenHeightDp,
+                config.densityDpi,
+                config.orientation,
+                screenLayout & Configuration.SCREENLAYOUT_SIZE_MASK,
+                longMode,
+                roundMode);
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (isInitialized) {
+            pushDisplayConfig();
         }
     }
 

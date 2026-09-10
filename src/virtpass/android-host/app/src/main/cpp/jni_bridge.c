@@ -15,6 +15,7 @@
 #include <android/sensor.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
+#include <android/configuration.h>  /* ACONFIGURATION_* constants */
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -48,6 +49,27 @@ static ALooper* g_looper = NULL;
 
 /* Window from Android */
 static ANativeWindow* g_native_window = NULL;
+
+/* Device configuration pushed from the Java Configuration object.
+ * The public NDK AConfiguration only carries quantised values, and the
+ * exact dp/density figures live on the Java side. */
+static struct {
+    int32_t width_dp;
+    int32_t height_dp;
+    int32_t density_dpi;
+    int32_t orientation;
+    int32_t screen_size;
+    int32_t screen_long;
+    int32_t screen_round;
+} g_display_cfg = {
+    .width_dp     = 640,
+    .height_dp    = 480,
+    .density_dpi  = ACONFIGURATION_DENSITY_MEDIUM,
+    .orientation  = ACONFIGURATION_ORIENTATION_LAND,
+    .screen_size  = ACONFIGURATION_SCREENSIZE_NORMAL,
+    .screen_long  = ACONFIGURATION_SCREENLONG_NO,
+    .screen_round = ACONFIGURATION_SCREENROUND_NO,
+};
 
 /* GameActivity state */
 static int32_t g_lifecycle_cmd_queue[32];
@@ -210,6 +232,39 @@ static int32_t on_window_set_buf(int32_t width, int32_t height, int32_t format)
     return result;
 }
 
+/* Device configuration callback (called from vp_cmdpost).
+ * Serves the values pushed by nativeSetDisplayConfig(). */
+static int32_t on_config_get(int32_t field, int32_t* outValue)
+{
+    if (!outValue) return -1;
+
+    switch (field) {
+    case VP_ACONFIG_QUERY_ORIENTATION:
+        *outValue = g_display_cfg.orientation;
+        return 0;
+    case VP_ACONFIG_QUERY_DENSITY:
+        *outValue = g_display_cfg.density_dpi;
+        return 0;
+    case VP_ACONFIG_QUERY_SCREEN_SIZE:
+        *outValue = g_display_cfg.screen_size;
+        return 0;
+    case VP_ACONFIG_QUERY_SCREEN_LONG:
+        *outValue = g_display_cfg.screen_long;
+        return 0;
+    case VP_ACONFIG_QUERY_SCREEN_ROUND:
+        *outValue = g_display_cfg.screen_round;
+        return 0;
+    case VP_ACONFIG_QUERY_SCREEN_WIDTH_DP:
+        *outValue = g_display_cfg.width_dp;
+        return 0;
+    case VP_ACONFIG_QUERY_SCREEN_HEIGHT_DP:
+        *outValue = g_display_cfg.height_dp;
+        return 0;
+    default:
+        return -1;
+    }
+}
+
 /* GameActivity lifecycle callback (called from vp_cmdpost) */
 static void on_game_lifecycle(int32_t cmd)
 {
@@ -257,12 +312,13 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
     cmdpost_set_window_callbacks(on_window_lock, on_window_unlock);
     cmdpost_set_window_size_callback(on_window_size);
     cmdpost_set_window_set_buf_callback(on_window_set_buf);
+    cmdpost_set_config_callback(on_config_get);
     
     /* Set GameActivity callbacks */
     cmdpost_set_game_callbacks(on_game_lifecycle, on_game_input);
 
-    /* Get Android sensor manager */
-    g_sensor_manager = ASensorManager_getInstance();
+    /* Get Android sensor manager (per-package singleton, API 26+) */
+    g_sensor_manager = ASensorManager_getInstanceForPackage(NULL);
     if (g_sensor_manager) {
         LOGI("Sensor manager initialized");
 
@@ -394,10 +450,10 @@ Java_com_rvvm_android_RvvmNative_nativePollEvents(JNIEnv* env, jobject thiz)
         return JNI_FALSE;
     }
 
-    /* Poll for events */
+    /* Poll for events: (timeoutMillis, outFd, outEvents, outData) */
     int events;
     void* data;
-    int result = ALooper_pollOnce(0, &events, &data, NULL);
+    int result = ALooper_pollOnce(0, NULL, &events, &data);
 
     if (result >= 0) {
         /* Read sensor events */
@@ -440,6 +496,29 @@ Java_com_rvvm_android_RvvmNative_nativeGetVersion(JNIEnv* env, jobject thiz)
 {
     (void)thiz;
     return (*env)->NewStringUTF(env, "1.0.0");
+}
+
+/* Push the real device configuration from the Java Configuration object.
+ * Called by MainActivity on start and on configuration changes. */
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeSetDisplayConfig(
+    JNIEnv* env, jobject thiz,
+    jint widthDp, jint heightDp, jint densityDpi,
+    jint orientation, jint screenSize, jint screenLong, jint screenRound)
+{
+    (void)env;
+    (void)thiz;
+
+    g_display_cfg.width_dp     = (int32_t)widthDp;
+    g_display_cfg.height_dp    = (int32_t)heightDp;
+    g_display_cfg.density_dpi  = (int32_t)densityDpi;
+    g_display_cfg.orientation  = (int32_t)orientation;
+    g_display_cfg.screen_size  = (int32_t)screenSize;
+    g_display_cfg.screen_long  = (int32_t)screenLong;
+    g_display_cfg.screen_round = (int32_t)screenRound;
+
+    LOGI("Display config: %dx%d dp, density=%d, orient=%d, size=%d, long=%d, round=%d",
+         widthDp, heightDp, densityDpi, orientation, screenSize, screenLong, screenRound);
 }
 
 JNIEXPORT void JNICALL

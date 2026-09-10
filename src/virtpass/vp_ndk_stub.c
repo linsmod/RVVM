@@ -499,6 +499,83 @@ long result = virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_WINDOW_UNLOCK,
 }
 
 /* ============================================================
+ * Configuration API Stubs (android/configuration.h)
+ *
+ * The device configuration is owned by the host, so every getter
+ * proxies to it through SYS_ANDROID_CONFIG. The handle is an opaque
+ * token; no configuration state is cached on the guest side.
+ * ============================================================ */
+
+struct AConfiguration {
+    int32_t reserved;
+};
+
+static int32_t guest_config_query(int32_t field)
+{
+    return (int32_t)virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_CONFIG,
+                                     field, 0, 0, 0, 0, 0);
+}
+
+AConfiguration* AConfiguration_new(void)
+{
+    AConfiguration* config = (AConfiguration*)malloc(sizeof(AConfiguration));
+    if (config) config->reserved = 0;
+    return config;
+}
+
+void AConfiguration_delete(AConfiguration* config)
+{
+    if (config) free(config);
+}
+
+void AConfiguration_copy(AConfiguration* dest, AConfiguration* src)
+{
+    if (dest && src) *dest = *src;
+}
+
+int32_t AConfiguration_getScreenSize(AConfiguration* config)
+{
+    (void)config;
+    return guest_config_query(VP_ACONFIG_QUERY_SCREEN_SIZE);
+}
+
+int32_t AConfiguration_getScreenWidthDp(AConfiguration* config)
+{
+    (void)config;
+    return guest_config_query(VP_ACONFIG_QUERY_SCREEN_WIDTH_DP);
+}
+
+int32_t AConfiguration_getScreenHeightDp(AConfiguration* config)
+{
+    (void)config;
+    return guest_config_query(VP_ACONFIG_QUERY_SCREEN_HEIGHT_DP);
+}
+
+int32_t AConfiguration_getDensity(AConfiguration* config)
+{
+    (void)config;
+    return guest_config_query(VP_ACONFIG_QUERY_DENSITY);
+}
+
+int32_t AConfiguration_getScreenLong(AConfiguration* config)
+{
+    (void)config;
+    return guest_config_query(VP_ACONFIG_QUERY_SCREEN_LONG);
+}
+
+int32_t AConfiguration_getScreenRound(AConfiguration* config)
+{
+    (void)config;
+    return guest_config_query(VP_ACONFIG_QUERY_SCREEN_ROUND);
+}
+
+int32_t AConfiguration_getOrientation(AConfiguration* config)
+{
+    (void)config;
+    return guest_config_query(VP_ACONFIG_QUERY_ORIENTATION);
+}
+
+/* ============================================================
  * Input API Stubs (android/input.h)
  * ============================================================ */
 

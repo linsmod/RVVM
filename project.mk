@@ -306,8 +306,10 @@ override android_build_type := $(call capitalize,$(ANDROID_VARIANT))
 # reserves address space in a way the Win32 mmap shim does not support yet.
 #
 
-# Samples to bundle (Space-separated, each must match guest-samples/<name>.c)
-ANDROID_GUEST_SAMPLES ?= test_game_activity test_render
+# Samples to bundle: every guest program found in guest-samples/, so dropping a
+# new <name>.c there is enough to get it built and copied into the assets tree
+override android_guest_samples := $(notdir $(basename $(filter %.c,$(call ls_dir,$(SRCDIR)/virtpass/guest-samples))))
+ANDROID_GUEST_SAMPLES ?= $(android_guest_samples)
 
 override ANDROID_ASSETS_DIR  := $(ANDROID_HOST)/app/src/main/assets
 override ANDROID_GUEST_DIR   := $(BUILDDIR)/android-guest

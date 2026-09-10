@@ -285,6 +285,59 @@ static int32_t on_window_set_buf(int32_t width, int32_t height, int32_t format)
     return 0;
 }
 
+/* Simulated host density (mdpi: 1 dp == 1 px). Once the layer-1
+ * virt_display PPI is plumbed through win32_host_init() this stands in
+ * for it; the guest only ever sees the quantised bucket. */
+static int32_t g_cfg_density_dpi = ACONFIGURATION_DENSITY_MEDIUM;
+
+static int32_t on_config_get(int32_t field, int32_t* outValue)
+{
+    int32_t w, h, width_dp, height_dp, long_dp, short_dp;
+
+    if (!outValue) return -1;
+
+    EnterCriticalSection(&g_surf_cs);
+    w = (g_surf_w > 0) ? g_surf_w : g_init_w;
+    h = (g_surf_h > 0) ? g_surf_h : g_init_h;
+    LeaveCriticalSection(&g_surf_cs);
+
+    width_dp  = w * 160 / g_cfg_density_dpi;
+    height_dp = h * 160 / g_cfg_density_dpi;
+    long_dp   = (width_dp >= height_dp) ? width_dp : height_dp;
+    short_dp  = (width_dp >= height_dp) ? height_dp : width_dp;
+
+    switch (field) {
+    case VP_ACONFIG_QUERY_ORIENTATION:
+        *outValue = (w >= h) ? ACONFIGURATION_ORIENTATION_LAND
+                             : ACONFIGURATION_ORIENTATION_PORT;
+        return 0;
+    case VP_ACONFIG_QUERY_DENSITY:
+        *outValue = g_cfg_density_dpi;
+        return 0;
+    case VP_ACONFIG_QUERY_SCREEN_SIZE:
+        *outValue = (short_dp < 320) ? ACONFIGURATION_SCREENSIZE_SMALL
+                  : (short_dp < 480) ? ACONFIGURATION_SCREENSIZE_NORMAL
+                  : (short_dp < 720) ? ACONFIGURATION_SCREENSIZE_LARGE
+                                     : ACONFIGURATION_SCREENSIZE_XLARGE;
+        return 0;
+    case VP_ACONFIG_QUERY_SCREEN_LONG:
+        *outValue = (long_dp * 5 >= short_dp * 8) ? ACONFIGURATION_SCREENLONG_YES
+                                                  : ACONFIGURATION_SCREENLONG_NO;
+        return 0;
+    case VP_ACONFIG_QUERY_SCREEN_ROUND:
+        *outValue = ACONFIGURATION_SCREENROUND_NO;
+        return 0;
+    case VP_ACONFIG_QUERY_SCREEN_WIDTH_DP:
+        *outValue = width_dp;
+        return 0;
+    case VP_ACONFIG_QUERY_SCREEN_HEIGHT_DP:
+        *outValue = height_dp;
+        return 0;
+    default:
+        return -1;
+    }
+}
+
 static void on_sensor_init(void)
 {
     winhost_log("sensor system initialized (stub sensors)");
@@ -614,6 +667,7 @@ bool win32_host_init(const char* title, int width, int height)
     cmdpost_set_window_callbacks(on_window_lock, on_window_unlock);
     cmdpost_set_window_size_callback(on_window_size);
     cmdpost_set_window_set_buf_callback(on_window_set_buf);
+    cmdpost_set_config_callback(on_config_get);
     cmdpost_set_game_callbacks(on_game_lifecycle, on_game_input);
     /* Phase 3: GL/EGL dispatch callbacks */
     cmdpost_set_gl_callbacks(on_egl_dispatch, on_gl_dispatch);

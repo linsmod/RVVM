@@ -128,6 +128,9 @@ typedef void (*game_input_callback)(void* motionEvent);
 typedef void (*window_size_callback)(int64_t* width, int64_t* height);
 typedef int32_t (*window_set_buf_callback)(int32_t width, int32_t height, int32_t format);
 
+/* Configuration callback: host resolves one AConfiguration field. */
+typedef int32_t (*config_get_callback)(int32_t field, int32_t* outValue);
+
 static sensor_init_callback g_sensor_init_cb = NULL;
 static sensor_enable_callback g_sensor_enable_cb = NULL;
 static sensor_data_callback g_sensor_data_cb = NULL;
@@ -136,6 +139,7 @@ static window_lock_callback g_window_lock_cb = NULL;
 static window_unlock_callback g_window_unlock_cb = NULL;
 static window_size_callback g_window_size_cb = NULL;
 static window_set_buf_callback g_window_set_buf_cb = NULL;
+static config_get_callback g_config_get_cb = NULL;
 
 static game_lifecycle_callback g_game_lifecycle_cb = NULL;
 static game_input_callback g_game_input_cb = NULL;
@@ -215,6 +219,11 @@ void cmdpost_set_window_size_callback(window_size_callback size_cb)
 void cmdpost_set_window_set_buf_callback(window_set_buf_callback set_buf_cb)
 {
     g_window_set_buf_cb = set_buf_cb;
+}
+
+void cmdpost_set_config_callback(config_get_callback get_cb)
+{
+    g_config_get_cb = get_cb;
 }
 
 void cmdpost_set_game_callbacks(game_lifecycle_callback lifecycle,
@@ -350,9 +359,13 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                 }
 
                 case SYS_ANDROID_CONFIG: {
-                    /* Get configuration */
-                    // TODO: Return device configuration
-                    return 0;
+                    /* Get one device configuration field (a1 = VP_ACONFIG_QUERY_*) */
+                    int32_t field = (int32_t)a1;
+                    int32_t value = 0;
+                    if (g_config_get_cb && g_config_get_cb(field, &value) == 0) {
+                        return (int64_t)value;
+                    }
+                    return -1; /* host provided no configuration */
                 }
 
                 case SYS_ANDROID_LOOPER_INIT: {
