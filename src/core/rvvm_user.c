@@ -887,8 +887,10 @@ static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, i
 static int rvvm_sys_munmap(void* addr, size_t size)
 {
     spin_lock(&mmap_lock);
-    /* Free anonymous VMAs through the portable layer too. vma_free() is a
-     * no-op / tiny on unrecognized pointers, so this is safe for both. */
+    /* Anonymous VMAs live in the portable VMA layer, which also emulates
+     * partial unmap (decommit) that raw VirtualFree(MEM_RELEASE) cannot.
+     * File-backed views / foreign pointers fail vma_free() and fall through
+     * to the raw munmap() below. */
     bool freed = vma_free(addr, size);
     spin_unlock(&mmap_lock);
     return freed ? 0 : errno_ret(munmap(addr, size));

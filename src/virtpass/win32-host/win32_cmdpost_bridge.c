@@ -39,6 +39,11 @@
 #define SENSOR_TIMER_ID   1
 #define SENSOR_TIMER_MS   100
 
+/* How long win32_host_shutdown() waits for the guest thread to unwind. Kept
+ * below the ~5s budget Windows grants a CTRL_CLOSE_EVENT handler so a
+ * console-close shutdown still completes before the OS hard-kills us. */
+#define GUEST_EXIT_TIMEOUT_MS 4000
+
 /* ------------------------------------------------------------------ */
 /* Host state                                                          */
 /* ------------------------------------------------------------------ */
@@ -84,6 +89,12 @@ static HANDLE g_guest_thread = NULL;
 static int    g_guest_argc   = 0;
 static char** g_guest_argv   = NULL;
 static int    g_guest_rc     = -1;
+
+/* Visibility edge (Android foreground/background). true while the OS window is
+ * minimized. PAUSE/STOP are emitted only on the visible -> minimized edge and
+ * START/RESUME only on the reverse edge, so the lifecycle commands are never
+ * spammed by the stream of WM_SIZE messages. */
+static bool   g_minimized    = false;
 
 static void winhost_log(const char* fmt, ...)
 {
@@ -797,15 +808,41 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
 
     case WM_SIZE:
-        if (wParam != SIZE_MINIMIZED) {
-            /* The window is just a viewport onto the fixed-size virtual panel,
-             * so on resize we only need to repaint: the panel is re-scaled to
-             * the new client area (contain fit). Invalidate the whole client
-             * area so WM_PAINT redraws immediately instead of leaving the
-             * freshly exposed region stale/unpainted. */
-            if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+        /* Visibility edge: the OS window is the activity's foreground/background
+         * signal (WM_ACTIVATE is deliberately ignored, see the note above).
+         * Minimizing is an Android "gone to background", NOT a destroy: the
+         * activity stays alive (STOP), so we pause it and stop the vsync source
+         * instead of letting a hidden window keep rendering at full speed. */
+        if (wParam == SIZE_MINIMIZED) {
+            if (!g_minimized) {
+                g_minimized = true;
+                queue_lifecycle(APP_CMD_PAUSE);
+                queue_lifecycle(APP_CMD_STOP);
+                vsync_clock_stop();
+            }
+            return 0;
+        }
+
+        if (g_minimized) {
+            /* Foreground again: re-arm the vsync source before resuming so the
+             * clock is running when the guest comes back. The guest re-probes
+             * the fd-wakeup path on its next frame (cmdpost_set_choreographer_
+             * callback clears the source-lost flag the stop above raised). */
+            g_minimized = false;
+            cmdpost_set_choreographer_callback(on_choreographer_wait);
+            vsync_clock_start();
+            queue_lifecycle(APP_CMD_START);
+            queue_lifecycle(APP_CMD_RESUME);
+        } else {
             queue_lifecycle(APP_CMD_WINDOW_RESIZED);
         }
+
+        /* The window is just a viewport onto the fixed-size virtual panel, so on
+         * resize we only need to repaint: the panel is re-scaled to the new
+         * client area (contain fit). Invalidate the whole client area so WM_PAINT
+         * redraws immediately instead of leaving the freshly exposed region
+         * stale/unpainted. */
+        if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
         return 0;
 
     case WM_LBUTTONDOWN:
@@ -850,9 +887,16 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
 
     case WM_CLOSE:
-        /* Android teardown order */
-        queue_lifecycle(APP_CMD_PAUSE);
-        queue_lifecycle(APP_CMD_STOP);
+        /* Real finish: DESTROY is the only command that ends the activity.
+         * PAUSE/STOP are now visibility-driven (WM_SIZE above), so we only add
+         * them here when the activity is still foreground, to keep the Android
+         * teardown order onPause -> onStop -> onDestroy. When the window was
+         * already minimized those two were sent on the way down and DESTROY
+         * alone is correct. */
+        if (!g_minimized) {
+            queue_lifecycle(APP_CMD_PAUSE);
+            queue_lifecycle(APP_CMD_STOP);
+        }
         queue_lifecycle(APP_CMD_DESTROY);
         DestroyWindow(hwnd);
         return 0;
@@ -864,6 +908,34 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     default:
         return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
+}
+
+/* Console control handler. Closing the console window (or Ctrl+C / Ctrl+Break)
+ * must follow the exact same graceful path as closing the OS window. Without a
+ * handler, Windows' default is to terminate the process outright (CSRSS ->
+ * TerminateProcess): the guest never sees PAUSE/STOP/DESTROY, the vsync clock
+ * is never stopped and the guest thread is killed mid-flight.
+ *
+ * This callback runs on a dedicated console thread with a ~5s budget before the
+ * OS hard-kills the process, so it only *posts* WM_CLOSE and lets the UI thread
+ * run the ordered teardown (lifecycle -> DestroyWindow -> PostQuitMessage). */
+static BOOL WINAPI console_ctrl_handler(DWORD type)
+{
+    switch (type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        if (g_hwnd) {
+            PostMessageA(g_hwnd, WM_CLOSE, 0, 0);
+            return TRUE; /* handled: do not fall back to TerminateProcess */
+        }
+        /* Window already gone (message loop exited): nothing left to drain. */
+        return FALSE;
+    default:
+        return FALSE;
     }
 }
 
@@ -950,6 +1022,12 @@ bool win32_host_init(const char* title, int win_w, int win_h,
         return false;
     }
 
+    /* Route console close / Ctrl+C through the same graceful WM_CLOSE path as
+     * the window close button (see console_ctrl_handler). */
+    if (!SetConsoleCtrlHandler(console_ctrl_handler, TRUE)) {
+        winhost_log("SetConsoleCtrlHandler failed; console close will not be graceful");
+    }
+
     SetTimer(g_hwnd, SENSOR_TIMER_ID, SENSOR_TIMER_MS, NULL);
 
     cmdpost_init();
@@ -1033,14 +1111,28 @@ void win32_host_shutdown(void)
      * source is gone, so the guest degrades instead of waiting forever. */
     vsync_clock_stop();
 
+    bool guest_stopped = true;
     if (g_guest_thread) {
-        WaitForSingleObject(g_guest_thread, INFINITE);
+        /* Bounded wait: a wedged guest must not make a graceful exit hang
+         * forever (CTRL_CLOSE_EVENT only grants ~5s before the OS kills us). */
+        if (WaitForSingleObject(g_guest_thread, GUEST_EXIT_TIMEOUT_MS) == WAIT_TIMEOUT) {
+            guest_stopped = false;
+            winhost_log("guest thread did not exit within %d ms; skipping post-guest cleanup",
+                        GUEST_EXIT_TIMEOUT_MS);
+        }
         CloseHandle(g_guest_thread);
         g_guest_thread = NULL;
     }
     if (g_hwnd) {
         KillTimer(g_hwnd, SENSOR_TIMER_ID);
         g_hwnd = NULL;
+    }
+    if (!guest_stopped) {
+        /* The guest thread is still live and may be touching cmdpost / the
+         * surface right now. Tearing those down underneath it would be a
+         * use-after-free, so leave them for process exit (ExitProcess reclaims
+         * every thread and handle) rather than racing a still-running guest. */
+        return;
     }
     cmdpost_cleanup();
     if (g_cs_ready) {

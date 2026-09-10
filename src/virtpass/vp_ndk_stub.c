@@ -856,7 +856,14 @@ static void vp_choreographer_enqueue(AChoreographer_frameCallback cb,
     e->cb = cb;
     e->cb64 = cb64;
     e->data = data;
-    e->due_ns = vp_guest_now_ns() + (int64_t)delay_ms * 1000000LL;
+    /* due_ns lives on the GUEST monotonic clock, the same domain the dispatcher
+     * compares against. 0 means "no delay": the plain postFrameCallback() case
+     * must fire on the next frame unconditionally. The host's frame time is a
+     * different clock domain (it is only handed to the callback as-is) and must
+     * never take part in this comparison. */
+    e->due_ns = delay_ms
+        ? (vp_guest_now_ns() + (int64_t)delay_ms * 1000000LL)
+        : 0;
     e->is64 = is64;
 
     /* One outstanding request per frame, like the real requestNextVsync(). */
@@ -987,7 +994,11 @@ static void vp_choreographer_dispatch(long frame_time)
     g_frame_callback_count = 0;   /* callbacks posted below queue up here */
 
     for (int i = 0; i < n; i++) {
-        if (batch[i].due_ns > (int64_t)frame_time) {
+        /* due_ns == 0: not a delayed posting, run on this frame. Otherwise
+         * compare against the guest clock - frame_time belongs to the host's
+         * clock domain and mixing the two would keep callbacks "not due"
+         * forever (stalling the whole render loop). */
+        if (batch[i].due_ns != 0 && batch[i].due_ns > vp_guest_now_ns()) {
             /* postFrameCallbackDelayed() not due yet: keep it for a later
              * frame and make sure we get one. */
             vp_choreographer_enqueue_entry(&batch[i]);

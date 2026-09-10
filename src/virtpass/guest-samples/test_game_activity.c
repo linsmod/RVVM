@@ -288,13 +288,21 @@ int main(void)
 
     /* Main loop: rendering is driven by the display vsync, NDK-style. The
      * frame callback re-arms itself, so all the main thread has to do is pump
-     * the Looper. */
+     * the Looper.
+     *
+     * Use ALooper_pollOnce(), NOT ALooper_pollAll(): pollAll keeps draining
+     * while the poll result is ALOOPER_POLL_CALLBACK, and the vsync frame
+     * callback always reports exactly that - so with the display running
+     * pollAll never returns and the loop below never re-evaluates
+     * g_destroy_requested. DESTROY would be consumed (and the callback chain
+     * stopped) yet the program would never leave the loop: pollOnce returns
+     * after each dispatched callback so the exit condition is actually seen. */
     AChoreographer_getInstance();
     AChoreographer_postFrameCallback(AChoreographer_getInstance(),
                                      on_frame_callback, app);
 
     while (!g_destroy_requested) {
-        ALooper_pollAll(-1, NULL, NULL, NULL);
+        ALooper_pollOnce(-1, NULL, NULL, NULL);
     }
 
     /* Destroy android_app */

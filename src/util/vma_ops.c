@@ -737,19 +737,35 @@ bool vma_free(void* addr, size_t size)
             rvvm_warn("vma_free(): VirtualQuery() failed!");
             return false;
         }
-        if (mbi.AllocationBase != addr) {
-            rvvm_warn("vma_free(): Invalid VMA address: %p != %p", mbi.AllocationBase, addr);
-        }
-        if (mbi.RegionSize != size) {
-            rvvm_warn("vma_free(): Invalid VMA size: %llx != %llx", (long long)mbi.RegionSize, (long long)size);
-        }
         if (mbi.Type == MEM_MAPPED) {
+            /* File-backed view. A non-base address means this is a view created
+             * by someone else (e.g. the POSIX shim mmap() handing back
+             * base + offset_delta) - report "not mine" so the caller falls back
+             * to munmap() instead of it looking like an error. */
+            if (mbi.AllocationBase != addr) {
+                return false;
+            }
             return UnmapViewOfFile(addr);
-        } else if (mbi.Type == MEM_PRIVATE) {
-            return VirtualFree(addr, 0, MEM_RELEASE);
-        } else {
-            rvvm_warn("vma_free(): Invalid win32 page type %x!", (uint32_t)mbi.Type);
         }
+        if (mbi.Type != MEM_PRIVATE) {
+            rvvm_warn("vma_free(): Invalid win32 page type %x!", (uint32_t)mbi.Type);
+            return false;
+        }
+        /* VirtualFree(MEM_RELEASE) only accepts the exact allocation base and
+         * always drops the *entire* region, so it can only serve a release of
+         * the whole thing. A guest doing a partial munmap() (e.g. a libc
+         * trimming a heap arena) would otherwise either fail with EINVAL or -
+         * far worse - silently release memory it still uses. Emulate a partial
+         * unmap by decommitting instead: pages go back to the OS while the
+         * address space stays reserved (matches anon munmap semantics). */
+        if (mbi.AllocationBase == addr && mbi.RegionSize == size) {
+            return VirtualFree(addr, 0, MEM_RELEASE);
+        }
+        if (VirtualFree(addr, size, MEM_DECOMMIT)) {
+            return true;
+        }
+        rvvm_warn("vma_free(): partial VirtualFree(%p, %llx, MEM_DECOMMIT) failed (err=%lu)", //
+                  addr, (long long)size, (unsigned long)GetLastError());
 #elif defined(VMA_MMAP_IMPL)
         return !munmap(addr, size);
 #else
