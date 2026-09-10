@@ -96,6 +96,58 @@ static int    g_guest_rc     = -1;
  * spammed by the stream of WM_SIZE messages. */
 static bool   g_minimized    = false;
 
+/* Off-screen composition surface for WM_PAINT. The whole client area is
+ * composed here (black letterbox + uniformly scaled panel + boundary frame)
+ * and blitted to the window DC in a single pass. Painting the background and
+ * then the panel straight onto the window DC in separate steps means the
+ * cleared area is on screen while the (possibly stretching) panel blit is
+ * still in flight - visible as a flash every frame. Recreated only when the
+ * client size changes. */
+static HDC     g_cmp_dc  = NULL;
+static HBITMAP g_cmp_bm  = NULL;
+static HGDIOBJ g_cmp_old = NULL;
+static int32_t g_cmp_w   = 0;
+static int32_t g_cmp_h   = 0;
+
+/* Caller holds g_surf_cs */
+static void cmp_surface_release_locked(void)
+{
+    if (g_cmp_dc) {
+        if (g_cmp_old) SelectObject(g_cmp_dc, g_cmp_old);
+        DeleteDC(g_cmp_dc);
+    }
+    if (g_cmp_bm) DeleteObject(g_cmp_bm);
+    g_cmp_dc  = NULL;
+    g_cmp_bm  = NULL;
+    g_cmp_old = NULL;
+    g_cmp_w   = 0;
+    g_cmp_h   = 0;
+}
+
+/* Caller holds g_surf_cs */
+static HDC cmp_surface_get_locked(HDC ref, int32_t w, int32_t h)
+{
+    HDC     dc;
+    HBITMAP bm;
+
+    if (g_cmp_dc && g_cmp_w == w && g_cmp_h == h) return g_cmp_dc;
+
+    cmp_surface_release_locked();
+    dc = CreateCompatibleDC(ref);
+    bm = dc ? CreateCompatibleBitmap(ref, w, h) : NULL;
+    if (!dc || !bm) {
+        if (bm) DeleteObject(bm);
+        if (dc) DeleteDC(dc);
+        return NULL;
+    }
+    g_cmp_old = SelectObject(dc, bm);
+    g_cmp_dc  = dc;
+    g_cmp_bm  = bm;
+    g_cmp_w   = w;
+    g_cmp_h   = h;
+    return g_cmp_dc;
+}
+
 static void winhost_log(const char* fmt, ...)
 {
     va_list ap;
@@ -332,19 +384,28 @@ static void convert_row(uint8_t* dst, const uint8_t* src, int32_t w, int32_t fmt
 /* ------------------------------------------------------------------ */
 
 static void present_frame_impl(const uint8_t* rows, int32_t w, int32_t h,
-                           int32_t src_fmt, bool rows_bottom_up)
+                           int32_t src_fmt, int32_t src_bpp,
+                           bool rows_bottom_up)
 {
     (void)src_fmt; /* conversion always uses the current surface format */
     EnterCriticalSection(&g_surf_cs);
-    if (!g_dib_back_bits || g_surf_w != w || g_surf_h != h) {
+    if (src_bpp <= 0) src_bpp = surf_bpp(); /* 0: source matches the surface */
+    if (!rows || !g_dib_back_bits || g_surf_w != w || g_surf_h != h) {
         LeaveCriticalSection(&g_surf_cs);
         return;
     }
-    for (int32_t y = 0; y < h; y++) {
-        int32_t sy = rows_bottom_up ? (h - 1 - y) : y;
-        convert_row(g_dib_back_bits + (size_t)y * (size_t)g_surf_w * 4,
-                    rows + (size_t)sy * (size_t)g_surf_w * 4,
-                    g_surf_w, g_surf_fmt);
+    {
+        /* The source pitch belongs to the caller's buffer. Hard-coding four
+         * bytes per pixel (as this used to) silently mis-strides RGB_565
+         * frames; the GL path always hands over 4-byte RGBA and says so. */
+        size_t src_pitch = (size_t)w * (size_t)src_bpp;
+        size_t dst_pitch = (size_t)w * 4u;
+        for (int32_t y = 0; y < h; y++) {
+            int32_t sy = rows_bottom_up ? (h - 1 - y) : y;
+            convert_row(g_dib_back_bits + (size_t)y * dst_pitch,
+                        rows + (size_t)sy * src_pitch,
+                        w, g_surf_fmt);
+        }
     }
     { HBITMAP tb = g_dib; uint8_t* tp = g_dib_bits;
       g_dib = g_dib_back; g_dib_bits = g_dib_back_bits;
@@ -356,7 +417,7 @@ static void present_frame_impl(const uint8_t* rows, int32_t w, int32_t h,
 void present_frame(const uint8_t* rows, int32_t w, int32_t h,
                     int32_t src_fmt, bool rows_bottom_up)
 {
-    present_frame_impl(rows, w, h, src_fmt, rows_bottom_up);
+    present_frame_impl(rows, w, h, src_fmt, 0, rows_bottom_up);
 }
 
 void present_gl_frame(void)
@@ -376,7 +437,7 @@ void present_gl_frame(void)
 
     if (!rb || w <= 0 || h <= 0) return;
     p_glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rb);
-    present_frame_impl(rb, w, h, WINDOW_FORMAT_RGBA_8888, true);
+    present_frame_impl(rb, w, h, WINDOW_FORMAT_RGBA_8888, 4, true);
 }
 
 static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
@@ -429,17 +490,6 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
     w   = g_surf_w;
     h   = g_surf_h;
     fmt = g_surf_fmt;
-    if (guestPixels && g_dib_back_bits && g_surf_w > 0 && g_surf_h > 0) {
-        int bpp = surf_bpp();
-        const uint8_t* src = (const uint8_t*)guestPixels;
-        uint8_t* dst = g_dib_back_bits;
-        int32_t y;
-        for (y = 0; y < g_surf_h; y++) {
-            convert_row(dst + (size_t)y * (size_t)g_surf_w * 4,
-                        src + (size_t)y * (size_t)g_surf_w * (size_t)bpp,
-                        g_surf_w, g_surf_fmt);
-        }
-    }
     LeaveCriticalSection(&g_surf_cs);
 
     if (guestPixels && !logged_frame) {
@@ -449,10 +499,13 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
         winhost_log("first frame posted: %dx%d fmt=%d from guest pixbuf %p", w, h, fmt, guestPixels);
     }
 
+    /* Conversion, buffer swap and invalidate all live in present_frame(). The
+     * old code converted the frame to BGRA here *and* again inside
+     * present_frame(), i.e. every single frame was converted twice. */
     present_frame(guestPixels ? (const uint8_t*)guestPixels : NULL,
-                  guestPixels ? g_surf_w : 0,
-                  guestPixels ? g_surf_h : 0,
-                  g_surf_fmt, false);
+                  guestPixels ? w : 0,
+                  guestPixels ? h : 0,
+                  fmt, false);
     return 0;
 }
 
@@ -752,43 +805,54 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         PAINTSTRUCT ps;
         HDC wdc = BeginPaint(hwnd, &ps);
         RECT rc;
+        HDC cdc;
         GetClientRect(hwnd, &rc);
         EnterCriticalSection(&g_surf_cs);
-        /* Letterbox background: the whole client area is black, the panel is
-         * drawn on top inside the centred contain-fit rectangle. */
-        FillRect(wdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-        if (g_dib && g_surf_w > 0 && g_surf_h > 0) {
-            /* The window is just a viewport onto the virtual panel: scale it
-             * uniformly to fit and centre it. The panel is never cropped and
-             * never distorted; window size and panel size are decoupled. */
-            vp_view v;
-            HDC mdc;
-            HGDIOBJ old;
-            viewport_fit(rc.right, rc.bottom, g_surf_w, g_surf_h, &v);
-            mdc = CreateCompatibleDC(wdc);
-            old = SelectObject(mdc, g_dib);
-            if (v.dw == g_surf_w && v.dh == g_surf_h) {
-                BitBlt(wdc, v.dx, v.dy, v.dw, v.dh, mdc, 0, 0, SRCCOPY);
-            } else {
-                SetStretchBltMode(wdc, HALFTONE);
-                SetBrushOrgEx(wdc, 0, 0, NULL);
-                StretchBlt(wdc, v.dx, v.dy, v.dw, v.dh,
-                           mdc, 0, 0, g_surf_w, g_surf_h, SRCCOPY);
-            }
-            SelectObject(mdc, old);
-            DeleteDC(mdc);
+        /* Compose the whole client area off-screen and blit it in one pass.
+         * Filling the background and then drawing the panel directly onto the
+         * window DC exposes the cleared area while the (stretching) panel blit
+         * is still in flight, which shows up as a flash on every frame. */
+        cdc = (rc.right > 0 && rc.bottom > 0)
+            ? cmp_surface_get_locked(wdc, rc.right, rc.bottom) : NULL;
+        if (cdc) {
+            /* Letterbox background: the whole client area is black, the panel
+             * goes on top inside the centred contain-fit rectangle. */
+            FillRect(cdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+            if (g_dib && g_surf_w > 0 && g_surf_h > 0) {
+                /* The window is just a viewport onto the virtual panel: scale
+                 * it uniformly to fit and centre it. The panel is never
+                 * cropped and never distorted; window size and panel size are
+                 * decoupled. */
+                vp_view v;
+                HDC mdc;
+                HGDIOBJ old;
+                viewport_fit(rc.right, rc.bottom, g_surf_w, g_surf_h, &v);
+                mdc = CreateCompatibleDC(cdc);
+                old = SelectObject(mdc, g_dib);
+                if (v.dw == g_surf_w && v.dh == g_surf_h) {
+                    BitBlt(cdc, v.dx, v.dy, v.dw, v.dh, mdc, 0, 0, SRCCOPY);
+                } else {
+                    SetStretchBltMode(cdc, HALFTONE);
+                    SetBrushOrgEx(cdc, 0, 0, NULL);
+                    StretchBlt(cdc, v.dx, v.dy, v.dw, v.dh,
+                               mdc, 0, 0, g_surf_w, g_surf_h, SRCCOPY);
+                }
+                SelectObject(mdc, old);
+                DeleteDC(mdc);
 
-            /* Mark the virtual display region with a red frame so the
-             * letterboxed panel boundary inside the OS window is visible. */
-            {
-                HPEN pen = CreatePen(PS_SOLID, 2, RGB(255, 0, 0));
-                HGDIOBJ old_pen = SelectObject(wdc, pen);
-                HGDIOBJ old_brush = SelectObject(wdc, GetStockObject(NULL_BRUSH));
-                Rectangle(wdc, v.dx, v.dy, v.dx + v.dw, v.dy + v.dh);
-                SelectObject(wdc, old_brush);
-                SelectObject(wdc, old_pen);
-                DeleteObject(pen);
+                /* Mark the virtual display region with a red frame so the
+                 * letterboxed panel boundary inside the OS window is visible. */
+                {
+                    HPEN pen = CreatePen(PS_SOLID, 2, RGB(255, 0, 0));
+                    HGDIOBJ old_pen = SelectObject(cdc, pen);
+                    HGDIOBJ old_brush = SelectObject(cdc, GetStockObject(NULL_BRUSH));
+                    Rectangle(cdc, v.dx, v.dy, v.dx + v.dw, v.dy + v.dh);
+                    SelectObject(cdc, old_brush);
+                    SelectObject(cdc, old_pen);
+                    DeleteObject(pen);
+                }
             }
+            BitBlt(wdc, 0, 0, rc.right, rc.bottom, cdc, 0, 0, SRCCOPY);
         }
         LeaveCriticalSection(&g_surf_cs);
         EndPaint(hwnd, &ps);
@@ -903,6 +967,13 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     case WM_DESTROY:
         queue_lifecycle(APP_CMD_TERM_WINDOW);
+        /* The window is gone: drop the composition surface with it. Guarded on
+         * g_cs_ready because teardown order is not guaranteed if init failed. */
+        if (g_cs_ready) {
+            EnterCriticalSection(&g_surf_cs);
+            cmp_surface_release_locked();
+            LeaveCriticalSection(&g_surf_cs);
+        }
         PostQuitMessage(0);
         return 0;
 

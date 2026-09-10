@@ -167,12 +167,23 @@ static void render_frame(ANativeWindow_Buffer* buf, int frame)
         }
     }
 
-    /* Animated top strip (proves the loop is running) */
+    /* Animated top strip (proves the loop is running). The animation is slow on
+     * purpose: stepping the colour every frame wraps all three channels several
+     * times a second, which reads as flicker rather than motion. This is a
+     * highlight band sweeping across the strip roughly every 3 seconds. */
     int strip_h = height / 12;
-    uint32_t strip_color = ((uint32_t)(frame * 40) << 16) | ((uint32_t)(frame * 80) << 8) | (uint32_t)(frame * 120);
-    for (int y = 0; y < strip_h; y++) {
-        for (int x = 0; x < width; x++) {
-            pixels[y * stride + x] = strip_color;
+    if (strip_h > 0 && width > 0) {
+        const int period = 180;          /* frames per sweep (~3 s at 60 fps) */
+        int band = width / 10;
+        if (band < 8) band = 8;
+        int pos = (frame % period) * width / period;
+        for (int y = 0; y < strip_h; y++) {
+            for (int x = 0; x < width; x++) {
+                int d = x - pos;
+                if (d < 0) d = -d;
+                if (d > width - d) d = width - d;   /* wrap around the strip */
+                pixels[y * stride + x] = (d < band) ? 0xFF20D0FFu : 0xFF184058u;
+            }
         }
     }
 
