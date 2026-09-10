@@ -163,6 +163,33 @@ void cmdpost_set_game_callbacks(game_lifecycle_callback lifecycle,
  * 未注册时 dispatch 仍成功但 ret=0：guest 可检测并退回 CPU 像素路径. */
 void cmdpost_set_gl_callbacks(egl_dispatch_callback egl, gl_dispatch_callback gl);
 
+/* Phase 4: display vsync source for AChoreographer. The host registers a
+ * blocking waiter returning the next frame time in nanoseconds (monotonic),
+ * or a negative value when it has no vsync source. The guest's AChoreographer
+ * stubs reach it through SYS_ANDROID_CHOREOGRAPHER_WAIT. */
+typedef int64_t (*choreographer_wait_callback)(void);
+void cmdpost_set_choreographer_callback(choreographer_wait_callback wait_cb);
+
+/* Phase 4 (fd wakeup / 方案 B): the same vsync source can wake the guest
+ * directly. The guest hands us the write end of a pipe that its Looper polls
+ * (SYS_ANDROID_CHOREOGRAPHER_SET_FD) and asks for exactly one vsync per
+ * request (SYS_ANDROID_CHOREOGRAPHER_REQUEST_VSYNC); we answer a request by
+ * writing the frame time into that fd, without the guest ever polling.
+ *
+ * The platform host calls vp_cmdpost_vsync_tick() from its vsync clock. If the
+ * clock goes away (activity destroyed) it must call
+ * vp_cmdpost_vsync_source_lost(): that wakes a guest blocked in poll() once
+ * with a negative frame time, so the stub degrades instead of hanging. */
+bool vp_cmdpost_vsync_tick(int64_t frame_time_ns);
+void vp_cmdpost_vsync_source_lost(void);
+
+/* Capability bits reported to the guest by CHOREOGRAPHER_INIT.
+ * Mirrored in virtpass/vp_android.h. */
+#ifndef VP_VSYNC_CAP_SOURCE
+#define VP_VSYNC_CAP_SOURCE    (1 << 0)
+#define VP_VSYNC_CAP_FD_WAKEUP (1 << 1)
+#endif
+
 /* Initialize the sensor ring buffer */
 void cmdpost_init_sensor_ringbuf(sensor_ringbuf_t* ringbuf);
 

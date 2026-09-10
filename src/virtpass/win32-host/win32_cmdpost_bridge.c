@@ -26,6 +26,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "virtpass/vp_cmdpost.h"  /* single copy lives in src/virtpass */
 #include "core/rvvm_user.h"       /* rvvm_user_linux() guest entry point */
@@ -60,6 +61,19 @@ static int32_t g_surf_fmt = WINDOW_FORMAT_RGBA_8888;
 static int32_t g_init_w   = 640;
 static int32_t g_init_h   = 480;
 
+/* Layer-2 OS window: pure viewport, its size is independent of the virtual
+ * panel. WM_PAINT scales the panel uniformly to fit (contain, never cropped)
+ * and centres it, filling the leftover area with black. */
+static int32_t g_win_w    = 1024;
+static int32_t g_win_h    = 768;
+
+/* Layer-1 virtual display: host-owned panel parameters. The guest observes
+ * them ONLY through the public NDK ABI (ANativeWindow_getWidth/Height and
+ * AConfiguration_*); no virtpass-specific display ABI is exposed. */
+static int32_t g_virt_w   = 1024;
+static int32_t g_virt_h   = 768;
+static int32_t g_virt_ppi = ACONFIGURATION_DENSITY_MEDIUM;
+
 /* Stub sensor enable state (handle table: vp_ndk_stub.c g_sensors[]) */
 static bool g_accel_on = false;  /* handle 0 */
 static bool g_gyro_on  = false;  /* handle 2 */
@@ -80,6 +94,150 @@ static void winhost_log(const char* fmt, ...)
     printf("\n");
     fflush(stdout);
     va_end(ap);
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 4: Win32 vsync clock                                          */
+/* ------------------------------------------------------------------ */
+/*
+ * The guest's AChoreographer needs one tick per display frame. Windows has no
+ * public vblank event, but DwmFlush() is the documented "wait until the
+ * compositor has presented the pending frame" call: it blocks for roughly one
+ * refresh interval whenever the window has something to present.
+ *
+ * Both guest paths are driven from the same clock:
+ *  - 方案 A (blocking WAIT): on_choreographer_wait() paces one frame and
+ *    returns the monotonic frame time the stub compares against its due_ns.
+ *  - 方案 B (fd wakeup): the clock thread runs at the refresh rate and calls
+ *    vp_cmdpost_vsync_tick(), which writes the frame time into the pipe the
+ *    guest's Looper is blocked in poll() on.
+ *
+ * DwmFlush is resolved dynamically so the host still runs (with plain Sleep
+ * pacing) where dwmapi or composition is unavailable.
+ */
+typedef HRESULT (WINAPI* dwm_flush_fn)(void);
+
+static dwm_flush_fn  g_dwm_flush    = NULL;
+static HANDLE        g_vsync_thread = NULL;
+static volatile LONG g_vsync_run    = 0;
+static int64_t       g_vsync_period_ns = 16666667LL;  /* 60 Hz fallback */
+
+/* Monotonic nanoseconds. rvvm-user serves the guest's clock_gettime() syscall
+ * from clock_gettime() in this very process, so using the same call keeps the
+ * frame times we hand the guest comparable with its own CLOCK_MONOTONIC. */
+static int64_t host_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+
+static void vsync_detect_rate(void)
+{
+    HDC hdc = GetDC(NULL);
+    int hz  = hdc ? GetDeviceCaps(hdc, VREFRESH) : 0;
+    if (hdc) {
+        ReleaseDC(NULL, hdc);
+    }
+    if (hz < 24 || hz > 480) {
+        hz = 60;  /* 0/1 means "hardware default" */
+    }
+    g_vsync_period_ns = 1000000000LL / hz;
+}
+
+/* Wait for one display frame and return its monotonic timestamp. DwmFlush may
+ * return immediately when nothing is pending, so the period grid provides the
+ * lower bound that keeps the cadence at the refresh rate. */
+static int64_t vsync_wait_frame(void)
+{
+    int64_t period = g_vsync_period_ns;
+    int64_t before = host_now_ns();
+    int64_t next   = ((before / period) + 1) * period;
+    int64_t now;
+
+    if (g_dwm_flush) {
+        g_dwm_flush();
+    }
+
+    now = host_now_ns();
+    if (now < next) {
+        DWORD ms = (DWORD)((next - now) / 1000000);
+        if (ms) {
+            Sleep(ms);
+        }
+        now = host_now_ns();
+        if (now < next) {
+            now = next;
+        }
+    }
+    return now;
+}
+
+static int64_t on_choreographer_wait(void)
+{
+    return vsync_wait_frame();
+}
+
+static DWORD WINAPI vsync_thread_main(LPVOID arg)
+{
+    (void)arg;
+    while (InterlockedCompareExchange(&g_vsync_run, 1, 1) == 1) {
+        int64_t t = vsync_wait_frame();
+        if (InterlockedCompareExchange(&g_vsync_run, 1, 1) != 1) {
+            break;
+        }
+        vp_cmdpost_vsync_tick(t);
+    }
+    return 0;
+}
+
+static void vsync_clock_start(void)
+{
+    HMODULE m;
+
+    if (g_vsync_thread) {
+        return;
+    }
+
+    m = LoadLibraryA("dwmapi.dll");
+    if (m) {
+        g_dwm_flush = (dwm_flush_fn)(void*)GetProcAddress(m, "DwmFlush");
+    }
+    vsync_detect_rate();
+
+    InterlockedExchange(&g_vsync_run, 1);
+    g_vsync_thread = CreateThread(NULL, 0, vsync_thread_main, NULL, 0, NULL);
+    if (!g_vsync_thread) {
+        InterlockedExchange(&g_vsync_run, 0);
+        winhost_log("vsync clock: CreateThread failed, guest paces itself");
+        return;
+    }
+
+    winhost_log("vsync clock: %d Hz via %s",
+                (int)(1000000000LL / g_vsync_period_ns),
+                g_dwm_flush ? "DwmFlush" : "Sleep pacing");
+}
+
+static void vsync_clock_stop(void)
+{
+    if (!g_vsync_thread) {
+        return;
+    }
+
+    /* Wake a guest parked in poll() and let it degrade: it would otherwise wait
+     * for a frame that will never come. */
+    vp_cmdpost_vsync_source_lost();
+
+    InterlockedExchange(&g_vsync_run, 0);
+    if (WaitForSingleObject(g_vsync_thread, 3000) == WAIT_OBJECT_0) {
+        CloseHandle(g_vsync_thread);
+    }
+    else {
+        /* DwmFlush cannot be interrupted: rather than risk the thread touching a
+         * torn-down cmdpost, let it observe g_vsync_run and exit on its own. */
+        winhost_log("vsync clock: thread did not stop in time");
+    }
+    g_vsync_thread = NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -165,6 +323,7 @@ static void convert_row(uint8_t* dst, const uint8_t* src, int32_t w, int32_t fmt
 static void present_frame_impl(const uint8_t* rows, int32_t w, int32_t h,
                            int32_t src_fmt, bool rows_bottom_up)
 {
+    (void)src_fmt; /* conversion always uses the current surface format */
     EnterCriticalSection(&g_surf_cs);
     if (!g_dib_back_bits || g_surf_w != w || g_surf_h != h) {
         LeaveCriticalSection(&g_surf_cs);
@@ -212,9 +371,13 @@ void present_gl_frame(void)
 static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
 {
     cmdpost_ANativeWindow_Buffer* buf = (cmdpost_ANativeWindow_Buffer*)outBuffer;
+    static bool logged_first = false;
     (void)window;
     (void)dirtyBounds;
-    if (!buf) return -1;
+    if (!buf) {
+        winhost_log("WINDOW_LOCK with NULL outBuffer -> rejected");
+        return -1;
+    }
 
     EnterCriticalSection(&g_surf_cs);
     if (g_surf_w <= 0) {
@@ -228,14 +391,33 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
     buf->stride = g_surf_w;    /* pixels, matches guest expectation */
     buf->format = g_surf_fmt;
     buf->bits   = NULL;        /* guest allocates its own buffer (pixbuf_ensure) */
+    if (!logged_first) {
+        logged_first = true;
+        winhost_log("WINDOW_LOCK ok: %dx%d stride=%d fmt=%d "
+                    "(guest renders into its own pixbuf; bits stays NULL)",
+                    buf->width, buf->height, buf->stride, buf->format);
+    }
     LeaveCriticalSection(&g_surf_cs);
     return 0;
 }
 
 static int32_t on_window_unlock(void* window, void* guestPixels)
 {
+    static bool logged_frame = false;
+    int32_t w = 0, h = 0, fmt = 0;
     (void)window;
+    if (!guestPixels) {
+        /* UNLOCK with a null pixel pointer is the fingerprint of the guest
+         * failing to allocate its own pixbuf after a *successful* LOCK
+         * (pixbuf_ensure in vp_ndk_stub.c). The window itself is fine; say so
+         * instead of silently posting nothing. */
+        winhost_log("WINDOW_UNLOCK with NULL pixels: guest pixbuf unavailable "
+                    "(lock succeeded, no frame posted)");
+    }
     EnterCriticalSection(&g_surf_cs);
+    w   = g_surf_w;
+    h   = g_surf_h;
+    fmt = g_surf_fmt;
     if (guestPixels && g_dib_back_bits && g_surf_w > 0 && g_surf_h > 0) {
         int bpp = surf_bpp();
         const uint8_t* src = (const uint8_t*)guestPixels;
@@ -248,6 +430,14 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
         }
     }
     LeaveCriticalSection(&g_surf_cs);
+
+    if (guestPixels && !logged_frame) {
+        /* Positive confirmation that the whole LOCK -> render -> UNLOCK path
+         * works, i.e. the guest did get its pixel buffer. */
+        logged_frame = true;
+        winhost_log("first frame posted: %dx%d fmt=%d from guest pixbuf %p", w, h, fmt, guestPixels);
+    }
+
     present_frame(guestPixels ? (const uint8_t*)guestPixels : NULL,
                   guestPixels ? g_surf_w : 0,
                   guestPixels ? g_surf_h : 0,
@@ -285,24 +475,49 @@ static int32_t on_window_set_buf(int32_t width, int32_t height, int32_t format)
     return 0;
 }
 
-/* Simulated host density (mdpi: 1 dp == 1 px). Once the layer-1
- * virt_display PPI is plumbed through win32_host_init() this stands in
- * for it; the guest only ever sees the quantised bucket. */
-static int32_t g_cfg_density_dpi = ACONFIGURATION_DENSITY_MEDIUM;
+/* Quantise an arbitrary physical PPI to the nearest public NDK density
+ * bucket. The exact PPI (virt_ppi) stays host-private: the public NDK only
+ * exposes these quantised buckets to the guest. */
+static int32_t density_bucket_for_ppi(int32_t ppi)
+{
+    static const int32_t buckets[] = {
+        ACONFIGURATION_DENSITY_LOW,     /* 120 */
+        ACONFIGURATION_DENSITY_MEDIUM,  /* 160 */
+        ACONFIGURATION_DENSITY_TV,      /* 213 */
+        ACONFIGURATION_DENSITY_HIGH,    /* 240 */
+        ACONFIGURATION_DENSITY_XHIGH,   /* 320 */
+        ACONFIGURATION_DENSITY_XXHIGH,  /* 480 */
+        ACONFIGURATION_DENSITY_XXXHIGH, /* 640 */
+    };
+    size_t i, best = 0;
+    int32_t best_d = -1;
+
+    if (ppi <= 0) return ACONFIGURATION_DENSITY_MEDIUM;
+    for (i = 0; i < sizeof(buckets) / sizeof(buckets[0]); i++) {
+        int32_t d = ppi - buckets[i];
+        if (d < 0) d = -d;
+        if (best_d < 0 || d < best_d) {
+            best_d = d;
+            best   = i;
+        }
+    }
+    return buckets[best];
+}
 
 static int32_t on_config_get(int32_t field, int32_t* outValue)
 {
-    int32_t w, h, width_dp, height_dp, long_dp, short_dp;
+    int32_t w, h, ppi, width_dp, height_dp, long_dp, short_dp;
 
     if (!outValue) return -1;
 
     EnterCriticalSection(&g_surf_cs);
-    w = (g_surf_w > 0) ? g_surf_w : g_init_w;
-    h = (g_surf_h > 0) ? g_surf_h : g_init_h;
+    w   = (g_surf_w > 0) ? g_surf_w : g_virt_w;
+    h   = (g_surf_h > 0) ? g_surf_h : g_virt_h;
+    ppi = (g_virt_ppi > 0) ? g_virt_ppi : ACONFIGURATION_DENSITY_MEDIUM;
     LeaveCriticalSection(&g_surf_cs);
 
-    width_dp  = w * 160 / g_cfg_density_dpi;
-    height_dp = h * 160 / g_cfg_density_dpi;
+    width_dp  = w * 160 / ppi;
+    height_dp = h * 160 / ppi;
     long_dp   = (width_dp >= height_dp) ? width_dp : height_dp;
     short_dp  = (width_dp >= height_dp) ? height_dp : width_dp;
 
@@ -312,7 +527,7 @@ static int32_t on_config_get(int32_t field, int32_t* outValue)
                              : ACONFIGURATION_ORIENTATION_PORT;
         return 0;
     case VP_ACONFIG_QUERY_DENSITY:
-        *outValue = g_cfg_density_dpi;
+        *outValue = density_bucket_for_ppi(ppi);
         return 0;
     case VP_ACONFIG_QUERY_SCREEN_SIZE:
         *outValue = (short_dp < 320) ? ACONFIGURATION_SCREENSIZE_SMALL
@@ -397,14 +612,42 @@ static void feed_stub_sensors(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Viewport mapping (layer 2 -> layer 1)                               */
+/* ------------------------------------------------------------------ */
+
+/* Contain-fit: scale the virtual panel uniformly to the largest size that
+ * fits inside the window client area, then centre it. The panel is never
+ * cropped and never distorted; the leftover area is painted black. */
+typedef struct { int dx, dy, dw, dh; } vp_view;
+
+static void viewport_fit(int cw, int ch, int sw, int sh, vp_view* v)
+{
+    double s, sx, sy;
+
+    v->dx = v->dy = v->dw = v->dh = 0;
+    if (cw <= 0 || ch <= 0 || sw <= 0 || sh <= 0) return;
+
+    sx = (double)cw / (double)sw;
+    sy = (double)ch / (double)sh;
+    s  = (sx < sy) ? sx : sy;
+    v->dw = (int)((double)sw * s + 0.5);
+    v->dh = (int)((double)sh * s + 0.5);
+    if (v->dw < 1) v->dw = 1;
+    if (v->dh < 1) v->dh = 1;
+    v->dx = (cw - v->dw) / 2;
+    v->dy = (ch - v->dh) / 2;
+}
+
+/* ------------------------------------------------------------------ */
 /* Input translation                                                   */
 /* ------------------------------------------------------------------ */
 
 static void queue_mouse_motion(int action, LPARAM lp)
 {
     RECT rc;
-    int cw, ch;
+    int cw, ch, sw, sh;
     float x, y;
+    vp_view v;
     cmdpost_GameActivityMotionEvent ev;
 
     if (!g_hwnd || !GetClientRect(g_hwnd, &rc)) return;
@@ -413,9 +656,19 @@ static void queue_mouse_motion(int action, LPARAM lp)
     if (cw <= 0 || ch <= 0) return;
 
     EnterCriticalSection(&g_surf_cs);
-    x = (float)(short)LOWORD(lp) * (float)(g_surf_w > 0 ? g_surf_w : g_init_w) / (float)cw;
-    y = (float)(short)HIWORD(lp) * (float)(g_surf_h > 0 ? g_surf_h : g_init_h) / (float)ch;
+    sw = (g_surf_w > 0) ? g_surf_w : g_init_w;
+    sh = (g_surf_h > 0) ? g_surf_h : g_init_h;
     LeaveCriticalSection(&g_surf_cs);
+
+    /* Undo the letterbox transform: window pixel -> panel pixel */
+    viewport_fit(cw, ch, sw, sh, &v);
+    if (v.dw <= 0 || v.dh <= 0) return;
+    x = ((float)(short)LOWORD(lp) - (float)v.dx) * (float)sw / (float)v.dw;
+    y = ((float)(short)HIWORD(lp) - (float)v.dy) * (float)sh / (float)v.dh;
+    if (x < 0.0f) x = 0.0f;
+    if (y < 0.0f) y = 0.0f;
+    if (x > (float)(sw - 1)) x = (float)(sw - 1);
+    if (y > (float)(sh - 1)) y = (float)(sh - 1);
 
     memset(&ev, 0, sizeof(ev));
     ev.eventTime        = (int64_t)GetTickCount64() * 1000000LL;
@@ -490,28 +743,41 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         RECT rc;
         GetClientRect(hwnd, &rc);
         EnterCriticalSection(&g_surf_cs);
+        /* Letterbox background: the whole client area is black, the panel is
+         * drawn on top inside the centred contain-fit rectangle. */
+        FillRect(wdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
         if (g_dib && g_surf_w > 0 && g_surf_h > 0) {
-            /* The window is just a viewport onto the bitmap: blit 1:1,
-             * NEVER scale. Window size and bitmap size are fully decoupled;
-             * the bitmap keeps its full resolution regardless of the window. */
-            HDC mdc = CreateCompatibleDC(wdc);
-            HGDIOBJ old = SelectObject(mdc, g_dib);
-            int blit_w = (rc.right < g_surf_w) ? rc.right : g_surf_w;
-            int blit_h = (rc.bottom < g_surf_h) ? rc.bottom : g_surf_h;
-            BitBlt(wdc, 0, 0, blit_w, blit_h, mdc, 0, 0, SRCCOPY);
-            /* Areas outside the bitmap (window bigger than surface): black */
-            if (rc.right > blit_w) {
-                RECT er = {blit_w, 0, rc.right, rc.bottom};
-                FillRect(wdc, &er, (HBRUSH)GetStockObject(BLACK_BRUSH));
-            }
-            if (rc.bottom > blit_h) {
-                RECT er = {0, blit_h, rc.right, rc.bottom};
-                FillRect(wdc, &er, (HBRUSH)GetStockObject(BLACK_BRUSH));
+            /* The window is just a viewport onto the virtual panel: scale it
+             * uniformly to fit and centre it. The panel is never cropped and
+             * never distorted; window size and panel size are decoupled. */
+            vp_view v;
+            HDC mdc;
+            HGDIOBJ old;
+            viewport_fit(rc.right, rc.bottom, g_surf_w, g_surf_h, &v);
+            mdc = CreateCompatibleDC(wdc);
+            old = SelectObject(mdc, g_dib);
+            if (v.dw == g_surf_w && v.dh == g_surf_h) {
+                BitBlt(wdc, v.dx, v.dy, v.dw, v.dh, mdc, 0, 0, SRCCOPY);
+            } else {
+                SetStretchBltMode(wdc, HALFTONE);
+                SetBrushOrgEx(wdc, 0, 0, NULL);
+                StretchBlt(wdc, v.dx, v.dy, v.dw, v.dh,
+                           mdc, 0, 0, g_surf_w, g_surf_h, SRCCOPY);
             }
             SelectObject(mdc, old);
             DeleteDC(mdc);
-        } else {
-            FillRect(wdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+            /* Mark the virtual display region with a red frame so the
+             * letterboxed panel boundary inside the OS window is visible. */
+            {
+                HPEN pen = CreatePen(PS_SOLID, 2, RGB(255, 0, 0));
+                HGDIOBJ old_pen = SelectObject(wdc, pen);
+                HGDIOBJ old_brush = SelectObject(wdc, GetStockObject(NULL_BRUSH));
+                Rectangle(wdc, v.dx, v.dy, v.dx + v.dw, v.dy + v.dh);
+                SelectObject(wdc, old_brush);
+                SelectObject(wdc, old_pen);
+                DeleteObject(pen);
+            }
         }
         LeaveCriticalSection(&g_surf_cs);
         EndPaint(hwnd, &ps);
@@ -532,6 +798,12 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
+            /* The window is just a viewport onto the fixed-size virtual panel,
+             * so on resize we only need to repaint: the panel is re-scaled to
+             * the new client area (contain fit). Invalidate the whole client
+             * area so WM_PAINT redraws immediately instead of leaving the
+             * freshly exposed region stale/unpainted. */
+            if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
             queue_lifecycle(APP_CMD_WINDOW_RESIZED);
         }
         return 0;
@@ -626,13 +898,31 @@ static DWORD WINAPI guest_thread_main(LPVOID arg)
 /* Public API                                                          */
 /* ------------------------------------------------------------------ */
 
-bool win32_host_init(const char* title, int width, int height)
+bool win32_host_init(const char* title, int win_w, int win_h,
+                     int virt_w, int virt_h, int virt_ppi)
 {
     WNDCLASSA wc;
     RECT r;
 
-    g_init_w = width;
-    g_init_h = height;
+    /* Layer 2: the OS window is only a viewport, sized independently of the
+     * virtual panel. */
+    g_win_w = (win_w > 0) ? win_w : 1024;
+    g_win_h = (win_h > 0) ? win_h : 768;
+
+    /* Layer 1: the host-owned virtual display the guest renders into. When no
+     * explicit panel geometry is requested it follows the window size, so the
+     * panel fills the viewport without borders. */
+    g_virt_w   = (virt_w > 0) ? virt_w : g_win_w;
+    g_virt_h   = (virt_h > 0) ? virt_h : g_win_h;
+    g_virt_ppi = (virt_ppi > 0) ? virt_ppi : ACONFIGURATION_DENSITY_MEDIUM;
+
+    /* The virtual panel is the surface geometry handed to the guest. */
+    g_init_w = g_virt_w;
+    g_init_h = g_virt_h;
+
+    winhost_log("window: %dx%d px | virtual display: %dx%d px @ %d ppi (bucket %d)",
+                g_win_w, g_win_h, g_virt_w, g_virt_h, g_virt_ppi,
+                density_bucket_for_ppi(g_virt_ppi));
 
     SetProcessDPIAware();
     InitializeCriticalSection(&g_surf_cs);
@@ -648,7 +938,7 @@ bool win32_host_init(const char* title, int width, int height)
         return false;
     }
 
-    r.left = 0; r.top = 0; r.right = width; r.bottom = height;
+    r.left = 0; r.top = 0; r.right = g_win_w; r.bottom = g_win_h;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
 
     g_hwnd = CreateWindowExA(0, wc.lpszClassName, title, WS_OVERLAPPEDWINDOW,
@@ -671,6 +961,11 @@ bool win32_host_init(const char* title, int width, int height)
     cmdpost_set_game_callbacks(on_game_lifecycle, on_game_input);
     /* Phase 3: GL/EGL dispatch callbacks */
     cmdpost_set_gl_callbacks(on_egl_dispatch, on_gl_dispatch);
+    /* Phase 4: vsync source. Registering the blocker makes the guest advertise
+     * the AChoreographer caps and, once the clock thread is up, it drives the
+     * fd-wakeup path the guest's Looper polls. */
+    cmdpost_set_choreographer_callback(on_choreographer_wait);
+    vsync_clock_start();
     /* Try to load the GL backend (angle/swiftshader) */
     if (win32_gl_backend_load()) {
         winhost_log("GL backend: %s ready", win32_gl_backend_name());
@@ -734,6 +1029,10 @@ int win32_host_guest_exit_code(void)
 
 void win32_host_shutdown(void)
 {
+    /* Stop the frame clock first: it tells a guest blocked in poll() that the
+     * source is gone, so the guest degrades instead of waiting forever. */
+    vsync_clock_stop();
+
     if (g_guest_thread) {
         WaitForSingleObject(g_guest_thread, INFINITE);
         CloseHandle(g_guest_thread);

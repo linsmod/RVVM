@@ -608,6 +608,8 @@ static void* rvvm_sys_brk(void* addr)
     DO_ONCE({
         brk_buffer = vma_alloc(NULL, BRK_HEAP_SIZE, VMA_RDWR);
         brk_ptr = brk_buffer;
+        rvvm_info("sys_brk: heap buffer %p .. %p (%lx bytes)", brk_buffer,
+                  brk_buffer ? brk_buffer + BRK_HEAP_SIZE : NULL, (long)BRK_HEAP_SIZE);
     });
 
     spin_lock(&brk_lock);
@@ -819,7 +821,10 @@ static inline int rvvm_sys_prot(int prot)
 
 static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, int fd, uint64_t offset)
 {
-    rvvm_info("sys_mmap(%lx, %lx, %x, %x, %d, %lx)", (size_t)addr, size, prot, flags, fd, offset);
+    /* NOTE: %llx, not %lx - on Windows host `long` is 32-bit, so %lx silently
+     * prints only the low half of a 64-bit address and makes hints look bogus. */
+    rvvm_info("sys_mmap(addr=%llx size=%llx prot=%x flags=%x fd=%d off=%llx)",
+              (long long)(size_t)addr, (long long)size, prot, flags, fd, (long long)offset);
     if (flags & UAPI_MAP_ILLEGAL) {
         return -UAPI_EINVAL;
     }
@@ -838,9 +843,17 @@ static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, i
         if (flags & UAPI_MAP_FIXED) vma_flags |= VMA_FIXED;
         void* vret = vma_mmap(addr, size, vma_flags, NULL, 0);
         if (!vret) {
+            /* Surface the exact parameters of a failed anonymous mapping: a
+             * guest-side malloc() failure only reports ENOMEM, the interesting
+             * part (hint address / size / flags) lives here. */
+            rvvm_warn("sys_mmap: anon map failed -> ENOMEM (addr=%llx size=%llx prot=%x flags=%x fixed=%d)",
+                      (long long)(size_t)addr, (long long)size, prot, flags, !!(flags & UAPI_MAP_FIXED));
             spin_unlock(&mmap_lock);
             return -UAPI_ENOMEM;
         }
+        rvvm_info("sys_mmap: anon -> %p (hint=%llx size=%llx prot=%x flags=%x fixed=%d)",
+                  vret, (long long)(size_t)addr, (long long)size, prot, flags,
+                  !!(flags & UAPI_MAP_FIXED));
         spin_unlock(&mmap_lock);
         return (rvvm_addr_t)(size_t)vret;
     }
@@ -959,9 +972,8 @@ static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* bu
     return unwrap_path(buffer, tmp, size);
 }
 
-// DEBUG: re-enable syscall trace (upstream had this compiled out)
-#undef rvvm_info
-#define rvvm_info(...) rvvm_warn(__VA_ARGS__);
+/* Syscall traces below use rvvm_info(), which is hidden at the default
+ * LOG_WARN level and shown only when verbose logging is enabled. */
 
 static void* rvvm_user_thread_wrap(void* arg)
 {
@@ -982,7 +994,6 @@ static void* rvvm_user_thread_wrap(void* arg)
 
     while (running) {
         rvvm_addr_t cause = rvvm_run_user_thread(cpu);
-        fprintf(stderr, "[dbg] rvvm_run_user_thread -> cause=0x%lx\n", (unsigned long)cause);
         if (cause == 8) {
             // Handle syscall trap
             rvvm_addr_t a0 = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 10);

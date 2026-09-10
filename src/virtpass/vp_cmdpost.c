@@ -14,6 +14,8 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+/* write(): used to publish vsync frame times into the guest's Looper pipe */
+#include <unistd.h>
 
 #if defined(ANDROID)
 #include <android/log.h>
@@ -62,6 +64,14 @@
 #define SYS_ANDROID_GAME_POLL_CMD    (SYS_ANDROID_BASE + 22)
 #define SYS_ANDROID_GAME_SWAP_INPUT  (SYS_ANDROID_BASE + 23)
 #define SYS_ANDROID_GAME_CLEAR_INPUT (SYS_ANDROID_BASE + 24)
+
+/* Choreographer (Phase 4: display vsync source) */
+#define SYS_ANDROID_CHOREOGRAPHER_INIT (SYS_ANDROID_BASE + 25)
+#define SYS_ANDROID_CHOREOGRAPHER_WAIT (SYS_ANDROID_BASE + 26)
+/* fd wakeup (方案 B): the guest hands us the write end of the pipe its Looper
+ * polls, and asks for exactly one vsync at a time. */
+#define SYS_ANDROID_CHOREOGRAPHER_SET_FD (SYS_ANDROID_BASE + 27)
+#define SYS_ANDROID_CHOREOGRAPHER_REQUEST_VSYNC (SYS_ANDROID_BASE + 28)
 
 /* Marshalled GL/EGL calls (Phase 3: hardware GL proxy) */
 #define SYS_GL_CALL_BASE   0x10020
@@ -147,6 +157,17 @@ static game_input_callback g_game_input_cb = NULL;
 /* Phase 3: GL/EGL dispatch callbacks (fn_id -> real host GL/EGL call) */
 static egl_dispatch_callback g_egl_dispatch_cb = NULL;
 static gl_dispatch_callback  g_gl_dispatch_cb  = NULL;
+
+/* Phase 4: AChoreographer vsync source (blocks until the next display frame) */
+static choreographer_wait_callback g_choreographer_wait_cb = NULL;
+
+/* Phase 4 (fd wakeup): guest-owned pipe that its Looper polls. The fd is a
+ * real host fd (guest syscalls are passed through), so the vsync clock can
+ * write the frame time straight into it. g_vsync_armed means "the guest is
+ * waiting for exactly one vsync" (requestNextVsync semantics). */
+static int  g_choreographer_fd = -1;
+static volatile bool g_vsync_armed = false;
+static volatile bool g_vsync_source_lost = false;
 
 /* ============================================================
  * Host->Guest queues (lifecycle commands + input events)
@@ -237,6 +258,51 @@ void cmdpost_set_gl_callbacks(egl_dispatch_callback egl, gl_dispatch_callback gl
 {
     g_egl_dispatch_cb = egl;
     g_gl_dispatch_cb  = gl;
+}
+
+void cmdpost_set_choreographer_callback(choreographer_wait_callback wait_cb)
+{
+    g_choreographer_wait_cb = wait_cb;
+    /* A (re)registered clock is alive again: Android recreates the activity by
+     * calling nativeInit once more, which lands here. */
+    g_vsync_source_lost = false;
+}
+
+bool vp_cmdpost_vsync_tick(int64_t frame_time_ns)
+{
+    if (!g_vsync_armed) {
+        return false;
+    }
+    g_vsync_armed = false;
+
+    int fd = g_choreographer_fd;
+    if (fd < 0) {
+        return false;
+    }
+
+    int64_t payload = frame_time_ns;
+    if (write(fd, &payload, sizeof(payload)) != (ssize_t)sizeof(payload)) {
+        /* The guest stopped draining (gone or falling back): drop the fd so we
+         * do not keep writing into a dead pipe. */
+        g_choreographer_fd = -1;
+        return false;
+    }
+    return true;
+}
+
+void vp_cmdpost_vsync_source_lost(void)
+{
+    g_vsync_source_lost = true;
+    g_vsync_armed = false;
+
+    /* Wake a guest that is blocked in poll(): a negative frame time tells the
+     * stub the clock is gone, so it degrades instead of hanging. */
+    int fd = g_choreographer_fd;
+    g_choreographer_fd = -1;
+    if (fd >= 0) {
+        int64_t payload = -1;
+        write(fd, &payload, sizeof(payload));
+    }
 }
 
 /*
@@ -384,11 +450,19 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                 }
 
                 case SYS_ANDROID_WINDOW_LOCK: {
-                    /* Lock window for drawing */
-                    if (g_window_lock_cb) {
-                        return g_window_lock_cb((void*)a1, (void*)a2, (void*)a3);
+                    /* Lock window for drawing. A non-zero return here means the
+                     * host surface itself is not ready; when it returns 0 the
+                     * guest still has to allocate its own pixbuf, so a later
+                     * failure is NOT a lock failure (see vp_ndk_stub.c). */
+                    if (!g_window_lock_cb) {
+                        CMDLOG("WINDOW_LOCK: no host callback registered");
+                        return -1;
                     }
-                    return -1;
+                    int32_t lock_rc = g_window_lock_cb((void*)a1, (void*)a2, (void*)a3);
+                    if (lock_rc != 0) {
+                        CMDLOG("WINDOW_LOCK: host refused lock -> %d", lock_rc);
+                    }
+                    return lock_rc;
                 }
 
                 case SYS_ANDROID_WINDOW_UNLOCK: {
@@ -479,6 +553,46 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                     return 0;
                 }
 
+                case SYS_ANDROID_CHOREOGRAPHER_INIT: {
+                    /* The host owns the vsync source; nothing to arm here.
+                     * Report what the guest can expect: whether a vsync clock
+                     * exists at all, and whether we can wake its Looper fd
+                     * directly instead of it calling WAIT every frame. */
+                    if (!g_choreographer_wait_cb || g_vsync_source_lost) {
+                        return 0;   /* no source: guest uses its own 60Hz clock */
+                    }
+                    return VP_VSYNC_CAP_SOURCE | VP_VSYNC_CAP_FD_WAKEUP;
+                }
+
+                case SYS_ANDROID_CHOREOGRAPHER_WAIT: {
+                    if (!g_choreographer_wait_cb) {
+                        return -1;   /* guest falls back to its own clock */
+                    }
+                    return g_choreographer_wait_cb();
+                }
+
+                case SYS_ANDROID_CHOREOGRAPHER_SET_FD: {
+                    /* Guest hands us the write end of the vsync pipe its Looper
+                     * polls; a1 < 0 unregisters. (a0 is the sub-command.) */
+                    if (!g_choreographer_wait_cb || g_vsync_source_lost) {
+                        return -1;
+                    }
+                    g_choreographer_fd = (int32_t)a1;
+                    g_vsync_armed = false;
+                    return 0;
+                }
+
+                case SYS_ANDROID_CHOREOGRAPHER_REQUEST_VSYNC: {
+                    /* One outstanding request per frame, answered by the vsync
+                     * clock through vp_cmdpost_vsync_tick(). */
+                    if (!g_choreographer_wait_cb || g_vsync_source_lost ||
+                        g_choreographer_fd < 0) {
+                        return -1;   /* guest degrades to the blocking WAIT path */
+                    }
+                    g_vsync_armed = true;
+                    return 0;
+                }
+
                 default:
                     rvvm_warn("cmdpost: Unknown Android sub-command %" PRId64, a0);
                     return -38;
@@ -535,5 +649,9 @@ void cmdpost_cleanup(void)
         g_game_input_cb = NULL;
         g_egl_dispatch_cb = NULL;
         g_gl_dispatch_cb = NULL;
+        g_choreographer_wait_cb = NULL;
+        g_choreographer_fd = -1;
+        g_vsync_armed = false;
+        g_vsync_source_lost = false;
     }
 }

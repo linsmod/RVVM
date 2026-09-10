@@ -413,6 +413,40 @@ static void* vma_mmap_aligned_internal(void* addr, size_t size, uint32_t flags, 
         }
     } else {
         ret = VirtualAlloc(addr, size, MEM_COMMIT | MEM_RESERVE, vma_native_prot(flags));
+        if (!ret && addr && !(flags & VMA_FIXED)) {
+            /* POSIX semantics: without MAP_FIXED the address is only a *hint*
+             * - the kernel relocates when the range is inconvenient. Win32
+             * VirtualAlloc() instead treats a non-NULL address as a hard
+             * requirement and never relocates, so a perfectly normal hint that
+             * collides with an adjacent mapping fails with ENOMEM. Retry once
+             * letting the OS pick, like mmap() would. */
+            DWORD err = GetLastError();
+            ret = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, vma_native_prot(flags));
+            if (ret) {
+                rvvm_info("vma_mmap(): hint %p unusable (err=%lu), relocated to %p (size=%llx)",
+                          addr, (unsigned long)err, ret, (long long)size);
+            } else {
+                rvvm_warn("vma_mmap(): VirtualAlloc(size=%llx) failed even without a hint (err=%lu)",
+                          (long long)size, (unsigned long)GetLastError());
+            }
+        } else if (!ret && addr) {
+            /* VMA_FIXED: the address was a hard requirement, so failing is the
+             * correct outcome. Report what actually sits on that range to tell
+             * "occupied" apart from "out of address space". */
+            DWORD                    err = GetLastError();
+            MEMORY_BASIC_INFORMATION mbi = {0};
+            const char* why = "unknown";
+            if (VirtualQuery(addr, &mbi, sizeof(mbi))) {
+                why = (mbi.State == MEM_FREE)     ? "reported free" :
+                      (mbi.Type == MEM_MAPPED)    ? "already mapped (file/anon view)" :
+                      (mbi.Type == MEM_IMAGE)     ? "inside a loaded image" : "already reserved";
+            }
+            rvvm_warn("vma_mmap(): fixed VirtualAlloc(%p, %llx) failed (err=%lu): %s; "
+                      "occupied by base=%p size=%llx state=%lx type=%lx prot=%lx",
+                      addr, (long long)size, (unsigned long)err, why,
+                      mbi.BaseAddress, (long long)mbi.RegionSize,
+                      (unsigned long)mbi.State, (unsigned long)mbi.Type, (unsigned long)mbi.Protect);
+        }
     }
 
 #elif defined(VMA_MMAP_IMPL)

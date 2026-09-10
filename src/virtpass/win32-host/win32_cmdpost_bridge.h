@@ -20,11 +20,24 @@
 #include <stdbool.h>
 
 /*
- * Create the host window, register vp_cmdpost callbacks, start plumbing.
- * Call before win32_host_start_guest().
+ * Create the host window, initialize the layer-1 virtual display, register
+ * vp_cmdpost callbacks. Call before win32_host_start_guest().
+ *
+ * Two independent layers:
+ *  - win_w/win_h  : layer 2, the OS window (a pure viewport; the panel is
+ *                   blitted 1:1 and leftover area is filled black).
+ *  - virt_w/virt_h/virt_ppi : layer 1, the virtual panel the guest renders
+ *                   into - the "target machine" of the remote-desktop-like
+ *                   model. These are the only display parameters the guest can
+ *                   observe, and only through the public NDK ABI
+ *                   (ANativeWindow_getWidth/Height, AConfiguration_*).
+ * Pass 0 for virt_w/virt_h to make the panel follow the window size; pass 0
+ * for any value to take its default.
+ *
  * Returns false on failure (window creation error).
  */
-bool win32_host_init(const char* title, int width, int height);
+bool win32_host_init(const char* title, int win_w, int win_h,
+                     int virt_w, int virt_h, int virt_ppi);
 
 /*
  * Launch the guest Linux ELF (argv[0] = ELF path, argv[1..] = guest args)

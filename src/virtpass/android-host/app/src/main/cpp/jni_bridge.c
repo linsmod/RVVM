@@ -16,8 +16,12 @@
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <android/configuration.h>  /* ACONFIGURATION_* constants */
+#include <android/choreographer.h> /* AChoreographer_* (display vsync) */
+#include <android/looper.h>        /* ALooper_* (vsync pump) */
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <time.h>
 #include <pthread.h>
 #include <unistd.h>
 
@@ -29,6 +33,7 @@
 
 #define LOG_TAG "RVVM-JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 /* Global references to Java objects */
@@ -75,6 +80,123 @@ static struct {
 static int32_t g_lifecycle_cmd_queue[32];
 static int32_t g_lifecycle_cmd_count = 0;
 static int32_t g_lifecycle_cmd_read = 0;
+
+/* ============================================================
+ * Choreographer (Phase 4): display vsync source
+ * ============================================================
+ * The guest's AChoreographer stubs consume this from two directions:
+ *  - fd wakeup (方案 B): the guest registers the write end of its Looper pipe
+ *    and asks for one vsync per request; vp_cmdpost_vsync_tick() below writes
+ *    the frame time into that fd, so the guest wakes in poll() instead of
+ *    polling us.
+ *  - blocking WAIT: a guest that could not use the fd path parks in
+ *    SYS_ANDROID_CHOREOGRAPHER_WAIT and is released by the condvar below.
+ *
+ * A dedicated thread owns the real NDK AChoreographer instance (it is
+ * per-thread and needs a Looper that is actually pumped), keeps one frame
+ * callback armed at all times, and publishes each vsync's frame time. Guest
+ * consumers only observe the latest tick, so a slow or stalled guest cannot
+ * hold up the vsync source itself.
+ */
+static pthread_t       g_vsync_thread;
+static ALooper*        g_vsync_looper = NULL;
+static volatile int    g_vsync_running = 0;
+static pthread_mutex_t g_vsync_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_vsync_cond  = PTHREAD_COND_INITIALIZER;
+static int64_t         g_vsync_frame_time = 0;
+static uint64_t        g_vsync_seq = 0;
+static int             g_vsync_warned = 0;
+
+static void on_vsync_frame(long frame_time_nanos, void* data)
+{
+    (void)data;
+
+    pthread_mutex_lock(&g_vsync_mutex);
+    g_vsync_frame_time = frame_time_nanos;
+    g_vsync_seq++;
+    pthread_cond_broadcast(&g_vsync_cond);
+    pthread_mutex_unlock(&g_vsync_mutex);
+
+    /* fd path: hand the frame time to the guest's Looper pipe if it asked for
+     * this vsync. Cheap no-op while nothing is armed. */
+    vp_cmdpost_vsync_tick((int64_t)frame_time_nanos);
+
+    /* Keep the tick continuous: re-arm immediately from inside the callback. */
+    if (g_vsync_running) {
+        AChoreographer* choreographer = AChoreographer_getInstance();
+        if (choreographer) {
+            AChoreographer_postFrameCallback(choreographer, on_vsync_frame, NULL);
+        }
+    }
+}
+
+/*
+ * Owns the AChoreographer instance. AChoreographer is per-thread and only
+ * dispatches while its Looper is pumped, so this thread prepares a Looper and
+ * then simply drains it; every drained frame callback publishes a new tick.
+ */
+static void* vsync_thread_func(void* arg)
+{
+    (void)arg;
+
+    g_vsync_looper = ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
+
+    AChoreographer* choreographer = AChoreographer_getInstance();
+    if (!choreographer) {
+        LOGE("vsync: AChoreographer_getInstance() failed, guest will fall back");
+        return NULL;
+    }
+
+    AChoreographer_postFrameCallback(choreographer, on_vsync_frame, NULL);
+    LOGI("vsync: AChoreographer source started");
+
+    while (g_vsync_running) {
+        int result = ALooper_pollOnce(-1, NULL, NULL, NULL);
+        if (result == ALOOPER_POLL_ERROR) {
+            LOGE("vsync: ALooper_pollOnce() error, stopping vsync source");
+            break;
+        }
+    }
+
+    LOGI("vsync: AChoreographer source stopped");
+    return NULL;
+}
+
+/*
+ * Blocks the caller until the next display vsync and returns its frame time in
+ * nanoseconds. Returns -1 when the source is unavailable, so the guest can
+ * fall back to its own clock instead of stalling.
+ */
+static int64_t android_vsync_wait(void)
+{
+    int64_t frame_time = -1;
+
+    pthread_mutex_lock(&g_vsync_mutex);
+
+    uint64_t start_seq = g_vsync_seq;
+    while (g_vsync_running && g_vsync_seq == start_seq) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 100 * 1000 * 1000;   /* 100ms safety net */
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        if (pthread_cond_timedwait(&g_vsync_cond, &g_vsync_mutex, &deadline) == ETIMEDOUT) {
+            break;
+        }
+    }
+
+    if (g_vsync_seq != start_seq) {
+        frame_time = g_vsync_frame_time;
+    } else if (!g_vsync_warned) {
+        g_vsync_warned = 1;
+        LOGW("vsync: no tick within 100ms, guest falls back to its own clock");
+    }
+
+    pthread_mutex_unlock(&g_vsync_mutex);
+    return frame_time;
+}
 
 /* Guest execution state */
 static pthread_t g_guest_thread;
@@ -189,6 +311,13 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
             }
         }
         LOGI("Unlock: copy done");
+    } else {
+        /* Lock succeeded but there is no frame to copy (guest pixbuf missing,
+         * or the surface buffer pointer was invalidated by a window change).
+         * Still post so the buffer queue keeps flowing, but make the cause
+         * visible instead of silently presenting an untouched frame. */
+        LOGW("Unlock: no frame copied (guestPixels=%p, surfaceBits=%p); posting untouched buffer",
+             guestPixels, g_locked_buffer.bits);
     }
 
     int32_t result = ANativeWindow_unlockAndPost(g_native_window);
@@ -317,6 +446,15 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
     /* Set GameActivity callbacks */
     cmdpost_set_game_callbacks(on_game_lifecycle, on_game_input);
 
+    /* Expose the real display vsync as the guest's AChoreographer source. */
+    cmdpost_set_choreographer_callback(android_vsync_wait);
+    g_vsync_running = 1;
+    if (pthread_create(&g_vsync_thread, NULL, vsync_thread_func, NULL) != 0) {
+        g_vsync_running = 0;
+        cmdpost_set_choreographer_callback(NULL);
+        LOGE("vsync: failed to start AChoreographer thread, guest will fall back");
+    }
+
     /* Get Android sensor manager (per-package singleton, API 26+) */
     g_sensor_manager = ASensorManager_getInstanceForPackage(NULL);
     if (g_sensor_manager) {
@@ -364,6 +502,27 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
     /* Destroy event queue */
     if (g_sensor_manager && g_event_queue) {
         ASensorManager_destroyEventQueue(g_sensor_manager, g_event_queue);
+    }
+
+    /* Stop the vsync source before tearing down the bridge. */
+    if (g_vsync_running) {
+        g_vsync_running = 0;
+
+        /* Release a guest blocked in poll() on the vsync fd: it is told the
+         * clock is gone so it degrades instead of waiting forever. */
+        vp_cmdpost_vsync_source_lost();
+
+        /* Wake a thread parked in ALooper_pollOnce(-1) ... */
+        if (g_vsync_looper) {
+            ALooper_wake(g_vsync_looper);
+        }
+        /* ... and one parked in android_vsync_wait(). */
+        pthread_mutex_lock(&g_vsync_mutex);
+        pthread_cond_broadcast(&g_vsync_cond);
+        pthread_mutex_unlock(&g_vsync_mutex);
+
+        pthread_join(g_vsync_thread, NULL);
+        g_vsync_looper = NULL;
     }
 
     /* Cleanup vp_cmdpost */
@@ -526,29 +685,36 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
 {
     (void)thiz;
     
-    /* Release previous window if any */
+    /* SurfaceCreated and SurfaceChanged both hand us a surface. The guest may
+     * hold a locked buffer across that transition, so acquire the window first
+     * and, if it is the same one we already track, keep it as-is (the extra
+     * reference is dropped immediately). */
+    ANativeWindow* new_window = NULL;
+    if (surface) {
+        new_window = ANativeWindow_fromSurface(env, surface);
+        if (!new_window) {
+            LOGE("Failed to get native window from surface");
+            return;
+        }
+        if (new_window == g_native_window) {
+            ANativeWindow_release(new_window);
+            LOGI("Native window unchanged, keeping existing window");
+            return;
+        }
+    }
+
+    /* A different window (or NULL) means the surface is really going away or
+     * being replaced: release the old one before adopting the new. */
     if (g_native_window) {
         ANativeWindow_release(g_native_window);
         g_native_window = NULL;
     }
-    
-    if (surface) {
-        /* SurfaceCreated and SurfaceChanged both hand us a surface; the guest
-         * may hold a locked buffer across the transition, so only re-acquire
-         * when the window was actually cleared or replaced. */
-        if (g_native_window) {
-            LOGI("Native window already set, keeping existing window");
-            return;
-        }
-        /* Get ANativeWindow from Java Surface */
-        g_native_window = ANativeWindow_fromSurface(env, surface);
-        if (g_native_window) {
-            LOGI("Native window set: %dx%d", 
-                 ANativeWindow_getWidth(g_native_window),
-                 ANativeWindow_getHeight(g_native_window));
-        } else {
-            LOGE("Failed to get native window from surface");
-        }
+
+    if (new_window) {
+        g_native_window = new_window;
+        LOGI("Native window set: %dx%d",
+             ANativeWindow_getWidth(g_native_window),
+             ANativeWindow_getHeight(g_native_window));
     } else {
         LOGI("Native window cleared");
     }

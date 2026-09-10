@@ -48,6 +48,10 @@
 #define SYS_ANDROID_GAME_SWAP_INPUT  (SYS_ANDROID_BASE + 23)
 #define SYS_ANDROID_GAME_CLEAR_INPUT (SYS_ANDROID_BASE + 24)
 
+/* Choreographer (Phase 4: display vsync source) */
+#define SYS_ANDROID_CHOREOGRAPHER_INIT (SYS_ANDROID_BASE + 25)
+#define SYS_ANDROID_CHOREOGRAPHER_WAIT (SYS_ANDROID_BASE + 26)
+
 /* ============================================================
  * Lifecycle Commands (NativeAppGlueAppCmd)
  * ============================================================ */
@@ -464,7 +468,14 @@ float GameActivityPointerAxes_getAxisValue(const GameActivityPointerAxes* pointe
 
 /* ============================================================
  * Looper API (android/looper.h)
- * ============================================================ */
+ * ============================================================
+ * The Looper is fd-driven, like the real one: ALooper_addFd() registers a
+ * descriptor with the looper, and ALooper_pollOnce()/ALooper_pollAll() block
+ * in a real poll() until one of them is ready, then dispatch every ready fd
+ * to its own callback. The AChoreographer vsync source is registered as one
+ * more fd, so it composes with any other event source the guest adds (input,
+ * assets, sockets, ...) instead of owning the whole pump.
+ */
 
 #define ALOOPER_POLL_WAKE       (-1)
 #define ALOOPER_POLL_CALLBACK   (-2)
@@ -472,12 +483,67 @@ float GameActivityPointerAxes_getAxisValue(const GameActivityPointerAxes* pointe
 #define ALOOPER_POLL_ERROR      (-4)
 #define ALOOPER_POLL_INVALID    (-5)
 
+#define ALOOPER_EVENT_INPUT     (1 << 0)
+#define ALOOPER_EVENT_OUTPUT    (1 << 1)
+#define ALOOPER_EVENT_ERROR     (1 << 2)
+#define ALOOPER_EVENT_HANGUP    (1 << 3)
+#define ALOOPER_EVENT_INVALID   (1 << 4)
+
 #define ALOOPER_PREPARE_ALLOW_NON_CALLBACKS (1 << 0)
+
+/* Invoked when a fd registered with ident == ALOOPER_POLL_CALLBACK becomes
+ * ready. Returning 0 removes the fd from the looper (NDK contract). */
+typedef int (*ALooper_callbackFunc)(int fd, int events, void* data);
 
 ALooper* ALooper_prepare(int opts);
 int ALooper_pollAll(int timeoutMillis, int* events, void** data, void** source);
 int ALooper_pollOnce(int timeoutMillis, int* events, void** data, void** source);
-int ALooper_addFd(ALooper* looper, int fd, int ident, int events, void* callback, void* data);
+int ALooper_addFd(ALooper* looper, int fd, int ident, int events,
+                  ALooper_callbackFunc callback, void* data);
 int ALooper_removeFd(ALooper* looper, int fd);
+
+/* ============================================================
+ * Choreographer API (android/choreographer.h)
+ * ============================================================
+ * Mirrors the NDK contract: postFrameCallback() queues the callback and
+ * returns immediately; the callback runs on the thread that pumps the
+ * Looper, once per display vsync, with the vsync frame time in nanoseconds.
+ *
+ * The vsync source itself is owned by the host (real AChoreographer on
+ * Android, the compositor clock elsewhere). Like the real NDK, it is
+ * delivered as a fd that the stub registers into the Looper: the stub asks
+ * the host for exactly one vsync per postFrameCallback() (requestNextVsync
+ * semantics) and the host answers by writing the frame time into a pipe. A
+ * guest that pumps the Looper with ALooper_pollAll(-1) therefore blocks in
+ * poll() until the display frame lands, instead of polling on its own.
+ *
+ * Hosts without fd wakeup support answer CHOREOGRAPHER_INIT without the
+ * VP_VSYNC_CAP_FD_WAKEUP capability; the stub then degrades to a blocking
+ * CHOREOGRAPHER_WAIT call, and finally to a 60Hz guest-clock tick.
+ */
+
+typedef struct AChoreographer AChoreographer;
+
+typedef void (*AChoreographer_frameCallback)(long frameTimeNanos, void* data);
+typedef void (*AChoreographer_frameCallback64)(int64_t frameTimeNanos, void* data);
+
+/* Capability bits returned by SYS_ANDROID_CHOREOGRAPHER_INIT (bitmask in a0,
+ * negative when the host has no vsync support at all). */
+#define VP_VSYNC_CAP_SOURCE    (1 << 0)   /* host has a vsync clock (WAIT works) */
+#define VP_VSYNC_CAP_FD_WAKEUP (1 << 1)   /* host can wake a guest fd per vsync */
+
+AChoreographer* AChoreographer_getInstance(void);
+void AChoreographer_postFrameCallback(AChoreographer* choreographer,
+                                      AChoreographer_frameCallback callback,
+                                      void* data);
+void AChoreographer_postFrameCallbackDelayed(AChoreographer* choreographer,
+                                             AChoreographer_frameCallback callback,
+                                             void* data, long delayMillis);
+void AChoreographer_postFrameCallback64(AChoreographer* choreographer,
+                                        AChoreographer_frameCallback64 callback,
+                                        void* data);
+void AChoreographer_postFrameCallbackDelayed64(AChoreographer* choreographer,
+                                               AChoreographer_frameCallback64 callback,
+                                               void* data, uint32_t delayMillis);
 
 #endif /* VIRTPASS_ANDROID */

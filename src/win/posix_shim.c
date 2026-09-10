@@ -956,16 +956,192 @@ int fstatfs(int fd, struct statfs* buf)
 /* poll / select / ioctl / shm - stubs                                 */
 /* ------------------------------------------------------------------ */
 
+/* Upper bound WaitForMultipleObjects() accepts in one call */
+#define SHIM_POLL_MAX_WAIT MAXIMUM_WAIT_OBJECTS
+
+/* Translate the *current* readiness of one fd into revents bits. Only called
+ * after WaitForMultipleObjects() reported the underlying handle as signaled
+ * (or for the immediate, non-blocking probe path). */
+static short shim_poll_revents(int fd, short events)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    short  revents = 0;
+
+    if (h == INVALID_HANDLE_VALUE || h == NULL) {
+        return POLLNVAL;
+    }
+
+    if (GetFileType(h) == FILE_TYPE_PIPE) {
+        DWORD avail = 0;
+        if (PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) {
+            if (avail && (events & POLLIN)) {
+                revents |= POLLIN;
+            }
+            /* Room in the pipe buffer: a write of at most PIPE_BUF bytes
+             * completes without blocking */
+            if (events & POLLOUT) {
+                revents |= POLLOUT;
+            }
+        }
+        else if (GetLastError() == ERROR_BROKEN_PIPE) {
+            /* Every write end is gone: reads report EOF and we are hung up */
+            revents |= POLLHUP;
+            if (events & POLLIN) {
+                revents |= POLLIN;
+            }
+        }
+    }
+    else {
+        /* Disk files and consoles: a signaled handle means the transfer is
+         * ready to proceed */
+        if (events & POLLIN) {
+            revents |= POLLIN;
+        }
+        if (events & POLLOUT) {
+            revents |= POLLOUT;
+        }
+    }
+
+    return revents;
+}
+
+/*
+ * Real poll() over Win32 kernel objects.
+ *
+ * Unlike a real Linux guest, rvvm-user passes syscalls straight through, so
+ * the guest's pipe()/read()/poll() share our CRT fd table and the underlying
+ * HANDLEs are waitable: an anonymous pipe's read handle is signaled exactly
+ * when data is available and its write handle when there is buffer space.
+ *
+ * This is what makes the virtpass vsync-fd path (ALooper_addFd) work: the
+ * guest parks in poll() on the pipe it owns and the host's frame clock wakes
+ * it with a plain write(). The old Sleep()-and-return-0 stub could not wake
+ * anyone, so the guest would have had to spin.
+ */
 int poll(struct pollfd* fds, nfds_t nfds, int timeout)
 {
-    nfds_t i;
-    if (fds) {
+    HANDLE    handles[SHIM_POLL_MAX_WAIT];
+    int       map[SHIM_POLL_MAX_WAIT];   /* fds[i] -> index into handles, or -1 */
+    unsigned  nhandles = 0;
+    int       ready = 0;
+    ULONGLONG deadline = 0;
+    nfds_t    i;
+    unsigned  k;
+
+    if (!fds || nfds <= 0) {
+        /* Nothing to wait on: only the timeout is meaningful */
+        Sleep(timeout > 0 ? (DWORD)timeout : 1);
+        return 0;
+    }
+
+    if (nfds > SHIM_POLL_MAX_WAIT) {
+        /* More fds than WaitForMultipleObjects() can take at once. Keep the
+         * old pacing behaviour rather than blocking on a partial set. */
         for (i = 0; i < nfds; i++) {
             fds[i].revents = 0;
         }
+        Sleep(timeout > 0 ? (DWORD)timeout : 1);
+        return 0;
     }
-    Sleep(timeout > 0 ? (DWORD)timeout : 1);
-    return 0;
+
+    if (timeout >= 0) {
+        deadline = GetTickCount64() + (ULONGLONG)timeout;
+    }
+
+    for (i = 0; i < nfds; i++) {
+        fds[i].revents = 0;
+        map[i] = -1;
+    }
+
+    /* One waitable handle per distinct fd; flag the invalid ones right away */
+    for (i = 0; i < nfds; i++) {
+        HANDLE h;
+        if (fds[i].fd < 0) {
+            continue;
+        }
+        h = (HANDLE)_get_osfhandle(fds[i].fd);
+        if (h == INVALID_HANDLE_VALUE || h == NULL) {
+            fds[i].revents = POLLNVAL;
+            ready++;
+            continue;
+        }
+        for (k = 0; k < nhandles; k++) {
+            if (handles[k] == h) {
+                break;
+            }
+        }
+        if (k == nhandles) {
+            handles[nhandles] = h;
+            nhandles++;
+        }
+        map[i] = (int)k;
+    }
+
+    if (ready) {
+        return ready;
+    }
+    if (!nhandles) {
+        /* Only negative fds: mimic a plain sleep */
+        if (timeout > 0) {
+            Sleep((DWORD)timeout);
+        }
+        else if (timeout < 0) {
+            Sleep(1);
+        }
+        return 0;
+    }
+
+    for (;;) {
+        DWORD wait_ms;
+        DWORD r;
+        int   woken = 0;
+
+        if (timeout < 0) {
+            wait_ms = INFINITE;
+        }
+        else {
+            ULONGLONG now = GetTickCount64();
+            wait_ms = (now >= deadline) ? 0 : (DWORD)(deadline - now);
+        }
+
+        r = WaitForMultipleObjects(nhandles, handles, FALSE, wait_ms);
+        if (r == WAIT_FAILED) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (r == WAIT_TIMEOUT) {
+            return 0;
+        }
+
+        /* A handle signaled: report every fd that maps onto it. Duplicated fds
+         * share a handle slot, so walk all of them. */
+        for (i = 0; i < nfds; i++) {
+            if (fds[i].fd < 0 || map[i] < 0) {
+                continue;
+            }
+            if ((unsigned)map[i] != r - WAIT_OBJECT_0) {
+                continue;
+            }
+            fds[i].revents |= shim_poll_revents(fds[i].fd, fds[i].events);
+            if (fds[i].revents) {
+                woken++;
+            }
+        }
+        if (woken) {
+            return woken;
+        }
+        if (timeout == 0) {
+            /* Non-blocking probe with nothing we care about ready */
+            return 0;
+        }
+        if (wait_ms == 0) {
+            /* The deadline passed while we were checking */
+            return 0;
+        }
+        /* Handle woke up but none of the requested events are ready: avoid a
+         * hot spin on an uninteresting signal. */
+        Sleep(1);
+    }
 }
 
 int select(int nfds, fd_set* rset, fd_set* wset, fd_set* eset, struct timeval* timeout)

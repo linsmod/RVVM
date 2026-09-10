@@ -14,7 +14,14 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <errno.h>
+#include <string.h>
 #include <sys/types.h>
+#include <time.h>
+#include <poll.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include "virtpass/vp_android.h"
 /*
  * Custom syscall numbers for Android NDK API proxying.
@@ -48,6 +55,14 @@
 #define SYS_ANDROID_GAME_POLL_CMD    (SYS_ANDROID_BASE + 22)
 #define SYS_ANDROID_GAME_SWAP_INPUT  (SYS_ANDROID_BASE + 23)
 #define SYS_ANDROID_GAME_CLEAR_INPUT (SYS_ANDROID_BASE + 24)
+
+/* Choreographer (Phase 4: display vsync source) */
+#define SYS_ANDROID_CHOREOGRAPHER_INIT (SYS_ANDROID_BASE + 25)
+#define SYS_ANDROID_CHOREOGRAPHER_WAIT (SYS_ANDROID_BASE + 26)
+/* fd wakeup (方案 B): guest hands the host the write end of the pipe that the
+ * Looper polls, and asks for exactly one vsync at a time. */
+#define SYS_ANDROID_CHOREOGRAPHER_SET_FD (SYS_ANDROID_BASE + 27)
+#define SYS_ANDROID_CHOREOGRAPHER_REQUEST_VSYNC (SYS_ANDROID_BASE + 28)
 
 /* GameActivity input constants */
 #define AMOTION_EVENT_ACTION_DOWN         0
@@ -455,8 +470,20 @@ static void* pixbuf_ensure(size_t need)
 {
     if (!g_pixbuf || g_pixbuf_size < need) {
         free(g_pixbuf);
+        g_pixbuf = NULL;
+        g_pixbuf_size = 0;
+
         g_pixbuf = malloc(need);
-        g_pixbuf_size = g_pixbuf ? need : 0;
+        if (!g_pixbuf) {
+            /* This is the real failure point when the guest cannot render:
+             * the anonymous mapping behind malloc() was refused. Log it here
+             * so callers do not have to guess from a generic -1. */
+            fprintf(stderr,
+                    "vp_ndk_stub: pixbuf_ensure: malloc(%zu) failed, errno=%d (%s)\n",
+                    need, errno, strerror(errno));
+            return NULL;
+        }
+        g_pixbuf_size = need;
     }
     return g_pixbuf;
 }
@@ -473,16 +500,29 @@ int32_t ANativeWindow_lock(ANativeWindow* window, ANativeWindow_Buffer* outBuffe
                                   (long)outBuffer,
                                   (long)inOutDirtyBounds,
                                   0, 0, 0);
-    if (result == 0) {
-        /* Provide the guest-owned pixel buffer */
-        size_t bpp = (outBuffer->format == WINDOW_FORMAT_RGB_565) ? 2 : 4;
-        outBuffer->bits = pixbuf_ensure((size_t)outBuffer->stride * outBuffer->height * bpp);
-        if (!outBuffer->bits) {
-            virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_WINDOW_UNLOCK, (long)window, 0, 0, 0, 0, 0);
-            return -1;
-        }
+    if (result != 0) {
+        /* The host refused the lock: the surface itself is not ready. */
+        fprintf(stderr, "vp_ndk_stub: ANativeWindow_lock: host LOCK failed -> %ld\n", result);
+        return (int32_t)result;
     }
-    return (int32_t)result;
+
+    /* Host locked successfully: the window IS ready. Fill in the guest-owned
+     * pixel buffer. Any failure from here on is a guest-side allocation
+     * problem, not a "window not ready" condition. */
+    size_t bpp  = (outBuffer->format == WINDOW_FORMAT_RGB_565) ? 2 : 4;
+    size_t need = (size_t)outBuffer->stride * outBuffer->height * bpp;
+    outBuffer->bits = pixbuf_ensure(need);
+    if (!outBuffer->bits) {
+        fprintf(stderr,
+                "vp_ndk_stub: ANativeWindow_lock: guest pixel buffer unavailable "
+                "(need=%zu bytes = %dx%d stride=%d bpp=%zu); window is ready, "
+                "host surface stays untouched\n",
+                need, outBuffer->width, outBuffer->height,
+                outBuffer->stride, bpp);
+        virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_WINDOW_UNLOCK, (long)window, 0, 0, 0, 0, 0);
+        return -1;
+    }
+    return 0;
 }
 
 /* NDK API: Unlock the window's drawing surface and post the new buffer */
@@ -665,10 +705,394 @@ int32_t AMotionEvent_getAction(AInputEvent* event)
 }
 
 /* ============================================================
- * Looper API Stubs (android/looper.h)
- * ============================================================ */
+ * Looper fd registry (android/looper.h)
+ * ============================================================
+ * Mirrors the NDK model instead of faking a pump: the Looper owns a set of
+ * fds, ALooper_pollOnce()/ALooper_pollAll() block in a real poll() until one
+ * of them is ready, and each ready fd is dispatched to its own callback.
+ *
+ * The vsync source is just another registered fd (see the Choreographer
+ * section below), so guest code can drive frames, input, assets and anything
+ * else from the single Looper loop exactly like with the real NDK.
+ */
 
 typedef struct ALooper ALooper;
+
+#define VP_LOOPER_MAX_FDS 16
+
+typedef struct {
+    int   fd;
+    int   ident;
+    int   events;
+    ALooper_callbackFunc cb;   /* only meaningful for ALOOPER_POLL_CALLBACK */
+    void* data;
+} vp_looper_fd_t;
+
+static vp_looper_fd_t g_looper_fds[VP_LOOPER_MAX_FDS];
+static int g_looper_fd_count = 0;
+
+static vp_looper_fd_t* vp_looper_find(int fd)
+{
+    for (int i = 0; i < g_looper_fd_count; i++) {
+        if (g_looper_fds[i].fd == fd) {
+            return &g_looper_fds[i];
+        }
+    }
+    return NULL;
+}
+
+static int vp_looper_add(int fd, int ident, int events,
+                         ALooper_callbackFunc cb, void* data)
+{
+    if (fd < 0 || g_looper_fd_count >= VP_LOOPER_MAX_FDS || vp_looper_find(fd)) {
+        return -1;
+    }
+    vp_looper_fd_t* e = &g_looper_fds[g_looper_fd_count++];
+    e->fd = fd;
+    e->ident = ident;
+    e->events = events;
+    e->cb = cb;
+    e->data = data;
+    return 0;
+}
+
+static int vp_looper_del(int fd)
+{
+    for (int i = 0; i < g_looper_fd_count; i++) {
+        if (g_looper_fds[i].fd != fd) {
+            continue;
+        }
+        for (int j = i + 1; j < g_looper_fd_count; j++) {
+            g_looper_fds[j - 1] = g_looper_fds[j];
+        }
+        g_looper_fd_count--;
+        return 0;
+    }
+    return -1;
+}
+
+/* ============================================================
+ * Choreographer API Stubs (android/choreographer.h)
+ * ============================================================
+ * postFrameCallback() only queues the callback (NDK semantics: it never
+ * blocks) and asks the host for exactly one more vsync, mirroring the real
+ * requestNextVsync(). The host answers by writing the frame time into a pipe
+ * we own, which is registered with the Looper above, so the queued callbacks
+ * are drained from whatever poll() that frame wakes up. Guest source stays
+ * indistinguishable from real NDK usage:
+ *
+ *   static void on_frame(long t, void* d) {
+ *       render();
+ *       AChoreographer_postFrameCallback(AChoreographer_getInstance(), on_frame, d);
+ *   }
+ *   ... while (running) ALooper_pollAll(-1, NULL, NULL, NULL);
+ *
+ * Hosts without fd wakeup support (capability bit missing) degrade to a
+ * blocking CHOREOGRAPHER_WAIT per frame, and to a 60Hz guest-clock tick when
+ * even that is unavailable.
+ */
+
+struct AChoreographer {
+    int32_t id;
+};
+
+#define VP_CHOREOGRAPHER_MAX_PENDING 8
+
+/* Safety net for a host-owned clock: never block forever on it. If a vsync is
+ * outstanding and nothing arrives within this window, the source is re-checked
+ * and the stub degrades instead of stalling the guest's render loop. */
+#define VP_VSYNC_WAIT_GUARD_MS 250
+
+typedef struct {
+    AChoreographer_frameCallback   cb;
+    AChoreographer_frameCallback64 cb64;
+    void*    data;
+    int64_t  due_ns;   /* guest-clock deadline (delayed postings) */
+    bool     is64;
+} vp_frame_callback_t;
+
+static vp_frame_callback_t g_frame_callbacks[VP_CHOREOGRAPHER_MAX_PENDING];
+static int g_frame_callback_count = 0;
+
+static AChoreographer g_choreographer = { .id = 0 };
+static bool g_choreographer_ready = false;
+
+/* fd-based vsync delivery: the host writes one frame time per requested vsync
+ * into g_vsync_write_fd; the read end is registered with the Looper. */
+static int  g_vsync_read_fd = -1;
+static int  g_vsync_write_fd = -1;
+static bool g_vsync_fd_mode = false;
+
+static void vp_choreographer_dispatch(long frame_time);
+static void vp_choreographer_arm(void);
+static bool vp_choreographer_fd_setup(void);
+static int vp_choreographer_fd_ready(int fd, int events, void* data);
+
+static int64_t vp_guest_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+
+/* Re-queue an entry as-is (used to carry not-yet-due delayed callbacks). */
+static void vp_choreographer_enqueue_entry(const vp_frame_callback_t* e)
+{
+    if (g_frame_callback_count >= VP_CHOREOGRAPHER_MAX_PENDING) {
+        return;
+    }
+    g_frame_callbacks[g_frame_callback_count++] = *e;
+}
+
+static void vp_choreographer_enqueue(AChoreographer_frameCallback cb,
+                                     AChoreographer_frameCallback64 cb64,
+                                     void* data, uint32_t delay_ms, bool is64)
+{
+    if ((!cb && !cb64) || g_frame_callback_count >= VP_CHOREOGRAPHER_MAX_PENDING) {
+        fprintf(stderr, "vp_ndk_stub: AChoreographer queue full, callback dropped\n");
+        return;
+    }
+    vp_frame_callback_t* e = &g_frame_callbacks[g_frame_callback_count++];
+    e->cb = cb;
+    e->cb64 = cb64;
+    e->data = data;
+    e->due_ns = vp_guest_now_ns() + (int64_t)delay_ms * 1000000LL;
+    e->is64 = is64;
+
+    /* One outstanding request per frame, like the real requestNextVsync(). */
+    vp_choreographer_arm();
+}
+
+/*
+ * Block until the next display vsync and return its frame time in
+ * nanoseconds. A negative host result means no vsync source is available;
+ * fall back to the guest monotonic clock so callers still make progress
+ * instead of stalling the render loop forever.
+ */
+static long vp_choreographer_wait_vsync(void)
+{
+    int64_t frame_time = (int64_t)virtpass_syscall(SYS_ANDROID_CALL,
+                                                   SYS_ANDROID_CHOREOGRAPHER_WAIT,
+                                                   0, 0, 0, 0, 0, 0);
+    if (frame_time < 0) {
+        /* No host vsync source (backend without a display clock yet): pace at
+         * 60Hz and report the guest clock, so callers still see a steady
+         * cadence instead of spinning at full speed. */
+        const int64_t fallback_period_ns = 16666667;
+        struct timespec now, sleep_for;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + (int64_t)now.tv_nsec;
+        int64_t next_ns = ((now_ns / fallback_period_ns) + 1) * fallback_period_ns;
+        sleep_for.tv_sec = (next_ns - now_ns) / 1000000000;
+        sleep_for.tv_nsec = (next_ns - now_ns) % 1000000000;
+        nanosleep(&sleep_for, NULL);
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        frame_time = (int64_t)now.tv_sec * 1000000000LL + (int64_t)now.tv_nsec;
+    }
+    return (long)frame_time;
+}
+
+/* Capability bits the host reports for CHOREOGRAPHER_INIT. */
+static long vp_choreographer_caps(void)
+{
+    long caps = virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_CHOREOGRAPHER_INIT,
+                                 0, 0, 0, 0, 0, 0);
+    return caps < 0 ? 0 : caps;
+}
+
+/* Give up on the fd wakeup path and go back to the blocking fallback. */
+static void vp_choreographer_drop_fd(void)
+{
+    if (g_vsync_read_fd >= 0) {
+        vp_looper_del(g_vsync_read_fd);
+        close(g_vsync_read_fd);
+        g_vsync_read_fd = -1;
+    }
+    if (g_vsync_write_fd >= 0) {
+        close(g_vsync_write_fd);
+        g_vsync_write_fd = -1;
+    }
+    g_vsync_fd_mode = false;
+}
+
+/* Ask the host for exactly one more vsync. In fd mode the host answers by
+ * writing the frame time into our pipe, which is what wakes poll(). */
+static void vp_choreographer_arm(void)
+{
+    if (g_vsync_fd_mode) {
+        virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_CHOREOGRAPHER_REQUEST_VSYNC,
+                         0, 0, 0, 0, 0, 0);
+        return;
+    }
+    /* Degraded path: keep probing, so a host that gains a vsync source later
+     * (window created after the guest started) upgrades without a restart. */
+    vp_choreographer_fd_setup();
+}
+
+/* Hand the host the write end of our vsync pipe and register the read end
+ * with the Looper. Returns true once the fd wakeup path is live. */
+static bool vp_choreographer_fd_setup(void)
+{
+    if (g_vsync_fd_mode) {
+        return true;
+    }
+    if (!(vp_choreographer_caps() & VP_VSYNC_CAP_FD_WAKEUP)) {
+        return false;
+    }
+
+    if (g_vsync_read_fd < 0) {
+        int fds[2];
+        if (pipe(fds) != 0) {
+            fprintf(stderr, "vp_ndk_stub: vsync pipe() failed: %s\n", strerror(errno));
+            return false;
+        }
+        /* Draining must never stall the pump. */
+        int fl = fcntl(fds[0], F_GETFL, 0);
+        if (fl >= 0) {
+            fcntl(fds[0], F_SETFL, fl | O_NONBLOCK);
+        }
+        g_vsync_read_fd = fds[0];
+        g_vsync_write_fd = fds[1];
+    }
+
+    if (virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_CHOREOGRAPHER_SET_FD,
+                         (long)g_vsync_write_fd, 0, 0, 0, 0, 0) != 0) {
+        return false;   /* host refused: keep the pipe and retry later */
+    }
+
+    ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
+    if (vp_looper_add(g_vsync_read_fd, ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT,
+                      vp_choreographer_fd_ready, NULL) != 0) {
+        return false;
+    }
+    g_vsync_fd_mode = true;
+    return true;
+}
+
+/*
+ * Run every queued callback that is due for this frame. Callbacks posted from
+ * inside a callback (the usual render loop re-arming itself) land in the next
+ * frame, i.e. one iteration of the real vsync loop.
+ */
+static void vp_choreographer_dispatch(long frame_time)
+{
+    int n = g_frame_callback_count;
+    if (n == 0) {
+        return;
+    }
+
+    vp_frame_callback_t batch[VP_CHOREOGRAPHER_MAX_PENDING];
+    memcpy(batch, g_frame_callbacks, sizeof(batch[0]) * (size_t)n);
+    g_frame_callback_count = 0;   /* callbacks posted below queue up here */
+
+    for (int i = 0; i < n; i++) {
+        if (batch[i].due_ns > (int64_t)frame_time) {
+            /* postFrameCallbackDelayed() not due yet: keep it for a later
+             * frame and make sure we get one. */
+            vp_choreographer_enqueue_entry(&batch[i]);
+            continue;
+        }
+        if (batch[i].is64) {
+            if (batch[i].cb64) {
+                batch[i].cb64((int64_t)frame_time, batch[i].data);
+            }
+        } else if (batch[i].cb) {
+            batch[i].cb(frame_time, batch[i].data);
+        }
+    }
+
+    if (g_frame_callback_count > 0) {
+        vp_choreographer_arm();
+    }
+}
+
+/*
+ * The vsync fd became readable: the host wrote the frame time of the vsync we
+ * requested. Drain it (newest frame wins) and run the due callbacks.
+ */
+static int vp_choreographer_fd_ready(int fd, int events, void* data)
+{
+    (void)events;
+    (void)data;
+
+    int64_t frame_time = 0;
+    bool got = false;
+
+    for (;;) {
+        uint8_t buf[sizeof(int64_t)];
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n != (ssize_t)sizeof(buf)) {
+            break;   /* drained (or a partial write: drop it) */
+        }
+        memcpy(&frame_time, buf, sizeof(frame_time));
+        got = true;
+
+        /* Only keep reading while more data is queued: where O_NONBLOCK is not
+         * honoured, a blind read would block the pump. */
+        struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+        if (poll(&p, 1, 0) <= 0 || !(p.revents & POLLIN)) {
+            break;
+        }
+    }
+    if (!got) {
+        return 1;
+    }
+
+    if (frame_time < 0) {
+        /* Host lost its vsync clock (activity gone): degrade instead of
+         * leaving the guest blocked on a fd that will never be written. */
+        vp_choreographer_drop_fd();
+        frame_time = vp_choreographer_wait_vsync();
+    }
+
+    vp_choreographer_dispatch((long)frame_time);
+    return 1;   /* keep the fd registered */
+}
+
+AChoreographer* AChoreographer_getInstance(void)
+{
+    if (!g_choreographer_ready) {
+        g_choreographer_ready = true;
+        /* Bring up the host-side vsync source: fd wakeup when the host
+         * supports it, otherwise the stub keeps the blocking fallback. */
+        vp_choreographer_fd_setup();
+    }
+    return &g_choreographer;
+}
+
+void AChoreographer_postFrameCallback(AChoreographer* choreographer,
+                                      AChoreographer_frameCallback callback,
+                                      void* data)
+{
+    (void)choreographer;
+    vp_choreographer_enqueue(callback, NULL, data, 0, false);
+}
+
+void AChoreographer_postFrameCallbackDelayed(AChoreographer* choreographer,
+                                             AChoreographer_frameCallback callback,
+                                             void* data, long delayMillis)
+{
+    (void)choreographer;
+    vp_choreographer_enqueue(callback, NULL, data,
+                             delayMillis > 0 ? (uint32_t)delayMillis : 0, false);
+}
+
+void AChoreographer_postFrameCallback64(AChoreographer* choreographer,
+                                        AChoreographer_frameCallback64 callback,
+                                        void* data)
+{
+    (void)choreographer;
+    vp_choreographer_enqueue(NULL, callback, data, 0, true);
+}
+
+void AChoreographer_postFrameCallbackDelayed64(AChoreographer* choreographer,
+                                               AChoreographer_frameCallback64 callback,
+                                               void* data, uint32_t delayMillis)
+{
+    (void)choreographer;
+    vp_choreographer_enqueue(NULL, callback, data, delayMillis, true);
+}
 
 struct ALooper {
     int32_t id;
@@ -683,40 +1107,116 @@ ALooper* ALooper_prepare(int opts)
     return &g_looper;
 }
 
-int ALooper_pollAll(int timeoutMillis, int* events, void** data, void** source)
-{
-    (void)timeoutMillis;
-    (void)events;
-    (void)data;
-    (void)source;
-    return -1; /* ALOOPER_POLL_TIMEOUT */
-}
-
+/*
+ * The real pump: block in poll() over every registered fd (the choreographer
+ * vsync pipe is one of them) until something is ready, then dispatch each
+ * ready fd. Callbacks that were registered with ident ALOOPER_POLL_CALLBACK
+ * run here; an explicit ident is reported back to the caller instead, as the
+ * NDK contract specifies.
+ */
 int ALooper_pollOnce(int timeoutMillis, int* events, void** data, void** source)
 {
-    (void)timeoutMillis;
-    (void)events;
-    (void)data;
-    (void)source;
-    return -1; /* ALOOPER_POLL_TIMEOUT */
+    if (events) *events = 0;
+    if (data) *data = NULL;
+    if (source) *source = NULL;
+
+    if (g_looper_fd_count == 0) {
+        /* Nothing registered: there is no fd to block on. While frame
+         * callbacks are pending, fall back to the blocking vsync call so the
+         * render loop still advances on hosts without fd wakeup support. */
+        if (g_frame_callback_count > 0) {
+            vp_choreographer_dispatch(vp_choreographer_wait_vsync());
+            return ALOOPER_POLL_CALLBACK;
+        }
+        /* Block a frame's worth so an idle caller cannot spin hot. */
+        poll(NULL, 0, timeoutMillis >= 0 ? timeoutMillis : 16);
+        return ALOOPER_POLL_TIMEOUT;
+    }
+
+    /* Snapshot: callbacks may add or remove fds while we dispatch. */
+    int n = g_looper_fd_count;
+    struct pollfd pfd[VP_LOOPER_MAX_FDS];
+    int snap_fd[VP_LOOPER_MAX_FDS];
+    for (int i = 0; i < n; i++) {
+        pfd[i].fd = g_looper_fds[i].fd;
+        pfd[i].events = (short)g_looper_fds[i].events;
+        pfd[i].revents = 0;
+        snap_fd[i] = g_looper_fds[i].fd;
+    }
+
+    for (;;) {
+        /* A host-owned clock must not be able to hang the guest: while a vsync
+         * is outstanding, wait with a bounded timeout and re-check the source. */
+        bool guarded = g_vsync_fd_mode && timeoutMillis < 0 && g_frame_callback_count > 0;
+        int wait_ms = guarded ? VP_VSYNC_WAIT_GUARD_MS : timeoutMillis;
+
+        int rc = poll(pfd, (nfds_t)n, wait_ms);
+        if (rc < 0) {
+            return ALOOPER_POLL_ERROR;
+        }
+        if (rc > 0) {
+            break;
+        }
+        if (!guarded) {
+            return ALOOPER_POLL_TIMEOUT;
+        }
+        if (!(vp_choreographer_caps() & VP_VSYNC_CAP_FD_WAKEUP)) {
+            /* The host clock went away: degrade rather than block forever. */
+            vp_choreographer_drop_fd();
+            vp_choreographer_dispatch(vp_choreographer_wait_vsync());
+            return ALOOPER_POLL_CALLBACK;
+        }
+        /* Clock alive but no frame delivered yet: ask again. */
+        virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_CHOREOGRAPHER_REQUEST_VSYNC,
+                         0, 0, 0, 0, 0, 0);
+    }
+
+    bool ran_callback = false;
+    for (int i = 0; i < n; i++) {
+        if (!pfd[i].revents) {
+            continue;
+        }
+        vp_looper_fd_t* e = vp_looper_find(snap_fd[i]);
+        if (!e) {
+            continue;   /* a previous callback removed it */
+        }
+        if (e->ident == ALOOPER_POLL_CALLBACK) {
+            ran_callback = true;
+            if (e->cb && e->cb(e->fd, pfd[i].revents, e->data) == 0) {
+                vp_looper_del(e->fd);   /* NDK: returning 0 unregisters the fd */
+            }
+            continue;
+        }
+        if (events) *events = pfd[i].revents;
+        if (data) *data = e->data;
+        if (source) *source = &g_looper;
+        return e->ident;
+    }
+    return ran_callback ? ALOOPER_POLL_CALLBACK : ALOOPER_POLL_TIMEOUT;
 }
 
-int ALooper_addFd(ALooper* looper, int fd, int ident, int events, void* callback, void* data)
+/* Keep draining callbacks until a poll returns something other than them. */
+int ALooper_pollAll(int timeoutMillis, int* events, void** data, void** source)
+{
+    for (;;) {
+        int r = ALooper_pollOnce(timeoutMillis, events, data, source);
+        if (r != ALOOPER_POLL_CALLBACK) {
+            return r;
+        }
+    }
+}
+
+int ALooper_addFd(ALooper* looper, int fd, int ident, int events,
+                  ALooper_callbackFunc callback, void* data)
 {
     (void)looper;
-    (void)fd;
-    (void)ident;
-    (void)events;
-    (void)callback;
-    (void)data;
-    return 0;
+    return vp_looper_add(fd, ident, events, callback, data);
 }
 
 int ALooper_removeFd(ALooper* looper, int fd)
 {
     (void)looper;
-    (void)fd;
-    return 0;
+    return vp_looper_del(fd);
 }
 
 /* ============================================================

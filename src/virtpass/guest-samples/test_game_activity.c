@@ -59,12 +59,48 @@ static float g_touch_x = -1, g_touch_y = -1;
 static bool g_touch_active = false;
 static int g_touch_count = 0;
 
-/* Simple delay function */
-static void delay(int count)
+/*
+ * Dump the layer-1 virtual display (the guest's "target machine") exactly as
+ * a guest can observe it: only through the public NDK ABI, i.e.
+ * ANativeWindow_getWidth/Height and the AConfiguration_* getters.
+ */
+static void print_virtual_display(void)
 {
-    for (int i = 0; i < count; i++) {
-        __asm__ __volatile__("nop");
+    static const char* size_names[]   = { "ANY", "SMALL", "NORMAL", "LARGE", "XLARGE" };
+    static const char* tri_names[]    = { "ANY", "NO", "YES" };
+    static const char* orient_names[] = { "ANY", "PORT", "LAND", "SQUARE" };
+
+    AConfiguration* cfg;
+    int32_t size, slong, sround, orient;
+
+    printf("GameActivity: --- layer-1 virtual display ---\n");
+    printf("GameActivity:   panel      : %d x %d px\n",
+           (int)ANativeWindow_getWidth(NULL), (int)ANativeWindow_getHeight(NULL));
+
+    cfg = AConfiguration_new();
+    if (!cfg) {
+        printf("GameActivity:   config     : unavailable\n");
+        return;
     }
+
+    size   = AConfiguration_getScreenSize(cfg);
+    slong  = AConfiguration_getScreenLong(cfg);
+    sround = AConfiguration_getScreenRound(cfg);
+    orient = AConfiguration_getOrientation(cfg);
+
+    printf("GameActivity:   density    : %d dpi\n", (int)AConfiguration_getDensity(cfg));
+    printf("GameActivity:   size       : %s\n",
+           (size >= 0 && size <= 4) ? size_names[size] : "?");
+    printf("GameActivity:   widthDp    : %d dp\n", (int)AConfiguration_getScreenWidthDp(cfg));
+    printf("GameActivity:   heightDp   : %d dp\n", (int)AConfiguration_getScreenHeightDp(cfg));
+    printf("GameActivity:   long/round : %s / %s\n",
+           (slong >= 0 && slong <= 2) ? tri_names[slong] : "?",
+           (sround >= 0 && sround <= 2) ? tri_names[sround] : "?");
+    printf("GameActivity:   orientation: %s\n",
+           (orient >= 0 && orient <= 3) ? orient_names[orient] : "?");
+    printf("GameActivity: ---------------------------------\n");
+
+    AConfiguration_delete(cfg);
 }
 
 /* Simple callback handler */
@@ -81,6 +117,7 @@ void on_app_cmd(struct android_app* app, int cmd)
     switch (cmd) {
         case APP_CMD_INIT_WINDOW:
             printf("GameActivity: Window initialized\n");
+            print_virtual_display();
             g_bg_color = state_colors[0];
             break;
         case APP_CMD_TERM_WINDOW:
@@ -165,6 +202,71 @@ static void render_frame(ANativeWindow_Buffer* buf, int frame)
     }
 }
 
+/* ============================================================
+ * Frame callback (runs once per display vsync)
+ * ============================================================ */
+
+static int g_render_frame = 0;
+
+static void on_frame_callback(long frame_time_nanos, void* data)
+{
+    struct android_app* app = (struct android_app*)data;
+    (void)frame_time_nanos;
+
+    /* 1. Pump lifecycle commands */
+    int32_t cmd;
+    while ((cmd = android_app_read_cmd(app)) != -1) {
+        android_app_exec_cmd(app, cmd);
+    }
+
+    /* 2. Swap input buffers */
+    int32_t motion_count = android_app_swap_input_buffers(app);
+    if (motion_count > 0) {
+        g_touch_count += motion_count;
+        for (int32_t i = 0; i < motion_count && i < 16; i++) {
+            GameActivityPointerAxes* p = &app->inputBuffer.motionEvents[i].pointers[0];
+            int32_t action = app->inputBuffer.motionEvents[i].action & AMOTION_EVENT_ACTION_MASK;
+            float x = GameActivityPointerAxes_getAxisValue(p, AMOTION_EVENT_AXIS_X);
+            float y = GameActivityPointerAxes_getAxisValue(p, AMOTION_EVENT_AXIS_Y);
+            printf("GameActivity: motion event %d action=%d at %.0f,%.0f\n", i, action, x, y);
+
+            if (action == AMOTION_EVENT_ACTION_DOWN || action == AMOTION_EVENT_ACTION_MOVE) {
+                g_touch_x = x;
+                g_touch_y = y;
+                g_touch_active = true;
+            } else if (action == AMOTION_EVENT_ACTION_UP || action == AMOTION_EVENT_ACTION_CANCEL) {
+                g_touch_active = false;
+            }
+        }
+        android_app_clear_motion_events(app);
+        android_app_clear_key_events(app);
+    }
+
+    /* 3. Render one frame */
+    {
+        ANativeWindow_Buffer buffer;
+        ARect dirty;
+        if (ANativeWindow_lock(NULL, &buffer, &dirty) == 0) {
+            render_frame(&buffer, g_render_frame);
+            ANativeWindow_unlockAndPost(NULL);
+        } else {
+            /* ANativeWindow_lock() failed. This does NOT imply the window is
+             * missing: vp_ndk_stub prints the actual cause on stderr (host
+             * LOCK refused vs. guest pixel-buffer malloc failure). The next
+             * vsync tick retries automatically. */
+            printf("GameActivity: ANativeWindow_lock() failed, retrying "
+                   "(cause reported by vp_ndk_stub)\n");
+        }
+    }
+    g_render_frame++;
+
+    /* 4. Re-arm for the next vsync (standard Choreographer pattern). */
+    if (!g_destroy_requested) {
+        AChoreographer_postFrameCallback(AChoreographer_getInstance(),
+                                         on_frame_callback, app);
+    }
+}
+
 int main(void)
 {
     printf("=== GameActivity Test Program ===\n\n");
@@ -184,56 +286,15 @@ int main(void)
     /* Set buffer format to RGBA_8888 (matching render_frame) */
     ANativeWindow_setBuffersGeometry(NULL, 0, 0, WINDOW_FORMAT_RGBA_8888);
 
-    /* Main game loop */
-    int frame = 0;
+    /* Main loop: rendering is driven by the display vsync, NDK-style. The
+     * frame callback re-arms itself, so all the main thread has to do is pump
+     * the Looper. */
+    AChoreographer_getInstance();
+    AChoreographer_postFrameCallback(AChoreographer_getInstance(),
+                                     on_frame_callback, app);
+
     while (!g_destroy_requested) {
-        /* 1. Pump lifecycle commands */
-        int32_t cmd;
-        while ((cmd = android_app_read_cmd(app)) != -1) {
-            android_app_exec_cmd(app, cmd);
-        }
-
-        /* 2. Swap input buffers */
-        int32_t motion_count = android_app_swap_input_buffers(app);
-        if (motion_count > 0) {
-            g_touch_count += motion_count;
-            for (int32_t i = 0; i < motion_count && i < 16; i++) {
-                GameActivityPointerAxes* p = &app->inputBuffer.motionEvents[i].pointers[0];
-                int32_t action = app->inputBuffer.motionEvents[i].action & AMOTION_EVENT_ACTION_MASK;
-                float x = GameActivityPointerAxes_getAxisValue(p, AMOTION_EVENT_AXIS_X);
-                float y = GameActivityPointerAxes_getAxisValue(p, AMOTION_EVENT_AXIS_Y);
-                printf("GameActivity: motion event %d action=%d at %.0f,%.0f\n", i, action, x, y);
-
-                if (action == AMOTION_EVENT_ACTION_DOWN || action == AMOTION_EVENT_ACTION_MOVE) {
-                    g_touch_x = x;
-                    g_touch_y = y;
-                    g_touch_active = true;
-                } else if (action == AMOTION_EVENT_ACTION_UP || action == AMOTION_EVENT_ACTION_CANCEL) {
-                    g_touch_active = false;
-                }
-            }
-            android_app_clear_motion_events(app);
-            android_app_clear_key_events(app);
-        }
-
-        /* 3. Render a frame */
-        {
-            ANativeWindow_Buffer buffer;
-            ARect dirty;
-            if (ANativeWindow_lock(NULL, &buffer, &dirty) == 0) {
-                render_frame(&buffer, frame);
-                ANativeWindow_unlockAndPost(NULL);
-            } else {
-                /* Window not ready yet - wake up less often */
-                printf("GameActivity: waiting for window...\n");
-                delay(5000000);
-                frame++;
-                continue;
-            }
-        }
-
-        frame++;
-        delay(100000);
+        ALooper_pollAll(-1, NULL, NULL, NULL);
     }
 
     /* Destroy android_app */
