@@ -389,11 +389,14 @@ static void guest_geometry_locked(int32_t* w, int32_t* h, int32_t* fmt)
 }
 
 /* Window lock callback (called from vp_cmdpost)
- * Fills geometry only; the guest renders into its own buffer (identity-mapped
- * guest/host addresses) and we copy pixels on unlock. Never expose the host
- * surface pointer to the guest. The geometry handed to the guest is the
- * virtual panel, never the live viewport, so a surface resize cannot move the
- * buffer the guest is mid-frame on. */
+ * Fills geometry only; the guest renders into its own buffer and we copy
+ * pixels on unlock. Never expose the host surface pointer to the guest. The
+ * geometry handed to the guest is the virtual panel, never the live viewport,
+ * so a surface resize cannot move the buffer the guest is mid-frame on.
+ *
+ * outBuffer is already a HOST pointer: cmdpost translates the guest address
+ * before calling in, since guest memory is the userland machine's own buffer
+ * and is not mapped into the host. */
 static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
 {
     (void)window;
@@ -450,7 +453,8 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
     pthread_mutex_unlock(&g_surf_cs);
 
     if (outBuffer) {
-        /* outBuffer points into guest memory; geometry only, bits stays 0 */
+        /* outBuffer is a host pointer to the guest's buffer; geometry only,
+         * bits stays 0 */
         cmdpost_ANativeWindow_Buffer* dst = (cmdpost_ANativeWindow_Buffer*)outBuffer;
         dst->bits   = NULL;       /* guest supplies its own buffer       */
         dst->width  = gw;         /* guest geometry == virtual panel     */

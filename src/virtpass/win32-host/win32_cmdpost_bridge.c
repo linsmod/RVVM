@@ -75,6 +75,13 @@ static int32_t g_surf_fmt = WINDOW_FORMAT_RGBA_8888;
 static int32_t g_init_w   = 640;
 static int32_t g_init_h   = 480;
 
+/* One-shot confirmations that the guest's render path works (first successful
+ * WINDOW_LOCK, first posted frame). Per-guest, not per-process: the launcher
+ * boots several guests one after another and every one of them has to be
+ * observable, not just the first. Reset in win32_host_start_guest(). */
+static bool g_logged_lock  = false;
+static bool g_logged_frame = false;
+
 /* Layer-2 OS window: pure viewport, its size is independent of the virtual
  * panel. WM_PAINT scales the panel uniformly to fit (contain, never cropped)
  * and centres it, filling the leftover area with black. */
@@ -134,9 +141,16 @@ static bool   g_minimized    = false;
 #define LAUNCH_COMBO_LIST_H  180  /* dropped list area                     */
 #define LAUNCH_COMBO_H       (LAUNCH_COMBO_EDIT_H + LAUNCH_COMBO_LIST_H)
 
-/* Row the buttons live on: below the combo's static box, NOT below the
- * dropped list (the list is a popup and floats over them when open). */
-#define LAUNCH_BTN_Y         (LAUNCH_MARGIN + LAUNCH_COMBO_EDIT_H + LAUNCH_CTRL_GAP)
+/*
+ * Vertical layout of the picker, top to bottom: title / combo / buttons. The
+ * controls stay visible while a guest runs (the parent has WS_CLIPCHILDREN,
+ * so the guest panel never paints over them), so the rows must not overlap.
+ * The buttons sit below the combo's static box, NOT below the dropped list:
+ * the list is a popup and floats over them while it is open.
+ */
+#define LAUNCH_TITLE_H   24
+#define LAUNCH_COMBO_Y   (LAUNCH_MARGIN + LAUNCH_TITLE_H + LAUNCH_CTRL_GAP)
+#define LAUNCH_BTN_Y     (LAUNCH_COMBO_Y + LAUNCH_COMBO_EDIT_H + LAUNCH_CTRL_GAP)
 
 /* Known sample guests; used when the assets directory holds no .exe files
  * (e.g. the assets haven't been built yet). */
@@ -155,6 +169,11 @@ static HWND g_combo     = NULL;      /* guest dropdown        */
 static HWND g_btn_run   = NULL;      /* Run  button           */
 static HWND g_btn_stop  = NULL;      /* Stop button           */
 static HWND g_btn_exit  = NULL;      /* Exit button           */
+
+/* Guest switch requested while another guest is still running: the old one is
+ * torn down cooperatively and this pick is booted from WM_APP_GUEST_EXIT. */
+static bool g_switch_pending = false;
+static int  g_switch_sel     = -1;
 
 /* Off-screen composition surface for WM_PAINT. The whole client area is
  * composed here (black letterbox + uniformly scaled panel + boundary frame)
@@ -503,7 +522,6 @@ void present_gl_frame(void)
 static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
 {
     cmdpost_ANativeWindow_Buffer* buf = (cmdpost_ANativeWindow_Buffer*)outBuffer;
-    static bool logged_first = false;
     (void)window;
     (void)dirtyBounds;
     if (!buf) {
@@ -523,8 +541,8 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
     buf->stride = g_surf_w;    /* pixels, matches guest expectation */
     buf->format = g_surf_fmt;
     buf->bits   = NULL;        /* guest allocates its own buffer (pixbuf_ensure) */
-    if (!logged_first) {
-        logged_first = true;
+    if (!g_logged_lock) {
+        g_logged_lock = true;
         winhost_log("WINDOW_LOCK ok: %dx%d stride=%d fmt=%d "
                     "(guest renders into its own pixbuf; bits stays NULL)",
                     buf->width, buf->height, buf->stride, buf->format);
@@ -535,7 +553,6 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
 
 static int32_t on_window_unlock(void* window, void* guestPixels)
 {
-    static bool logged_frame = false;
     int32_t w = 0, h = 0, fmt = 0;
     (void)window;
     if (!guestPixels) {
@@ -552,10 +569,10 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
     fmt = g_surf_fmt;
     LeaveCriticalSection(&g_surf_cs);
 
-    if (guestPixels && !logged_frame) {
+    if (guestPixels && !g_logged_frame) {
         /* Positive confirmation that the whole LOCK -> render -> UNLOCK path
          * works, i.e. the guest did get its pixel buffer. */
-        logged_frame = true;
+        g_logged_frame = true;
         winhost_log("first frame posted: %dx%d fmt=%d from guest pixbuf %p", w, h, fmt, guestPixels);
     }
 
@@ -924,6 +941,7 @@ static void dbg_trace(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
  * calls them from WM_COMMAND / WM_APP_GUEST_EXIT. Forward declarations. */
 static void launcher_ui_idle(void);
 static void launcher_launch(void);
+static void launcher_launch_sel(int sel);
 static void launcher_stop(void);
 
 static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -979,8 +997,8 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             HBRUSH bg = CreateSolidBrush(RGB(16, 16, 24));
             HPEN   br = CreatePen(PS_SOLID, 0, RGB(90, 90, 110));
             HGDIOBJ ob, op;
-            t.top += LAUNCH_MARGIN;
-            t.bottom = t.top + 24;
+            t.top = LAUNCH_MARGIN;
+            t.bottom = t.top + LAUNCH_TITLE_H;
             FillRect(wdc, &rc, bg);
             DeleteObject(bg);
             SetBkMode(wdc, TRANSPARENT);
@@ -1143,16 +1161,25 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             set_title(title);
         }
         winhost_log("guest exited with code %d", g_guest_rc);
-        /* Guest is gone: no one will poll lifecycle cmds anymore. Tear down
-         * the same way as WM_CLOSE (Android teardown order). */
-        queue_lifecycle(APP_CMD_PAUSE);
-        queue_lifecycle(APP_CMD_STOP);
-        queue_lifecycle(APP_CMD_DESTROY);
+        /* Guest is gone: nobody polls lifecycle cmds / input anymore, and the
+         * guest thread already ran cmdpost_cleanup(). Queuing the Android
+         * teardown here (as WM_CLOSE does) would only leave PAUSE/STOP/DESTROY
+         * sitting in the queue for the *next* guest booted in this process,
+         * which then destroys itself on its first poll - the classic "second
+         * Run does not work". Drop whatever is still pending instead; a new
+         * launch queues a fresh startup sequence. */
+        cmdpost_clear_lifecycle_cmds();
+        cmdpost_clear_motion_events();
         if (g_launcher) {
             /* Launcher mode: do NOT close the window. Reset the guest-owned
              * surface and re-show the picker so another guest can be booted
              * in the same window. */
             launcher_ui_idle();
+            if (g_switch_pending) {
+                g_switch_pending = false;
+                launcher_launch_sel(g_switch_sel);
+                g_switch_sel = -1;
+            }
             return 0;
         }
         /* Non-launcher mode: the host has no reason to keep running - quit
@@ -1326,7 +1353,7 @@ static void launcher_ui_create(void)
     g_combo = CreateWindowA("COMBOBOX", "",
                             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP |
                             CBS_DROPDOWNLIST,
-                            LAUNCH_MARGIN, LAUNCH_MARGIN, 260, LAUNCH_COMBO_H,
+                            LAUNCH_MARGIN, LAUNCH_COMBO_Y, 260, LAUNCH_COMBO_H,
                             g_hwnd, (HMENU)(INT_PTR)IDC_COMBO, hinst, NULL);
     if (g_combo) {
         for (i = 0; i < g_guest_count; i++) {
@@ -1349,31 +1376,33 @@ static void launcher_ui_create(void)
                                g_hwnd, (HMENU)(INT_PTR)IDC_EXIT, hinst, NULL);
 }
 
-/* Enter the guest-running view: hide the picker controls and arm the frame
- * clock (it is stopped while the launcher is idle). */
+/* Enter the guest-running view. The picker controls stay visible: the parent
+ * has WS_CLIPCHILDREN, so the guest panel is composited under them and the
+ * combo/buttons keep working (Run switches guests, Stop tears the current one
+ * down). Only the frame clock is armed here - it is stopped while idle. */
 static void launcher_ui_running(void)
 {
     g_launcher_idle = false;
-    if (g_combo)    ShowWindow(g_combo, SW_HIDE);
-    if (g_btn_run)  ShowWindow(g_btn_run, SW_HIDE);
-    if (g_btn_stop) ShowWindow(g_btn_stop, SW_HIDE);
-    if (g_btn_exit) ShowWindow(g_btn_exit, SW_HIDE);
     vsync_clock_start();
 }
 
-/* Back to the picker: re-show the controls, reset the surface so the next
+/* Back to the picker: keep the controls up, reset the surface so the next
  * guest starts on a clean panel, and stop the frame clock while idle. */
 static void launcher_ui_idle(void)
 {
-    if (g_combo)    { SendMessageA(g_combo, CB_SETCURSEL, 0, 0); ShowWindow(g_combo, SW_SHOW); }
-    if (g_btn_run)  ShowWindow(g_btn_run, SW_SHOW);
-    if (g_btn_stop) ShowWindow(g_btn_stop, SW_SHOW);
-    if (g_btn_exit) ShowWindow(g_btn_exit, SW_SHOW);
+    /* Preserve the current selection: launcher_ui_running() no longer hides
+     * the combo, so re-selecting entry 0 here would fight the user's pick. */
+    if (g_combo && SendMessageA(g_combo, CB_GETCURSEL, 0, 0) < 0) {
+        SendMessageA(g_combo, CB_SETCURSEL, 0, 0);
+    }
 
     EnterCriticalSection(&g_surf_cs);
     surf_recreate_locked(g_init_w, g_init_h);
     g_surf_w = g_init_w;
     g_surf_h = g_init_h;
+    /* The geometry the previous guest negotiated (SET_BUF) must not leak into
+     * the next one: until it calls SET_BUF itself it gets the host default. */
+    g_surf_fmt = WINDOW_FORMAT_RGBA_8888;
     LeaveCriticalSection(&g_surf_cs);
 
     vsync_clock_stop();
@@ -1394,23 +1423,26 @@ bool win32_host_set_launcher(const char* assets_dir)
     return true;
 }
 
-/* Boot the selected guest into the existing window. Runs on the UI thread
+/* Boot the given guest into the existing window. Runs on the UI thread
  * (button click handler). */
-static void launcher_launch(void)
+static void launcher_launch_sel(int sel)
 {
     char path[MAX_PATH + 96];
     char* argv[1];
-    int sel;
 
-    if (g_guest_thread || g_guest_count <= 0 || !g_combo) return;
-    sel = (int)SendMessageA(g_combo, CB_GETCURSEL, 0, 0);
-    if (sel < 0 || sel >= g_guest_count) return;
+    if (g_guest_count <= 0 || sel < 0 || sel >= g_guest_count) return;
 
     snprintf(path, sizeof(path), "%s\\%s.exe", g_assets_dir, g_guest_names[sel]);
     if (_access(path, 0) != 0) {
         winhost_log("launcher: guest not found: %s", path);
         return;
     }
+
+    /* Boot on a clean slate: anything still queued belongs to the previous
+     * guest, or to the idle window (e.g. PAUSE/STOP from a minimize). A stale
+     * DESTROY reaching the new guest makes it exit before it ever renders. */
+    cmdpost_clear_lifecycle_cmds();
+    cmdpost_clear_motion_events();
 
     /* Android GameActivity startup sequence. The WM_CREATE path is skipped
      * while the launcher is idle, so it is queued here - before the guest
@@ -1425,6 +1457,29 @@ static void launcher_launch(void)
         winhost_log("launcher: starting %s", g_guest_names[sel]);
         launcher_ui_running();
     }
+}
+
+/* Run button. Now that the picker stays on screen it is reachable while a
+ * guest is running, so it switches guests instead of doing nothing: the guest
+ * thread cannot be killed, so the current one is asked to tear down and the
+ * new pick is booted from WM_APP_GUEST_EXIT once it is gone. */
+static void launcher_launch(void)
+{
+    int sel;
+
+    if (g_guest_count <= 0 || !g_combo) return;
+    sel = (int)SendMessageA(g_combo, CB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= g_guest_count) return;
+
+    if (g_guest_thread) {
+        g_switch_sel     = sel;
+        g_switch_pending = true;
+        winhost_log("launcher: switching to %s once %s exits",
+                    g_guest_names[sel], "the running guest");
+        launcher_stop();
+        return;
+    }
+    launcher_launch_sel(sel);
 }
 
 /* Stop the running guest. The guest thread cannot be force-killed safely, so
@@ -1564,6 +1619,10 @@ bool win32_host_start_guest(int argc, char** argv)
      * guest thread starts, or the guest probes a dead proxy and exits(1)
      * at its first AAUDIO_QUERY. */
     win32_cmdpost_register_callbacks();
+
+    /* Per-guest diagnostics: report this guest's first lock/frame too. */
+    g_logged_lock  = false;
+    g_logged_frame = false;
 
     g_guest_argv = (char**)calloc((size_t)argc + 1, sizeof(char*));
     if (!g_guest_argv) return false;

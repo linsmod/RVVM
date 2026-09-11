@@ -884,9 +884,16 @@ void cmdpost_cleanup(void)
         g_window_initialized = false;
         g_input_initialized = false;
         g_looper_initialized = false;
+        memset(g_sensors_enabled, 0, sizeof(g_sensors_enabled));
         g_sensor_ringbuf = NULL;
+        g_sensor_init_cb = NULL;
+        g_sensor_enable_cb = NULL;
+        g_sensor_data_cb = NULL;
         g_window_lock_cb = NULL;
         g_window_unlock_cb = NULL;
+        g_window_size_cb = NULL;
+        g_window_set_buf_cb = NULL;
+        g_config_get_cb = NULL;
         g_game_lifecycle_cb = NULL;
         g_game_input_cb = NULL;
         g_egl_dispatch_cb = NULL;
@@ -895,6 +902,14 @@ void cmdpost_cleanup(void)
         g_choreographer_fd = -1;
         g_vsync_armed = false;
         g_vsync_source_lost = false;
+
+        /* The guest that owned these queues is gone, so nothing will ever
+         * drain them. A host that reuses the process (launcher: Run after
+         * Run) must not hand the next guest the PAUSE/STOP/DESTROY left over
+         * from the previous teardown - it would destroy the new activity on
+         * its very first poll. */
+        cmdpost_clear_lifecycle_cmds();
+        cmdpost_clear_motion_events();
 
         /* Tear down every live AAudio stream before dropping the backend. */
         if (g_audio_ops && g_audio_ops->close) {

@@ -237,10 +237,12 @@ static int32_t android_write(void* user, const void* buf, int32_t frames, int32_
     android_stream_t* s = (android_stream_t*)user;
     if (!s || !s->stream) return VP_AUDIO_ERROR_INVALID_ARG;
 
-    /* Copy from guest memory (identity-mapped) into a local buffer, then
-     * hand it to the real AAudio stream.  The local copy is necessary
-     * because AAudio may hold onto the buffer after write returns (async
-     * rendering), and the guest could reclaim it immediately. */
+    /* Copy from the guest buffer into a local buffer, then hand it to the
+     * real AAudio stream.  buf is a HOST pointer - cmdpost translates the
+     * guest address before calling in, since guest memory is the userland
+     * machine's own buffer.  The local copy is necessary because AAudio may
+     * hold onto the buffer after write returns (async rendering), and the
+     * guest could reclaim it immediately. */
     size_t bytes = (size_t)frames * (size_t)frame_bytes;
     void* local = malloc(bytes);
     if (!local) return VP_AUDIO_ERROR_NO_MEMORY;
