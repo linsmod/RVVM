@@ -726,6 +726,11 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
         LOGE("vsync: failed to start AChoreographer thread, guest will fall back");
     }
 
+    /* Phase 5: register the real AAudio backend. The pump thread in
+     * vp_aaudio_android.c bridges the guest's SPSC ring to AAudioStream. */
+    extern const vp_audio_ops_t* android_aaudio_ops(void);
+    cmdpost_set_audio_callbacks(android_aaudio_ops());
+
     /* Get Android sensor manager (per-package singleton, API 26+) */
     g_sensor_manager = ASensorManager_getInstanceForPackage(NULL);
     if (g_sensor_manager) {

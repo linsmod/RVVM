@@ -122,6 +122,7 @@ target_link_libraries(rvvm_core
 # ============================================================
 add_library(rvvm_jni SHARED
     jni_bridge.c
+    vp_aaudio_android.c
 )
 
 target_include_directories(rvvm_jni PRIVATE
@@ -133,6 +134,7 @@ target_link_libraries(rvvm_jni
     android
     log
     m
+    aaudio
 )
 
 # ============================================================

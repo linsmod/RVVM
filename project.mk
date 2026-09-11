@@ -200,7 +200,7 @@ override lib_src_rvvm_libretro := $(SRCDIR)/bindings/libretro/libretro.c
 
 # Guest-side stubs under src/virtpass are RISC-V (ecall trampolines),
 # they are cross-compiled by the guest builds - never build them for the host
-override lib_src_virtpass_guest := $(SRCDIR)/virtpass/vp_ndk_stub.c $(SRCDIR)/virtpass/vp_gl_stub.c
+override lib_src_virtpass_guest := $(SRCDIR)/virtpass/vp_ndk_stub.c $(SRCDIR)/virtpass/vp_gl_stub.c $(SRCDIR)/virtpass/vp_aaudio_stub.c
 
 # Other non-host subtrees under src/virtpass: the guest programs and the
 # Android JNI pass are cross-built for RISC-V / Android, win32-host provides
@@ -238,7 +238,8 @@ override BIN_TARGETS           := $(BIN_TARGETS) rvvm_winhost
 override bin_src_rvvm_winhost  := $(SRCDIR)/virtpass/win32-host/win32_main.c \
                                   $(SRCDIR)/virtpass/win32-host/win32_cmdpost_bridge.c \
                                   $(SRCDIR)/virtpass/win32-host/win32_gl_backend.c \
-                                  $(SRCDIR)/virtpass/win32-host/win32_gl_dispatch.c
+                                  $(SRCDIR)/virtpass/win32-host/win32_gl_dispatch.c \
+                                  $(SRCDIR)/virtpass/win32-host/win32_aaudio_wasapi.c
 override bin_libs_rvvm_winhost := rvvm
 endif
 endif
@@ -316,7 +317,7 @@ override ANDROID_GUEST_DIR   := $(BUILDDIR)/android-guest
 override ANDROID_GUEST_ZIG   := zig cc
 override ANDROID_GUEST_AR    := zig ar
 override ANDROID_GUEST_FLAGS := -target riscv64-linux-musl -O2 -I$(INCDIR) -fno-sanitize=undefined
-override ANDROID_GUEST_HEADS := $(INCDIR)/virtpass/vp_android.h $(INCDIR)/virtpass/vp_gl.h
+override ANDROID_GUEST_HEADS := $(INCDIR)/virtpass/vp_android.h $(INCDIR)/virtpass/vp_gl.h $(INCDIR)/virtpass/vp_audio_ringbuf.h
 override ANDROID_GUEST_LIBS  := $(ANDROID_GUEST_DIR)/libandroid_stubs.a $(ANDROID_GUEST_DIR)/libgles_stubs.a
 override android_guest_assets := $(addprefix $(ANDROID_ASSETS_DIR)/,$(addsuffix .exe,$(ANDROID_GUEST_SAMPLES)))
 
@@ -331,9 +332,14 @@ $(ANDROID_GUEST_DIR)/vp_gl_stub.o: $(SRCDIR)/virtpass/vp_gl_stub.c $(ANDROID_GUE
 	$(call println,$(TEXT)[$(GREEN)CC$(TEXT)] $@ $(RESET))
 	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -c -o $@ $<)
 
-$(ANDROID_GUEST_DIR)/libandroid_stubs.a: $(ANDROID_GUEST_DIR)/vp_ndk_stub.o
+$(ANDROID_GUEST_DIR)/vp_aaudio_stub.o: $(SRCDIR)/virtpass/vp_aaudio_stub.c $(ANDROID_GUEST_HEADS)
+	$(call create_dirs,$(dir $@))
+	$(call println,$(TEXT)[$(GREEN)CC$(TEXT)] $@ $(RESET))
+	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -c -o $@ $<)
+
+$(ANDROID_GUEST_DIR)/libandroid_stubs.a: $(ANDROID_GUEST_DIR)/vp_ndk_stub.o $(ANDROID_GUEST_DIR)/vp_aaudio_stub.o
 	$(call println,$(TEXT)[$(GREEN)AR$(TEXT)] $@ $(RESET))
-	@$(call shell_esc,$(ANDROID_GUEST_AR) rcs $@ $<)
+	@$(call shell_esc,$(ANDROID_GUEST_AR) rcs $@ $(ANDROID_GUEST_DIR)/vp_ndk_stub.o $(ANDROID_GUEST_DIR)/vp_aaudio_stub.o)
 
 $(ANDROID_GUEST_DIR)/libgles_stubs.a: $(ANDROID_GUEST_DIR)/vp_gl_stub.o
 	$(call println,$(TEXT)[$(GREEN)AR$(TEXT)] $@ $(RESET))
@@ -343,7 +349,7 @@ $(ANDROID_GUEST_DIR)/libgles_stubs.a: $(ANDROID_GUEST_DIR)/vp_gl_stub.o
 $(ANDROID_ASSETS_DIR)/%.exe: $(SRCDIR)/virtpass/guest-samples/%.c $(ANDROID_GUEST_LIBS) $(ANDROID_GUEST_HEADS)
 	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)LD$(TEXT)] $@ $(RESET))
-	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -static -L$(ANDROID_GUEST_DIR) -landroid_stubs -lgles_stubs -o $@ $<)
+	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -static -L$(ANDROID_GUEST_DIR) $< -landroid_stubs -lgles_stubs -o $@)
 
 .PHONY: android-assets # Cross-compile the guest samples into the APK assets
 android-assets: $(android_guest_assets)

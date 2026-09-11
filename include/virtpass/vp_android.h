@@ -52,6 +52,10 @@
 #define SYS_ANDROID_CHOREOGRAPHER_INIT (SYS_ANDROID_BASE + 25)
 #define SYS_ANDROID_CHOREOGRAPHER_WAIT (SYS_ANDROID_BASE + 26)
 
+/* AAudio (Phase 5: audio). The 40..50 window is owned by
+ * virtpass/vp_audio_ringbuf.h, which is pulled in through vp_aaudio.h below;
+ * it holds both the SYS_ANDROID_AAUDIO_* numbers and the shared PCM ring. */
+
 /* ============================================================
  * Lifecycle Commands (NativeAppGlueAppCmd)
  * ============================================================ */
@@ -545,5 +549,9 @@ void AChoreographer_postFrameCallback64(AChoreographer* choreographer,
 void AChoreographer_postFrameCallbackDelayed64(AChoreographer* choreographer,
                                                AChoreographer_frameCallback64 callback,
                                                void* data, uint32_t delayMillis);
+
+/* AAudio proxy: pulls in virtpass/vp_aaudio.h for the NDK-compatible API and
+ * virtpass/vp_audio_ringbuf.h for the SYS_ANDROID_AAUDIO_* transport. */
+#include "virtpass/vp_aaudio.h"
 
 #endif /* VIRTPASS_ANDROID */

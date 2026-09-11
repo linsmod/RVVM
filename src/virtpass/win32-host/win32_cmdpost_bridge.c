@@ -33,6 +33,7 @@
 #include "virtpass/vp_android.h"  /* guest ABI constants: APP_CMD_*, WINDOW_FORMAT_*, ASENSOR_TYPE_* */
 #include "win32_gl_dispatch.h" /* on_egl_dispatch, on_gl_dispatch, g_gl_active */
 #include "win32_gl_backend.h"  /* win32_gl_backend_load/ready/name/unload, w32gl_arg_f */
+#include "win32_aaudio_wasapi.h" /* win32_aaudio_ops, win32_aaudio_shutdown */
 
 #define WM_APP_GUEST_EXIT (WM_APP + 1)
 #define WM_APP_RESIZE_TO_SURFACE (WM_APP + 2)
@@ -1121,6 +1122,9 @@ bool win32_host_init(const char* title, int win_w, int win_h,
     } else {
         winhost_log("GL backend: unavailable, fallback to CPU path");
     }
+    /* Phase 5: AAudio backend (WASAPI). query() reports 0 caps when no audio
+     * device exists, so every AAudio call on the guest fails gracefully. */
+    cmdpost_set_audio_callbacks(win32_aaudio_ops());
 
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
@@ -1181,6 +1185,10 @@ void win32_host_shutdown(void)
     /* Stop the frame clock first: it tells a guest blocked in poll() that the
      * source is gone, so the guest degrades instead of waiting forever. */
     vsync_clock_stop();
+
+    /* Stop the audio backend before the guest thread: the WASAPI pump threads
+     * must be joined before cmdpost_cleanup() tears down the stream table. */
+    win32_aaudio_shutdown();
 
     bool guest_stopped = true;
     if (g_guest_thread) {
