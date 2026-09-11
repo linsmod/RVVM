@@ -319,22 +319,39 @@ override ANDROID_GUEST_AR    := zig ar
 # Debug build of the guests: -O0 -g keeps line tables for the in-host
 # userland debugger; -fno-sanitize=undefined is a zig cc requirement
 override ANDROID_GUEST_FLAGS := -target riscv64-linux-musl -O0 -g -I$(INCDIR) -fno-sanitize=undefined
-override ANDROID_GUEST_HEADS := $(INCDIR)/virtpass/vp_android.h $(INCDIR)/virtpass/vp_gl.h $(INCDIR)/virtpass/vp_audio_ringbuf.h
+# Whole guest ABI header directory: listing the headers by hand silently missed
+# vp_aaudio.h / vp_sensor_ringbuf.h, so edits to those never rebuilt a guest.
+override ANDROID_GUEST_HEADS := $(filter %.h,$(call ls_dir,$(INCDIR)/virtpass))
 override ANDROID_GUEST_LIBS  := $(ANDROID_GUEST_DIR)/libandroid_stubs.a $(ANDROID_GUEST_DIR)/libgles_stubs.a
 override android_guest_assets := $(addprefix $(ANDROID_ASSETS_DIR)/,$(addsuffix .exe,$(ANDROID_GUEST_SAMPLES)))
 
+# Guest ELFs left behind by samples that no longer exist. Both launchers
+# enumerate guests by scanning *.exe, so a stale file stays listed forever and
+# fails to launch. Computed before the build so it only ever names orphans.
+override android_guest_stale := $(filter-out $(android_guest_assets),$(filter %.exe,$(call ls_dir,$(ANDROID_ASSETS_DIR))))
+
+# Cross-compile flags are data, not a file, so they are not prerequisites of
+# the objects they affect. Keep them in a stamp and depend on it: the stamp is
+# rewritten (and thus made newer than every guest) only when the flags change,
+# so an unchanged build stays up to date.
+override ANDROID_GUEST_STAMP := $(ANDROID_GUEST_DIR)/guest_flags.stamp
+ifneq ($(if $(wildcard $(ANDROID_GUEST_STAMP)),$(file <$(ANDROID_GUEST_STAMP)),),$(ANDROID_GUEST_FLAGS))
+$(call create_dirs,$(ANDROID_GUEST_DIR))
+$(file >$(ANDROID_GUEST_STAMP),$(ANDROID_GUEST_FLAGS))
+endif
+
 # Guest-side syscall stubs, shared by every sample
-$(ANDROID_GUEST_DIR)/vp_ndk_stub.o: $(SRCDIR)/virtpass/vp_ndk_stub.c $(ANDROID_GUEST_HEADS)
+$(ANDROID_GUEST_DIR)/vp_ndk_stub.o: $(SRCDIR)/virtpass/vp_ndk_stub.c $(ANDROID_GUEST_HEADS) $(ANDROID_GUEST_STAMP)
 	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)CC$(TEXT)] $@ $(RESET))
 	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -c -o $@ $<)
 
-$(ANDROID_GUEST_DIR)/vp_gl_stub.o: $(SRCDIR)/virtpass/vp_gl_stub.c $(ANDROID_GUEST_HEADS)
+$(ANDROID_GUEST_DIR)/vp_gl_stub.o: $(SRCDIR)/virtpass/vp_gl_stub.c $(ANDROID_GUEST_HEADS) $(ANDROID_GUEST_STAMP)
 	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)CC$(TEXT)] $@ $(RESET))
 	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -c -o $@ $<)
 
-$(ANDROID_GUEST_DIR)/vp_aaudio_stub.o: $(SRCDIR)/virtpass/vp_aaudio_stub.c $(ANDROID_GUEST_HEADS)
+$(ANDROID_GUEST_DIR)/vp_aaudio_stub.o: $(SRCDIR)/virtpass/vp_aaudio_stub.c $(ANDROID_GUEST_HEADS) $(ANDROID_GUEST_STAMP)
 	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)CC$(TEXT)] $@ $(RESET))
 	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -c -o $@ $<)
@@ -348,13 +365,15 @@ $(ANDROID_GUEST_DIR)/libgles_stubs.a: $(ANDROID_GUEST_DIR)/vp_gl_stub.o
 	@$(call shell_esc,$(ANDROID_GUEST_AR) rcs $@ $<)
 
 # Each sample is linked straight into the APK assets tree
-$(ANDROID_ASSETS_DIR)/%.exe: $(SRCDIR)/virtpass/guest-samples/%.c $(ANDROID_GUEST_LIBS) $(ANDROID_GUEST_HEADS)
+$(ANDROID_ASSETS_DIR)/%.exe: $(SRCDIR)/virtpass/guest-samples/%.c $(ANDROID_GUEST_LIBS) $(ANDROID_GUEST_HEADS) $(ANDROID_GUEST_STAMP)
 	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)LD$(TEXT)] $@ $(RESET))
 	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -static -L$(ANDROID_GUEST_DIR) $< -landroid_stubs -lgles_stubs -o $@)
 
 .PHONY: android-assets # Cross-compile the guest samples into the APK assets
 android-assets: $(android_guest_assets)
+	$(if $(android_guest_stale),$(call log_info,Removing stale guests: $(notdir $(android_guest_stale))))
+	$(if $(android_guest_stale),$(if $(HOST_POSIX),$(call shell_ex,rm -f $(call path_shell,$(android_guest_stale))),$(call shell_ex,del /F /Q $(call path_shell,$(subst /,\,$(android_guest_stale))))))
 
 .PHONY: android       # Build the Android APK (Java + librvvm_jni.so + guest assets)
 android: android-assets
