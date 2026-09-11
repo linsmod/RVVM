@@ -221,6 +221,9 @@ static char g_guest_elf_path[512];
 static int g_guest_argc = 0;
 static char* g_guest_argv[16];
 
+/* Guest exit callback (Java object reference, held by global ref) */
+static jobject g_exit_listener = NULL;
+
 /* Guest thread function */
 static void* guest_thread_func(void* arg)
 {
@@ -699,6 +702,9 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved)
  * Native methods called from Java
  * ============================================================ */
 
+/* Forward declaration */
+static void on_guest_exit(int exit_code);
+
 JNIEXPORT void JNICALL
 Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
 {
@@ -754,6 +760,9 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
         g_event_queue = ASensorManager_createEventQueue(g_sensor_manager, g_looper, 0, NULL, NULL);
         LOGI("Event queue created");
     }
+
+    /* Set guest exit callback */
+    rvvm_user_set_exit_callback(on_guest_exit);
 
     LOGI("Native init complete");
 }
@@ -1208,5 +1217,49 @@ Java_com_rvvm_android_RvvmNative_nativeStopGuest(JNIEnv* env, jobject thiz)
         /* TODO: Send signal to guest thread to stop */
         /* For now, we just mark it as not running */
         g_guest_running = 0;
+    }
+}
+
+/* C callback invoked by rvvm_user when the guest exits */
+static void on_guest_exit(int exit_code)
+{
+    LOGI("Guest exited with code: %d", exit_code);
+    g_guest_running = 0;
+
+    if (g_exit_listener) {
+        JNIEnv* env = NULL;
+        int attached = (*g_jvm)->GetEnv(g_jvm, (void**)&env, JNI_VERSION_1_6);
+        if (attached == JNI_EDETACHED) {
+            (*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL);
+        }
+        if (env) {
+            jclass clazz = (*env)->GetObjectClass(env, g_exit_listener);
+            jmethodID mid = (*env)->GetMethodID(env, clazz, "onExit", "(I)V");
+            if (mid) {
+                (*env)->CallVoidMethod(env, g_exit_listener, mid, (jint)exit_code);
+            }
+            (*env)->DeleteLocalRef(env, clazz);
+        }
+        if (attached == JNI_EDETACHED) {
+            (*g_jvm)->DetachCurrentThread(g_jvm);
+        }
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeSetExitCallback(JNIEnv* env, jobject thiz, jobject listener)
+{
+    (void)thiz;
+
+    if (g_exit_listener) {
+        (*env)->DeleteGlobalRef(env, g_exit_listener);
+        g_exit_listener = NULL;
+    }
+
+    if (listener) {
+        g_exit_listener = (*env)->NewGlobalRef(env, listener);
+        rvvm_user_set_exit_callback(on_guest_exit);
+    } else {
+        rvvm_user_set_exit_callback(NULL);
     }
 }

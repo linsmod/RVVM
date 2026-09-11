@@ -12,7 +12,10 @@ import android.util.Log;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.widget.AdapterView;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.Spinner;
 import android.widget.TextView;
 
 import java.io.File;
@@ -56,6 +59,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private SurfaceView surfaceView;
     private SurfaceHolder surfaceHolder;
     private Button runButton;
+    private Button stopButton;
+    private Spinner guestAppSpinner;
+
+    // Guest app list: .exe files from assets
+    private String[] guestApps;
+    private String selectedGuestApp;
 
     // Reusable per-pointer buffers for multi-touch passthrough. Sized to match
     // CMDPOST_MAX_NUM_POINTERS_IN_MOTION_EVENT on the native side; reused to
@@ -79,6 +88,25 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         sensorDataText = findViewById(R.id.sensorDataText);
         surfaceView = findViewById(R.id.surfaceView);
         runButton = findViewById(R.id.runButton);
+        stopButton = findViewById(R.id.stopButton);
+        guestAppSpinner = findViewById(R.id.guestAppSpinner);
+
+        // Populate guest app spinner from assets
+        populateGuestApps();
+        ArrayAdapter<String> spinnerAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, guestApps);
+        spinnerAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        guestAppSpinner.setAdapter(spinnerAdapter);
+        guestAppSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, android.view.View view, int position, long id) {
+                selectedGuestApp = guestApps[position];
+                Log.i(TAG, "Selected guest app: " + selectedGuestApp);
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {}
+        });
 
         // Setup surface holder
         surfaceHolder = surfaceView.getHolder();
@@ -90,8 +118,10 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
         light = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT);
 
-        // Setup run button
+        // Setup buttons
         runButton.setOnClickListener(v -> runGuestElf());
+        stopButton.setOnClickListener(v -> stopGuestElf());
+        updateButtonStates();
 
         // Forward touches on the surface to the guest (all pointers)
         surfaceView.setOnTouchListener((v, event) -> {
@@ -225,8 +255,13 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             return;
         }
 
+        String elfName = selectedGuestApp;
+        if (elfName == null || elfName.isEmpty()) {
+            statusText.setText("No guest app selected");
+            return;
+        }
+
         // Copy ELF from assets to internal storage (always refresh so updated builds take effect)
-        String elfName = "test_game_activity.exe";
         File elfFile = new File(getFilesDir(), elfName);
 
         try {
@@ -248,6 +283,59 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         } else {
             statusText.setText("Failed to start guest");
             Log.e(TAG, "Failed to start guest");
+        }
+        updateButtonStates();
+
+        // Monitor guest exit: poll the flag and re-enable buttons when the
+        // guest thread finishes (e.g. test_audio exits after 1 second).
+        new Thread(() -> {
+            while (RvvmNative.nativeIsGuestRunning()) {
+                try { Thread.sleep(100); } catch (InterruptedException e) { return; }
+            }
+            runOnUiThread(this::updateButtonStates);
+        }, "guest-exit-monitor").start();
+    }
+
+    private void stopGuestElf() {
+        if (!isInitialized || !RvvmNative.nativeIsGuestRunning()) {
+            return;
+        }
+        Log.i(TAG, "Stopping guest");
+        RvvmNative.nativeStopGuest();
+        statusText.setText("Guest stopped");
+        updateButtonStates();
+    }
+
+    private void updateButtonStates() {
+        boolean running = RvvmNative.nativeIsGuestRunning();
+        runButton.setEnabled(!running);
+        stopButton.setEnabled(running);
+        guestAppSpinner.setEnabled(!running);
+    }
+
+    /**
+     * Scan assets for .exe files and populate the guest app list.
+     */
+    private void populateGuestApps() {
+        try {
+            String[] assets = getAssets().list("");
+            java.util.List<String> exeList = new java.util.ArrayList<>();
+            if (assets != null) {
+                for (String name : assets) {
+                    if (name.endsWith(".exe")) {
+                        exeList.add(name);
+                    }
+                }
+            }
+            java.util.Collections.sort(exeList);
+            guestApps = exeList.toArray(new String[0]);
+            if (guestApps.length > 0) {
+                selectedGuestApp = guestApps[0];
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to list assets", e);
+            guestApps = new String[]{ "test_game_activity.exe" };
+            selectedGuestApp = guestApps[0];
         }
     }
 

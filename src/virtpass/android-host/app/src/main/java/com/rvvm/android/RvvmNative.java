@@ -129,7 +129,21 @@ public class RvvmNative {
     public static native boolean nativeIsGuestRunning();
 
     /**
-     * Stop the running guest.
-     */
+      * Stop the running guest.
+      */
     public static native void nativeStopGuest();
+
+    /**
+      * Set a callback invoked when the guest exits.
+      * Called on the guest thread after rvvm_user_linux returns.
+      * @param callback Listener for guest exit events, or null to clear
+      */
+    public static native void nativeSetExitCallback(ExitListener callback);
+
+    /**
+      * Listener interface for guest exit events.
+      */
+    public interface ExitListener {
+        void onExit(int exitCode);
+    }
 }

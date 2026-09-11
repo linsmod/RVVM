@@ -202,19 +202,17 @@ void vp_cmdpost_vsync_source_lost(void);
  * call fails with VP_AUDIO_ERROR_UNSUPPORTED so guests degrade gracefully.
  * ============================================================ */
 typedef struct vp_audio_ops {
-    /* Bring up a backend stream. *out_user becomes the host-private handle that
-     * every other entry point receives. `cfg` points at guest memory that stays
-     * valid for the stream's lifetime: the ring descriptor and the two wake
-     * pipe fds are read from it (guest addresses are identity mapped). */
     int32_t (*open)(const vp_aaudio_config_t* cfg, void** out_user);
     int32_t (*close)(void* user);
     int32_t (*start)(void* user, int64_t timeout_ns);
     int32_t (*pause)(void* user, int64_t timeout_ns);
     int32_t (*stop)(void* user, int64_t timeout_ns);
     int32_t (*flush)(void* user);
-    /* The guest produced (VP_AUDIO_NOTIFY_WROTE) or consumed
-     * (VP_AUDIO_NOTIFY_READ) frames: kick the backend's pump thread. */
-    int32_t (*notify)(void* user, int32_t kind);
+    /* Data-path passthrough: host copies between guest buffer and real AAudio.
+     * `buf` is a guest virtual address (identity-mapped). `frame_bytes` tells
+     * the host how many bytes per frame (from the negotiated geometry). */
+    int32_t (*write)(void* user, const void* buf, int32_t frames, int32_t frame_bytes);
+    int32_t (*read)(void* user, void* buf, int32_t frames, int32_t frame_bytes);
     int32_t (*get_info)(void* user, vp_aaudio_info_t* out);
     int32_t (*get_timestamp)(void* user, vp_aaudio_timestamp_t* out);
     int32_t (*set_buffer_size)(void* user, int32_t frames, int32_t* applied_out);
@@ -224,11 +222,6 @@ typedef struct vp_audio_ops {
 
 /* Register the host audio backend. Pass NULL to detach (used on teardown). */
 void cmdpost_set_audio_callbacks(const vp_audio_ops_t* ops);
-
-/* Wake a guest blocked in read()/poll() on one of its stream pipes. Safe to
- * call from any backend thread; `code` is one of VP_AUDIO_WAKE_*. Missing or
- * closed fds are ignored, so the wake path never fails the audio thread. */
-void vp_cmdpost_audio_wake_guest(int32_t fd, int32_t code);
 
 /* Initialize the sensor ring buffer */
 void cmdpost_init_sensor_ringbuf(sensor_ringbuf_t* ringbuf);

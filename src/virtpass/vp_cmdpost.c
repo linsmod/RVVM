@@ -318,9 +318,8 @@ typedef struct {
     bool                  used;
     void*                 user;      /* host backend handle                   */
     const vp_aaudio_config_t* cfg;   /* guest memory; valid while open        */
-    int32_t               wake_fd;   /* guest pipe: host wakes guest          */
-    int32_t               state_fd;  /* guest pipe: state changes (may be <0) */
     int32_t               direction; /* VP_AUDIO_DIR_*                        */
+    int32_t               frame_bytes; /* negotiated frame size               */
     int32_t               state;     /* VP_AUDIO_STATE_*                      */
 } cmdpost_audio_stream_t;
 
@@ -330,17 +329,6 @@ static const vp_audio_ops_t*  g_audio_ops = NULL;
 void cmdpost_set_audio_callbacks(const vp_audio_ops_t* ops)
 {
     g_audio_ops = ops;
-}
-
-void vp_cmdpost_audio_wake_guest(int32_t fd, int32_t code)
-{
-    if (fd < 0) {
-        return;
-    }
-    int32_t payload = code;
-    /* Best effort: a guest that stopped draining is not our problem, and a
-     * blocking backend thread must never stall on a dead pipe. */
-    (void)write(fd, &payload, sizeof(payload));
 }
 
 static int32_t cmdpost_audio_alloc_slot(void)
@@ -680,14 +668,12 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                 /* ---------- Phase 5: AAudio ---------- */
 
                 case SYS_ANDROID_AAUDIO_OPEN: {
-                    /* a1 = vp_aaudio_config_t* (guest memory). The config must
-                     * stay live for as long as the stream: the host reads the
-                     * ring descriptor and the wake fds straight out of it. */
+                    /* a1 = vp_aaudio_config_t* (guest memory). */
                     if (!g_audio_ops || !g_audio_ops->open) {
                         return VP_AUDIO_ERROR_UNSUPPORTED;
                     }
                     const vp_aaudio_config_t* cfg = (const vp_aaudio_config_t*)(size_t)a1;
-                    if (!cfg || !cfg->ring) {
+                    if (!cfg) {
                         return VP_AUDIO_ERROR_INVALID_ARG;
                     }
                     int32_t slot = cmdpost_audio_alloc_slot();
@@ -703,9 +689,8 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                     cmdpost_audio_stream_t* stream = &g_audio_streams[slot];
                     stream->user = user;
                     stream->cfg = cfg;
-                    stream->wake_fd = cfg->wake_fd;
-                    stream->state_fd = cfg->state_fd;
                     stream->direction = cfg->direction;
+                    stream->frame_bytes = (int32_t)vp_audio_frame_bytes(cfg->format, cfg->channel_count);
                     stream->state = VP_AUDIO_STATE_OPEN;
                     cmdpost_audio_refresh_state(stream);
                     return slot;
@@ -755,15 +740,30 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                          ? g_audio_ops->flush(stream->user) : VP_AUDIO_ERROR_UNSUPPORTED;
                 }
 
-                case SYS_ANDROID_AAUDIO_NOTIFY: {
-                    /* The guest produced (WROTE) or consumed (READ) frames.
-                     * Backends with a pump thread use this to stop waiting. */
+                case SYS_ANDROID_AAUDIO_WRITE: {
                     cmdpost_audio_stream_t* stream = cmdpost_audio_lookup(a1);
-                    if (!stream) {
+                    if (!stream || !g_audio_ops || !g_audio_ops->write) {
                         return VP_AUDIO_ERROR_INVALID_ARG;
                     }
-                    return g_audio_ops && g_audio_ops->notify
-                         ? g_audio_ops->notify(stream->user, (int32_t)a2) : VP_AUDIO_OK;
+                    const void* buf = (const void*)(size_t)a2;
+                    int32_t frames = (int32_t)a3;
+                    if (!buf || frames <= 0) {
+                        return VP_AUDIO_ERROR_INVALID_ARG;
+                    }
+                    return g_audio_ops->write(stream->user, buf, frames, stream->frame_bytes);
+                }
+
+                case SYS_ANDROID_AAUDIO_READ: {
+                    cmdpost_audio_stream_t* stream = cmdpost_audio_lookup(a1);
+                    if (!stream || !g_audio_ops || !g_audio_ops->read) {
+                        return VP_AUDIO_ERROR_INVALID_ARG;
+                    }
+                    void* buf = (void*)(size_t)a2;
+                    int32_t frames = (int32_t)a3;
+                    if (!buf || frames <= 0) {
+                        return VP_AUDIO_ERROR_INVALID_ARG;
+                    }
+                    return g_audio_ops->read(stream->user, buf, frames, stream->frame_bytes);
                 }
 
                 case SYS_ANDROID_AAUDIO_INFO: {

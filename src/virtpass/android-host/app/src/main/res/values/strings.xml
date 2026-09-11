@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">RVVM Android</string>
+    <string name="guest_app_label">Guest App:</string>
+    <string name="run_guest">Run</string>
+    <string name="stop_guest">Stop</string>
 </resources>

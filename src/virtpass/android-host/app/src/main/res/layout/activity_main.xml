@@ -16,12 +16,42 @@
         android:orientation="vertical"
         android:padding="8dp">
 
-        <Button
-            android:id="@+id/runButton"
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/guest_app_label"
+            android:textSize="12sp"
+            android:layout_marginBottom="2dp" />
+
+        <Spinner
+            android:id="@+id/guestAppSpinner"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Run Guest ELF"
             android:layout_marginBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="4dp">
+
+            <Button
+                android:id="@+id/runButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/run_guest"
+                android:layout_marginEnd="4dp" />
+
+            <Button
+                android:id="@+id/stopButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/stop_guest"
+                android:enabled="false" />
+
+        </LinearLayout>
 
         <TextView
             android:id="@+id/statusText"

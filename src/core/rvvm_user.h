@@ -29,6 +29,14 @@ typedef ssize_t (*rvvm_user_io_callback)(int fd, const void* buf, size_t count);
 // If callback returns -1, the syscall will fail with errno
 void rvvm_user_set_io_callback(rvvm_user_io_callback callback);
 
+// Callback type for guest exit event
+// Called when the guest exits (sys_exit or sys_exit_group)
+typedef void (*rvvm_user_exit_callback)(int exit_code);
+
+// Set callback invoked when the guest exits
+// Called from the guest thread after rvvm_user_linux returns
+void rvvm_user_set_exit_callback(rvvm_user_exit_callback callback);
+
 // Just call this like main(), envp may be NULL
 int rvvm_user_linux(int argc, char** argv, char** envp);
 

@@ -1,36 +1,27 @@
 /*
  * vp_aaudio_stub.c - Guest-side AAudio proxy for statically-linked riscv64 ELFs
  *
- * Implements the API declared in virtpass/vp_aaudio.h on top of the shared PCM
- * ring in virtpass/vp_audio_ringbuf.h. Every control operation is one
- * SYS_ANDROID_CALL hypercall; the PCM itself never crosses a hypercall, it is
- * carried through the ring that both sides map at the same address.
+ * Implements the API declared in virtpass/vp_aaudio.h on top of the shared
+ * wire protocol in virtpass/vp_audio_ringbuf.h. Every control operation and
+ * every data transfer is one hypercall; no shared ring buffer.
  *
  * How a stream works:
  *
  *   AAudioStreamBuilder_openStream()
- *       - allocate the ring + one guest-owned pipe
- *       - SYS_ANDROID_AAUDIO_OPEN  (host brings up WASAPI / real AAudio)
+ *       - build config, SYS_ANDROID_AAUDIO_OPEN hypercall
  *       - SYS_ANDROID_AAUDIO_INFO  (learn the effective geometry)
  *
- *   AAudioStream_write()                 (output, producer = guest)
- *       - copy as many frames into the ring as fit
- *       - SYS_ANDROID_AAUDIO_NOTIFY, then block in poll() on the pipe until
- *         the backend has drained part of the ring and wakes us
+ *   AAudioStream_write()   ->  SYS_ANDROID_AAUDIO_WRITE hypercall
+ *   AAudioStream_read()    ->  SYS_ANDROID_AAUDIO_READ  hypercall
  *
- *   AAudioStream_read()                  (input, consumer = guest)
- *       - drain whatever the backend already captured, otherwise wait
+ *   AAudioStream_close()   ->  SYS_ANDROID_AAUDIO_CLOSE hypercall
  *
- * Data-callback streams run a guest thread that plays the part of the blocking
- * caller, so AAudioStream_write()/_read() stay on the same code path.
- *
- * Guest threads are real host threads and guest fds are real host fds, so the
- * pipe is a genuine wakeup channel (same mechanism as AChoreographer vsync).
+ * Data-callback streams run a guest thread that calls the app callback,
+ * fills a staging buffer, and pushes it through a WRITE hypercall.
  */
 
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -43,7 +34,7 @@
 #include "virtpass/vp_audio_ringbuf.h"
 
 /* ============================================================
- * Hypercall plumbing (same ecall trampoline as vp_ndk_stub.c)
+ * Hypercall plumbing
  * ============================================================ */
 static inline long virtpass_syscall(long nr, long a0, long a1, long a2,
                                     long a3, long a4, long a5)
@@ -76,14 +67,19 @@ static inline long virtpass_syscall(long nr, long a0, long a1, long a2,
     ((int64_t)virtpass_syscall((long)(SYS_ANDROID_CALL), (long)(int64_t)(cmd), \
                                (long)(int64_t)(x), (long)(int64_t)(y), 0, 0, 0))
 
+#define AAUDIO_CALL3(cmd, x, y, z) \
+    ((int64_t)virtpass_syscall((long)(SYS_ANDROID_CALL), (long)(int64_t)(cmd), \
+                               (long)(int64_t)(x), (long)(int64_t)(y), \
+                               (long)(int64_t)(z), 0, 0))
+
 /* ============================================================
  * Defaults / limits
  * ============================================================ */
 #define AAUDIO_DEFAULT_SAMPLE_RATE   48000
 #define AAUDIO_DEFAULT_CHANNELS      2
 #define AAUDIO_DEFAULT_FORMAT        AAUDIO_FORMAT_PCM_FLOAT
-#define AAUDIO_DEFAULT_RING_FRAMES   4096
-#define AAUDIO_MIN_RING_FRAMES       256
+#define AAUDIO_DEFAULT_BUFFER_FRAMES 4096
+#define AAUDIO_MIN_BUFFER_FRAMES     256
 #define AAUDIO_MAX_CHANNELS          8
 #define AAUDIO_NS_PER_SEC            1000000000LL
 #define AAUDIO_NS_PER_MS             1000000LL
@@ -141,11 +137,7 @@ struct AAudioStream {
     bool     source_lost;
     bool     closed;
 
-    /* Guest memory the host keeps reading for the stream's whole life. */
     vp_aaudio_config_t cfg;
-    vp_audio_ring_t    ring;
-    uint8_t*           ring_data;
-    int32_t            wake_pipe[2];   /* [0] guest reads, [1] host writes   */
 
     /* Data callback mode */
     AAudioStream_dataCallback  data_callback;
@@ -170,31 +162,6 @@ static int64_t aaudio_now_ns(void)
     return (int64_t)ts.tv_sec * AAUDIO_NS_PER_SEC + (int64_t)ts.tv_nsec;
 }
 
-static void aaudio_close_fd(int32_t fd)
-{
-    if (fd >= 0) {
-        close(fd);
-    }
-}
-
-/* Opens a guest pipe with both ends non-blocking. */
-static int aaudio_make_pipe(int32_t pipefd[2])
-{
-    pipefd[0] = -1;
-    pipefd[1] = -1;
-    if (pipe(pipefd) != 0) {
-        return -1;
-    }
-    /* Set both ends non-blocking so poll()/read() never stall the guest. */
-    for (int i = 0; i < 2; i++) {
-        int flags = fcntl(pipefd[i], F_GETFL, 0);
-        if (flags >= 0) {
-            fcntl(pipefd[i], F_SETFL, flags | O_NONBLOCK);
-        }
-    }
-    return 0;
-}
-
 static void aaudio_set_state(AAudioStream* stream, int32_t state)
 {
     pthread_mutex_lock(&stream->lock);
@@ -207,171 +174,8 @@ static void aaudio_set_state(AAudioStream* stream, int32_t state)
 
 static aaudio_result_t aaudio_refresh_info(AAudioStream* stream);
 
-/* Nudges a thread parked in aaudio_wait_wake() so it re-reads its flags. */
-static void aaudio_kick_self(AAudioStream* stream)
-{
-    if (stream->wake_pipe[1] >= 0) {
-        int32_t code = VP_AUDIO_WAKE_STATE_CHANGED;
-        (void)write(stream->wake_pipe[1], &code, sizeof(code));
-    }
-}
-
-/*
- * Block until the backend signals the stream.
- *
- * Returns 0 on a usable signal (room appeared / data landed / state moved),
- * AAUDIO_ERROR_TIMEOUT when timeout_ns elapsed with nothing to report, or a
- * negative AAudio error when the stream died.
- */
-static aaudio_result_t aaudio_wait_wake(AAudioStream* stream, int64_t timeout_ns)
-{
-    int64_t deadline = timeout_ns < 0 ? -1 : aaudio_now_ns() + timeout_ns;
-
-    for (;;) {
-        int timeout_ms;
-        if (deadline < 0) {
-            timeout_ms = -1;
-        } else {
-            int64_t left = deadline - aaudio_now_ns();
-            if (left <= 0) {
-                return AAUDIO_ERROR_TIMEOUT;
-            }
-            timeout_ms = (int)((left + AAUDIO_NS_PER_MS - 1) / AAUDIO_NS_PER_MS);
-        }
-
-        struct pollfd pfd;
-        pfd.fd = stream->wake_pipe[0];
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-
-        int pr = poll(&pfd, 1, timeout_ms);
-        if (pr == 0) {
-            return AAUDIO_ERROR_TIMEOUT;
-        }
-        if (pr < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return AAUDIO_ERROR_INTERNAL;
-        }
-
-        int32_t code = 0;
-        ssize_t got = read(stream->wake_pipe[0], &code, sizeof(code));
-        if (got != (ssize_t)sizeof(code)) {
-            continue;   /* short/spurious wake, re-arm */
-        }
-
-        if (code == VP_AUDIO_WAKE_SOURCE_LOST) {
-            stream->source_lost = true;
-            aaudio_set_state(stream, AAUDIO_STREAM_STATE_DISCONNECTED);
-            if (stream->error_callback) {
-                stream->error_callback(stream, stream->error_user, AAUDIO_ERROR_DISCONNECTED);
-            }
-            return AAUDIO_ERROR_DISCONNECTED;
-        }
-
-        if (code == VP_AUDIO_WAKE_STATE_CHANGED) {
-            aaudio_refresh_info(stream);
-        }
-        return 0;
-    }
-}
-
-/* Re-reads the negotiated geometry and current state from the host. */
-static aaudio_result_t aaudio_refresh_info(AAudioStream* stream)
-{
-    vp_aaudio_info_t info;
-    memset(&info, 0, sizeof(info));
-    int64_t rc = AAUDIO_CALL2(SYS_ANDROID_AAUDIO_INFO, stream->handle, (intptr_t)&info);
-    if (rc != VP_AUDIO_OK) {
-        return (aaudio_result_t)rc;
-    }
-
-    stream->sample_rate      = info.sample_rate;
-    stream->channel_count    = info.channel_count;
-    stream->format           = info.format;
-    stream->sharing_mode     = info.sharing_mode;
-    stream->performance_mode = info.performance_mode;
-    stream->usage            = info.usage;
-    stream->content_type     = info.content_type;
-    stream->device_id        = info.device_id;
-    stream->session_id       = info.session_id;
-    stream->frames_per_burst = info.frames_per_burst;
-    stream->buffer_size_frames = info.buffer_size_frames;
-    stream->buffer_capacity_frames = info.buffer_capacity_frames;
-    stream->xrun_count       = info.xrun_count;
-    if (info.frame_bytes > 0) {
-        stream->frame_bytes = info.frame_bytes;
-    }
-    if (info.state != stream->state) {
-        aaudio_set_state(stream, info.state);
-    }
-    return AAUDIO_OK;
-}
-
-/*
- * Shared body of AAudioStream_write()/()_read(): move `frames` between the
- * caller's buffer and the ring, waiting for the backend when it runs dry/full.
- */
-static aaudio_result_t aaudio_stream_transfer(AAudioStream* stream, void* buffer,
-                                              int32_t frames, int64_t timeout_ns,
-                                              bool output)
-{
-    int32_t done = 0;
-    int64_t deadline = timeout_ns < 0 ? -1 : aaudio_now_ns() + timeout_ns;
-    uint8_t* base = (uint8_t*)buffer;
-
-    while (done < frames) {
-        uint8_t* cursor = base + (size_t)done * (size_t)stream->frame_bytes;
-        uint32_t moved = output
-                       ? vp_audio_ring_write(&stream->ring, cursor, (uint32_t)(frames - done))
-                       : vp_audio_ring_read(&stream->ring, cursor, (uint32_t)(frames - done));
-
-        if (moved > 0) {
-            done += (int32_t)moved;
-            if (output) {
-                stream->frames_written += moved;
-                AAUDIO_CALL2(SYS_ANDROID_AAUDIO_NOTIFY, stream->handle, VP_AUDIO_NOTIFY_WROTE);
-            } else {
-                stream->frames_read += moved;
-                AAUDIO_CALL2(SYS_ANDROID_AAUDIO_NOTIFY, stream->handle, VP_AUDIO_NOTIFY_READ);
-            }
-            /* Keep going without a hypercall while the ring still has room. */
-            if (output ? vp_audio_ring_space(&stream->ring) > 0
-                       : vp_audio_ring_count(&stream->ring) > 0) {
-                continue;
-            }
-        }
-
-        if (done >= frames) {
-            break;
-        }
-        if (stream->callback_quit) {
-            break;      /* callback thread is shutting down */
-        }
-
-        int64_t left = deadline < 0 ? -1 : deadline - aaudio_now_ns();
-        if (left == 0) {
-            break;      /* timed out with a partial transfer, as AAudio does */
-        }
-        aaudio_result_t rc = aaudio_wait_wake(stream, left);
-        if (rc == AAUDIO_ERROR_TIMEOUT) {
-            break;
-        }
-        if (rc < 0) {
-            return rc;
-        }
-    }
-
-    return (aaudio_result_t)done;
-}
-
 /* ============================================================
  * Data-callback worker
- *
- * AAudio's real implementation calls the callback from its own thread. Guest
- * threads are host threads, so we do exactly that: the thread fills (output)
- * or drains (input) a staging buffer and pushes it through the ring.
  * ============================================================ */
 static void* aaudio_callback_worker(void* arg)
 {
@@ -399,15 +203,21 @@ static void* aaudio_callback_worker(void* arg)
         }
 
         if (stream->direction == AAUDIO_DIRECTION_OUTPUT) {
-            /* Ask the app to fill the staging buffer, then push it out. */
             stream->data_callback(stream, stream->data_user, stream->callback_buf, frames);
-            aaudio_stream_transfer(stream, stream->callback_buf, frames, -1, true);
+            int64_t rc = AAUDIO_CALL3(SYS_ANDROID_AAUDIO_WRITE, stream->handle,
+                                      (intptr_t)stream->callback_buf, frames);
+            if (rc > 0) {
+                stream->frames_written += rc;
+            }
         } else {
-            /* Pull captured frames in, then hand them to the app. */
             memset(stream->callback_buf, 0, (size_t)frames * stream->frame_bytes);
-            int32_t got = aaudio_stream_transfer(stream, stream->callback_buf, frames, -1, false);
-            stream->data_callback(stream, stream->data_user, stream->callback_buf,
-                                  got > 0 ? got : 0);
+            int64_t rc = AAUDIO_CALL3(SYS_ANDROID_AAUDIO_READ, stream->handle,
+                                      (intptr_t)stream->callback_buf, frames);
+            int32_t got = rc > 0 ? (int32_t)rc : 0;
+            if (got > 0) {
+                stream->frames_read += got;
+            }
+            stream->data_callback(stream, stream->data_user, stream->callback_buf, got);
         }
     }
 
@@ -416,8 +226,6 @@ static void* aaudio_callback_worker(void* arg)
 
 static void aaudio_callback_start(AAudioStream* stream)
 {
-    /* Only callback-driven streams need the worker: blocking streams are
-     * served entirely by the guest's own AAudioStream_write()/_read() calls. */
     if (!stream->data_callback) {
         return;
     }
@@ -439,10 +247,6 @@ static void aaudio_callback_stop(AAudioStream* stream)
     stream->callback_quit = true;
     pthread_cond_broadcast(&stream->cond);
     pthread_mutex_unlock(&stream->lock);
-
-    /* The worker may be parked in poll() on the ring's pipe: kick it with our
-     * own wake code so it observes callback_quit immediately. */
-    aaudio_kick_self(stream);
 
     pthread_join(stream->callback_thread, NULL);
     stream->callback_started = false;
@@ -486,7 +290,7 @@ void AAudioStreamBuilder_setDeviceId(AAudioStreamBuilder* builder, int32_t devic
 void AAudioStreamBuilder_setPackageName(AAudioStreamBuilder* builder, const char* packageName)
 {
     (void)builder;
-    (void)packageName;    /* attribution is a host-app concern; not proxied */
+    (void)packageName;
 }
 
 void AAudioStreamBuilder_setAttributionTag(AAudioStreamBuilder* builder, const char* attributionTag)
@@ -558,7 +362,7 @@ void AAudioStreamBuilder_setSessionId(AAudioStreamBuilder* builder, aaudio_sessi
 void AAudioStreamBuilder_setChannelMask(AAudioStreamBuilder* builder, aaudio_channel_mask_t channelMask)
 {
     (void)builder;
-    (void)channelMask;    /* channel masks are not part of the ring ABI */
+    (void)channelMask;
 }
 
 void AAudioStreamBuilder_setFramesPerDataCallback(AAudioStreamBuilder* builder, int32_t numFrames)
@@ -586,6 +390,40 @@ void AAudioStreamBuilder_setErrorCallback(AAudioStreamBuilder* builder,
     }
 }
 
+/* ============================================================
+ * Re-read negotiated geometry from the host.
+ * ============================================================ */
+static aaudio_result_t aaudio_refresh_info(AAudioStream* stream)
+{
+    vp_aaudio_info_t info;
+    memset(&info, 0, sizeof(info));
+    int64_t rc = AAUDIO_CALL2(SYS_ANDROID_AAUDIO_INFO, stream->handle, (intptr_t)&info);
+    if (rc != VP_AUDIO_OK) {
+        return (aaudio_result_t)rc;
+    }
+
+    stream->sample_rate      = info.sample_rate;
+    stream->channel_count    = info.channel_count;
+    stream->format           = info.format;
+    stream->sharing_mode     = info.sharing_mode;
+    stream->performance_mode = info.performance_mode;
+    stream->usage            = info.usage;
+    stream->content_type     = info.content_type;
+    stream->device_id        = info.device_id;
+    stream->session_id       = info.session_id;
+    stream->frames_per_burst = info.frames_per_burst;
+    stream->buffer_size_frames = info.buffer_size_frames;
+    stream->buffer_capacity_frames = info.buffer_capacity_frames;
+    stream->xrun_count       = info.xrun_count;
+    if (info.frame_bytes > 0) {
+        stream->frame_bytes = info.frame_bytes;
+    }
+    if (info.state != stream->state) {
+        aaudio_set_state(stream, info.state);
+    }
+    return AAUDIO_OK;
+}
+
 AAudioStream* AAudioStreamBuilder_openStream(AAudioStreamBuilder* builder,
                                              aaudio_result_t* pError)
 {
@@ -594,15 +432,13 @@ AAudioStream* AAudioStreamBuilder_openStream(AAudioStreamBuilder* builder,
         return NULL;
     }
 
-    /* No audio backend on this host -> fail fast, the way a device-less
-     * Android build does, instead of handing out a stream that never runs. */
     if ((int64_t)AAUDIO_CALL0(SYS_ANDROID_AAUDIO_QUERY) == 0) {
         if (pError) *pError = AAUDIO_ERROR_UNAVAILABLE;
         return NULL;
     }
 
     int32_t format  = builder->format > AAUDIO_FORMAT_UNSPECIFIED
-                    ? builder->format : AAUDIO_DEFAULT_FORMAT;
+                    ? builder->format : AAUDIO_FORMAT_PCM_FLOAT;
     int32_t channels = builder->channel_count > 0
                      ? builder->channel_count : AAUDIO_DEFAULT_CHANNELS;
     int32_t rate    = builder->sample_rate > 0
@@ -618,9 +454,9 @@ AAudioStream* AAudioStreamBuilder_openStream(AAudioStreamBuilder* builder,
     }
 
     int32_t capacity = builder->buffer_capacity_frames > 0
-                     ? builder->buffer_capacity_frames : AAUDIO_DEFAULT_RING_FRAMES;
-    if (capacity < AAUDIO_MIN_RING_FRAMES) {
-        capacity = AAUDIO_MIN_RING_FRAMES;
+                     ? builder->buffer_capacity_frames : AAUDIO_DEFAULT_BUFFER_FRAMES;
+    if (capacity < AAUDIO_MIN_BUFFER_FRAMES) {
+        capacity = AAUDIO_MIN_BUFFER_FRAMES;
     }
 
     AAudioStream* stream = (AAudioStream*)calloc(1, sizeof(AAudioStream));
@@ -652,15 +488,13 @@ AAudioStream* AAudioStreamBuilder_openStream(AAudioStreamBuilder* builder,
     pthread_mutex_init(&stream->lock, NULL);
     pthread_cond_init(&stream->cond, NULL);
 
-    stream->ring_data = (uint8_t*)calloc((size_t)capacity, frame_bytes);
+    /* Allocate callback staging buffer (used in callback mode). */
     stream->callback_buf = (uint8_t*)calloc((size_t)capacity, frame_bytes);
-    if (!stream->ring_data || !stream->callback_buf ||
-        aaudio_make_pipe(stream->wake_pipe) != 0) {
+    if (!stream->callback_buf) {
         goto fail;
     }
 
-    vp_audio_ring_init(&stream->ring, stream->ring_data, (uint32_t)capacity, frame_bytes);
-
+    /* Build the config for the host. */
     memset(&stream->cfg, 0, sizeof(stream->cfg));
     stream->cfg.direction        = stream->direction;
     stream->cfg.sharing_mode     = stream->sharing_mode;
@@ -676,9 +510,6 @@ AAudioStream* AAudioStreamBuilder_openStream(AAudioStreamBuilder* builder,
     stream->cfg.buffer_frames    = capacity;
     stream->cfg.callback_flags   = stream->data_callback ? 1 : 0;
     stream->cfg.timeout_ns       = 0;
-    stream->cfg.ring             = (uint64_t)(uintptr_t)&stream->ring;
-    stream->cfg.wake_fd          = stream->wake_pipe[1];
-    stream->cfg.state_fd         = -1;   /* the wake pipe carries state too */
     stream->cfg.app_token        = (int64_t)(intptr_t)stream;
 
     int64_t handle = AAUDIO_CALL1(SYS_ANDROID_AAUDIO_OPEN, (intptr_t)&stream->cfg);
@@ -697,12 +528,9 @@ AAudioStream* AAudioStreamBuilder_openStream(AAudioStreamBuilder* builder,
     return stream;
 
 fail:
-    aaudio_close_fd(stream->wake_pipe[0]);
-    aaudio_close_fd(stream->wake_pipe[1]);
     pthread_cond_destroy(&stream->cond);
     pthread_mutex_destroy(&stream->lock);
     free(stream->callback_buf);
-    free(stream->ring_data);
     free(stream);
     if (pError && *pError == AAUDIO_OK) {
         *pError = AAUDIO_ERROR_NO_MEMORY;
@@ -754,6 +582,7 @@ aaudio_result_t AAudioStream_requestPause(AAudioStream* stream)
 
 aaudio_result_t AAudioStream_requestStop(AAudioStream* stream)
 {
+    aaudio_callback_stop(stream);
     return aaudio_request_state(stream, SYS_ANDROID_AAUDIO_STOP,
                                 AAUDIO_STREAM_STATE_STOPPING, AAUDIO_STREAM_STATE_STOPPED);
 }
@@ -793,13 +622,9 @@ aaudio_result_t AAudioStream_close(AAudioStream* stream)
         stream->handle = -1;
     }
 
-    aaudio_close_fd(stream->wake_pipe[0]);
-    aaudio_close_fd(stream->wake_pipe[1]);
-
     pthread_cond_destroy(&stream->cond);
     pthread_mutex_destroy(&stream->lock);
     free(stream->callback_buf);
-    free(stream->ring_data);
     free(stream);
 
     return rc;
@@ -857,11 +682,12 @@ aaudio_result_t AAudioStream_waitForStateChange(AAudioStream* stream,
 }
 
 /* ============================================================
- * Blocking I/O
+ * Blocking I/O — hypercall passthrough
  * ============================================================ */
 aaudio_result_t AAudioStream_write(AAudioStream* stream, const void* buffer,
                                    int32_t numFrames, int64_t timeoutNanoseconds)
 {
+    (void)timeoutNanoseconds;
     if (!stream || stream->handle < 0 || stream->closed) {
         return AAUDIO_ERROR_INVALID_HANDLE;
     }
@@ -871,13 +697,20 @@ aaudio_result_t AAudioStream_write(AAudioStream* stream, const void* buffer,
     if (stream->direction != AAUDIO_DIRECTION_OUTPUT) {
         return AAUDIO_ERROR_INVALID_STATE;
     }
-    return aaudio_stream_transfer(stream, (void*)buffer, numFrames,
-                                  timeoutNanoseconds, true);
+
+    int64_t rc = AAUDIO_CALL3(SYS_ANDROID_AAUDIO_WRITE, stream->handle,
+                              (intptr_t)buffer, numFrames);
+    if (rc < 0) {
+        return (aaudio_result_t)rc;
+    }
+    stream->frames_written += rc;
+    return (aaudio_result_t)rc;
 }
 
 aaudio_result_t AAudioStream_read(AAudioStream* stream, void* buffer,
                                   int32_t numFrames, int64_t timeoutNanoseconds)
 {
+    (void)timeoutNanoseconds;
     if (!stream || stream->handle < 0 || stream->closed) {
         return AAUDIO_ERROR_INVALID_HANDLE;
     }
@@ -887,8 +720,14 @@ aaudio_result_t AAudioStream_read(AAudioStream* stream, void* buffer,
     if (stream->direction != AAUDIO_DIRECTION_INPUT) {
         return AAUDIO_ERROR_INVALID_STATE;
     }
-    return aaudio_stream_transfer(stream, buffer, numFrames,
-                                  timeoutNanoseconds, false);
+
+    int64_t rc = AAUDIO_CALL3(SYS_ANDROID_AAUDIO_READ, stream->handle,
+                              (intptr_t)buffer, numFrames);
+    if (rc < 0) {
+        return (aaudio_result_t)rc;
+    }
+    stream->frames_read += rc;
+    return (aaudio_result_t)rc;
 }
 
 /* ============================================================
@@ -1001,7 +840,7 @@ aaudio_result_t AAudioStream_getTimestamp(AAudioStream* stream, clockid_t clocki
                                           int64_t* framePosition,
                                           int64_t* timeNanoseconds)
 {
-    (void)clockid;      /* the host always reports CLOCK_MONOTONIC */
+    (void)clockid;
     if (!stream || stream->handle < 0) {
         return AAUDIO_ERROR_INVALID_HANDLE;
     }

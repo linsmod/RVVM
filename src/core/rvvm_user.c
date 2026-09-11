@@ -351,6 +351,7 @@ static void uapi_sigaction_convert(struct uapi_sigaction* dst, const struct siga
 
 static rvvm_machine_t* userland; // Emulated RVVM process context
 static rvvm_user_io_callback io_callback = NULL; // Custom I/O callback
+static rvvm_user_exit_callback exit_callback = NULL; // Guest exit callback
 
 // Short cast rvvm_addr_t -> void*
 static void* to_ptr(rvvm_addr_t addr)
@@ -384,6 +385,11 @@ static rvvm_addr_t errno_ret(int64_t val)
 PUBLIC void rvvm_user_set_io_callback(rvvm_user_io_callback callback)
 {
     io_callback = callback;
+}
+
+PUBLIC void rvvm_user_set_exit_callback(rvvm_user_exit_callback callback)
+{
+    exit_callback = callback;
 }
 
 // This is for debugging sake
@@ -1261,11 +1267,13 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 93: // exit
                     rvvm_warn("sys_exit(%ld) @ PC %lx", (long)a0, rvvm_read_cpu_reg(cpu, RVVM_REGID_PC));
-                    running = false;
+                    if (exit_callback) exit_callback((int)a0);
+                    else _Exit(a0);
                     break;
                 case 94: // exit_group
                     rvvm_warn("sys_exit_group(%ld)", (long)a0);
-                    _Exit(a0);
+                    if (exit_callback) exit_callback((int)a0);
+                    else _Exit(a0);
                     break;
                 case 96: // set_tid_address
                     thread->child_cleartid = to_ptr(a0);
@@ -1753,7 +1761,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
             }
             if ((int64_t)a0 < 0) {
-                //rvvm_warn("Syscall %ld failed: %ld", a7, a0);
+                rvvm_warn("Syscall %ld failed: %ld", a7, a0);
             }
             rvvm_info("  nr=%ld -> %lx", a7, a0);
             rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 10, a0);

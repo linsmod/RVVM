@@ -117,6 +117,9 @@ target_link_libraries(rvvm_core
     log
 )
 
+# 16KB page size alignment for Android 15+ compatibility
+target_link_options(rvvm_core PRIVATE -Wl,-z,max-page-size=16384)
+
 # ============================================================
 # JNI shared library (the final .so loaded by Java)
 # ============================================================
@@ -136,6 +139,9 @@ target_link_libraries(rvvm_jni
     m
     aaudio
 )
+
+# 16KB page size alignment for Android 15+ compatibility
+target_link_options(rvvm_jni PRIVATE -Wl,-z,max-page-size=16384)
 
 # ============================================================
 # Guest-side API stub (riscv64 ecall trampolines)

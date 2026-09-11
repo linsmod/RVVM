@@ -32,6 +32,12 @@ android {
         }
     }
 
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+
     externalNativeBuild {
         cmake {
             path = file('src/main/cpp/CMakeLists.txt')

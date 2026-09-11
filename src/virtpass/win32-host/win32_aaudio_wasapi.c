@@ -1,93 +1,49 @@
 /*
- * win32_aaudio_wasapi.c - WASAPI backend for the AAudio guest proxy
+ * win32_aaudio_wasapi.c - Windows WASAPI backend for the AAudio guest proxy
  *
- * Implements vp_audio_ops_t (see vp_cmdpost.h) on top of WASAPI shared mode.
- * The guest's PCM ring is the buffer: a render thread drives the endpoint from
- * it and a capture thread fills it, so both directions are the same shape.
- *
- * Design notes
- * ------------
- * - AUTOCONVERTPCM + SRC_DEFAULT_QUALITY let the audio engine accept the
- *   format the guest asked for and resample/mix internally, so this file never
- *   writes a converter. The ring always carries the guest's format.
- * - ole32.dll / avrt.dll are resolved with LoadLibraryA rather than linked, so
- *   the build picks up no new link flags (same trick as win32_gl_backend.c).
- *   The class/interface GUIDs are declared locally for the same reason.
- * - Every thread runs in COINIT_MULTITHREADED; WASAPI's objects are free
- *   threaded, so no marshalling is needed.
- * - Whenever the guest gains room (render) or data (capture), the backend
- *   writes one VP_AUDIO_WAKE_* code into the guest's pipe. That is the only
- *   cross-boundary signal on the steady-state path.
+ * Implements vp_audio_ops_t (see vp_cmdpost.h) on top of Windows WASAPI.
+ * Thin passthrough: each WRITE/READ hypercall does a memcpy between guest
+ * memory and a local buffer, then calls the real WASAPI render/capture.
+ * No pump threads, no shared ring buffer.
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define COBJMACROS
-#include <windows.h>
-#include <mmdeviceapi.h>
-#include <audioclient.h>
+#include "rvvm.h"
+#include "riscv.h"
+#include "rvvm_types.h"
+#include "virtpass/vp_audio_ringbuf.h"
+#include "virtpass/vp_cmdpost.h"
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <windows.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <avrt.h>
 
-#include "win32_aaudio_wasapi.h"
-
-/* ============================================================
- * Logging
- * ============================================================ */
-static void wasapi_log(const char* fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    fputs("[aaudio/wasapi] ", stderr);
-    vfprintf(stderr, fmt, args);
-    fputc('\n', stderr);
-    va_end(args);
-    fflush(stderr);
-}
-
-/* ============================================================
- * Runtime-loaded COM / MMCSS entry points
- * ============================================================ */
-typedef HRESULT (WINAPI *pfn_CoInitializeEx)(LPVOID, DWORD);
-typedef void    (WINAPI *pfn_CoUninitialize)(void);
-typedef HRESULT (WINAPI *pfn_CoCreateInstance)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
-typedef void    (WINAPI *pfn_CoTaskMemFree)(LPVOID);
-typedef HANDLE  (WINAPI *pfn_AvSetMmThreadCharacteristicsW)(LPCWSTR, LPDWORD);
-typedef BOOL    (WINAPI *pfn_AvRevertMmThreadCharacteristics)(HANDLE);
-
+/* COM vtable pointers resolved once at load time. */
 static struct {
     HMODULE ole32;
     HMODULE avrt;
-    pfn_CoInitializeEx                CoInitializeEx;
-    pfn_CoUninitialize                CoUninitialize;
-    pfn_CoCreateInstance              CoCreateInstance;
-    pfn_CoTaskMemFree                 CoTaskMemFree;
-    pfn_AvSetMmThreadCharacteristicsW AvSetMmThreadCharacteristicsW;
-    pfn_AvRevertMmThreadCharacteristics AvRevertMmThreadCharacteristics;
+    HRESULT (WINAPI *CoCreateInstance)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
+    HRESULT (WINAPI *CoInitializeEx)(LPVOID, DWORD);
+    HANDLE  (WINAPI *AvSetMmThreadCharacteristicsW)(LPCWSTR, LPDWORD);
+    BOOL    (WINAPI *AvRevertMmThreadCharacteristics)(HANDLE);
 } g_com;
 
 static void com_load(void)
 {
+    if (g_com.ole32) return;
+    g_com.ole32 = LoadLibraryW(L"ole32.dll");
     if (g_com.ole32) {
-        return;
+        g_com.CoCreateInstance = (void*)GetProcAddress(g_com.ole32, "CoCreateInstance");
+        g_com.CoInitializeEx  = (void*)GetProcAddress(g_com.ole32, "CoInitializeEx");
     }
-    g_com.ole32 = LoadLibraryA("ole32.dll");
-    if (g_com.ole32) {
-        g_com.CoInitializeEx  = (pfn_CoInitializeEx)(void*)GetProcAddress(g_com.ole32, "CoInitializeEx");
-        g_com.CoUninitialize  = (pfn_CoUninitialize)(void*)GetProcAddress(g_com.ole32, "CoUninitialize");
-        g_com.CoCreateInstance = (pfn_CoCreateInstance)(void*)GetProcAddress(g_com.ole32, "CoCreateInstance");
-        g_com.CoTaskMemFree   = (pfn_CoTaskMemFree)(void*)GetProcAddress(g_com.ole32, "CoTaskMemFree");
-    }
-    g_com.avrt = LoadLibraryA("avrt.dll");
+    g_com.avrt = LoadLibraryW(L"avrt.dll");
     if (g_com.avrt) {
-        g_com.AvSetMmThreadCharacteristicsW =
-            (pfn_AvSetMmThreadCharacteristicsW)(void*)GetProcAddress(g_com.avrt, "AvSetMmThreadCharacteristicsW");
-        g_com.AvRevertMmThreadCharacteristics =
-            (pfn_AvRevertMmThreadCharacteristics)(void*)GetProcAddress(g_com.avrt, "AvRevertMmThreadCharacteristics");
-    }
-    if (!g_com.ole32) {
-        wasapi_log("ole32.dll unavailable: AAudio will report no backend");
+        g_com.AvSetMmThreadCharacteristicsW = (void*)GetProcAddress(g_com.avrt, "AvSetMmThreadCharacteristicsW");
+        g_com.AvRevertMmThreadCharacteristics = (void*)GetProcAddress(g_com.avrt, "AvRevertMmThreadCharacteristics");
     }
 }
 
@@ -95,12 +51,119 @@ static void com_unload(void)
 {
     if (g_com.avrt)  { FreeLibrary(g_com.avrt);  g_com.avrt = NULL; }
     if (g_com.ole32) { FreeLibrary(g_com.ole32); g_com.ole32 = NULL; }
-    memset(&g_com, 0, sizeof(g_com));
 }
 
 /* ============================================================
- * Well-known GUIDs (declared locally so no -luuid is needed)
+ * Logging
  * ============================================================ */
+#define wasapi_log(...) fprintf(stderr, "[WASAPI] " __VA_ARGS__)
+
+/* ============================================================
+ * COM vtable wrappers (avoids #including x64 headers)
+ * ============================================================ */
+typedef struct IMMDeviceEnumeratorVtbl {
+    HRESULT (WINAPI *QueryInterface)(void*,REFIID,void**);
+    ULONG   (WINAPI *AddRef)(void*);
+    ULONG   (WINAPI *Release)(void*);
+    HRESULT (WINAPI *EnumAudioEndpoints)(void*,EDataFlow,DWORD,void**);
+    HRESULT (WINAPI *GetDefaultAudioEndpoint)(void*,EDataFlow,ERole,void**);
+} IMMDeviceEnumeratorVtbl;
+
+typedef struct IMMDeviceVtbl {
+    HRESULT (WINAPI *QueryInterface)(void*,REFIID,void**);
+    ULONG   (WINAPI *AddRef)(void*);
+    ULONG   (WINAPI *Release)(void*);
+    HRESULT (WINAPI *Activate)(void*,REFIID,DWORD,PROPVARIANT,void**);
+    HRESULT (WINAPI *OpenPropertyStore)(void*,DWORD,void**);
+    HRESULT (WINAPI *GetId)(void*,LPWSTR*);
+    HRESULT (WINAPI *GetState)(void*,DWORD*);
+} IMMDeviceVtbl;
+
+typedef struct IAudioClientVtbl {
+    HRESULT (WINAPI *QueryInterface)(void*,REFIID,void**);
+    ULONG   (WINAPI *AddRef)(void*);
+    ULONG   (WINAPI *Release)(void*);
+    HRESULT (WINAPI *Initialize)(void*,AUDCLNT_SHAREMODE,DWORD,REFERENCE_TIME,REFERENCE_TIME,const WAVEFORMATEX*,void*);
+    HRESULT (WINAPI *GetBufferFormat)(void*,WAVEFORMATEX**);
+    HRESULT (WINAPI *GetMixFormat)(void*,WAVEFORMATEX**);
+    HRESULT (WINAPI *GetDevicePeriod)(void*,REFERENCE_TIME*,REFERENCE_TIME*);
+    HRESULT (WINAPI *Start)(void*);
+    HRESULT (WINAPI *Stop)(void*);
+    HRESULT (WINAPI *Reset)(void*);
+    HRESULT (WINAPI *SetEventHandle)(void*,HANDLE);
+    HRESULT (WINAPI *GetService)(void*,REFIID,void**);
+} IAudioClientVtbl;
+
+typedef struct IAudioRenderClientVtbl {
+    HRESULT (WINAPI *QueryInterface)(void*,REFIID,void**);
+    ULONG   (WINAPI *AddRef)(void*);
+    ULONG   (WINAPI *Release)(void*);
+    HRESULT (WINAPI *GetBuffer)(void*,UINT32,BYTE**);
+    HRESULT (WINAPI *ReleaseBuffer)(void*,UINT32,DWORD);
+    HRESULT (WINAPI *GetPadding)(void*,UINT32*);
+    HRESULT (WINAPI *GetCurrentPadding)(void*,UINT32*);
+    HRESULT (WINAPI *IsFormatSupported)(void*,AUDCLNT_SHAREMODE,WAVEFORMATEX*,WAVEFORMATEX**);
+    HRESULT (WINAPI *GetMixFormat)(void*,WAVEFORMATEX**);
+    HRESULT (WINAPI *GetDevicePeriod)(void*,REFERENCE_TIME*,REFERENCE_TIME*);
+    HRESULT (WINAPI *Start)(void*);
+    HRESULT (WINAPI *Stop)(void*);
+    HRESULT (WINAPI *Reset)(void*);
+} IAudioRenderClientVtbl;
+
+typedef struct IAudioCaptureClientVtbl {
+    HRESULT (WINAPI *QueryInterface)(void*,REFIID,void**);
+    ULONG   (WINAPI *AddRef)(void*);
+    ULONG   (WINAPI *Release)(void*);
+    HRESULT (WINAPI *GetBuffer)(void*,BYTE**,UINT32*,DWORD*,UINT64*,UINT64*);
+    HRESULT (WINAPI *ReleaseBuffer)(void*,UINT32);
+    HRESULT (WINAPI *GetNextPacketSize)(void*,UINT32*);
+} IAudioCaptureClientVtbl;
+
+typedef struct IAudioClockVtbl {
+    HRESULT (WINAPI *QueryInterface)(void*,REFIID,void**);
+    ULONG   (WINAPI *AddRef)(void*);
+    ULONG   (WINAPI *Release)(void*);
+    HRESULT (WINAPI *GetFrequency)(void*,UINT64*);
+    HRESULT (WINAPI *GetPosition)(void*,UINT64*,UINT64*);
+    HRESULT (WINAPI *GetCharacteristics)(void*,DWORD*);
+} IAudioClockVtbl;
+
+#define IMMDeviceEnumerator_QueryInterface(e,i,p)      ((IMMDeviceEnumeratorVtbl*)(e))->QueryInterface(e,i,p)
+#define IMMDeviceEnumerator_AddRef(e)                  ((IMMDeviceEnumeratorVtbl*)(e))->AddRef(e)
+#define IMMDeviceEnumerator_Release(e)                 ((IMMDeviceEnumeratorVtbl*)(e))->Release(e)
+#define IMMDeviceEnumerator_GetDefaultAudioEndpoint(e,f,r,p) ((IMMDeviceEnumeratorVtbl*)(e))->GetDefaultAudioEndpoint(e,f,r,p)
+
+#define IMMDevice_QueryInterface(e,i,p)  ((IMMDeviceVtbl*)(e))->QueryInterface(e,i,p)
+#define IMMDevice_AddRef(e)              ((IMMDeviceVtbl*)(e))->AddRef(e)
+#define IMMDevice_Release(e)             ((IMMDeviceVtbl*)(e))->Release(e)
+#define IMMDevice_Activate(e,i,d,v,p)    ((IMMDeviceVtbl*)(e))->Activate(e,i,d,v,p)
+
+#define IAudioClient_QueryInterface(c,i,p)  ((IAudioClientVtbl*)(c))->QueryInterface(c,i,p)
+#define IAudioClient_AddRef(c)              ((IAudioClientVtbl*)(c))->AddRef(c)
+#define IAudioClient_Release(c)             ((IAudioClientVtbl*)(c))->Release(c)
+#define IAudioClient_Initialize(c,m,f,d,b,f2,p) ((IAudioClientVtbl*)(c))->Initialize(c,m,f,d,b,f2,p)
+#define IAudioClient_Start(c)               ((IAudioClientVtbl*)(c))->Start(c)
+#define IAudioClient_Stop(c)                ((IAudioClientVtbl*)(c))->Stop(c)
+#define IAudioClient_Reset(c)               ((IAudioClientVtbl*)(c))->Reset(c)
+#define IAudioClient_SetEventHandle(c,h)    ((IAudioClientVtbl*)(c))->SetEventHandle(c,h)
+#define IAudioClient_GetService(c,i,p)      ((IAudioClientVtbl*)(c))->GetService(c,i,p)
+#define IAudioClient_GetBufferSize(c,p)     ((IAudioClientVtbl*)(c))->GetBufferSize(c,p)
+
+#define IAudioRenderClient_Release(r)         ((IAudioRenderClientVtbl*)(r))->Release(r)
+#define IAudioRenderClient_GetBuffer(r,n,b)   ((IAudioRenderClientVtbl*)(r))->GetBuffer(r,n,b)
+#define IAudioRenderClient_ReleaseBuffer(r,n,f) ((IAudioRenderClientVtbl*)(r))->ReleaseBuffer(r,n,f)
+#define IAudioRenderClient_GetCurrentPadding(r,p) ((IAudioRenderClientVtbl*)(r))->GetCurrentPadding(r,p)
+
+#define IAudioCaptureClient_Release(c)              ((IAudioCaptureClientVtbl*)(c))->Release(c)
+#define IAudioCaptureClient_GetBuffer(c,b,n,f,t,t2) ((IAudioCaptureClientVtbl*)(c))->GetBuffer(c,b,n,f,t,t2)
+#define IAudioCaptureClient_ReleaseBuffer(c,n)      ((IAudioCaptureClientVtbl*)(c))->ReleaseBuffer(c,n)
+#define IAudioCaptureClient_GetNextPacketSize(c,p)  ((IAudioCaptureClientVtbl*)(c))->GetNextPacketSize(c,p)
+
+#define IAudioClock_Release(cl)          ((IAudioClockVtbl*)(cl))->Release(cl)
+#define IAudioClock_GetFrequency(cl,f)   ((IAudioClockVtbl*)(cl))->GetFrequency(cl,f)
+#define IAudioClock_GetPosition(cl,p,q)  ((IAudioClockVtbl*)(cl))->GetPosition(cl,p,q)
+
+/* Well-known GUIDs */
 static const GUID IID_CLSID_MMDeviceEnumerator = {
     0xBCDE0395, 0xE52F, 0x467C, { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
 static const GUID IID_IMMDeviceEnumeratorL = {
@@ -124,9 +187,6 @@ static const GUID SUBTYPE_IEEE_FLOAT_L = {
 typedef struct wasapi_stream {
     struct wasapi_stream* next;
 
-    const vp_aaudio_config_t* cfg;   /* guest memory, live for the stream  */
-    vp_audio_ring_t*          ring;  /* guest memory, identity mapped      */
-    int32_t                   wake_fd;
     int32_t                   direction;
     int32_t                   format;
     int32_t                   channel_count;
@@ -136,18 +196,12 @@ typedef struct wasapi_stream {
     int32_t                   buffer_frames;
     LONG                      state;
     LONG                      xruns;
-    volatile LONG             quit;
-    volatile LONG             started;
 
     IAudioClient*             client;
     IAudioRenderClient*       render;
     IAudioCaptureClient*      capture;
     IAudioClock*              clock;
-    HANDLE                    audio_event;   /* engine period signal   */
-    HANDLE                    notify_event;  /* guest NOTIFY -> pump   */
-    HANDLE                    thread;
-    HANDLE                    mmcss;
-    int64_t                   frames_io;     /* played / captured      */
+    HANDLE                    audio_event;
     CRITICAL_SECTION          lock;
 } wasapi_stream_t;
 
@@ -162,21 +216,21 @@ static void streams_lock_init(void)
     }
 }
 
-static void streams_add(wasapi_stream_t* stream)
+static void streams_add(wasapi_stream_t* s)
 {
     EnterCriticalSection(&g_streams_lock);
-    stream->next = g_streams;
-    g_streams = stream;
+    s->next = g_streams;
+    g_streams = s;
     LeaveCriticalSection(&g_streams_lock);
 }
 
-static void streams_remove(wasapi_stream_t* stream)
+static void streams_remove(wasapi_stream_t* s)
 {
     EnterCriticalSection(&g_streams_lock);
     wasapi_stream_t** link = &g_streams;
     while (*link) {
-        if (*link == stream) {
-            *link = stream->next;
+        if (*link == s) {
+            *link = s->next;
             break;
         }
         link = &(*link)->next;
@@ -187,18 +241,6 @@ static void streams_remove(wasapi_stream_t* stream)
 /* ============================================================
  * Time helpers
  * ============================================================ */
-static int64_t qpc_freq(void)
-{
-    static int64_t freq = 0;
-    if (freq == 0) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        freq = f.QuadPart ? f.QuadPart : 1;
-    }
-    return freq;
-}
-
-/* Monotonic milliseconds-since-boot, in nanoseconds. */
 static int64_t wasapi_now_ns(void)
 {
     return (int64_t)GetTickCount64() * 1000000LL;
@@ -218,7 +260,6 @@ static int wasapi_make_format(int32_t format, int32_t channels, int32_t rate,
         case VP_AUDIO_FMT_I32:   bits = 32; sub = &SUBTYPE_PCM_L;         break;
         case VP_AUDIO_FMT_FLOAT: bits = 32; sub = &SUBTYPE_IEEE_FLOAT_L;  break;
         default:
-            /* I24 packed has no shared-mode representation in the engine. */
             return -1;
     }
 
@@ -234,40 +275,6 @@ static int wasapi_make_format(int32_t format, int32_t channels, int32_t rate,
     wf->dwChannelMask = channels == 1 ? 0x4 : (channels == 2 ? 0x3 : 0);
     wf->SubFormat = *sub;
     return 0;
-}
-
-/* Cheap "is there any audio hardware" probe, cached after the first answer. */
-static LONG g_device_probe = -1;   /* -1 unknown, 0 none, 1 present */
-
-static int wasapi_probe_device(int32_t direction)
-{
-    if (!g_com.ole32 || !g_com.CoCreateInstance) {
-        return 0;
-    }
-    if (g_device_probe >= 0) {
-        return g_device_probe;
-    }
-
-    int found = 0;
-    g_com.CoInitializeEx(NULL, COINIT_MULTITHREADED);
-
-    IMMDeviceEnumerator* enumerator = NULL;
-    HRESULT hr = g_com.CoCreateInstance(&IID_CLSID_MMDeviceEnumerator, NULL,
-                                        CLSCTX_ALL, &IID_IMMDeviceEnumeratorL,
-                                        (void**)&enumerator);
-    if (SUCCEEDED(hr) && enumerator) {
-        IMMDevice* device = NULL;
-        EDataFlow flow = direction == VP_AUDIO_DIR_INPUT ? eCapture : eRender;
-        if (SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator, flow,
-                                                                 eConsole, &device)) && device) {
-            found = 1;
-            IMMDevice_Release(device);
-        }
-        IMMDeviceEnumerator_Release(enumerator);
-    }
-
-    g_device_probe = found;
-    return found;
 }
 
 /* ============================================================
@@ -314,7 +321,6 @@ static HRESULT wasapi_initialize(IAudioClient* client, const WAVEFORMATEX* forma
                 | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
                 | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
 
-    /* Lowest latency first (0 = engine minimum period), then relax. */
     static const REFERENCE_TIME durations[] = { 0, 200000, 1000000 };
     HRESULT hr = E_FAIL;
     for (size_t i = 0; i < sizeof(durations) / sizeof(durations[0]); i++) {
@@ -328,157 +334,16 @@ static HRESULT wasapi_initialize(IAudioClient* client, const WAVEFORMATEX* forma
 }
 
 /* ============================================================
- * Worker threads
- * ============================================================ */
-static void wasapi_join_mmcss(wasapi_stream_t* stream)
-{
-    if (stream->mmcss && g_com.AvRevertMmThreadCharacteristics) {
-        g_com.AvRevertMmThreadCharacteristics(stream->mmcss);
-        stream->mmcss = NULL;
-    }
-}
-
-static DWORD WINAPI wasapi_render_thread(LPVOID param)
-{
-    wasapi_stream_t* stream = (wasapi_stream_t*)param;
-    HANDLE events[2];
-
-    g_com.CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (g_com.AvSetMmThreadCharacteristicsW) {
-        DWORD task = 0;
-        stream->mmcss = g_com.AvSetMmThreadCharacteristicsW(L"Pro Audio", &task);
-    }
-
-    events[0] = stream->audio_event;
-    events[1] = stream->notify_event;
-
-    while (!stream->quit) {
-        DWORD wr = WaitForMultipleObjects(2, events, FALSE, 200);
-        if (stream->quit) {
-            break;
-        }
-        if (wr == WAIT_FAILED) {
-            break;
-        }
-
-        /* Drain as much of the engine's buffer as it will take. */
-        for (;;) {
-            UINT32 padding = 0;
-            if (FAILED(IAudioClient_GetCurrentPadding(stream->client, &padding))) {
-                break;
-            }
-            UINT32 available = stream->buffer_frames - (int32_t)padding;
-            if (available == 0) {
-                break;
-            }
-
-            BYTE* dst = NULL;
-            if (FAILED(IAudioRenderClient_GetBuffer(stream->render, available, &dst)) || !dst) {
-                break;
-            }
-
-            uint32_t got = vp_audio_ring_read(stream->ring, dst, available);
-            if (got < available) {
-                /* Underrun: pad with silence instead of stalling the endpoint. */
-                memset(dst + (size_t)got * stream->frame_bytes, 0,
-                       (size_t)(available - got) * stream->frame_bytes);
-                InterlockedIncrement(&stream->xruns);
-            }
-            IAudioRenderClient_ReleaseBuffer(stream->render, available, got == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
-
-            stream->frames_io += available;
-            if (got > 0) {
-                vp_cmdpost_audio_wake_guest(stream->wake_fd, VP_AUDIO_WAKE_WRITE_SPACE);
-            }
-        }
-    }
-
-    wasapi_join_mmcss(stream);
-    return 0;
-}
-
-static DWORD WINAPI wasapi_capture_thread(LPVOID param)
-{
-    wasapi_stream_t* stream = (wasapi_stream_t*)param;
-    HANDLE events[2];
-
-    g_com.CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (g_com.AvSetMmThreadCharacteristicsW) {
-        DWORD task = 0;
-        stream->mmcss = g_com.AvSetMmThreadCharacteristicsW(L"Audio", &task);
-    }
-
-    events[0] = stream->audio_event;
-    events[1] = stream->notify_event;
-
-    while (!stream->quit) {
-        UINT32 packet = 0;
-        if (FAILED(IAudioCaptureClient_GetNextPacketSize(stream->capture, &packet))) {
-            break;
-        }
-        if (packet == 0) {
-            DWORD wr = WaitForMultipleObjects(2, events, FALSE, 200);
-            if (stream->quit || wr == WAIT_FAILED) {
-                break;
-            }
-            continue;
-        }
-
-        for (;;) {
-            BYTE* src = NULL;
-            UINT32 frames = 0;
-            DWORD flags = 0;
-            if (FAILED(IAudioCaptureClient_GetBuffer(stream->capture, &src, &frames,
-                                                     &flags, NULL, NULL))) {
-                break;
-            }
-            if (frames == 0) {
-                IAudioCaptureClient_ReleaseBuffer(stream->capture, 0);
-                break;
-            }
-
-            uint32_t room = vp_audio_ring_space(stream->ring);
-            if (room < frames) {
-                /* Guest is behind: drop the oldest frames so capture stays live. */
-                uint32_t drop = frames - room;
-                if (drop > vp_audio_ring_count(stream->ring)) {
-                    drop = vp_audio_ring_count(stream->ring);
-                }
-                vp_audio_ring_commit_read(stream->ring, drop);
-                InterlockedIncrement(&stream->xruns);
-            }
-
-            uint32_t put = vp_audio_ring_write(stream->ring,
-                                               (flags & AUDCLNT_BUFFERFLAGS_SILENT) ? NULL : src,
-                                               frames);
-            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                (void)put;
-            }
-            IAudioCaptureClient_ReleaseBuffer(stream->capture, frames);
-
-            stream->frames_io += frames;
-            vp_cmdpost_audio_wake_guest(stream->wake_fd, VP_AUDIO_WAKE_READ_DATA);
-        }
-    }
-
-    wasapi_join_mmcss(stream);
-    return 0;
-}
-
-/* ============================================================
  * vp_audio_ops_t implementation
  * ============================================================ */
 static int32_t wasapi_open(const vp_aaudio_config_t* cfg, void** out_user)
 {
-    wasapi_stream_t* stream;
+    wasapi_stream_t* s;
     WAVEFORMATEXTENSIBLE wf;
     IMMDevice* device = NULL;
     HRESULT hr;
-    int32_t channels;
-    int32_t rate;
-    int32_t format;
 
-    if (!cfg || !out_user || !(cfg->ring & ~0ULL)) {
+    if (!cfg || !out_user) {
         return VP_AUDIO_ERROR_INVALID_ARG;
     }
 
@@ -487,313 +352,319 @@ static int32_t wasapi_open(const vp_aaudio_config_t* cfg, void** out_user)
         return VP_AUDIO_ERROR_UNSUPPORTED;
     }
 
-    channels = cfg->channel_count > 0 ? cfg->channel_count : 2;
-    rate     = cfg->sample_rate > 0 ? cfg->sample_rate : 48000;
-    format   = cfg->format > VP_AUDIO_FMT_UNSPECIFIED ? cfg->format : VP_AUDIO_FMT_FLOAT;
+    int32_t channels = cfg->channel_count > 0 ? cfg->channel_count : 2;
+    int32_t rate     = cfg->sample_rate > 0 ? cfg->sample_rate : 48000;
+    int32_t format   = cfg->format > VP_AUDIO_FMT_UNSPECIFIED ? cfg->format : VP_AUDIO_FMT_FLOAT;
 
-    if (channels < 1 || channels > 8) {
-        return VP_AUDIO_ERROR_INVALID_ARG;
-    }
-    if (wasapi_make_format(format, channels, rate, &wf) != 0) {
-        return VP_AUDIO_ERROR_UNSUPPORTED;
-    }
+    if (channels < 1 || channels > 8) return VP_AUDIO_ERROR_INVALID_ARG;
+    if (wasapi_make_format(format, channels, rate, &wf) != 0) return VP_AUDIO_ERROR_UNSUPPORTED;
 
-    stream = (wasapi_stream_t*)calloc(1, sizeof(wasapi_stream_t));
-    if (!stream) {
-        return VP_AUDIO_ERROR_NO_MEMORY;
-    }
-    InitializeCriticalSection(&stream->lock);
+    s = (wasapi_stream_t*)calloc(1, sizeof(wasapi_stream_t));
+    if (!s) return VP_AUDIO_ERROR_NO_MEMORY;
+    InitializeCriticalSection(&s->lock);
 
-    stream->cfg           = cfg;
-    stream->ring          = (vp_audio_ring_t*)(uintptr_t)cfg->ring;
-    stream->wake_fd       = cfg->wake_fd;
-    stream->direction     = cfg->direction;
-    stream->format        = format;
-    stream->channel_count = channels;
-    stream->sample_rate   = rate;
-    stream->frame_bytes   = (int32_t)vp_audio_frame_bytes(format, channels);
-    stream->state         = VP_AUDIO_STATE_OPEN;
-
-    if (stream->ring->frame_bytes != (uint32_t)stream->frame_bytes || stream->frame_bytes <= 0) {
-        wasapi_log("ring/frame mismatch (ring=%u want=%d); refusing stream",
-                   stream->ring->frame_bytes, (int)stream->frame_bytes);
-        DeleteCriticalSection(&stream->lock);
-        free(stream);
-        return VP_AUDIO_ERROR_INVALID_ARG;
-    }
+    s->direction     = cfg->direction;
+    s->format        = format;
+    s->channel_count = channels;
+    s->sample_rate   = rate;
+    s->frame_bytes   = (int32_t)vp_audio_frame_bytes(format, channels);
+    s->state         = VP_AUDIO_STATE_OPEN;
 
     g_com.CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
-    if (wasapi_open_client(stream, &device, &stream->client) != 0) {
-        DeleteCriticalSection(&stream->lock);
-        free(stream);
+    if (wasapi_open_client(s, &device, &s->client) != 0) {
+        DeleteCriticalSection(&s->lock);
+        free(s);
         return VP_AUDIO_ERROR_NO_DEVICE;
     }
 
-    hr = wasapi_initialize(stream->client, &wf.Format);
+    hr = wasapi_initialize(s->client, &wf.Format);
     if (FAILED(hr)) {
         wasapi_log("IAudioClient::Initialize failed: 0x%08lX (fmt=%d ch=%d rate=%d)",
                    (unsigned long)hr, (int)format, (int)channels, (int)rate);
-        IAudioClient_Release(stream->client);
+        IAudioClient_Release(s->client);
         IMMDevice_Release(device);
-        DeleteCriticalSection(&stream->lock);
-        free(stream);
+        DeleteCriticalSection(&s->lock);
+        free(s);
         return VP_AUDIO_ERROR_UNSUPPORTED;
     }
 
     UINT32 buffer_frames = 0;
-    IAudioClient_GetBufferSize(stream->client, &buffer_frames);
-    stream->buffer_frames = (int32_t)buffer_frames;
-    stream->burst_frames  = (int32_t)buffer_frames;
+    IAudioClient_GetBufferSize(s->client, &buffer_frames);
+    s->buffer_frames = (int32_t)buffer_frames;
+    s->burst_frames  = (int32_t)buffer_frames;
 
-    stream->audio_event  = CreateEventW(NULL, FALSE, FALSE, NULL);
-    stream->notify_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!stream->audio_event || !stream->notify_event) {
-        goto fail_client;
-    }
-    if (FAILED(IAudioClient_SetEventHandle(stream->client, stream->audio_event))) {
+    s->audio_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!s->audio_event) goto fail_client;
+    if (FAILED(IAudioClient_SetEventHandle(s->client, s->audio_event))) {
         wasapi_log("SetEventHandle failed");
         goto fail_client;
     }
 
-    if (stream->direction == VP_AUDIO_DIR_INPUT) {
-        hr = IAudioClient_GetService(stream->client, &IID_IAudioCaptureClientL,
-                                     (void**)&stream->capture);
+    if (s->direction == VP_AUDIO_DIR_INPUT) {
+        hr = IAudioClient_GetService(s->client, &IID_IAudioCaptureClientL, (void**)&s->capture);
     } else {
-        hr = IAudioClient_GetService(stream->client, &IID_IAudioRenderClientL,
-                                     (void**)&stream->render);
+        hr = IAudioClient_GetService(s->client, &IID_IAudioRenderClientL, (void**)&s->render);
     }
-    if (FAILED(hr) || (!stream->render && !stream->capture)) {
+    if (FAILED(hr) || (!s->render && !s->capture)) {
         wasapi_log("GetService failed: 0x%08lX", (unsigned long)hr);
         goto fail_client;
     }
-    /* Optional, used only for getTimestamp(). */
-    IAudioClient_GetService(stream->client, &IID_IAudioClockL, (void**)&stream->clock);
-    if (stream->clock) {
+
+    IAudioClient_GetService(s->client, &IID_IAudioClockL, (void**)&s->clock);
+    if (s->clock) {
         UINT64 freq = 0;
-        IAudioClock_GetFrequency(stream->clock, &freq);
+        IAudioClock_GetFrequency(s->clock, &freq);
     }
 
     IMMDevice_Release(device);
+    streams_add(s);
+    *out_user = s;
 
-    /* Write back negotiated burst so the guest can read it. The config lives
-     * in guest memory and is safe to mutate (identity-mapped). */
-    ((vp_aaudio_config_t*)cfg)->frames_per_burst = stream->burst_frames;
-    *out_user = stream;
-    streams_add(stream);
-
-    wasapi_log("%s stream: %d Hz, %d ch, fmt %d, %d-frame buffer, burst %d",
-               stream->direction == VP_AUDIO_DIR_INPUT ? "capture" : "render",
+    wasapi_log("%s stream: %d Hz, %d ch, fmt %d, buffer %d, burst %d",
+               s->direction == VP_AUDIO_DIR_INPUT ? "capture" : "render",
                (int)rate, (int)channels, (int)format,
-               (int)stream->buffer_frames, (int)stream->burst_frames);
+               (int)s->buffer_frames, (int)s->burst_frames);
     return VP_AUDIO_OK;
 
 fail_client:
-    if (stream->audio_event)  { CloseHandle(stream->audio_event);  stream->audio_event = NULL; }
-    if (stream->notify_event) { CloseHandle(stream->notify_event); stream->notify_event = NULL; }
-    if (stream->clock)   { IAudioClock_Release(stream->clock);         stream->clock = NULL; }
-    if (stream->render)  { IAudioRenderClient_Release(stream->render); stream->render = NULL; }
-    if (stream->capture) { IAudioCaptureClient_Release(stream->capture); stream->capture = NULL; }
-    if (stream->client)  { IAudioClient_Release(stream->client);       stream->client = NULL; }
+    if (s->audio_event) { CloseHandle(s->audio_event); s->audio_event = NULL; }
+    if (s->clock)   { IAudioClock_Release(s->clock);         s->clock = NULL; }
+    if (s->render)  { IAudioRenderClient_Release(s->render); s->render = NULL; }
+    if (s->capture) { IAudioCaptureClient_Release(s->capture); s->capture = NULL; }
+    if (s->client)  { IAudioClient_Release(s->client);       s->client = NULL; }
     IMMDevice_Release(device);
-    DeleteCriticalSection(&stream->lock);
-    free(stream);
+    DeleteCriticalSection(&s->lock);
+    free(s);
     return VP_AUDIO_ERROR_NO_DEVICE;
-}
-
-static int32_t wasapi_stop_threads(wasapi_stream_t* stream)
-{
-    if (stream->thread) {
-        InterlockedExchange(&stream->quit, 1);
-        if (stream->notify_event) {
-            SetEvent(stream->notify_event);
-        }
-        if (stream->audio_event) {
-            SetEvent(stream->audio_event);
-        }
-        WaitForSingleObject(stream->thread, 3000);
-        CloseHandle(stream->thread);
-        stream->thread = NULL;
-    }
-    return VP_AUDIO_OK;
 }
 
 static int32_t wasapi_close(void* user)
 {
-    wasapi_stream_t* stream = (wasapi_stream_t*)user;
-    if (!stream) {
-        return VP_AUDIO_ERROR_INVALID_ARG;
+    wasapi_stream_t* s = (wasapi_stream_t*)user;
+    if (!s) return VP_AUDIO_ERROR_INVALID_ARG;
+
+    if (s->client) {
+        IAudioClient_Stop(s->client);
     }
+    if (s->clock)   { IAudioClock_Release(s->clock);           s->clock = NULL; }
+    if (s->render)  { IAudioRenderClient_Release(s->render);   s->render = NULL; }
+    if (s->capture) { IAudioCaptureClient_Release(s->capture); s->capture = NULL; }
+    if (s->client)  { IAudioClient_Release(s->client);         s->client = NULL; }
+    if (s->audio_event) { CloseHandle(s->audio_event); s->audio_event = NULL; }
 
-    wasapi_stop_threads(stream);
-
-    if (stream->client) {
-        IAudioClient_Stop(stream->client);
-    }
-    if (stream->clock)   { IAudioClock_Release(stream->clock);           stream->clock = NULL; }
-    if (stream->render)  { IAudioRenderClient_Release(stream->render);   stream->render = NULL; }
-    if (stream->capture) { IAudioCaptureClient_Release(stream->capture); stream->capture = NULL; }
-    if (stream->client)  { IAudioClient_Release(stream->client);         stream->client = NULL; }
-    if (stream->audio_event)  { CloseHandle(stream->audio_event);  stream->audio_event = NULL; }
-    if (stream->notify_event) { CloseHandle(stream->notify_event); stream->notify_event = NULL; }
-
-    streams_remove(stream);
-    DeleteCriticalSection(&stream->lock);
-    free(stream);
+    streams_remove(s);
+    DeleteCriticalSection(&s->lock);
+    free(s);
     return VP_AUDIO_OK;
 }
 
 static int32_t wasapi_start(void* user, int64_t timeout_ns)
 {
-    wasapi_stream_t* stream = (wasapi_stream_t*)user;
+    wasapi_stream_t* s = (wasapi_stream_t*)user;
     (void)timeout_ns;
-    if (!stream) {
-        return VP_AUDIO_ERROR_INVALID_ARG;
-    }
-    if (stream->started) {
-        return VP_AUDIO_OK;
-    }
+    if (!s || !s->client) return VP_AUDIO_ERROR_INVALID_ARG;
 
-    /* Start the endpoint before the pump so capture already has a clock. */
-    if (FAILED(IAudioClient_Start(stream->client))) {
+    if (FAILED(IAudioClient_Start(s->client))) {
         return VP_AUDIO_ERROR_INTERNAL;
     }
-
-    if (!stream->thread) {
-        LPTHREAD_START_ROUTINE entry = stream->direction == VP_AUDIO_DIR_INPUT
-                                     ? wasapi_capture_thread : wasapi_render_thread;
-        InterlockedExchange(&stream->quit, 0);
-        stream->thread = CreateThread(NULL, 0, entry, stream, 0, NULL);
-        if (!stream->thread) {
-            IAudioClient_Stop(stream->client);
-            return VP_AUDIO_ERROR_INTERNAL;
-        }
-    }
-
-    stream->started = 1;
-    InterlockedExchange(&stream->state, VP_AUDIO_STATE_STARTED);
+    InterlockedExchange(&s->state, VP_AUDIO_STATE_STARTED);
     return VP_AUDIO_OK;
 }
 
 static int32_t wasapi_pause(void* user, int64_t timeout_ns)
 {
-    wasapi_stream_t* stream = (wasapi_stream_t*)user;
+    wasapi_stream_t* s = (wasapi_stream_t*)user;
     (void)timeout_ns;
-    if (!stream) {
-        return VP_AUDIO_ERROR_INVALID_ARG;
-    }
-    /* Shared mode has no true pause: stop the clock, keep the buffers. */
-    IAudioClient_Stop(stream->client);
-    stream->started = 0;
-    InterlockedExchange(&stream->state, VP_AUDIO_STATE_PAUSED);
+    if (!s || !s->client) return VP_AUDIO_ERROR_INVALID_ARG;
+
+    IAudioClient_Stop(s->client);
+    InterlockedExchange(&s->state, VP_AUDIO_STATE_PAUSED);
     return VP_AUDIO_OK;
 }
 
 static int32_t wasapi_stop(void* user, int64_t timeout_ns)
 {
-    wasapi_stream_t* stream = (wasapi_stream_t*)user;
+    wasapi_stream_t* s = (wasapi_stream_t*)user;
     (void)timeout_ns;
-    if (!stream) {
-        return VP_AUDIO_ERROR_INVALID_ARG;
-    }
-    wasapi_stop_threads(stream);
-    IAudioClient_Stop(stream->client);
-    IAudioClient_Reset(stream->client);
-    stream->started = 0;
-    InterlockedExchange(&stream->state, VP_AUDIO_STATE_STOPPED);
+    if (!s || !s->client) return VP_AUDIO_ERROR_INVALID_ARG;
+
+    IAudioClient_Stop(s->client);
+    IAudioClient_Reset(s->client);
+    InterlockedExchange(&s->state, VP_AUDIO_STATE_STOPPED);
     return VP_AUDIO_OK;
 }
 
 static int32_t wasapi_flush(void* user)
 {
-    wasapi_stream_t* stream = (wasapi_stream_t*)user;
-    if (!stream) {
-        return VP_AUDIO_ERROR_INVALID_ARG;
-    }
-    /* Drop whatever is still queued in the ring. */
-    vp_audio_ring_commit_read(stream->ring, vp_audio_ring_count(stream->ring));
-    InterlockedExchange(&stream->state, VP_AUDIO_STATE_FLUSHED);
+    wasapi_stream_t* s = (wasapi_stream_t*)user;
+    if (!s || !s->client) return VP_AUDIO_ERROR_INVALID_ARG;
+
+    IAudioClient_Reset(s->client);
+    InterlockedExchange(&s->state, VP_AUDIO_STATE_FLUSHED);
     return VP_AUDIO_OK;
 }
 
-static int32_t wasapi_notify(void* user, int32_t kind)
+/* ============================================================
+ * Data-path passthrough: memcpy between guest and real WASAPI
+ * ============================================================ */
+static int32_t wasapi_write(void* user, const void* buf, int32_t frames, int32_t frame_bytes)
 {
-    wasapi_stream_t* stream = (wasapi_stream_t*)user;
-    (void)kind;
-    if (!stream) {
-        return VP_AUDIO_ERROR_INVALID_ARG;
+    wasapi_stream_t* s = (wasapi_stream_t*)user;
+    if (!s || !s->render) return VP_AUDIO_ERROR_INVALID_ARG;
+
+    /* Wait for engine period so the buffer is available. */
+    WaitForSingleObject(s->audio_event, 100);
+
+    UINT32 padding = 0;
+    if (FAILED(IAudioClient_GetCurrentPadding(s->client, &padding))) {
+        return VP_AUDIO_ERROR_INTERNAL;
     }
-    /* Wake the pump immediately instead of waiting out the audio period. */
-    if (stream->notify_event) {
-        SetEvent(stream->notify_event);
+    int32_t available = s->buffer_frames - (int32_t)padding;
+    if (available <= 0) {
+        return 0;  /* buffer full */
     }
-    return VP_AUDIO_OK;
+    if (frames > available) {
+        frames = available;
+    }
+
+    BYTE* dst = NULL;
+    if (FAILED(IAudioRenderClient_GetBuffer(s->render, (UINT32)frames, &dst)) || !dst) {
+        return VP_AUDIO_ERROR_INTERNAL;
+    }
+
+    size_t bytes = (size_t)frames * (size_t)frame_bytes;
+    memcpy(dst, buf, bytes);
+
+    IAudioRenderClient_ReleaseBuffer(s->render, (UINT32)frames, 0);
+    return frames;
 }
 
+static int32_t wasapi_read(void* user, void* buf, int32_t frames, int32_t frame_bytes)
+{
+    wasapi_stream_t* s = (wasapi_stream_t*)user;
+    if (!s || !s->capture) return VP_AUDIO_ERROR_INVALID_ARG;
+
+    /* Drain any available capture data. */
+    int32_t total_read = 0;
+    BYTE* dst = (BYTE*)buf;
+
+    while (total_read < frames) {
+        UINT32 packet = 0;
+        if (FAILED(IAudioCaptureClient_GetNextPacketSize(s->capture, &packet)) || packet == 0) {
+            break;
+        }
+
+        BYTE* src = NULL;
+        UINT32 avail = 0;
+        DWORD flags = 0;
+        if (FAILED(IAudioCaptureClient_GetBuffer(s->capture, &src, &avail, &flags, NULL, NULL))) {
+            break;
+        }
+
+        int32_t to_copy = frames - total_read;
+        if ((int32_t)avail < to_copy) {
+            to_copy = (int32_t)avail;
+        }
+
+        size_t bytes = (size_t)to_copy * (size_t)frame_bytes;
+        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+            memset(dst, 0, bytes);
+        } else {
+            memcpy(dst, src, bytes);
+        }
+
+        IAudioCaptureClient_ReleaseBuffer(s->capture, avail);
+        dst += bytes;
+        total_read += to_copy;
+    }
+
+    return total_read;
+}
+
+/* ============================================================
+ * Introspection
+ * ============================================================ */
 static int32_t wasapi_get_info(void* user, vp_aaudio_info_t* out)
 {
-    wasapi_stream_t* stream = (wasapi_stream_t*)user;
-    if (!stream || !out) {
-        return VP_AUDIO_ERROR_INVALID_ARG;
-    }
+    wasapi_stream_t* s = (wasapi_stream_t*)user;
+    if (!s || !out) return VP_AUDIO_ERROR_INVALID_ARG;
 
     memset(out, 0, sizeof(*out));
-    out->direction               = stream->direction;
-    out->sample_rate             = stream->sample_rate;
-    out->channel_count           = stream->channel_count;
-    out->format                  = stream->format;
-    out->sharing_mode            = VP_AUDIO_SHARING_SHARED;
-    out->performance_mode        = stream->cfg->performance_mode;
-    out->usage                   = stream->cfg->usage;
-    out->content_type            = stream->cfg->content_type;
-    out->device_id               = stream->cfg->device_id;
-    out->session_id              = stream->cfg->session_id;
-    out->frames_per_burst        = stream->burst_frames;
-    out->buffer_size_frames      = stream->buffer_frames;
-    out->buffer_capacity_frames  = (int32_t)stream->ring->capacity_frames;
-    out->frame_bytes             = stream->frame_bytes;
-    out->state                   = stream->state;
-    out->xrun_count              = stream->xruns;
-    out->app_token               = stream->cfg->app_token;
+    out->direction              = s->direction;
+    out->sample_rate            = s->sample_rate;
+    out->channel_count          = s->channel_count;
+    out->format                 = s->format;
+    out->sharing_mode           = VP_AUDIO_SHARING_SHARED;
+    out->frames_per_burst       = s->burst_frames;
+    out->buffer_size_frames     = s->buffer_frames;
+    out->buffer_capacity_frames = s->buffer_frames;
+    out->frame_bytes            = s->frame_bytes;
+    out->state                  = s->state;
+    out->xrun_count            = s->xruns;
     return VP_AUDIO_OK;
 }
 
 static int32_t wasapi_get_timestamp(void* user, vp_aaudio_timestamp_t* out)
 {
-    wasapi_stream_t* stream = (wasapi_stream_t*)user;
-    if (!stream || !out) {
-        return VP_AUDIO_ERROR_INVALID_ARG;
-    }
+    wasapi_stream_t* s = (wasapi_stream_t*)user;
+    if (!s || !out) return VP_AUDIO_ERROR_INVALID_ARG;
 
-    int64_t position = stream->frames_io;
-    if (stream->clock) {
+    int64_t position = 0;
+    if (s->clock) {
         UINT64 pos = 0;
         UINT64 qpc = 0;
-        if (SUCCEEDED(IAudioClock_GetPosition(stream->clock, &pos, &qpc))) {
+        if (SUCCEEDED(IAudioClock_GetPosition(s->clock, &pos, &qpc))) {
             position = (int64_t)pos;
         }
     }
 
     memset(out, 0, sizeof(*out));
     out->position     = position;
-    /* The engine reports positions ahead of the speaker; the monotonic stamp is
-     * the one the guest compares against, so they stay consistent. */
     out->timestamp_ns = wasapi_now_ns();
-    out->sample_rate  = stream->sample_rate;
+    out->sample_rate  = s->sample_rate;
     return VP_AUDIO_OK;
 }
 
 static int32_t wasapi_set_buffer_size(void* user, int32_t frames, int32_t* applied_out)
 {
-    wasapi_stream_t* stream = (wasapi_stream_t*)user;
-    if (!stream) {
-        return VP_AUDIO_ERROR_INVALID_ARG;
-    }
-    /* Shared mode: the engine owns the period, we only report it back. */
+    wasapi_stream_t* s = (wasapi_stream_t*)user;
+    if (!s) return VP_AUDIO_ERROR_INVALID_ARG;
+
+    /* Shared mode: the engine owns the period, report it back. */
     if (applied_out) {
-        *applied_out = stream->buffer_frames;
+        *applied_out = s->buffer_frames;
     }
     return VP_AUDIO_OK;
+}
+
+static LONG g_device_probe = -1;
+
+static int wasapi_probe_device(int32_t direction)
+{
+    if (!g_com.ole32 || !g_com.CoCreateInstance) return 0;
+    if (g_device_probe >= 0) return g_device_probe;
+
+    int found = 0;
+    g_com.CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+    IMMDeviceEnumerator* enumerator = NULL;
+    HRESULT hr = g_com.CoCreateInstance(&IID_CLSID_MMDeviceEnumerator, NULL,
+                                        CLSCTX_ALL, &IID_IMMDeviceEnumeratorL,
+                                        (void**)&enumerator);
+    if (SUCCEEDED(hr) && enumerator) {
+        IMMDevice* device = NULL;
+        EDataFlow flow = direction == VP_AUDIO_DIR_INPUT ? eCapture : eRender;
+        if (SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator, flow,
+                                                                 eConsole, &device)) && device) {
+            found = 1;
+            IMMDevice_Release(device);
+        }
+        IMMDeviceEnumerator_Release(enumerator);
+    }
+
+    g_device_probe = found;
+    return found;
 }
 
 static uint32_t wasapi_query(void)
@@ -802,17 +673,11 @@ static uint32_t wasapi_query(void)
     if (!g_com.ole32 || !g_com.CoCreateInstance) {
         return 0;
     }
-    if (!wasapi_probe_device(VP_AUDIO_DIR_OUTPUT)) {
-        return 0;
-    }
-
-    uint32_t caps = VP_AUDIO_CAP_OUTPUT | VP_AUDIO_CAP_SHARED_ALIAS_PLACEHOLDER;
+    uint32_t caps = VP_AUDIO_CAP_OUTPUT;
     if (wasapi_probe_device(VP_AUDIO_DIR_INPUT)) {
         caps |= VP_AUDIO_CAP_INPUT;
     }
-    /* Timestamps come from IAudioClock, wsapi always runs on its own thread,
-     * and the ring is driven from the guest's pipe. */
-    caps |= VP_AUDIO_CAP_TIMESTAMP | VP_AUDIO_CAP_FD_WAKEUP;
+    caps |= VP_AUDIO_CAP_TIMESTAMP;
     return caps;
 }
 
@@ -823,7 +688,8 @@ static const vp_audio_ops_t g_wasapi_ops = {
     .pause           = wasapi_pause,
     .stop            = wasapi_stop,
     .flush           = wasapi_flush,
-    .notify          = wasapi_notify,
+    .write           = wasapi_write,
+    .read            = wasapi_read,
     .get_info        = wasapi_get_info,
     .get_timestamp   = wasapi_get_timestamp,
     .set_buffer_size = wasapi_set_buffer_size,
@@ -838,17 +704,15 @@ const vp_audio_ops_t* win32_aaudio_ops(void)
 
 void win32_aaudio_shutdown(void)
 {
-    /* cmdpost_cleanup() already closes every stream through the ops table, so
-     * all that is left here is dropping the COM/MMCSS handles. */
     if (g_streams_lock_ready) {
         EnterCriticalSection(&g_streams_lock);
-        wasapi_stream_t* stream = g_streams;
+        wasapi_stream_t* s = g_streams;
         g_streams = NULL;
         LeaveCriticalSection(&g_streams_lock);
-        while (stream) {
-            wasapi_stream_t* next = stream->next;
-            wasapi_close(stream);
-            stream = next;
+        while (s) {
+            wasapi_stream_t* next = s->next;
+            wasapi_close(s);
+            s = next;
         }
     }
     com_unload();
