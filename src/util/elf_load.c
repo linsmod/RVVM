@@ -105,16 +105,23 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
     } else {
         // Userland ELF loading
         elf->buf_size = elf_hiaddr - elf_loaddr;
+        // Round the mapping extent up to the OS allocation granularity:
+        // VirtualAlloc() rounds RESERVE sizes to it anyway, and vma_free()
+        // can only MEM_RELEASE the exact allocation extent, so ask for the
+        // rounded size upfront and remember it for elf_unload_file().
+        elf->buf_size = align_size_up(elf->buf_size, vma_alloc_granularity());
         if (elf_type == ELF_ET_DYN) {
             // Dynamic (PIC) ELF, relocate it
             elf->base = vma_alloc(NULL, elf->buf_size, VMA_RDWR);
             WRAP_ERR(elf->base, "Failed to allocate dynamic ELF VMA");
+            elf->map_size = elf->buf_size;
         } else {
             // Non-relocatable ELF at fixed address
             // Extra pages past the image serve as the initial brk heap area,
             // real kernels map them accessible right after the image
             elf->base = vma_alloc((void*)(size_t)elf_loaddr, elf->buf_size + ELF_USERLAND_HEAP_MARGIN, VMA_RDWR | VMA_FIXED);
             WRAP_ERR(elf->base, "Failed to map fixed ELF VMA, address collision?");
+            elf->map_size = elf->buf_size + ELF_USERLAND_HEAP_MARGIN;
         }
         if (elf->entry) {
             elf->entry += (size_t)elf->base - elf_loaddr;
@@ -164,6 +171,20 @@ bool bin_objcopy(rvfile_t* file, void* buffer, size_t size, bool try_elf)
         }
     }
     return rvread(file, buffer, size, 0);
+}
+
+void elf_unload_file(elf_desc_t* elf)
+{
+    if (elf) {
+        if (elf->map_size && elf->base) {
+            // Free the exact extent passed to vma_alloc(): vma_free()'s
+            // MEM_RELEASE path requires the full OS allocation size, which
+            // map_size was rounded to at load time.
+            vma_free(elf->base, elf->map_size);
+        }
+        free(elf->interp_path);
+        memset(elf, 0, sizeof(*elf));
+    }
 }
 
 POP_OPTIMIZATION_SIZE

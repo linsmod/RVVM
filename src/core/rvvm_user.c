@@ -128,6 +128,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "spinlock.h"
 #include "rvtimer.h"
 #include "stacktrace.h"
+#include "../cpu/riscv_hart.h" // riscv_hart_queue_pause() for clean userland shutdown
 
 /* Android NDK API Proxy - vp_cmdpost integration (single copy lives in src/virtpass) */
 #include "virtpass/vp_cmdpost.h"
@@ -527,6 +528,7 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
     if (p < buf + sizeof(buf)) *p = '\0';
     __android_log_write(ANDROID_LOG_INFO, "RVVM-HOSTFAULT", buf);
 #endif
+    rvvm_warn("_Exit due to HOST FAULT inside guest");
     _Exit(128 + sig);
 }
 
@@ -545,7 +547,87 @@ typedef struct {
     uint32_t* child_settid;
     uint32_t* child_cleartid;
     uint32_t tid;
+    uint32_t finished; // Set by userland shutdown to stop this vCPU
 } rvvm_user_thread_t;
+
+/* ============================================================
+ * Guest thread registry & userland shutdown
+ *
+ * Upstream RVVM assumes "guest == process": exit/exit_group either
+ * _Exit()s the host process or (with an exit callback installed, as
+ * done by embedded hosts like Android) fires the callback and simply
+ * keeps running the vCPU, which turns into a zombie thread faulting
+ * on freed guest memory or destroyed host resources.
+ *
+ * We instead track every guest thread and shut the vCPUs down cleanly
+ * once the guest process terminates (sys_exit_group, or sys_exit on
+ * the main thread, matching Linux semantics).
+ * ============================================================ */
+
+static spinlock_t userland_threads_lock = SPINLOCK_INIT;
+static vector_t(rvvm_user_thread_t*) userland_threads = ZERO_INIT;
+static rvvm_user_thread_t* userland_main_thread = NULL;
+static uint32_t userland_exit_reported = 0;
+
+static void userland_thread_register(rvvm_user_thread_t* thread)
+{
+    spin_lock(&userland_threads_lock);
+    vector_push_back(userland_threads, thread);
+    spin_unlock(&userland_threads_lock);
+}
+
+static void userland_thread_unregister(rvvm_user_thread_t* thread)
+{
+    spin_lock(&userland_threads_lock);
+    vector_foreach_back(userland_threads, i) {
+        if (vector_at(userland_threads, i) == thread) {
+            vector_erase(userland_threads, i);
+            break;
+        }
+    }
+    spin_unlock(&userland_threads_lock);
+}
+
+/*
+ * Process-wide guest termination: fire the exit callback once, then
+ * stop every guest vCPU. Threads other than @self get kicked out of
+ * the interpreter loop via a hart pause and unwind in their own wrap
+ * loop; @self unwinds via its syscall handling path.
+ */
+static void userland_process_exit(int code, rvvm_user_thread_t* self)
+{
+    if (atomic_swap_uint32(&userland_exit_reported, 1) == 0 && exit_callback) {
+        exit_callback(code);
+    }
+
+    spin_lock(&userland_threads_lock);
+    vector_foreach(userland_threads, i) {
+        rvvm_user_thread_t* thread = vector_at(userland_threads, i);
+        atomic_store_uint32(&thread->finished, 1);
+        if (thread != self && thread->cpu) {
+            // Make the vCPU return from the interpreter loop promptly
+            riscv_hart_queue_pause(thread->cpu);
+        }
+    }
+    spin_unlock(&userland_threads_lock);
+}
+
+/*
+ * Wait (bounded) for all guest threads to deregister themselves.
+ * Returns true once the registry is empty.
+ */
+static bool userland_threads_gone(uint32_t timeout_ms)
+{
+    while (timeout_ms--) {
+        bool empty = false;
+        spin_lock(&userland_threads_lock);
+        empty = vector_size(userland_threads) == 0;
+        spin_unlock(&userland_threads_lock);
+        if (empty) return true;
+        sleep_ms(1);
+    }
+    return false;
+}
 
 /* ============================================================
  * Memory read/write helpers for Guest↔Host data transfer
@@ -996,6 +1078,8 @@ static void* rvvm_user_thread_wrap(void* arg)
 
     current_user_hart = cpu;
 
+    userland_thread_register(thread);
+
     char path_buf[UAPI_PATH_MAX] = {0};
     char path_buf1[UAPI_PATH_MAX] = {0};
 
@@ -1006,6 +1090,10 @@ static void* rvvm_user_thread_wrap(void* arg)
     }
 
     while (running) {
+        if (atomic_load_uint32(&thread->finished)) {
+            // Userland is shutting down - leave the run loop cleanly
+            break;
+        }
         rvvm_addr_t cause = rvvm_run_user_thread(cpu);
         if (cause == 8) {
             // Handle syscall trap
@@ -1267,13 +1355,25 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 93: // exit
                     rvvm_warn("sys_exit(%ld) @ PC %lx", (long)a0, rvvm_read_cpu_reg(cpu, RVVM_REGID_PC));
-                    if (exit_callback) exit_callback((int)a0);
-                    else _Exit(a0);
+                    if (exit_callback) {
+                        if (thread == userland_main_thread) {
+                            // Linux semantics: main thread exit terminates the process
+                            userland_process_exit((int)a0, thread);
+                        } else {
+                            // Secondary thread exit: stop this vCPU only
+                            atomic_store_uint32(&thread->finished, 1);
+                        }
+                    } else {
+                        _Exit(a0);
+                    }
                     break;
                 case 94: // exit_group
                     rvvm_warn("sys_exit_group(%ld)", (long)a0);
-                    if (exit_callback) exit_callback((int)a0);
-                    else _Exit(a0);
+                    if (exit_callback) {
+                        userland_process_exit((int)a0, thread);
+                    } else {
+                        _Exit(a0);
+                    }
                     break;
                 case 96: // set_tid_address
                     thread->child_cleartid = to_ptr(a0);
@@ -1766,6 +1866,9 @@ static void* rvvm_user_thread_wrap(void* arg)
             rvvm_info("  nr=%ld -> %lx", a7, a0);
             rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 10, a0);
             rvvm_write_cpu_reg(cpu, RVVM_REGID_PC, rvvm_read_cpu_reg(cpu, RVVM_REGID_PC) + 4);
+        } else if (atomic_load_uint32(&thread->finished)) {
+            // Hart was paused by userland shutdown - exit quietly
+            break;
         } else {
             // Boom!
             rvvm_warn("Exception %lx (tval %lx) at PC %lx, SP %lx",
@@ -1825,6 +1928,8 @@ static void* rvvm_user_thread_wrap(void* arg)
         rvvm_sys_futex(thread->child_cleartid, UAPI_FUTEX_WAKE, 1, 0, NULL, 0);
     }
 
+    userland_thread_unregister(thread);
+
     rvvm_free_user_thread(cpu);
     free(thread);
     return NULL;
@@ -1856,15 +1961,26 @@ static void jump_start(void* entry, void* stack_top)
     );
 #else
     userland = rvvm_create_userland("rv64");
+    atomic_store_uint32(&userland_exit_reported, 0);
+
     rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
     thread->cpu = rvvm_create_user_thread(userland);
+    userland_main_thread = thread;
 
     rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_X0 + 2, (size_t)stack_top);
     rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_PC,     (size_t)entry);
 
     rvvm_user_thread_wrap(thread);
+    userland_main_thread = NULL;
 
-    rvvm_free_machine(userland);
+    /* Guest threads wind down asynchronously: wait for them to leave
+     * the machine before freeing it. On timeout, leak the machine
+     * instead of leaving a running vCPU on freed memory. */
+    if (userland_threads_gone(1000)) {
+        rvvm_free_machine(userland);
+    } else {
+        rvvm_warn("Guest threads linger after exit, leaking userland machine");
+    }
 #endif
 }
 
@@ -2033,6 +2149,23 @@ int rvvm_user_linux(int argc, char** argv, char** envp)
     if (env_prefix) {
         prefix_path = env_prefix[0] ? env_prefix : NULL;
     }
+
+    /* Launcher-style hosts call rvvm_user_linux() multiple times in one
+     * process. Reset the per-launch state left by the previous guest:
+     *  - a stale elf/interp .base makes elf_load_file() take the objcopy
+     *    path (no fresh mapping, entry relocated wrongly -> jump into the
+     *    NULL page), and the old image blocks the next fixed VMA mapping;
+     *  - brk_ptr still points at the previous guest's heap end;
+     *  - siga[] carries the previous guest's signal dispositions. */
+    elf_unload_file(&elf);
+    elf_unload_file(&interp);
+    memset(siga, 0, sizeof(siga));
+    spin_lock(&brk_lock);
+    if (brk_buffer) {
+        brk_ptr = brk_buffer;
+    }
+    spin_unlock(&brk_lock);
+
     stacktrace_init();
     user_fault_handler_install();
     

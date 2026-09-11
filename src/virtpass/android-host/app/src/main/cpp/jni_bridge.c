@@ -1220,11 +1220,15 @@ Java_com_rvvm_android_RvvmNative_nativeStopGuest(JNIEnv* env, jobject thiz)
     }
 }
 
-/* C callback invoked by rvvm_user when the guest exits */
+/* C callback invoked by rvvm_user when the guest exits.
+ * NOTE: g_guest_running is NOT cleared here - the guest native thread is
+ * still winding down (rvvm_user_linux has not returned yet). guest_thread_func
+ * clears it after rvvm_user_linux() returns, keeping the "running" state in
+ * sync with the actual thread and preventing a premature re-Run from starting
+ * a second userland over the existing one. */
 static void on_guest_exit(int exit_code)
 {
     LOGI("Guest exited with code: %d", exit_code);
-    g_guest_running = 0;
 
     if (g_exit_listener) {
         JNIEnv* env = NULL;

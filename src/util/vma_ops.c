@@ -233,6 +233,12 @@ size_t vma_page_size(void)
     return host_pagesize;
 }
 
+size_t vma_alloc_granularity(void)
+{
+    vma_page_size_init();
+    return host_granularity;
+}
+
 static size_t vma_granularity(void)
 {
     vma_page_size_init();

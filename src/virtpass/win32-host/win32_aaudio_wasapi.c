@@ -7,9 +7,6 @@
  * No pump threads, no shared ring buffer.
  */
 
-#include "rvvm.h"
-#include "riscv.h"
-#include "rvvm_types.h"
 #include "virtpass/vp_audio_ringbuf.h"
 #include "virtpass/vp_cmdpost.h"
 
@@ -18,6 +15,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+
+/* The MinGW WIDL headers (mmdeviceapi.h / audioclient.h) only emit the COM
+ * interface helper functions (IMMDeviceEnumerator_*, IAudio*Client_*) behind
+ * COBJMACROS. WIDL_C_INLINE_WRAPPERS picks the static-inline wrapper form
+ * instead of pollution-heavy object macros. Must be set before the headers. */
+#define COBJMACROS 1
+#define WIDL_C_INLINE_WRAPPERS 1
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <avrt.h>
@@ -59,109 +63,11 @@ static void com_unload(void)
 #define wasapi_log(...) fprintf(stderr, "[WASAPI] " __VA_ARGS__)
 
 /* ============================================================
- * COM vtable wrappers (avoids #including x64 headers)
+ * COM vtable wrappers (deliberately NOT defined here: system headers
+ * mmdeviceapi.h / audioclient.h already provide IMMDevice*Vtbl and every
+ * IAudio*Client method macro used below. A hand-rolled duplicate previously
+ * collided with them (redefinition), so just rely on the system ones.)
  * ============================================================ */
-typedef struct IMMDeviceEnumeratorVtbl {
-    HRESULT (WINAPI *QueryInterface)(void*,REFIID,void**);
-    ULONG   (WINAPI *AddRef)(void*);
-    ULONG   (WINAPI *Release)(void*);
-    HRESULT (WINAPI *EnumAudioEndpoints)(void*,EDataFlow,DWORD,void**);
-    HRESULT (WINAPI *GetDefaultAudioEndpoint)(void*,EDataFlow,ERole,void**);
-} IMMDeviceEnumeratorVtbl;
-
-typedef struct IMMDeviceVtbl {
-    HRESULT (WINAPI *QueryInterface)(void*,REFIID,void**);
-    ULONG   (WINAPI *AddRef)(void*);
-    ULONG   (WINAPI *Release)(void*);
-    HRESULT (WINAPI *Activate)(void*,REFIID,DWORD,PROPVARIANT,void**);
-    HRESULT (WINAPI *OpenPropertyStore)(void*,DWORD,void**);
-    HRESULT (WINAPI *GetId)(void*,LPWSTR*);
-    HRESULT (WINAPI *GetState)(void*,DWORD*);
-} IMMDeviceVtbl;
-
-typedef struct IAudioClientVtbl {
-    HRESULT (WINAPI *QueryInterface)(void*,REFIID,void**);
-    ULONG   (WINAPI *AddRef)(void*);
-    ULONG   (WINAPI *Release)(void*);
-    HRESULT (WINAPI *Initialize)(void*,AUDCLNT_SHAREMODE,DWORD,REFERENCE_TIME,REFERENCE_TIME,const WAVEFORMATEX*,void*);
-    HRESULT (WINAPI *GetBufferFormat)(void*,WAVEFORMATEX**);
-    HRESULT (WINAPI *GetMixFormat)(void*,WAVEFORMATEX**);
-    HRESULT (WINAPI *GetDevicePeriod)(void*,REFERENCE_TIME*,REFERENCE_TIME*);
-    HRESULT (WINAPI *Start)(void*);
-    HRESULT (WINAPI *Stop)(void*);
-    HRESULT (WINAPI *Reset)(void*);
-    HRESULT (WINAPI *SetEventHandle)(void*,HANDLE);
-    HRESULT (WINAPI *GetService)(void*,REFIID,void**);
-} IAudioClientVtbl;
-
-typedef struct IAudioRenderClientVtbl {
-    HRESULT (WINAPI *QueryInterface)(void*,REFIID,void**);
-    ULONG   (WINAPI *AddRef)(void*);
-    ULONG   (WINAPI *Release)(void*);
-    HRESULT (WINAPI *GetBuffer)(void*,UINT32,BYTE**);
-    HRESULT (WINAPI *ReleaseBuffer)(void*,UINT32,DWORD);
-    HRESULT (WINAPI *GetPadding)(void*,UINT32*);
-    HRESULT (WINAPI *GetCurrentPadding)(void*,UINT32*);
-    HRESULT (WINAPI *IsFormatSupported)(void*,AUDCLNT_SHAREMODE,WAVEFORMATEX*,WAVEFORMATEX**);
-    HRESULT (WINAPI *GetMixFormat)(void*,WAVEFORMATEX**);
-    HRESULT (WINAPI *GetDevicePeriod)(void*,REFERENCE_TIME*,REFERENCE_TIME*);
-    HRESULT (WINAPI *Start)(void*);
-    HRESULT (WINAPI *Stop)(void*);
-    HRESULT (WINAPI *Reset)(void*);
-} IAudioRenderClientVtbl;
-
-typedef struct IAudioCaptureClientVtbl {
-    HRESULT (WINAPI *QueryInterface)(void*,REFIID,void**);
-    ULONG   (WINAPI *AddRef)(void*);
-    ULONG   (WINAPI *Release)(void*);
-    HRESULT (WINAPI *GetBuffer)(void*,BYTE**,UINT32*,DWORD*,UINT64*,UINT64*);
-    HRESULT (WINAPI *ReleaseBuffer)(void*,UINT32);
-    HRESULT (WINAPI *GetNextPacketSize)(void*,UINT32*);
-} IAudioCaptureClientVtbl;
-
-typedef struct IAudioClockVtbl {
-    HRESULT (WINAPI *QueryInterface)(void*,REFIID,void**);
-    ULONG   (WINAPI *AddRef)(void*);
-    ULONG   (WINAPI *Release)(void*);
-    HRESULT (WINAPI *GetFrequency)(void*,UINT64*);
-    HRESULT (WINAPI *GetPosition)(void*,UINT64*,UINT64*);
-    HRESULT (WINAPI *GetCharacteristics)(void*,DWORD*);
-} IAudioClockVtbl;
-
-#define IMMDeviceEnumerator_QueryInterface(e,i,p)      ((IMMDeviceEnumeratorVtbl*)(e))->QueryInterface(e,i,p)
-#define IMMDeviceEnumerator_AddRef(e)                  ((IMMDeviceEnumeratorVtbl*)(e))->AddRef(e)
-#define IMMDeviceEnumerator_Release(e)                 ((IMMDeviceEnumeratorVtbl*)(e))->Release(e)
-#define IMMDeviceEnumerator_GetDefaultAudioEndpoint(e,f,r,p) ((IMMDeviceEnumeratorVtbl*)(e))->GetDefaultAudioEndpoint(e,f,r,p)
-
-#define IMMDevice_QueryInterface(e,i,p)  ((IMMDeviceVtbl*)(e))->QueryInterface(e,i,p)
-#define IMMDevice_AddRef(e)              ((IMMDeviceVtbl*)(e))->AddRef(e)
-#define IMMDevice_Release(e)             ((IMMDeviceVtbl*)(e))->Release(e)
-#define IMMDevice_Activate(e,i,d,v,p)    ((IMMDeviceVtbl*)(e))->Activate(e,i,d,v,p)
-
-#define IAudioClient_QueryInterface(c,i,p)  ((IAudioClientVtbl*)(c))->QueryInterface(c,i,p)
-#define IAudioClient_AddRef(c)              ((IAudioClientVtbl*)(c))->AddRef(c)
-#define IAudioClient_Release(c)             ((IAudioClientVtbl*)(c))->Release(c)
-#define IAudioClient_Initialize(c,m,f,d,b,f2,p) ((IAudioClientVtbl*)(c))->Initialize(c,m,f,d,b,f2,p)
-#define IAudioClient_Start(c)               ((IAudioClientVtbl*)(c))->Start(c)
-#define IAudioClient_Stop(c)                ((IAudioClientVtbl*)(c))->Stop(c)
-#define IAudioClient_Reset(c)               ((IAudioClientVtbl*)(c))->Reset(c)
-#define IAudioClient_SetEventHandle(c,h)    ((IAudioClientVtbl*)(c))->SetEventHandle(c,h)
-#define IAudioClient_GetService(c,i,p)      ((IAudioClientVtbl*)(c))->GetService(c,i,p)
-#define IAudioClient_GetBufferSize(c,p)     ((IAudioClientVtbl*)(c))->GetBufferSize(c,p)
-
-#define IAudioRenderClient_Release(r)         ((IAudioRenderClientVtbl*)(r))->Release(r)
-#define IAudioRenderClient_GetBuffer(r,n,b)   ((IAudioRenderClientVtbl*)(r))->GetBuffer(r,n,b)
-#define IAudioRenderClient_ReleaseBuffer(r,n,f) ((IAudioRenderClientVtbl*)(r))->ReleaseBuffer(r,n,f)
-#define IAudioRenderClient_GetCurrentPadding(r,p) ((IAudioRenderClientVtbl*)(r))->GetCurrentPadding(r,p)
-
-#define IAudioCaptureClient_Release(c)              ((IAudioCaptureClientVtbl*)(c))->Release(c)
-#define IAudioCaptureClient_GetBuffer(c,b,n,f,t,t2) ((IAudioCaptureClientVtbl*)(c))->GetBuffer(c,b,n,f,t,t2)
-#define IAudioCaptureClient_ReleaseBuffer(c,n)      ((IAudioCaptureClientVtbl*)(c))->ReleaseBuffer(c,n)
-#define IAudioCaptureClient_GetNextPacketSize(c,p)  ((IAudioCaptureClientVtbl*)(c))->GetNextPacketSize(c,p)
-
-#define IAudioClock_Release(cl)          ((IAudioClockVtbl*)(cl))->Release(cl)
-#define IAudioClock_GetFrequency(cl,f)   ((IAudioClockVtbl*)(cl))->GetFrequency(cl,f)
-#define IAudioClock_GetPosition(cl,p,q)  ((IAudioClockVtbl*)(cl))->GetPosition(cl,p,q)
 
 /* Well-known GUIDs */
 static const GUID IID_CLSID_MMDeviceEnumerator = {

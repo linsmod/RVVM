@@ -25,9 +25,20 @@ typedef struct {
     char*  interp_path;
     size_t phdr;
     size_t phnum;
+
+    // Mapping extent allocated by elf_load_file() in userland mode (rounded
+    // to the OS allocation granularity); zero in objcopy mode.
+    // Released by elf_unload_file().
+    size_t map_size;
 } elf_desc_t;
 
 bool elf_load_file(rvfile_t* file, elf_desc_t* elf);
+
+// Release the mapping made by a previous elf_load_file() userland load and
+// reset the descriptor. Required before re-loading into the same descriptor:
+// a stale elf->base makes elf_load_file() take the objcopy path and produces
+// a wrongly relocated entry.
+void elf_unload_file(elf_desc_t* elf);
 
 bool bin_objcopy(rvfile_t* file, void* buffer, size_t size, bool try_elf);
 

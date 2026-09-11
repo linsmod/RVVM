@@ -37,7 +37,19 @@
  * Returns false on failure (window creation error).
  */
 bool win32_host_init(const char* title, int win_w, int win_h,
-                     int virt_w, int virt_h, int virt_ppi);
+                     int virt_w, int virt_h, int virt_ppi, bool launcher);
+
+/*
+ * Enable the Android-style picker (launcher): a dropdown listing the guest
+ * programs found in assets_dir plus Run / Stop / Exit buttons. When idle
+ * (no guest running) the picker is shown; Run boots the selected guest into
+ * the existing window and Stop requests a graceful teardown. When a guest
+ * exits for any reason the picker is re-shown instead of closing the window.
+ *
+ * Call after win32_host_init() and before win32_host_message_loop(). Pass
+ * NULL for assets_dir to scan the current directory.
+ */
+bool win32_host_set_launcher(const char* assets_dir);
 
 /*
  * Launch the guest Linux ELF (argv[0] = ELF path, argv[1..] = guest args)

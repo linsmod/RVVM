@@ -32,6 +32,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // Get host page size
 size_t vma_page_size(void);
 
+// Get host allocation granularity (RESERVE size rounding on Windows)
+size_t vma_alloc_granularity(void);
+
 // Create anonymous memory-backed FD (POSIX only!)
 int vma_anon_memfd(size_t size);
 

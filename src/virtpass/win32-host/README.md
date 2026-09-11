@@ -74,7 +74,7 @@ Win32 message mapping:
 | `APP_CMD_WINDOW_RESIZED` | `WM_SIZE` |
 | `APP_CMD_PAUSE / STOP / DESTROY` | `WM_CLOSE` |
 | `APP_CMD_TERM_WINDOW` | `WM_DESTROY` |
-| guest exit | `WM_APP_GUEST_EXIT` -> teardown lifecycle + host exits with the guest's code |
+| guest exit | `sys_exit`/`sys_exit_group` -> `host_guest_exit_cb()` (rvvm exit callback) records the code; once the guest thread unwinds, `WM_APP_GUEST_EXIT` -> teardown lifecycle + launcher returns to the picker (host mode exits with the guest's code). The callback must stay registered: rvvm_user.c otherwise `_Exit()`s the whole process from the guest thread |
 | `AMOTION_EVENT_ACTION_DOWN/MOVE/UP` | `WM_LBUTTONDOWN / WM_MOUSEMOVE(+MK_LBUTTON) / WM_LBUTTONUP`, client coords mapped to surface coords |
 | key events | `WM_KEYDOWN / WM_KEYUP` (logged; VK->AKEYCODE mapping + key-event queueing is future work) |
 
@@ -113,7 +113,30 @@ Build the guests first (`mingw32-make android-assets`, zig/musl - see
 ```powershell
 .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
     src\virtpass\android-host\app\src\main\assets\test_render.exe
+
+.\release.windows.x86_64\rvvm_winhost_x86_64.exe --help   # options + environment
 ```
+
+### Launcher (Android-style picker)
+
+Run with **no guest argument** and the host shows a picker instead: a dropdown
+listing the `.exe` guests found in the assets directory plus **Run / Stop /
+Exit** buttons. `--assets <dir>` (or `RVVM_ASSETS`) points at that directory;
+the default is `src\virtpass\android-host\app\src\main\assets`. Known sample
+names are used as a fallback when the directory is missing or empty.
+
+```powershell
+.\release.windows.x86_64\rvvm_winhost_x86_64.exe                # picker
+.\release.windows.x86_64\rvvm_winhost_x86_64.exe --assets D:\guests
+```
+
+- **Run** boots the selected guest into the existing window (it also sends
+  the Android startup lifecycle). When the guest exits, the picker is
+  re-shown in the same window so another guest can be run.
+- **Stop** is a cooperative stop: it queues the Android teardown
+  (`PAUSE`/`STOP`/`DESTROY`) so a well-behaved guest tears down and exits on
+  its own. The guest thread cannot be force-killed safely, so a guest that
+  ignores lifecycle commands will not stop.
 
 Debug switches:
 

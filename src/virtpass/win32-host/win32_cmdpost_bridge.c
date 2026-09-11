@@ -27,7 +27,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <io.h>  /* _access(): launcher guest-existence check */
 
+#include "win32_cmdpost_bridge.h" /* self-protypes for forward refs (launcher) */
 #include "virtpass/vp_cmdpost.h"  /* single copy lives in src/virtpass */
 #include "core/rvvm_user.h"       /* rvvm_user_linux() guest entry point */
 #include "virtpass/vp_android.h"  /* guest ABI constants: APP_CMD_*, WINDOW_FORMAT_*, ASENSOR_TYPE_* */
@@ -39,6 +41,12 @@
 #define WM_APP_RESIZE_TO_SURFACE (WM_APP + 2)
 #define SENSOR_TIMER_ID   1
 #define SENSOR_TIMER_MS   100
+
+/* Launcher (Android-style picker) child control IDs. */
+#define IDC_COMBO 101
+#define IDC_RUN   102
+#define IDC_STOP  103
+#define IDC_EXIT  104
 
 /* How long win32_host_shutdown() waits for the guest thread to unwind. Kept
  * below the ~5s budget Windows grants a CTRL_CLOSE_EVENT handler so a
@@ -89,6 +97,9 @@ static bool g_light_on = false;  /* handle 3 */
 static HANDLE g_guest_thread = NULL;
 static int    g_guest_argc   = 0;
 static char** g_guest_argv   = NULL;
+/* Guest exit code. Written on the guest thread: host_guest_exit_cb() stores
+ * the real code at sys_exit time, guest_thread_main() may overwrite it with
+ * the rvvm_user_linux() error code if the guest never started. */
 static int    g_guest_rc     = -1;
 
 /* Visibility edge (Android foreground/background). true while the OS window is
@@ -96,6 +107,34 @@ static int    g_guest_rc     = -1;
  * START/RESUME only on the reverse edge, so the lifecycle commands are never
  * spammed by the stream of WM_SIZE messages. */
 static bool   g_minimized    = false;
+
+/* ------------------------------------------------------------------ */
+/* Launcher (Android-style picker) state                               */
+/* ------------------------------------------------------------------ */
+
+#define MAX_GUESTS      64
+#define MAX_GUEST_NAME  96
+#define LAUNCH_MARGIN   16
+#define LAUNCH_CTRL_H   28
+#define LAUNCH_CTRL_GAP  8
+
+/* Known sample guests; used when the assets directory holds no .exe files
+ * (e.g. the assets haven't been built yet). */
+static const char* LAUNCHER_DEFAULT_GUESTS[] = {
+    "test_render", "test_game_activity", "test_sensor_guest",
+    "test_render_gles", "test_audio",
+};
+
+static char g_assets_dir[MAX_PATH] = ".";
+static char g_guest_names[MAX_GUESTS][MAX_GUEST_NAME];
+static int  g_guest_count   = 0;
+static bool g_launcher      = false; /* launcher UI enabled (only when no
+                                        guest is given on the command line) */
+static bool g_launcher_idle = false; /* picker shown, no guest running */
+static HWND g_combo     = NULL;      /* guest dropdown        */
+static HWND g_btn_run   = NULL;      /* Run  button           */
+static HWND g_btn_stop  = NULL;      /* Stop button           */
+static HWND g_btn_exit  = NULL;      /* Exit button           */
 
 /* Off-screen composition surface for WM_PAINT. The whole client area is
  * composed here (black letterbox + uniformly scaled panel + boundary frame)
@@ -781,6 +820,12 @@ static void set_title(const char* suffix)
 /* Window procedure                                                    */
 /* ------------------------------------------------------------------ */
 
+/* Launcher helpers are defined further down (Public API section) but win_proc
+ * calls them from WM_COMMAND / WM_APP_GUEST_EXIT. Forward declarations. */
+static void launcher_ui_idle(void);
+static void launcher_launch(void);
+static void launcher_stop(void);
+
 static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -795,12 +840,28 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
      * surface, which shows up as the window visibly flashing.
      */
     case WM_CREATE:
-        /* Android GameActivity startup order */
-        queue_lifecycle(APP_CMD_START);
-        queue_lifecycle(APP_CMD_INIT_WINDOW);
-        queue_lifecycle(APP_CMD_RESUME);
-        queue_lifecycle(APP_CMD_GAINED_FOCUS);
+        /* Android GameActivity startup order. Skipped while the launcher is
+         * idle - there is no guest to consume them yet; the launcher queues
+         * them when it boots a guest. */
+        if (!g_launcher) {
+            queue_lifecycle(APP_CMD_START);
+            queue_lifecycle(APP_CMD_INIT_WINDOW);
+            queue_lifecycle(APP_CMD_RESUME);
+            queue_lifecycle(APP_CMD_GAINED_FOCUS);
+        }
         return 0;
+
+    case WM_COMMAND:
+        /* Launcher child controls (dropdown / buttons) notify their parent
+         * window via WM_COMMAND. Ignored when not in launcher mode. */
+        if (!g_launcher) return DefWindowProcA(hwnd, msg, wParam, lParam);
+        switch (LOWORD(wParam)) {
+        case IDC_RUN:  launcher_launch();       return 0;
+        case IDC_STOP: launcher_stop();         return 0;
+        case IDC_EXIT: PostMessageA(hwnd, WM_CLOSE, 0, 0); return 0;
+        default: break;
+        }
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
 
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -808,6 +869,33 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         RECT rc;
         HDC cdc;
         GetClientRect(hwnd, &rc);
+
+        /* Launcher idle view: no guest is running, so instead of the guest
+         * panel paint an opaque background behind the picker controls. Child
+         * controls (combo + buttons) are separate windows drawn on top. */
+        if (g_launcher_idle) {
+            RECT t = rc;
+            HBRUSH bg = CreateSolidBrush(RGB(16, 16, 24));
+            HPEN   br = CreatePen(PS_SOLID, 0, RGB(90, 90, 110));
+            HGDIOBJ ob, op;
+            t.top += LAUNCH_MARGIN;
+            t.bottom = t.top + 24;
+            FillRect(wdc, &rc, bg);
+            DeleteObject(bg);
+            SetBkMode(wdc, TRANSPARENT);
+            SetTextColor(wdc, RGB(240, 240, 240));
+            DrawTextA(wdc, "RVVM WinHost - pick a guest, then Run", -1,
+                      &t, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            op = SelectObject(wdc, br);
+            ob = SelectObject(wdc, (HGDIOBJ)GetStockObject(NULL_BRUSH));
+            Rectangle(wdc, 0, 0, rc.right, rc.bottom);
+            SelectObject(wdc, ob);
+            SelectObject(wdc, op);
+            DeleteObject(br);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
         EnterCriticalSection(&g_surf_cs);
         /* Compose the whole client area off-screen and blit it in one pass.
          * Filling the background and then drawing the panel directly onto the
@@ -940,14 +1028,34 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
 
     case WM_APP_GUEST_EXIT:
-        set_title(g_guest_rc == 0 ? "guest exited (0)" : "guest exited");
+        /* Release the finished guest thread handle: launcher_launch() guards
+         * on g_guest_thread, so keeping it would silently block the next Run
+         * in the picker. The thread has posted its final message and only
+         * unwinds from here, which does not need our handle. */
+        if (g_guest_thread) {
+            CloseHandle(g_guest_thread);
+            g_guest_thread = NULL;
+        }
+        {
+            char title[48];
+            snprintf(title, sizeof(title), "guest exited (%d)", g_guest_rc);
+            set_title(title);
+        }
         winhost_log("guest exited with code %d", g_guest_rc);
-        /* Guest is gone: no one will poll lifecycle cmds anymore, and the
-         * host has no reason to keep running. Tear down the same way as
-         * WM_CLOSE (Android teardown order) and quit the message loop. */
+        /* Guest is gone: no one will poll lifecycle cmds anymore. Tear down
+         * the same way as WM_CLOSE (Android teardown order). */
         queue_lifecycle(APP_CMD_PAUSE);
         queue_lifecycle(APP_CMD_STOP);
         queue_lifecycle(APP_CMD_DESTROY);
+        if (g_launcher) {
+            /* Launcher mode: do NOT close the window. Reset the guest-owned
+             * surface and re-show the picker so another guest can be booted
+             * in the same window. */
+            launcher_ui_idle();
+            return 0;
+        }
+        /* Non-launcher mode: the host has no reason to keep running - quit
+         * the message loop like WM_CLOSE. */
         DestroyWindow(hwnd);
         return 0;
 
@@ -1015,6 +1123,25 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
 /* Guest thread                                                        */
 /* ------------------------------------------------------------------ */
 
+/* rvvm exit hook (rvvm_user_set_exit_callback). Fires on the guest vCPU
+ * thread the instant the guest calls sys_exit / sys_exit_group, while
+ * rvvm_user_linux() is still unwinding the other vCPUs - so this must not
+ * touch cmdpost, the surface or the window; the ordered teardown runs later
+ * in WM_APP_GUEST_EXIT.
+ *
+ * Registering it is load-bearing: with no callback registered, rvvm_user.c
+ * falls back to _Exit(exit_code) inside the syscall path, which terminates
+ * the whole WinHost process from the guest thread - guest_thread_main would
+ * never post WM_APP_GUEST_EXIT and the launcher could never return to the
+ * picker (and Stop would take the window down with the guest). */
+static void host_guest_exit_cb(int exit_code)
+{
+    /* rvvm_user_linux() itself always returns 0 on a guest-driven exit, so
+     * this callback is the only source of the real exit code. */
+    g_guest_rc = exit_code;
+    winhost_log("guest exit callback: code %d", exit_code);
+}
+
 static DWORD WINAPI guest_thread_main(LPVOID arg)
 {
     static char* envp[] = { NULL };
@@ -1024,7 +1151,15 @@ static DWORD WINAPI guest_thread_main(LPVOID arg)
     /* Same pattern as jni_bridge.c: assets resolve relative to CWD */
     putenv(env_prefix);
 
-    g_guest_rc = rvvm_user_linux(g_guest_argc, g_guest_argv, envp);
+    {
+        int rc = rvvm_user_linux(g_guest_argc, g_guest_argv, envp);
+        /* 0 = guest-driven exit: host_guest_exit_cb() already recorded the
+         * real exit code. Nonzero = the guest never started (ELF load
+         * failure), the callback never fired, so propagate the error. */
+        if (rc != 0) {
+            g_guest_rc = rc;
+        }
+    }
 
     if (g_guest_argv) {
         int i;
@@ -1042,11 +1177,200 @@ static DWORD WINAPI guest_thread_main(LPVOID arg)
 /* Public API                                                          */
 /* ------------------------------------------------------------------ */
 
+static void launcher_scan_guests(void)
+{
+    char pattern[MAX_PATH + 4];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    int n = 0;
+
+    g_guest_count = 0;
+
+    snprintf(pattern, sizeof(pattern), "%s\\*.exe", g_assets_dir);
+    h = FindFirstFileA(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            char* ext = strrchr(fd.cFileName, '.');
+            if (ext) *ext = '\0';               /* strip ".exe" */
+            if (fd.cFileName[0] != '\0' && n < MAX_GUESTS) {
+                snprintf(g_guest_names[n], MAX_GUEST_NAME, "%s", fd.cFileName);
+                n++;
+            }
+        } while (FindNextFileA(h, &fd) && n < MAX_GUESTS);
+        FindClose(h);
+    }
+
+    /* Missing/empty assets dir: fall back to the known sample names so the
+     * picker is usable even before the guest assets have been built. */
+    if (n == 0) {
+        size_t n_def = sizeof(LAUNCHER_DEFAULT_GUESTS) / sizeof(LAUNCHER_DEFAULT_GUESTS[0]);
+        for (n = 0; n < (int)n_def && n < MAX_GUESTS; n++) {
+            snprintf(g_guest_names[n], MAX_GUEST_NAME, "%s", LAUNCHER_DEFAULT_GUESTS[n]);
+        }
+    }
+    g_guest_count = n;
+    winhost_log("launcher: %d guest(s) in %s", g_guest_count, g_assets_dir);
+}
+
+/* Create the dropdown + Run/Stop/Exit buttons as children of the host window. */
+static void launcher_ui_create(void)
+{
+    int i;
+    HMODULE hinst = GetModuleHandleA(NULL);
+
+    if (g_combo || !g_hwnd) return;
+    if (g_guest_count == 0) launcher_scan_guests();
+
+    g_combo = CreateWindowA("COMBOBOX", "",
+                            WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST,
+                            LAUNCH_MARGIN, LAUNCH_MARGIN, 260, 22,
+                            g_hwnd, (HMENU)(INT_PTR)IDC_COMBO, hinst, NULL);
+    if (g_combo) {
+        for (i = 0; i < g_guest_count; i++) {
+            SendMessageA(g_combo, CB_ADDSTRING, 0, (LPARAM)(LPCTSTR)g_guest_names[i]);
+        }
+        SendMessageA(g_combo, CB_SETCURSEL, 0, 0);
+    }
+
+    g_btn_run  = CreateWindowA("BUTTON", "Run",
+                               WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                               LAUNCH_MARGIN, LAUNCH_MARGIN + 22 + LAUNCH_CTRL_GAP, 80, LAUNCH_CTRL_H,
+                               g_hwnd, (HMENU)(INT_PTR)IDC_RUN, hinst, NULL);
+    g_btn_stop = CreateWindowA("BUTTON", "Stop",
+                               WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                               LAUNCH_MARGIN + 88,   LAUNCH_MARGIN + 22 + LAUNCH_CTRL_GAP, 80, LAUNCH_CTRL_H,
+                               g_hwnd, (HMENU)(INT_PTR)IDC_STOP, hinst, NULL);
+    g_btn_exit = CreateWindowA("BUTTON", "Exit",
+                               WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                               LAUNCH_MARGIN + 176,  LAUNCH_MARGIN + 22 + LAUNCH_CTRL_GAP, 80, LAUNCH_CTRL_H,
+                               g_hwnd, (HMENU)(INT_PTR)IDC_EXIT, hinst, NULL);
+}
+
+/* Enter the guest-running view: hide the picker controls and arm the frame
+ * clock (it is stopped while the launcher is idle). */
+static void launcher_ui_running(void)
+{
+    g_launcher_idle = false;
+    if (g_combo)    ShowWindow(g_combo, SW_HIDE);
+    if (g_btn_run)  ShowWindow(g_btn_run, SW_HIDE);
+    if (g_btn_stop) ShowWindow(g_btn_stop, SW_HIDE);
+    if (g_btn_exit) ShowWindow(g_btn_exit, SW_HIDE);
+    vsync_clock_start();
+}
+
+/* Back to the picker: re-show the controls, reset the surface so the next
+ * guest starts on a clean panel, and stop the frame clock while idle. */
+static void launcher_ui_idle(void)
+{
+    if (g_combo)    { SendMessageA(g_combo, CB_SETCURSEL, 0, 0); ShowWindow(g_combo, SW_SHOW); }
+    if (g_btn_run)  ShowWindow(g_btn_run, SW_SHOW);
+    if (g_btn_stop) ShowWindow(g_btn_stop, SW_SHOW);
+    if (g_btn_exit) ShowWindow(g_btn_exit, SW_SHOW);
+
+    EnterCriticalSection(&g_surf_cs);
+    surf_recreate_locked(g_init_w, g_init_h);
+    g_surf_w = g_init_w;
+    g_surf_h = g_init_h;
+    LeaveCriticalSection(&g_surf_cs);
+
+    vsync_clock_stop();
+
+    g_launcher_idle = true;
+    if (g_hwnd) { InvalidateRect(g_hwnd, NULL, TRUE); set_title("launcher"); }
+}
+
+bool win32_host_set_launcher(const char* assets_dir)
+{
+    if (assets_dir && *assets_dir) {
+        snprintf(g_assets_dir, sizeof(g_assets_dir), "%s", assets_dir);
+    }
+    g_launcher = true;
+    launcher_scan_guests();
+    launcher_ui_create();
+    launcher_ui_idle();
+    return true;
+}
+
+/* Boot the selected guest into the existing window. Runs on the UI thread
+ * (button click handler). */
+static void launcher_launch(void)
+{
+    char path[MAX_PATH + 96];
+    char* argv[1];
+    int sel;
+
+    if (g_guest_thread || g_guest_count <= 0 || !g_combo) return;
+    sel = (int)SendMessageA(g_combo, CB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= g_guest_count) return;
+
+    snprintf(path, sizeof(path), "%s\\%s.exe", g_assets_dir, g_guest_names[sel]);
+    if (_access(path, 0) != 0) {
+        winhost_log("launcher: guest not found: %s", path);
+        return;
+    }
+
+    /* Android GameActivity startup sequence. The WM_CREATE path is skipped
+     * while the launcher is idle, so it is queued here - before the guest
+     * thread starts, so the guest finds it on its first poll. */
+    queue_lifecycle(APP_CMD_START);
+    queue_lifecycle(APP_CMD_INIT_WINDOW);
+    queue_lifecycle(APP_CMD_RESUME);
+    queue_lifecycle(APP_CMD_GAINED_FOCUS);
+
+    argv[0] = path;
+    if (win32_host_start_guest(1, argv)) {
+        winhost_log("launcher: starting %s", g_guest_names[sel]);
+        launcher_ui_running();
+    }
+}
+
+/* Stop the running guest. The guest thread cannot be force-killed safely, so
+ * this is a cooperative stop: queue the Android teardown and let the guest
+ * exit on its own (WM_APP_GUEST_EXIT then returns us to the picker). */
+static void launcher_stop(void)
+{
+    if (!g_guest_thread) return;
+    queue_lifecycle(APP_CMD_PAUSE);
+    queue_lifecycle(APP_CMD_STOP);
+    queue_lifecycle(APP_CMD_DESTROY);
+    winhost_log("Stop requested: teardown lifecycle queued");
+}
+
+/* (Re)register every host-side cmdpost callback. Done once at init and again
+ * before each launch: rvvm_user.c's guest exit path calls cmdpost_cleanup(),
+ * which NULLs all callbacks and drops the AAudio backend - a relaunched guest
+ * would probe a dead proxy (AAUDIO_QUERY -> 0 caps) and exit(1) before ever
+ * reaching main(). Runs on the UI thread before the guest thread exists, so
+ * there is no race with in-flight guest dispatches. */
+static void win32_cmdpost_register_callbacks(void)
+{
+    cmdpost_set_sensor_callbacks(on_sensor_init, on_sensor_enable, on_sensor_data);
+    cmdpost_set_window_callbacks(on_window_lock, on_window_unlock);
+    cmdpost_set_window_size_callback(on_window_size);
+    cmdpost_set_window_set_buf_callback(on_window_set_buf);
+    cmdpost_set_config_callback(on_config_get);
+    cmdpost_set_game_callbacks(on_game_lifecycle, on_game_input);
+    /* Phase 3: GL/EGL dispatch callbacks */
+    cmdpost_set_gl_callbacks(on_egl_dispatch, on_gl_dispatch);
+    /* Phase 4: vsync source. Registering the blocker makes the guest advertise
+     * the AChoreographer caps and, once the clock thread is up, it drives the
+     * fd-wakeup path the guest's Looper polls. */
+    cmdpost_set_choreographer_callback(on_choreographer_wait);
+    /* Phase 5: AAudio backend (WASAPI). query() reports 0 caps when no audio
+     * device exists, so every AAudio call on the guest fails gracefully. */
+    cmdpost_set_audio_callbacks(win32_aaudio_ops());
+}
+
 bool win32_host_init(const char* title, int win_w, int win_h,
-                     int virt_w, int virt_h, int virt_ppi)
+                     int virt_w, int virt_h, int virt_ppi, bool launcher)
 {
     WNDCLASSA wc;
     RECT r;
+
+    /* Set the launcher flag before the window is created: WM_CREATE fires
+     * synchronously inside CreateWindowExA and must not queue the Android
+     * startup lifecycle when there is no guest to consume it yet. */
+    g_launcher = launcher;
 
     /* Layer 2: the OS window is only a viewport, sized independently of the
      * virtual panel. */
@@ -1103,18 +1427,11 @@ bool win32_host_init(const char* title, int win_w, int win_h,
     SetTimer(g_hwnd, SENSOR_TIMER_ID, SENSOR_TIMER_MS, NULL);
 
     cmdpost_init();
-    cmdpost_set_sensor_callbacks(on_sensor_init, on_sensor_enable, on_sensor_data);
-    cmdpost_set_window_callbacks(on_window_lock, on_window_unlock);
-    cmdpost_set_window_size_callback(on_window_size);
-    cmdpost_set_window_set_buf_callback(on_window_set_buf);
-    cmdpost_set_config_callback(on_config_get);
-    cmdpost_set_game_callbacks(on_game_lifecycle, on_game_input);
-    /* Phase 3: GL/EGL dispatch callbacks */
-    cmdpost_set_gl_callbacks(on_egl_dispatch, on_gl_dispatch);
-    /* Phase 4: vsync source. Registering the blocker makes the guest advertise
-     * the AChoreographer caps and, once the clock thread is up, it drives the
-     * fd-wakeup path the guest's Looper polls. */
-    cmdpost_set_choreographer_callback(on_choreographer_wait);
+    win32_cmdpost_register_callbacks();
+    /* Guest exit: record the real exit code and route sys_exit through the
+     * graceful unwind instead of rvvm_user.c's _Exit() fallback (see
+     * host_guest_exit_cb). Same role as jni_bridge.c's on_guest_exit. */
+    rvvm_user_set_exit_callback(host_guest_exit_cb);
     vsync_clock_start();
     /* Try to load the GL backend (angle/swiftshader) */
     if (win32_gl_backend_load()) {
@@ -1122,9 +1439,6 @@ bool win32_host_init(const char* title, int win_w, int win_h,
     } else {
         winhost_log("GL backend: unavailable, fallback to CPU path");
     }
-    /* Phase 5: AAudio backend (WASAPI). query() reports 0 caps when no audio
-     * device exists, so every AAudio call on the guest fails gracefully. */
-    cmdpost_set_audio_callbacks(win32_aaudio_ops());
 
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
@@ -1136,6 +1450,12 @@ bool win32_host_start_guest(int argc, char** argv)
     int i;
 
     if (g_guest_thread) return false;
+
+    /* The previous guest's exit ran cmdpost_cleanup(), which NULLed every
+     * host-side callback (audio backend included). Restore them before the
+     * guest thread starts, or the guest probes a dead proxy and exits(1)
+     * at its first AAUDIO_QUERY. */
+    win32_cmdpost_register_callbacks();
 
     g_guest_argv = (char**)calloc((size_t)argc + 1, sizeof(char*));
     if (!g_guest_argv) return false;
