@@ -262,6 +262,74 @@ static void on_sensor_data(float x, float y, float z, int type, int64_t timestam
 /* Locked window buffer info (kept between lock and unlock) */
 static ANativeWindow_Buffer g_locked_buffer;
 
+/* The surface the buffer above came from, holding a reference taken at lock
+ * time and dropped at unlock time. The Java thread can destroy the Surface at
+ * any moment (surfaceDestroyed / surface replaced), and touching a released
+ * Surface aborts inside libgui:
+ *   FATAL: 'FORTIFY: pthread_mutex_lock called on a destroyed mutex'
+ *   #04 android::Surface::lock()
+ *   #05 android::Surface::hook_perform()
+ * so a lock()/unlockAndPost() pair must own the object it is working on for
+ * its whole duration. g_native_window itself is only ever touched under
+ * g_surf_cs. */
+static ANativeWindow* g_locked_window = NULL;
+
+/* Take a reference to the current surface, or NULL if there is none. The
+ * caller owns the reference and must ANativeWindow_release() it. This is how
+ * the guest-driven callbacks obtain the window: they must never use
+ * g_native_window directly, since it can be swapped out underneath them. */
+static ANativeWindow* surf_acquire(void)
+{
+    ANativeWindow* w;
+
+    pthread_mutex_lock(&g_surf_cs);
+    w = g_native_window;
+    if (w) {
+        ANativeWindow_acquire(w);
+    }
+    pthread_mutex_unlock(&g_surf_cs);
+
+    return w;
+}
+
+/* Per-frame chatter guard. At 60 fps the lock/unlock path used to emit four
+ * log lines per frame, which filled the logcat ring buffer in seconds and
+ * buried the crash reports. Log one line whenever the geometry changes. */
+static int32_t g_log_gw = -1, g_log_gh = -1, g_log_gf = -1;
+
+/* Set while "no window" has already been reported for the current surface. */
+static int g_no_window_logged = 0;
+
+static void log_frame_geometry(int32_t gw, int32_t gh, int32_t gf,
+                               const ANativeWindow_Buffer* buf, int32_t cols, int32_t rows)
+{
+    if (gw == g_log_gw && gh == g_log_gh && gf == g_log_gf) {
+        return;
+    }
+    g_log_gw = gw;
+    g_log_gh = gh;
+    g_log_gf = gf;
+
+    LOGI("Frame: guest %dx%d fmt=%d, surface buffer %dx%d stride=%d fmt=%d, copy %dx%d",
+         gw, gh, gf,
+         buf->width, buf->height, buf->stride, buf->format, cols, rows);
+}
+
+/* Drop the reference kept between lock and unlock. Safe to call when idle. */
+static void surf_drop_locked(void)
+{
+    ANativeWindow* w;
+
+    pthread_mutex_lock(&g_surf_cs);
+    w = g_locked_window;
+    g_locked_window = NULL;
+    pthread_mutex_unlock(&g_surf_cs);
+
+    if (w) {
+        ANativeWindow_release(w);
+    }
+}
+
 /* The buffer descriptor handed back on WINDOW_LOCK uses the shared guest-ABI
  * type cmdpost_ANativeWindow_Buffer (vp_cmdpost.h), the same one the win32 host
  * uses. Note `bits` is a 64-bit pointer here because the guest is riscv64:
@@ -276,14 +344,15 @@ static ANativeWindow_Buffer g_locked_buffer;
  * the window size and then stays put across resizes. */
 static void panel_latch_locked(void)
 {
+    ANativeWindow* win = g_native_window;
     int32_t w, h;
 
     if (g_surf_w > 0 && g_surf_h > 0) return;   /* guest already saw it */
     if (g_virt_w > 0 && g_virt_h > 0) return;   /* already latched      */
-    if (!g_native_window) return;
+    if (!win) return;
 
-    w = ANativeWindow_getWidth(g_native_window);
-    h = ANativeWindow_getHeight(g_native_window);
+    w = ANativeWindow_getWidth(win);
+    h = ANativeWindow_getHeight(win);
     if (w <= 0 || h <= 0) return;
 
     g_virt_w = w;
@@ -327,12 +396,21 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
     (void)window;
     (void)dirtyBounds;
 
-    if (!g_native_window) {
-        LOGE("Window not initialized");
+    int32_t gw, gh, gf;
+
+    /* Own the surface for the whole lock() ... unlockAndPost() pair; the Java
+     * thread may drop it right now (see g_locked_window). */
+    ANativeWindow* w = surf_acquire();
+    if (!w) {
+        /* Normal while the surface is being recreated: the host cleared the
+         * window and the guest has not drained APP_CMD_TERM_WINDOW yet. Log it
+         * once per window (not once per frame) so it cannot flood logcat. */
+        if (!g_no_window_logged) {
+            g_no_window_logged = 1;
+            LOGW("Window not initialized, frame dropped");
+        }
         return -1;
     }
-
-    int32_t gw, gh, gf;
 
     pthread_mutex_lock(&g_surf_cs);
     panel_latch_locked();
@@ -340,7 +418,7 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
     /* Push the panel geometry onto the real surface so lock() hands back a
      * buffer we can copy the guest frame into one-for-one. */
     if (g_applied_w != gw || g_applied_h != gh || g_applied_fmt != gf) {
-        if (ANativeWindow_setBuffersGeometry(g_native_window, gw, gh, gf) == 0) {
+        if (ANativeWindow_setBuffersGeometry(w, gw, gh, gf) == 0) {
             g_applied_w   = gw;
             g_applied_h   = gh;
             g_applied_fmt = gf;
@@ -351,23 +429,35 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
     ANativeWindow_Buffer buffer;
     ARect dirty;
 
-    int32_t result = ANativeWindow_lock(g_native_window, &buffer, &dirty);
-    if (result == 0) {
-        g_locked_buffer = buffer;
-        if (outBuffer) {
-            /* outBuffer points into guest memory; geometry only, bits stays 0 */
-            cmdpost_ANativeWindow_Buffer* dst = (cmdpost_ANativeWindow_Buffer*)outBuffer;
-            dst->bits   = NULL;       /* guest supplies its own buffer       */
-            dst->width  = gw;         /* guest geometry == virtual panel     */
-            dst->height = gh;
-            dst->stride = gw;         /* guest stride == panel width         */
-            dst->format = gf;
-
-            LOGI("Window locked: guest %dx%d stride=%d fmt=%d (surface %dx%d stride=%d fmt=%d)",
-                 gw, gh, gw, gf,
-                 buffer.width, buffer.height, buffer.stride, buffer.format);
-        }
+    int32_t result = ANativeWindow_lock(w, &buffer, &dirty);
+    if (result != 0) {
+        ANativeWindow_release(w);
+        return result;
     }
+
+    int32_t cols = (gw < buffer.width)  ? gw : buffer.width;
+    int32_t rows = (gh < buffer.height) ? gh : buffer.height;
+    if (cols < 0) cols = 0;
+    if (rows < 0) rows = 0;
+
+    /* Hand the reference over to on_window_unlock(). */
+    pthread_mutex_lock(&g_surf_cs);
+    g_locked_window = w;
+    g_locked_buffer = buffer;
+    pthread_mutex_unlock(&g_surf_cs);
+
+    if (outBuffer) {
+        /* outBuffer points into guest memory; geometry only, bits stays 0 */
+        cmdpost_ANativeWindow_Buffer* dst = (cmdpost_ANativeWindow_Buffer*)outBuffer;
+        dst->bits   = NULL;       /* guest supplies its own buffer       */
+        dst->width  = gw;         /* guest geometry == virtual panel     */
+        dst->height = gh;
+        dst->stride = gw;         /* guest stride == panel width         */
+        dst->format = gf;
+    }
+
+    log_frame_geometry(gw, gh, gf, &buffer, cols, rows);
+
     return result;
 }
 
@@ -377,42 +467,43 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
 {
     (void)window;
 
-    if (!g_native_window) {
-        LOGE("Window not initialized");
-        return -1;
-    }
-
     int32_t gw, gh, gf;
+    ANativeWindow_Buffer lbuf;
+    ANativeWindow* w;
 
     pthread_mutex_lock(&g_surf_cs);
     guest_geometry_locked(&gw, &gh, &gf);
+    w = g_locked_window;
+    lbuf = g_locked_buffer;
     pthread_mutex_unlock(&g_surf_cs);
 
-    if (guestPixels && g_locked_buffer.bits) {
+    if (!w) {
+        /* No lock outstanding: the surface went away between lock and unlock
+         * (that is now a clean no-op instead of a libgui abort). */
+        LOGW("Unlock without a locked window, frame dropped");
+        return -1;
+    }
+
+    if (guestPixels && lbuf.bits) {
         size_t sbpp = (gf == WINDOW_FORMAT_RGB_565) ? 2 : 4;
-        size_t dbpp = (g_locked_buffer.format == WINDOW_FORMAT_RGB_565) ? 2 : 4;
+        size_t dbpp = (lbuf.format == WINDOW_FORMAT_RGB_565) ? 2 : 4;
 
         /* Copy only what BOTH sides agree on. The guest buffer is panel-sized
          * (g_surf_w x g_surf_h); the surface buffer is whatever the platform
          * granted for the lock. Clamping here means a surface that ignored our
          * geometry can never turn this into an out-of-bounds access. */
-        int32_t cols = (gw < g_locked_buffer.width)  ? gw : g_locked_buffer.width;
-        int32_t rows = (gh < g_locked_buffer.height) ? gh : g_locked_buffer.height;
+        int32_t cols = (gw < lbuf.width)  ? gw : lbuf.width;
+        int32_t rows = (gh < lbuf.height) ? gh : lbuf.height;
         if (cols < 0) cols = 0;
         if (rows < 0) rows = 0;
 
-        size_t sstride = (size_t)gw * sbpp;                     /* guest row pitch   */
-        size_t dstride = (size_t)g_locked_buffer.stride * dbpp; /* surface row pitch */
+        size_t sstride = (size_t)gw * sbpp;             /* guest row pitch   */
+        size_t dstride = (size_t)lbuf.stride * dbpp;    /* surface row pitch */
         size_t srow    = (size_t)cols * sbpp;
         size_t drow    = (size_t)cols * dbpp;
 
-        LOGI("Unlock: panel %dx%d fmt=%d -> surface %dx%d stride=%d fmt=%d (copy %dx%d)",
-             gw, gh, gf,
-             g_locked_buffer.width, g_locked_buffer.height,
-             g_locked_buffer.stride, g_locked_buffer.format, cols, rows);
-
         uint8_t* src = (uint8_t*)guestPixels;
-        uint8_t* dst = (uint8_t*)g_locked_buffer.bits;
+        uint8_t* dst = (uint8_t*)lbuf.bits;
         if (srow == drow) {
             for (int32_t y = 0; y < rows; y++) {
                 memcpy(dst + (size_t)y * dstride, src + (size_t)y * sstride, srow);
@@ -429,20 +520,20 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
                 }
             }
         }
-        LOGI("Unlock: copy done (%d rows)", rows);
     } else {
         /* Lock succeeded but there is no frame to copy (guest pixbuf missing,
          * or the surface buffer pointer was invalidated by a window change).
          * Still post so the buffer queue keeps flowing, but make the cause
          * visible instead of silently presenting an untouched frame. */
         LOGW("Unlock: no frame copied (guestPixels=%p, surfaceBits=%p); posting untouched buffer",
-             guestPixels, g_locked_buffer.bits);
+             guestPixels, lbuf.bits);
     }
 
-    int32_t result = ANativeWindow_unlockAndPost(g_native_window);
-    if (result == 0) {
-        LOGI("Window unlocked and posted");
-    }
+    int32_t result = ANativeWindow_unlockAndPost(w);
+
+    /* Drop the reference taken in on_window_lock(). */
+    surf_drop_locked();
+
     return result;
 }
 
@@ -874,11 +965,9 @@ JNIEXPORT void JNICALL
 Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobject surface)
 {
     (void)thiz;
-    
-    /* SurfaceCreated and SurfaceChanged both hand us a surface. The guest may
-     * hold a locked buffer across that transition, so acquire the window first
-     * and, if it is the same one we already track, keep it as-is (the extra
-     * reference is dropped immediately). */
+
+    /* SurfaceCreated and SurfaceChanged both hand us a surface. Acquire it
+     * first; a NULL surface means the surface is going away. */
     ANativeWindow* new_window = NULL;
     if (surface) {
         new_window = ANativeWindow_fromSurface(env, surface);
@@ -886,35 +975,55 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
             LOGE("Failed to get native window from surface");
             return;
         }
-        if (new_window == g_native_window) {
-            ANativeWindow_release(new_window);
-            LOGI("Native window unchanged, keeping existing window");
-            return;
-        }
     }
 
-    /* A different window (or NULL) means the surface is really going away or
-     * being replaced: release the old one before adopting the new. */
-    if (g_native_window) {
-        ANativeWindow_release(g_native_window);
-        g_native_window = NULL;
-    }
+    int32_t pw, ph;
+
+    /* Swap the tracked window while holding g_surf_cs. The guest-driven
+     * callbacks take their own reference under the same mutex, so the Surface
+     * is never released while a lock()/unlockAndPost() pair is using it (that
+     * race is what aborted in Surface::lock). The old reference is dropped
+     * only after the swap, outside the critical section. */
+    pthread_mutex_lock(&g_surf_cs);
+    ANativeWindow* old_window = g_native_window;
+    g_native_window = new_window;
 
     if (new_window) {
-        g_native_window = new_window;
-
         /* Freeze the virtual panel at the first surface size we ever see. From
          * here on the surface is only a viewport: later resizes repaint, they
          * do not move the geometry the guest renders into. */
-        pthread_mutex_lock(&g_surf_cs);
         panel_latch_locked();
-        int32_t pw = g_virt_w;
-        int32_t ph = g_virt_h;
-        pthread_mutex_unlock(&g_surf_cs);
+        g_no_window_logged = 0;
+    }
+    if (old_window != new_window) {
+        /* A brand new Surface starts with the platform's default geometry:
+         * forget what we pushed so the next lock re-applies the panel size. */
+        g_applied_w   = 0;
+        g_applied_h   = 0;
+        g_applied_fmt = 0;
+    }
+    pw = g_virt_w;
+    ph = g_virt_h;
+    pthread_mutex_unlock(&g_surf_cs);
 
+    if (old_window == new_window) {
+        /* SurfaceCreated/SurfaceChanged handed us the very same surface: keep
+         * it, just drop the extra reference we took. */
+        if (new_window) {
+            ANativeWindow_release(new_window);
+            LOGI("Native window unchanged, keeping existing window");
+        }
+        return;
+    }
+
+    if (old_window) {
+        ANativeWindow_release(old_window);
+    }
+
+    if (new_window) {
         LOGI("Native window set: %dx%d (panel %dx%d)",
-             ANativeWindow_getWidth(g_native_window),
-             ANativeWindow_getHeight(g_native_window), pw, ph);
+             ANativeWindow_getWidth(new_window),
+             ANativeWindow_getHeight(new_window), pw, ph);
     } else {
         LOGI("Native window cleared");
     }

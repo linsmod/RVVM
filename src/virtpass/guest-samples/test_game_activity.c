@@ -10,6 +10,11 @@
  * Runs as an endless game loop (app-like behavior): pumps lifecycle
  * commands, swaps input buffers and renders touch dots + state bar.
  *
+ * The lifecycle is handled as a state machine over the APP_CMD_* stream (see
+ * the flags below), not as "the last command received": that is what lets the
+ * guest go back to showing its normal rendered content after the Activity was
+ * backgrounded and resumed.
+ *
  * Build (RISC-V cross-compiler):
  *   riscv64-unknown-linux-gnu-gcc -static -O2 -o test_game_activity.exe test_game_activity.c -L../vp_ndk_stub -landroid-stub
  */
@@ -42,17 +47,38 @@ static const char* cmd_names[] = {
     "WINDOW_INSETS_CHANGED",
 };
 
-/* Per-lifecycle-state background colors (RGBA_8888) */
-static uint32_t state_colors[] = {
-    0xFF1B1B1B, /* INIT_WINDOW  - dark gray */
-    0xFF1B1B1B, /* TERM_WINDOW  - dark gray */
-    0xFF1B5E20, /* RESUME       - dark green  */
-    0xFFB71C1C, /* PAUSE        - dark red    */
-    0xFFE65100, /* DESTROY      - orange      */
-};
-
-static uint32_t g_bg_color = 0xFF1B1B1B;
+/*
+ * Lifecycle state.
+ *
+ * Android never hands the guest a single "current state" value: the APP_CMD_*
+ * stream is a sequence of transitions whose order is not fixed (the surface
+ * can appear before or after RESUME, TERM_WINDOW can land after STOP, and a
+ * burst of transitions is drained at once if the guest was not polling). So
+ * keep one flag per transition and derive the display state from all of them.
+ * That is what makes "resume after backgrounding" restore the previous
+ * rendered state instead of whatever command happened to arrive last.
+ */
+static bool g_has_window = false;
+static bool g_started    = false;
+static bool g_resumed    = false;
+static bool g_focused    = false;
 static bool g_destroy_requested = false;
+
+/* True while the guest is on screen and may present its normal content. */
+static bool is_live(void)
+{
+    return g_has_window && g_started && g_resumed;
+}
+
+/* Background colour for the current lifecycle state (RGBA_8888). */
+static uint32_t lifecycle_bg_color(void)
+{
+    if (g_destroy_requested) return 0xFFE65100; /* orange     - destroying   */
+    if (!g_has_window)       return 0xFF1B1B1B; /* dark grey  - no surface   */
+    if (!g_started)          return 0xFF263238; /* blue grey  - stopped      */
+    if (!g_resumed)          return 0xFFB71C1C; /* dark red   - paused       */
+    return 0xFF0B3D14;                          /* dark green - live content */
+}
 
 /* Touch tracking: one slot per active pointer, keyed by pointer id */
 #define MAX_TOUCH_POINTERS 16
@@ -120,28 +146,50 @@ void on_app_cmd(struct android_app* app, int cmd)
         case APP_CMD_INIT_WINDOW:
             printf("GameActivity: Window initialized\n");
             print_virtual_display();
-            g_bg_color = state_colors[0];
+            g_has_window = true;
             break;
         case APP_CMD_TERM_WINDOW:
             printf("GameActivity: Window terminated\n");
-            g_bg_color = state_colors[1];
+            g_has_window = false;
+            break;
+        case APP_CMD_GAINED_FOCUS:
+            printf("GameActivity: Gained focus\n");
+            g_focused = true;
+            break;
+        case APP_CMD_LOST_FOCUS:
+            printf("GameActivity: Lost focus\n");
+            g_focused = false;
+            break;
+        case APP_CMD_START:
+            printf("GameActivity: Started\n");
+            g_started = true;
+            break;
+        case APP_CMD_STOP:
+            printf("GameActivity: Stopped\n");
+            g_started = false;
             break;
         case APP_CMD_RESUME:
             printf("GameActivity: Resumed\n");
-            g_bg_color = state_colors[2];
+            g_resumed = true;
             break;
         case APP_CMD_PAUSE:
             printf("GameActivity: Paused\n");
-            g_bg_color = state_colors[3];
+            g_resumed = false;
             break;
         case APP_CMD_DESTROY:
             printf("GameActivity: Destroy requested\n");
-            g_bg_color = state_colors[4];
             g_destroy_requested = true;
             break;
         default:
             break;
     }
+
+    /* One line per transition telling exactly which state the guest derived,
+     * so logcat shows the resume/background cycle end to end. */
+    printf("GameActivity: state window=%d started=%d resumed=%d focused=%d -> %s\n",
+           (int)g_has_window, (int)g_started, (int)g_resumed, (int)g_focused,
+           is_live() ? "LIVE (showing rendered content)"
+                     : "NOT presenting content");
 }
 
 /* Fill a pixel with RGBA color */
@@ -161,11 +209,14 @@ static void render_frame(ANativeWindow_Buffer* buf, int frame)
     int height = buf->height;
     int stride = buf->stride;
     uint32_t* pixels = (uint32_t*)buf->bits;
+    uint32_t bg = lifecycle_bg_color();
+    bool live = is_live();
 
-    /* Solid background */
+    /* Solid background. The colour encodes the lifecycle state, so the guest
+     * turns green again as soon as it is resumed on screen. */
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            pixels[y * stride + x] = g_bg_color;
+            pixels[y * stride + x] = bg;
         }
     }
 
@@ -189,11 +240,13 @@ static void render_frame(ANativeWindow_Buffer* buf, int frame)
         }
     }
 
-    /* State bar at the bottom */
+    /* State bar at the bottom: bright green while live, otherwise the colour
+     * of the lifecycle state the guest is parked in. */
     int bar_h = height / 16;
+    uint32_t bar_color = live ? 0xFF35E07A : (bg ^ 0x00FFFF00);
     for (int y = height - bar_h; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            pixels[y * stride + x] = g_bg_color ^ 0x00FFFF00;
+            pixels[y * stride + x] = bar_color;
         }
     }
 
@@ -282,13 +335,24 @@ static void on_frame_callback(long frame_time_nanos, void* data)
         android_app_clear_key_events(app);
     }
 
-    /* 3. Render one frame */
-    {
+    /* 3. Render one frame.
+     *
+     * The frame callback always re-arms (step 4), so the guest keeps drawing
+     * for every lifecycle state. "Live" draws the usual content, any other
+     * state draws the same scene tinted by the state; only the presentation
+     * itself is skipped when the host has no surface to present on.
+     *
+     * g_render_frame advances only for frames that actually reached the
+     * display, so the animation phase (and everything else the guest keeps in
+     * memory: touch dots, counters) is exactly where it was left when the
+     * guest comes back from a background trip. */
+    if (g_has_window) {
         ANativeWindow_Buffer buffer;
         ARect dirty;
         if (ANativeWindow_lock(NULL, &buffer, &dirty) == 0) {
             render_frame(&buffer, g_render_frame);
             ANativeWindow_unlockAndPost(NULL);
+            g_render_frame++;
         } else {
             /* ANativeWindow_lock() failed. This does NOT imply the window is
              * missing: vp_ndk_stub prints the actual cause on stderr (host
@@ -298,7 +362,6 @@ static void on_frame_callback(long frame_time_nanos, void* data)
                    "(cause reported by vp_ndk_stub)\n");
         }
     }
-    g_render_frame++;
 
     /* 4. Re-arm for the next vsync (standard Choreographer pattern). */
     if (!g_destroy_requested) {

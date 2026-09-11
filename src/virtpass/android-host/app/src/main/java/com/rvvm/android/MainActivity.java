@@ -24,9 +24,27 @@ import java.io.InputStream;
  * Main Activity for RVVM Android host app.
  * This activity manages the RVVM process and sensor integration.
  */
-public class MainActivity extends Activity implements SensorEventListener, SurfaceHolder.Callback {
+public class MainActivity extends Activity implements SensorEventListener, SurfaceHolder.Callback2 {
 
     private static final String TAG = "RVVM-MainActivity";
+
+    // Lifecycle commands forwarded to the guest. These are the APP_CMD_* values
+    // from include/virtpass/vp_android.h - they are the wire format of the
+    // host -> guest lifecycle channel and must stay in sync with that enum.
+    private static final int APP_CMD_INIT_WINDOW          = 1;
+    private static final int APP_CMD_TERM_WINDOW          = 2;
+    private static final int APP_CMD_WINDOW_RESIZED       = 3;
+    private static final int APP_CMD_WINDOW_REDRAW_NEEDED = 4;
+    private static final int APP_CMD_GAINED_FOCUS         = 6;
+    private static final int APP_CMD_LOST_FOCUS           = 7;
+    private static final int APP_CMD_CONFIG_CHANGED       = 8;
+    private static final int APP_CMD_LOW_MEMORY           = 9;
+    private static final int APP_CMD_START                = 10;
+    private static final int APP_CMD_RESUME               = 11;
+    private static final int APP_CMD_SAVE_STATE           = 12;
+    private static final int APP_CMD_PAUSE                = 13;
+    private static final int APP_CMD_STOP                 = 14;
+    private static final int APP_CMD_DESTROY              = 15;
 
     private SensorManager sensorManager;
     private Sensor accelerometer;
@@ -160,11 +178,30 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 roundMode);
     }
 
+    /**
+     * Forward one Activity/Surface lifecycle transition to the guest.
+     *
+     * The guest runs its own GameActivity-style loop and consumes these through
+     * android_app_read_cmd(), so the host must deliver the same transitions, in
+     * the same order, that a real GameActivity would. The native side keeps the
+     * aggregate state (window / activityState) in sync around the guest's
+     * onAppCmd() callback, which is what lets the guest restore its "showing
+     * rendered content" state after the Activity was backgrounded and resumed.
+     */
+    private void postLifecycleCmd(int cmd) {
+        if (!isInitialized) {
+            return;
+        }
+        Log.i(TAG, "Lifecycle -> guest: cmd=" + cmd);
+        RvvmNative.nativePostLifecycleCmd(cmd);
+    }
+
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
         if (isInitialized) {
             pushDisplayConfig();
+            postLifecycleCmd(APP_CMD_CONFIG_CHANGED);
         }
     }
 
@@ -233,11 +270,11 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     public void surfaceCreated(SurfaceHolder holder) {
         Log.i(TAG, "Surface created");
         isSurfaceReady = true;
-        
+
         // Set the native window
         if (isInitialized) {
             RvvmNative.nativeSetWindow(holder.getSurface());
-            RvvmNative.nativePostLifecycleCmd(1); // APP_CMD_INIT_WINDOW
+            postLifecycleCmd(APP_CMD_INIT_WINDOW);
             maybeAutoStartGuest();
         }
     }
@@ -245,10 +282,13 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         Log.i(TAG, "Surface changed: " + width + "x" + height);
-        
-        // Update the native window
+        isSurfaceReady = true;
+
+        // Update the native window; the guest gets a resize notification too so
+        // it can re-query the panel geometry.
         if (isInitialized) {
             RvvmNative.nativeSetWindow(holder.getSurface());
+            postLifecycleCmd(APP_CMD_WINDOW_RESIZED);
         }
     }
 
@@ -256,12 +296,28 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     public void surfaceDestroyed(SurfaceHolder holder) {
         Log.i(TAG, "Surface destroyed");
         isSurfaceReady = false;
-        
+
         // Clear the native window
         if (isInitialized) {
             RvvmNative.nativeSetWindow(null);
-            RvvmNative.nativePostLifecycleCmd(2); // APP_CMD_TERM_WINDOW
+            postLifecycleCmd(APP_CMD_TERM_WINDOW);
         }
+    }
+
+    /**
+     * Called by the framework right before the surface is shown again (and
+     * after every surfaceCreated/surfaceChanged) to ask the view to redraw its
+     * content. Forwarding it lets the guest repaint immediately instead of
+     * waiting for the next vsync.
+     *
+     * Implementing SurfaceHolder.Callback2 rather than Callback is what makes
+     * SurfaceView deliver this callback; the async variant has a default
+     * implementation that calls this one, so only the synchronous form is
+     * needed here.
+     */
+    @Override
+    public void surfaceRedrawNeeded(SurfaceHolder holder) {
+        postLifecycleCmd(APP_CMD_WINDOW_REDRAW_NEEDED);
     }
 
     @Override
@@ -304,6 +360,23 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         }
     }
 
+    // --- Activity lifecycle --------------------------------------------------
+    // The whole Activity lifecycle is mirrored to the guest, at the same points
+    // the framework runs it, so the guest game loop can drive itself from
+    // android_app_read_cmd() exactly as it would on a real GameActivity:
+    //   onStart/onStop        -> APP_CMD_START / APP_CMD_STOP
+    //   onResume/onPause      -> APP_CMD_RESUME / APP_CMD_PAUSE
+    //   onWindowFocusChanged  -> APP_CMD_GAINED_FOCUS / APP_CMD_LOST_FOCUS
+    //   onSaveInstanceState   -> APP_CMD_SAVE_STATE
+    //   onDestroy             -> APP_CMD_DESTROY
+    // The surface (window) side is handled in the SurfaceHolder callbacks above.
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        postLifecycleCmd(APP_CMD_START);
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
@@ -317,9 +390,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         if (light != null) {
             sensorManager.registerListener(this, light, SensorManager.SENSOR_DELAY_NORMAL);
         }
-        if (isInitialized) {
-            RvvmNative.nativePostLifecycleCmd(11); // APP_CMD_RESUME
-        }
+        postLifecycleCmd(APP_CMD_RESUME);
     }
 
     @Override
@@ -327,17 +398,37 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         super.onPause();
         // Unregister sensors
         sensorManager.unregisterListener(this);
-        if (isInitialized) {
-            RvvmNative.nativePostLifecycleCmd(13); // APP_CMD_PAUSE
-        }
+        postLifecycleCmd(APP_CMD_PAUSE);
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        postLifecycleCmd(APP_CMD_STOP);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        postLifecycleCmd(hasFocus ? APP_CMD_GAINED_FOCUS : APP_CMD_LOST_FOCUS);
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        postLifecycleCmd(APP_CMD_SAVE_STATE);
+    }
+
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        postLifecycleCmd(APP_CMD_LOW_MEMORY);
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        if (isInitialized) {
-            RvvmNative.nativePostLifecycleCmd(15); // APP_CMD_DESTROY
-        }
+        postLifecycleCmd(APP_CMD_DESTROY);
         // Stop guest if running
         if (RvvmNative.nativeIsGuestRunning()) {
             RvvmNative.nativeStopGuest();

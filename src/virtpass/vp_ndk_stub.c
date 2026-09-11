@@ -1270,10 +1270,95 @@ int32_t android_app_read_cmd(android_app* app)
     return (int32_t)virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_GAME_POLL_CMD, 0, 0, 0, 0, 0, 0);
 }
 
+/*
+ * Bring the aggregate android_app state up to date for a lifecycle command,
+ * mirroring android_native_app_glue.c's android_app_pre_exec_cmd(): the user
+ * callback always observes app->window / app->activityState as the real glue
+ * would leave them, so guest code can derive "may I present content?" from the
+ * struct instead of re-implementing the state machine itself.
+ *
+ * activityState is a bitmask built from the transitions currently in effect:
+ *   APP_CMD_START        - Activity is started (foreground-ish, surface may exist)
+ *   APP_CMD_RESUME       - Activity is resumed (visible, interactive)
+ *   APP_CMD_GAINED_FOCUS - window currently holds input focus
+ * Each bit is set by its positive transition and cleared by the matching
+ * negative one, so the usual test
+ *
+ *     bool live = app->window != NULL && (app->activityState & APP_CMD_RESUME);
+ *
+ * stays correct regardless of the order the host delivers the commands in
+ * (surface before/after RESUME, TERM_WINDOW after STOP, commands drained in a
+ * burst after the guest was not polling, ...).
+ *
+ * Note: for APP_CMD_INIT_WINDOW the window is installed *before* the callback
+ * (the callback must be able to use it) and for APP_CMD_TERM_WINDOW it is
+ * removed *before* the callback (the surface is already gone and must not be
+ * touched), same as the NDK glue.
+ */
+static void vp_app_pre_exec_cmd(android_app* app, int32_t cmd)
+{
+    switch (cmd) {
+        case APP_CMD_INIT_WINDOW:
+            /* Refresh the cached panel geometry, then publish the window. */
+            guest_window_query_size();
+            app->window = &g_window;
+            break;
+
+        case APP_CMD_TERM_WINDOW:
+            app->window = NULL;
+            break;
+
+        case APP_CMD_WINDOW_RESIZED:
+            /* Keep the cached geometry in sync for ANativeWindow_query() users. */
+            guest_window_query_size();
+            break;
+
+        case APP_CMD_START:
+            app->activityState |= (1 << APP_CMD_START);
+            break;
+
+        case APP_CMD_STOP:
+            app->activityState &= ~(1 << APP_CMD_START);
+            /* A stopped Activity can never still be resumed. The host always
+             * sends PAUSE first, this only guarantees the invariant. */
+            app->activityState &= ~(1 << APP_CMD_RESUME);
+            break;
+
+        case APP_CMD_RESUME:
+            app->activityState |= (1 << APP_CMD_RESUME);
+            break;
+
+        case APP_CMD_PAUSE:
+            app->activityState &= ~(1 << APP_CMD_RESUME);
+            break;
+
+        case APP_CMD_GAINED_FOCUS:
+            app->activityState |= (1 << APP_CMD_GAINED_FOCUS);
+            break;
+
+        case APP_CMD_LOST_FOCUS:
+            app->activityState &= ~(1 << APP_CMD_GAINED_FOCUS);
+            break;
+
+        case APP_CMD_DESTROY:
+            app->destroyRequested = 1;
+            break;
+
+        default:
+            break;
+    }
+}
+
 /* GameActivity API: Execute lifecycle command */
 void android_app_exec_cmd(android_app* app, int32_t cmd)
 {
-    if (app && app->onAppCmd) {
+    if (!app) {
+        return;
+    }
+
+    vp_app_pre_exec_cmd(app, cmd);
+
+    if (app->onAppCmd) {
         app->onAppCmd(app, cmd);
     }
 }
