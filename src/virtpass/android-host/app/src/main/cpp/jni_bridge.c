@@ -959,12 +959,43 @@ Java_com_rvvm_android_RvvmNative_nativePostLifecycleCmd(JNIEnv* env, jobject thi
 
 JNIEXPORT void JNICALL
 Java_com_rvvm_android_RvvmNative_nativePostMotionEvent(JNIEnv* env, jobject thiz,
-                                                        jfloat x, jfloat y, jint action,
-                                                        jlong eventTime)
+                                                       jfloatArray xs, jfloatArray ys,
+                                                       jintArray ids, jint pointerCount,
+                                                       jint action, jlong eventTime)
 {
-    (void)env;
     (void)thiz;
-    
+
+    if (!xs || !ys) {
+        return;
+    }
+
+    /* Clamp to the smaller of the caller's count, the array length and the ABI
+     * limit (CMDPOST_MAX_NUM_POINTERS_IN_MOTION_EVENT). */
+    jsize count = (*env)->GetArrayLength(env, xs);
+    if (pointerCount < count) {
+        count = pointerCount;
+    }
+    if (count > CMDPOST_MAX_NUM_POINTERS_IN_MOTION_EVENT) {
+        count = CMDPOST_MAX_NUM_POINTERS_IN_MOTION_EVENT;
+    }
+    if (count <= 0) {
+        return;
+    }
+
+    float  xbuf[CMDPOST_MAX_NUM_POINTERS_IN_MOTION_EVENT];
+    float  ybuf[CMDPOST_MAX_NUM_POINTERS_IN_MOTION_EVENT];
+    int32_t idbuf[CMDPOST_MAX_NUM_POINTERS_IN_MOTION_EVENT];
+
+    (*env)->GetFloatArrayRegion(env, xs, 0, count, xbuf);
+    (*env)->GetFloatArrayRegion(env, ys, 0, count, ybuf);
+    if (ids && (*env)->GetArrayLength(env, ids) >= count) {
+        (*env)->GetIntArrayRegion(env, ids, 0, count, idbuf);
+    } else {
+        for (jsize i = 0; i < count; i++) {
+            idbuf[i] = (int32_t)i;
+        }
+    }
+
     /* Build a motion event matching the guest ABI and queue it for the guest */
     cmdpost_GameActivityMotionEvent ev;
     memset(&ev, 0, sizeof(ev));
@@ -972,18 +1003,22 @@ Java_com_rvvm_android_RvvmNative_nativePostMotionEvent(JNIEnv* env, jobject thiz
     ev.deviceId = 0;
     ev.source = 0x0002; /* AINPUT_SOURCE_TOUCHSCREEN */
     ev.action = (int32_t)action;
-    ev.pointerCount = 1;
-    ev.pointers[0].x = x;
-    ev.pointers[0].y = y;
-    ev.pointers[0].rawX = x;
-    ev.pointers[0].rawY = y;
-    ev.pointers[0].pressure = 1.0f;
-    ev.pointers[0].size = 1.0f;
-    ev.pointers[0].id = 0;
-    ev.pointers[0].toolType = 1; /* AMOTION_EVENT_TOOL_TYPE_FINGER */
-    
+    ev.pointerCount = (int32_t)count;
+
+    for (jsize i = 0; i < count; i++) {
+        ev.pointers[i].x = xbuf[i];
+        ev.pointers[i].y = ybuf[i];
+        ev.pointers[i].rawX = xbuf[i];
+        ev.pointers[i].rawY = ybuf[i];
+        ev.pointers[i].pressure = 1.0f;
+        ev.pointers[i].size = 1.0f;
+        ev.pointers[i].id = idbuf[i];
+        ev.pointers[i].toolType = 1; /* AMOTION_EVENT_TOOL_TYPE_FINGER */
+    }
+
     cmdpost_queue_motion_event(&ev);
-    LOGI("Motion event queued: x=%.0f y=%.0f action=%d", x, y, action);
+    LOGI("Motion event queued: pointers=%d action=0x%x first=(%.0f,%.0f)",
+         (int)count, (unsigned)action, xbuf[0], ybuf[0]);
 }
 
 JNIEXPORT jboolean JNICALL

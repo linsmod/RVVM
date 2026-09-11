@@ -39,6 +39,14 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private SurfaceHolder surfaceHolder;
     private Button runButton;
 
+    // Reusable per-pointer buffers for multi-touch passthrough. Sized to match
+    // CMDPOST_MAX_NUM_POINTERS_IN_MOTION_EVENT on the native side; reused to
+    // avoid allocating on every touch event.
+    private static final int MAX_POINTERS = 16;
+    private final float[] motionX = new float[MAX_POINTERS];
+    private final float[] motionY = new float[MAX_POINTERS];
+    private final int[] motionId = new int[MAX_POINTERS];
+
     private boolean isInitialized = false;
     private boolean isSurfaceReady = false;
     private boolean hasAutoStarted = false;
@@ -67,13 +75,24 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         // Setup run button
         runButton.setOnClickListener(v -> runGuestElf());
 
-        // Forward touches on the surface to the guest
+        // Forward touches on the surface to the guest (all pointers)
         surfaceView.setOnTouchListener((v, event) -> {
             if (!isInitialized) {
                 return false;
             }
-            int action = event.getActionMasked();
-            RvvmNative.nativePostMotionEvent(event.getX(), event.getY(), action, event.getEventTime() * 1000000L);
+            int count = event.getPointerCount();
+            if (count > MAX_POINTERS) {
+                count = MAX_POINTERS;
+            }
+            for (int i = 0; i < count; i++) {
+                motionX[i] = event.getX(i);
+                motionY[i] = event.getY(i);
+                motionId[i] = event.getPointerId(i);
+            }
+            // Use the raw action: ACTION_POINTER_DOWN/UP encode the pointer
+            // index in the upper bits, which the guest's GameActivity expects.
+            RvvmNative.nativePostMotionEvent(motionX, motionY, motionId, count,
+                    event.getAction(), event.getEventTime() * 1000000L);
             return true;
         });
 

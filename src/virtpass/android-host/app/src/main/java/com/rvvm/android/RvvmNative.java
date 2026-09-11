@@ -100,12 +100,19 @@ public class RvvmNative {
 
     /**
      * Post a motion event to the guest-facing input queue.
-     * @param x X coordinate
-     * @param y Y coordinate
-     * @param action Motion action (AMOTION_EVENT_ACTION_*)
+     * All pointers of the MotionEvent are forwarded so the guest sees true
+     * multi-touch input.
+     * @param xs Pointer X coordinates, indexed by pointer index
+     * @param ys Pointer Y coordinates, indexed by pointer index
+     * @param ids Pointer IDs (MotionEvent.getPointerId)
+     * @param pointerCount Number of valid entries in the arrays
+     * @param action Raw motion action (AMOTION_EVENT_ACTION_*). For
+     *               ACTION_POINTER_DOWN/UP this carries the pointer index in
+     *               the upper bits, matching the GameActivity ABI.
      * @param eventTime Event timestamp in nanoseconds
      */
-    public static native void nativePostMotionEvent(float x, float y, int action, long eventTime);
+    public static native void nativePostMotionEvent(float[] xs, float[] ys, int[] ids,
+                                                    int pointerCount, int action, long eventTime);
 
     /**
      * Run a RISC-V ELF program.

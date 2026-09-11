@@ -54,9 +54,11 @@ static uint32_t state_colors[] = {
 static uint32_t g_bg_color = 0xFF1B1B1B;
 static bool g_destroy_requested = false;
 
-/* Touch tracking */
-static float g_touch_x = -1, g_touch_y = -1;
-static bool g_touch_active = false;
+/* Touch tracking: one slot per active pointer, keyed by pointer id */
+#define MAX_TOUCH_POINTERS 16
+static float g_touch_x[MAX_TOUCH_POINTERS];
+static float g_touch_y[MAX_TOUCH_POINTERS];
+static bool  g_touch_active[MAX_TOUCH_POINTERS];
 static int g_touch_count = 0;
 
 /*
@@ -195,21 +197,26 @@ static void render_frame(ANativeWindow_Buffer* buf, int frame)
         }
     }
 
-    /* Touch dot */
-    if (g_touch_active && g_touch_x >= 0 && g_touch_y >= 0) {
-        int cx = (int)g_touch_x;
-        int cy = (int)g_touch_y;
+    /* Touch dots: one per active pointer (multi-touch) */
+    {
         int r = width / 40;
         if (r < 8) r = 8;
-        uint32_t dot_color = 0xFFFF0000;
-        for (int dy = -r; dy <= r; dy++) {
-            for (int dx = -r; dx <= r; dx++) {
-                if (dx * dx + dy * dy <= r * r) {
-                    put_pixel(buf, cx + dx, cy + dy, dot_color);
+        for (int i = 0; i < MAX_TOUCH_POINTERS; i++) {
+            if (!g_touch_active[i] || g_touch_x[i] < 0 || g_touch_y[i] < 0) {
+                continue;
+            }
+            int cx = (int)g_touch_x[i];
+            int cy = (int)g_touch_y[i];
+            uint32_t dot_color = (i == 0) ? 0xFFFF0000u : 0xFFFFFF00u;
+            for (int dy = -r; dy <= r; dy++) {
+                for (int dx = -r; dx <= r; dx++) {
+                    if (dx * dx + dy * dy <= r * r) {
+                        put_pixel(buf, cx + dx, cy + dy, dot_color);
+                    }
                 }
             }
+            printf("GameActivity: drawing touch dot %d at %d,%d\n", i, cx, cy);
         }
-        printf("GameActivity: drawing touch dot at %d,%d\n", cx, cy);
     }
 }
 
@@ -235,18 +242,40 @@ static void on_frame_callback(long frame_time_nanos, void* data)
     if (motion_count > 0) {
         g_touch_count += motion_count;
         for (int32_t i = 0; i < motion_count && i < 16; i++) {
-            GameActivityPointerAxes* p = &app->inputBuffer.motionEvents[i].pointers[0];
-            int32_t action = app->inputBuffer.motionEvents[i].action & AMOTION_EVENT_ACTION_MASK;
-            float x = GameActivityPointerAxes_getAxisValue(p, AMOTION_EVENT_AXIS_X);
-            float y = GameActivityPointerAxes_getAxisValue(p, AMOTION_EVENT_AXIS_Y);
-            printf("GameActivity: motion event %d action=%d at %.0f,%.0f\n", i, action, x, y);
+            GameActivityMotionEvent* me = &app->inputBuffer.motionEvents[i];
+            int32_t action = me->action & AMOTION_EVENT_ACTION_MASK;
+            int32_t action_index =
+                (me->action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK)
+                >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
+            int32_t pcount = me->pointerCount;
+            if (pcount < 1) pcount = 1;
+            if (pcount > MAX_TOUCH_POINTERS) pcount = MAX_TOUCH_POINTERS;
+            printf("GameActivity: motion event %d action=%d index=%d pointers=%d\n",
+                   i, action, action_index, pcount);
 
-            if (action == AMOTION_EVENT_ACTION_DOWN || action == AMOTION_EVENT_ACTION_MOVE) {
-                g_touch_x = x;
-                g_touch_y = y;
-                g_touch_active = true;
-            } else if (action == AMOTION_EVENT_ACTION_UP || action == AMOTION_EVENT_ACTION_CANCEL) {
-                g_touch_active = false;
+            /* A cancel lifts every pointer at once. */
+            if (action == AMOTION_EVENT_ACTION_CANCEL) {
+                for (int p = 0; p < MAX_TOUCH_POINTERS; p++) {
+                    g_touch_active[p] = false;
+                }
+                continue;
+            }
+
+            for (int32_t p = 0; p < pcount; p++) {
+                GameActivityPointerAxes* axes = &me->pointers[p];
+                float x = GameActivityPointerAxes_getAxisValue(axes, AMOTION_EVENT_AXIS_X);
+                float y = GameActivityPointerAxes_getAxisValue(axes, AMOTION_EVENT_AXIS_Y);
+                int slot = axes->id % MAX_TOUCH_POINTERS;
+
+                /* Only the pointer named by actionIndex lifts on POINTER_UP/UP;
+                 * every other pointer in the event is still down. */
+                bool lifting = (action == AMOTION_EVENT_ACTION_UP ||
+                                action == AMOTION_EVENT_ACTION_POINTER_UP)
+                               && p == action_index;
+
+                g_touch_x[slot] = x;
+                g_touch_y[slot] = y;
+                g_touch_active[slot] = !lifting;
             }
         }
         android_app_clear_motion_events(app);
