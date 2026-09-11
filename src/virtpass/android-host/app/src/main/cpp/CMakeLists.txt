@@ -17,7 +17,7 @@ add_definitions(
     -DUSE_RV64
     -DANDROID
     -D__linux__
-    -DUSE_NO_RVJIT
+    -DUSE_JIT
     -D_GNU_SOURCE
     -DUSE_FPU
 )
@@ -48,7 +48,7 @@ add_library(cmdpost STATIC
 )
 
 # ============================================================
-# RVVM core static library (no JIT for Android)
+# RVVM core static library
 # ============================================================
 add_library(rvvm_core STATIC
     # NDK compat (syscalls missing below API 30)
@@ -69,7 +69,11 @@ add_library(rvvm_core STATIC
     ${RVVM_SRC}/cpu/riscv_priv.c
     ${RVVM_SRC}/cpu/riscv_fpu.c
     ${RVVM_SRC}/cpu/riscv64_interpreter.c
-    
+
+    # JIT (ARM64 backend, RVJIT_NATIVE_LINKER)
+    ${RVVM_SRC}/rvjit/rvjit.c
+    ${RVVM_SRC}/rvjit/rvjit_emit.c
+
     # Utils
     ${RVVM_SRC}/util/elf_load.c
     ${RVVM_SRC}/util/vma_ops.c
