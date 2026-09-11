@@ -209,8 +209,9 @@ typedef struct vp_audio_ops {
     int32_t (*stop)(void* user, int64_t timeout_ns);
     int32_t (*flush)(void* user);
     /* Data-path passthrough: host copies between guest buffer and real AAudio.
-     * `buf` is a guest virtual address (identity-mapped). `frame_bytes` tells
-     * the host how many bytes per frame (from the negotiated geometry). */
+     * `buf` is already a *host* pointer - cmdpost translates the guest address
+     * before calling in. `frame_bytes` tells the host how many bytes per frame
+     * (from the negotiated geometry). */
     int32_t (*write)(void* user, const void* buf, int32_t frames, int32_t frame_bytes);
     int32_t (*read)(void* user, void* buf, int32_t frames, int32_t frame_bytes);
     int32_t (*get_info)(void* user, vp_aaudio_info_t* out);

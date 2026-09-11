@@ -438,14 +438,28 @@ static void* vma_mmap_aligned_internal(void* addr, size_t size, uint32_t flags, 
         } else if (!ret && addr) {
             /* VMA_FIXED: the address was a hard requirement, so failing is the
              * correct outcome. Report what actually sits on that range to tell
-             * "occupied" apart from "out of address space". */
+             * "occupied" apart from "out of address space". Walk the whole
+             * range: the requested base may well be free while something sits
+             * further in, which is what actually broke the allocation.
+             *
+             * Callers actually relying on this are the JIT's W^X pair (the RW
+             * and exec views must sit at the same offset, since emitted code
+             * references them relatively) and in-place vma_remap() growth. */
             DWORD                    err = GetLastError();
             MEMORY_BASIC_INFORMATION mbi = {0};
-            const char* why = "unknown";
-            if (VirtualQuery(addr, &mbi, sizeof(mbi))) {
-                why = (mbi.State == MEM_FREE)     ? "reported free" :
-                      (mbi.Type == MEM_MAPPED)    ? "already mapped (file/anon view)" :
-                      (mbi.Type == MEM_IMAGE)     ? "inside a loaded image" : "already reserved";
+            const char*              why = "out of address space";
+            for (uint8_t* ptr = addr; ptr < ((uint8_t*)addr) + size;) {
+                if (!VirtualQuery(ptr, &mbi, sizeof(mbi)) || !mbi.RegionSize) {
+                    mbi.BaseAddress = ptr;
+                    mbi.RegionSize  = 0;
+                    break;
+                }
+                if (mbi.State != MEM_FREE) {
+                    why = (mbi.Type == MEM_MAPPED) ? "already mapped (file/anon view)" :
+                          (mbi.Type == MEM_IMAGE)  ? "inside a loaded image" : "already reserved";
+                    break;
+                }
+                ptr = ((uint8_t*)mbi.BaseAddress) + mbi.RegionSize;
             }
             rvvm_warn("vma_mmap(): fixed VirtualAlloc(%p, %llx) failed (err=%lu): %s; "
                       "occupied by base=%p size=%llx state=%lx type=%lx prot=%lx",

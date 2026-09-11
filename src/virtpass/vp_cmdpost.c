@@ -33,6 +33,7 @@
 /* Host-side logging (rvvm_warn) + fixed-width int types (int64_t, PRId64) */
 #include "utils.h"
 #include "rvvm_types.h"
+#include "core/rvvm_user.h"
 
 /* ============================================================
  * Custom syscall numbers (must match vp_ndk_stub)
@@ -82,9 +83,12 @@
  * Phase 3: marshalled GL/EGL call struct - minimal controlled copy of the
  * guest ABI layout in vp_gles_stub.h (kept in sync by hand; see handover
  * 0.3-1). The guest allocates gl_call on its stack and passes its address
- * in a0. Pointers inside args[] are guest addresses; guest memory is
- * identity-mapped, so the host uses them directly. Floats travel
- * bit-packed through the int64_t slots.
+ * in a0. Pointers inside args[] are GUEST addresses: guest memory is no
+ * longer mapped into the host, so a backend must run each pointer argument
+ * through rvvm_user_guest_ptr() before dereferencing it. (Handles such as
+ * EGLDisplay/EGLSurface are host values the guest passes back unchanged and
+ * must NOT be translated - hence per-function handling, not a blanket map.)
+ * Floats travel bit-packed through the int64_t slots.
  */
 #define GL_CALL_MAX_ARGS 9
 typedef struct {
@@ -317,10 +321,13 @@ void vp_cmdpost_vsync_source_lost(void)
 typedef struct {
     bool                  used;
     void*                 user;      /* host backend handle                   */
-    const vp_aaudio_config_t* cfg;   /* guest memory; valid while open        */
     int32_t               direction; /* VP_AUDIO_DIR_*                        */
     int32_t               frame_bytes; /* negotiated frame size               */
     int32_t               state;     /* VP_AUDIO_STATE_*                      */
+    /* The stream must outlive the guest's config object, which may be freed or
+     * reused right after OPEN - and it lives in guest memory we cannot reach
+     * from host state anyway. Keep a host-side copy. */
+    vp_aaudio_config_t    cfg_copy;
 } cmdpost_audio_stream_t;
 
 static cmdpost_audio_stream_t g_audio_streams[CMDPOST_MAX_AUDIO_STREAMS];
@@ -523,7 +530,11 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                         CMDLOG("WINDOW_LOCK: no host callback registered");
                         return -1;
                     }
-                    int32_t lock_rc = g_window_lock_cb((void*)a1, (void*)a2, (void*)a3);
+                    /* window (a1) is a guest static, outBuffer (a2) and
+                     * dirtyBounds (a3) are guest buffers; a3 may be NULL */
+                    int32_t lock_rc = g_window_lock_cb(rvvm_user_guest_ptr((uint64_t)a1),
+                                                       rvvm_user_guest_ptr((uint64_t)a2),
+                                                       rvvm_user_guest_ptr((uint64_t)a3));
                     if (lock_rc != 0) {
                         CMDLOG("WINDOW_LOCK: host refused lock -> %d", lock_rc);
                     }
@@ -533,7 +544,8 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                 case SYS_ANDROID_WINDOW_UNLOCK: {
                     /* Unlock window and post buffer; a2 = guest pixel buffer */
                     if (g_window_unlock_cb) {
-                        return g_window_unlock_cb((void*)a1, (void*)a2);
+                        return g_window_unlock_cb(rvvm_user_guest_ptr((uint64_t)a1),
+                                                  rvvm_user_guest_ptr((uint64_t)a2));
                     }
                     return -1;
                 }
@@ -589,12 +601,15 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                     if (!a1) {
                         return 0;
                     }
-                    cmdpost_GameActivityInputBuffer* guest_buf = (cmdpost_GameActivityInputBuffer*)(size_t)a1;
+                    cmdpost_GameActivityInputBuffer* guest_buf = rvvm_user_guest_ptr((uint64_t)a1);
+                    if (!guest_buf) {
+                        return 0;
+                    }
                     int32_t out_count = g_motion_event_count;
                     if (out_count > 0) {
                         /* Copy motion events into guest-provided array */
                         cmdpost_GameActivityMotionEvent* dst =
-                            (cmdpost_GameActivityMotionEvent*)(size_t)guest_buf->motionEvents;
+                            rvvm_user_guest_ptr((uint64_t)(size_t)guest_buf->motionEvents);
                         int32_t capacity = guest_buf->motionEventsCapacity > 0
                                          ? guest_buf->motionEventsCapacity : CMDPOST_MAX_MOTION_EVENTS;
                         int32_t copy_count = out_count < capacity ? out_count : capacity;
@@ -672,7 +687,9 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                     if (!g_audio_ops || !g_audio_ops->open) {
                         return VP_AUDIO_ERROR_UNSUPPORTED;
                     }
-                    const vp_aaudio_config_t* cfg = (const vp_aaudio_config_t*)(size_t)a1;
+                    /* a1 is a guest address: guest memory is no longer mapped
+                     * into the host, so it has to be translated. */
+                    const vp_aaudio_config_t* cfg = rvvm_user_guest_ptr((uint64_t)a1);
                     if (!cfg) {
                         return VP_AUDIO_ERROR_INVALID_ARG;
                     }
@@ -688,9 +705,10 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                     }
                     cmdpost_audio_stream_t* stream = &g_audio_streams[slot];
                     stream->user = user;
-                    stream->cfg = cfg;
-                    stream->direction = cfg->direction;
-                    stream->frame_bytes = (int32_t)vp_audio_frame_bytes(cfg->format, cfg->channel_count);
+                    stream->cfg_copy = *cfg;
+                    stream->direction = stream->cfg_copy.direction;
+                    stream->frame_bytes = (int32_t)vp_audio_frame_bytes(stream->cfg_copy.format,
+                                                                      stream->cfg_copy.channel_count);
                     stream->state = VP_AUDIO_STATE_OPEN;
                     cmdpost_audio_refresh_state(stream);
                     return slot;
@@ -745,7 +763,7 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                     if (!stream || !g_audio_ops || !g_audio_ops->write) {
                         return VP_AUDIO_ERROR_INVALID_ARG;
                     }
-                    const void* buf = (const void*)(size_t)a2;
+                    const void* buf = rvvm_user_guest_ptr((uint64_t)a2);
                     int32_t frames = (int32_t)a3;
                     if (!buf || frames <= 0) {
                         return VP_AUDIO_ERROR_INVALID_ARG;
@@ -758,7 +776,7 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                     if (!stream || !g_audio_ops || !g_audio_ops->read) {
                         return VP_AUDIO_ERROR_INVALID_ARG;
                     }
-                    void* buf = (void*)(size_t)a2;
+                    void* buf = rvvm_user_guest_ptr((uint64_t)a2);
                     int32_t frames = (int32_t)a3;
                     if (!buf || frames <= 0) {
                         return VP_AUDIO_ERROR_INVALID_ARG;
@@ -768,7 +786,7 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
 
                 case SYS_ANDROID_AAUDIO_INFO: {
                     cmdpost_audio_stream_t* stream = cmdpost_audio_lookup(a1);
-                    vp_aaudio_info_t* out = (vp_aaudio_info_t*)(size_t)a2;
+                    vp_aaudio_info_t* out = rvvm_user_guest_ptr((uint64_t)a2);
                     if (!stream || !out) {
                         return VP_AUDIO_ERROR_INVALID_ARG;
                     }
@@ -784,7 +802,7 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
 
                 case SYS_ANDROID_AAUDIO_TS: {
                     cmdpost_audio_stream_t* stream = cmdpost_audio_lookup(a1);
-                    vp_aaudio_timestamp_t* out = (vp_aaudio_timestamp_t*)(size_t)a2;
+                    vp_aaudio_timestamp_t* out = rvvm_user_guest_ptr((uint64_t)a2);
                     if (!stream || !out) {
                         return VP_AUDIO_ERROR_INVALID_ARG;
                     }
@@ -823,14 +841,16 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
         }
 
         case SYS_EGL_CALL: {   /* a0 = guest gl_call* */
-            gl_call* c = (gl_call*)(size_t)a0;
+            gl_call* c = rvvm_user_guest_ptr((uint64_t)a0);
             if (!c) return -1;
+            /* args[] carries guest addresses, which the GL backend is expected
+             * to translate via rvvm_user_guest_ptr() before dereferencing */
             if (g_egl_dispatch_cb) g_egl_dispatch_cb((uint32_t)c->fn_id, c->args, &c->ret);
             else c->ret = 0;
             return 0;
         }
         case SYS_GL_CALL: {
-            gl_call* c = (gl_call*)(size_t)a0;
+            gl_call* c = rvvm_user_guest_ptr((uint64_t)a0);
             if (!c) return -1;
             if (g_gl_dispatch_cb) g_gl_dispatch_cb((uint32_t)c->fn_id, c->args, &c->ret);
             else c->ret = 0;

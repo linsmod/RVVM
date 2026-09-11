@@ -234,8 +234,9 @@ typedef unsigned int  w32gl_EGLenum;
  * Marshalling struct (guest fills, host consumes)
  *
  * Guest allocates gl_call on its stack and passes its address in a0.
- * Pointers inside args[] are guest addresses - identity-mapped into
- * host memory by the emulator, so the host uses them directly.
+ * Pointers inside args[] are guest addresses and MUST be translated with
+ * rvvm_user_guest_ptr() before use - guest memory is no longer mapped into
+ * the host. Host handles (EGLDisplay, EGLSurface, ...) pass through as-is.
  * ============================================================ */
 typedef struct {
     uint32_t fn_id;                    /* GL_FN_* / EGL_FN_*            */

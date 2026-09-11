@@ -13,6 +13,11 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "utils.h"
 #include "vma_ops.h"
 
+#if defined(_WIN32)
+#include <stdio.h>
+#include <windows.h>
+#endif
+
 PUSH_OPTIMIZATION_SIZE
 
 #define ELF_ET_NONE    0x00
@@ -110,11 +115,30 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
         // can only MEM_RELEASE the exact allocation extent, so ask for the
         // rounded size upfront and remember it for elf_unload_file().
         elf->buf_size = align_size_up(elf->buf_size, vma_alloc_granularity());
-        if (elf_type == ELF_ET_DYN) {
+        // Guest address the image ends up at: elf->base is the host pointer,
+        // entry/phdr below are guest addresses and follow this instead.
+        uint64_t guest_base = elf_loaddr;
+        if (elf->guest_window && elf_type == ELF_ET_DYN) {
+            // Dynamic (PIC) ELF inside a guest memory window: place it at the
+            // address the caller picked, no host mapping involved
+            WRAP_ERR(elf->load_addr, "Dynamic ELF needs an explicit load address in guest window mode");
+            guest_base  = elf->load_addr;
+            elf->base   = elf->guest_window + elf->load_addr;
+            memset(elf->base, 0, elf->buf_size);
+            elf->map_size = 0;
+        } else if (elf_type == ELF_ET_DYN) {
             // Dynamic (PIC) ELF, relocate it
             elf->base = vma_alloc(NULL, elf->buf_size, VMA_RDWR);
             WRAP_ERR(elf->base, "Failed to allocate dynamic ELF VMA");
             elf->map_size = elf->buf_size;
+        } else if (elf->guest_window) {
+            /* Non-relocatable ELF inside a guest memory window: just copy the
+             * image at its link-time guest address. No host VMA is needed (and
+             * map_size stays 0 - the window owns this memory), so a debugger
+             * disabling host ASLR can no longer collide with it. */
+            elf->base = elf->guest_window + elf_loaddr;
+            memset(elf->base, 0, elf->buf_size + ELF_USERLAND_HEAP_MARGIN);
+            elf->map_size = 0;
         } else {
             // Non-relocatable ELF at fixed address
             // Extra pages past the image serve as the initial brk heap area,
@@ -122,12 +146,13 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
             elf->base = vma_alloc((void*)(size_t)elf_loaddr, elf->buf_size + ELF_USERLAND_HEAP_MARGIN, VMA_RDWR | VMA_FIXED);
             WRAP_ERR(elf->base, "Failed to map fixed ELF VMA, address collision?");
             elf->map_size = elf->buf_size + ELF_USERLAND_HEAP_MARGIN;
+            guest_base = (size_t)elf->base; // Identity-mapped mode
         }
         if (elf->entry) {
-            elf->entry += (size_t)elf->base - elf_loaddr;
+            elf->entry += guest_base - elf_loaddr;
         }
         if (elf->phdr) {
-            elf->phdr += (size_t)elf->base - elf_loaddr;
+            elf->phdr += guest_base - elf_loaddr;
         }
     }
 

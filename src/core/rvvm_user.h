@@ -20,6 +20,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #define RVVM_USER_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 // Callback type for guest I/O redirection
 // Returns number of bytes written, or -1 on error
@@ -39,5 +40,19 @@ void rvvm_user_set_exit_callback(rvvm_user_exit_callback callback);
 
 // Just call this like main(), envp may be NULL
 int rvvm_user_linux(int argc, char** argv, char** envp);
+
+// Translate a guest virtual address into a host pointer.
+//
+// Guest memory is a private buffer of the userland machine, so a guest address
+// is NOT a host address. Host code that reads or writes guest memory directly
+// (syscall structs, the Android NDK proxy, ...) must go through this.
+//
+// Returns NULL when @addr is not a mappable guest address (NULL, or outside
+// the guest address space - e.g. a host handle the guest passed back).
+void* rvvm_user_guest_ptr(uint64_t addr);
+
+// Inverse of rvvm_user_guest_ptr(): host pointer inside guest memory -> guest
+// address. Returns 0 when @ptr does not belong to guest memory.
+uint64_t rvvm_user_host_ptr(const void* ptr);
 
 #endif

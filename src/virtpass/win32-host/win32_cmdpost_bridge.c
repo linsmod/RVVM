@@ -6,8 +6,8 @@
  *  - WINDOW_LOCK:  guest passes its own ANativeWindow_Buffer; the host fills
  *                  width/height/stride/format. "bits" stays NULL: the guest
  *                  allocates its own pixel buffer (pixbuf_ensure).
- *  - WINDOW_UNLOCK: a1 = guest pixel pointer (identity-mapped guest memory);
- *                  the host converts pixels to a DIB and blits them.
+ *  - WINDOW_UNLOCK: a1 = guest pixel pointer; cmdpost translates it to a host
+ *                  pointer, the host converts pixels to a DIB and blits them.
  *  - WINDOW_SET_BUF: (width, height, format) geometry change request.
  *  - WINDOW_GET_SIZE: callback fills long* out-params (LLP64 caveat: see README).
  *  - Lifecycle:     queued via cmdpost_queue_lifecycle_cmd(), consumed by the

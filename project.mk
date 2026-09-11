@@ -316,7 +316,9 @@ override ANDROID_ASSETS_DIR  := $(ANDROID_HOST)/app/src/main/assets
 override ANDROID_GUEST_DIR   := $(BUILDDIR)/android-guest
 override ANDROID_GUEST_ZIG   := zig cc
 override ANDROID_GUEST_AR    := zig ar
-override ANDROID_GUEST_FLAGS := -target riscv64-linux-musl -O2 -I$(INCDIR) -fno-sanitize=undefined
+# Debug build of the guests: -O0 -g keeps line tables for the in-host
+# userland debugger; -fno-sanitize=undefined is a zig cc requirement
+override ANDROID_GUEST_FLAGS := -target riscv64-linux-musl -O0 -g -I$(INCDIR) -fno-sanitize=undefined
 override ANDROID_GUEST_HEADS := $(INCDIR)/virtpass/vp_android.h $(INCDIR)/virtpass/vp_gl.h $(INCDIR)/virtpass/vp_audio_ringbuf.h
 override ANDROID_GUEST_LIBS  := $(ANDROID_GUEST_DIR)/libandroid_stubs.a $(ANDROID_GUEST_DIR)/libgles_stubs.a
 override android_guest_assets := $(addprefix $(ANDROID_ASSETS_DIR)/,$(addsuffix .exe,$(ANDROID_GUEST_SAMPLES)))

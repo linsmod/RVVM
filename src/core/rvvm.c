@@ -18,6 +18,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <util/threading.h>
 #include <util/utils.h>
 #include <util/vector.h>
+#include <util/vma_ops.h>
 
 #include <core/rvvm.h>
 #include <core/rvvm_isolation.h>
@@ -1090,6 +1091,17 @@ PUBLIC bool rvvm_attach_msi_target(rvvm_machine_t* machine, const rvvm_mmio_dev_
  * Userland emulation API (WIP)
  */
 
+// Guest address space handed to a rvvm-user process: 1 GiB covers the guest
+// ELF image, its brk heap, mmap()s and the main stack.
+//
+// NOTE: this used to be the whole host address space with mem.data == mem.addr,
+// i.e. guest addresses were identity-mapped onto host addresses. That forced a
+// non-relocatable guest ELF to be mapped at the very same *host* address, which
+// breaks as soon as the host (or a debugger disabling ASLR, or the loader of
+// any DLL) has already put something there.
+#define USERLAND_MEM_BASE 0x1000
+#define USERLAND_MEM_SIZE 0x40000000
+
 PUBLIC rvvm_machine_t* rvvm_create_userland(const char* isa)
 {
     // TODO: Proper ISA string parsing
@@ -1105,12 +1117,18 @@ PUBLIC rvvm_machine_t* rvvm_create_userland(const char* isa)
 
     rvvm_machine_t* machine = safe_new_obj(rvvm_machine_t);
 
-    // Pass whole process address space except the NULL page
-    // RVVM expects mem.data to be non-NULL, let's leave that for now
-    machine->mem.addr = 0x1000;
-    machine->mem.size = (size_t)-0x1000ULL;
-    machine->mem.data = (void*)0x1000;
-    machine->rv64     = rv64;
+    // Guest memory is a private buffer, so guest addresses are unrelated to
+    // host addresses: a non-PIE guest can live at its link-time address no
+    // matter what the host address space looks like.
+    machine->mem.addr = USERLAND_MEM_BASE;
+    machine->mem.size = USERLAND_MEM_SIZE - USERLAND_MEM_BASE;
+    machine->mem.data = vma_alloc(NULL, machine->mem.size, VMA_RDWR);
+    if (!machine->mem.data) {
+        rvvm_error("Failed to allocate guest memory (%llu bytes)", (unsigned long long)USERLAND_MEM_SIZE);
+        free(machine);
+        return NULL;
+    }
+    machine->rv64 = rv64;
 
     // Set nanosecond machine timer precision by default
     rvvm_set_opt(machine, RVVM_OPT_TIME_FREQ, 1000000000ULL);
@@ -1141,6 +1159,16 @@ PUBLIC void rvvm_flush_icache(rvvm_machine_t* machine, rvvm_addr_t addr, size_t 
     }
 }
 
+#if defined(USE_JIT)
+// True when a guest address doubles as a valid host address, i.e. guest memory
+// is mapped at its own base address. Only then may the JIT dereference guest
+// addresses directly instead of translating them through the TLB.
+static inline bool rvvm_mem_identity_mapped(const rvvm_machine_t* machine)
+{
+    return machine->mem.data && machine->mem.data == (void*)(size_t)machine->mem.addr;
+}
+#endif
+
 PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
 {
     if (likely(machine)) {
@@ -1165,8 +1193,17 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
 #endif
 
 #if defined(USE_JIT)
-        // Enable pointer optimization
-        rvjit_set_native_ptrs(&thread->jit, true);
+        /* The "native pointers" optimization emits loads/stores that use the
+         * guest address as the host address, which is only valid while guest
+         * memory is identity-mapped. Derive it from the actual layout instead
+         * of hardcoding: userland used to be identity-mapped (mem.data ==
+         * mem.addr) but now owns a private buffer, so this is off today, and
+         * turns itself back on if that ever changes.
+         *
+         * Off is always the safe answer - the TLB path is the general one.
+         * This is evaluated at hart creation, i.e. after RVVM_OPT_MEM_BASE
+         * and friends have been applied to mem.addr. */
+        rvjit_set_native_ptrs(&thread->jit, rvvm_mem_identity_mapped(machine));
 #endif
 
         riscv_switch_priv(thread, RISCV_PRIV_USER);

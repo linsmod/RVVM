@@ -1367,9 +1367,10 @@ void android_app_exec_cmd(android_app* app, int32_t cmd)
 int32_t android_app_swap_input_buffers(android_app* app)
 {
     if (app) {
-        /* Pass the guest input buffer address so the host can fill events into it.
-         * In RVVM user-mode the guest address space aliases the host, so the
-         * raw pointer value is directly usable by the host side. */
+        /* Pass the guest input buffer address so the host can fill events into
+         * it. Guest addresses are NOT host addresses (guest memory is the
+         * userland machine's own buffer), so the host translates it with
+         * rvvm_user_guest_ptr() - we just hand over the guest address. */
         return (int32_t)virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_GAME_SWAP_INPUT, 
                                         (uintptr_t)&app->inputBuffer, 0, 0, 0, 0, 0);
     }

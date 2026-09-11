@@ -30,6 +30,20 @@ typedef struct {
     // to the OS allocation granularity); zero in objcopy mode.
     // Released by elf_unload_file().
     size_t map_size;
+
+    // Userland guest memory window: host pointer standing for guest address 0,
+    // or NULL to keep mapping the ELF at its link-time *host* address (the
+    // legacy identity-mapped mode).
+    //
+    // When set, the image is copied into window[link_addr ...] instead of being
+    // mapped, so nothing has to be free at that address on the host. The window
+    // owns the memory, so map_size stays 0 and elf_unload_file() won't free it.
+    uint8_t* guest_window;
+
+    // Guest address to place a relocatable (ET_DYN) image at when guest_window
+    // is set; ignored otherwise. Zero means "pick one", which only works
+    // without a window.
+    size_t load_addr;
 } elf_desc_t;
 
 bool elf_load_file(rvfile_t* file, elf_desc_t* elf);

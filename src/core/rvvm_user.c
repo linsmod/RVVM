@@ -194,6 +194,26 @@ struct uapi_new_utsname {
     char domainname[65];
 };
 
+// Guest iovec: iov_base is a *guest* address. Guest and host are both LP64 so
+// the layout matches, but the pointer values do not (see rvvm_iovec_from_guest).
+struct uapi_iovec {
+    uapi_ulong_t base;
+    uapi_ulong_t len;
+};
+
+// Guest msghdr: msg_name / msg_iov / msg_control are guest addresses
+struct uapi_msghdr {
+    uapi_ulong_t name;
+    uint32_t     namelen;
+    uint32_t     _pad;
+    uapi_ulong_t iov;
+    uapi_ulong_t iovlen;
+    uapi_ulong_t control;
+    uapi_ulong_t controllen;
+    uint32_t     flags;
+    uint32_t     _pad2;
+};
+
 struct uapi_stat {
     uapi_ulong_t dev;
     uapi_ulong_t ino;
@@ -357,13 +377,176 @@ static rvvm_user_exit_callback exit_callback = NULL; // Guest exit callback
 // Short cast rvvm_addr_t -> void*
 static void* to_ptr(rvvm_addr_t addr)
 {
-    return (void*)(size_t)addr;
+    if (!userland) {
+        // RVVM_USER_TEST* modes run the guest natively, guest == host
+        return (void*)(size_t)addr;
+    }
+    // Preserve NULL: the guest's NULL page is unmapped, and callers test the
+    // result for NULL (a bare offset would make addr 0 look like valid memory)
+    if (addr < userland->mem.addr) {
+        return NULL;
+    }
+    return ((uint8_t*)userland->mem.data) + (addr - userland->mem.addr);
 }
 
 // Short cast rvvm_addr_t -> const char*
 static const char* to_str(rvvm_addr_t addr)
 {
-    return (const char*)(size_t)addr;
+    return (const char*)to_ptr(addr);
+}
+
+// Host pointer inside guest memory -> rvvm_addr_t
+static rvvm_addr_t to_addr(const void* ptr)
+{
+    if (!userland) {
+        return (rvvm_addr_t)(size_t)ptr;
+    }
+    return (rvvm_addr_t)(((const uint8_t*)ptr) - ((const uint8_t*)userland->mem.data)) + userland->mem.addr;
+}
+
+#include <core/rvvm_user.h>
+
+PUBLIC void* rvvm_user_guest_ptr(uint64_t addr)
+{
+    if (!userland) {
+        // RVVM_USER_TEST* modes run the guest natively, guest == host
+        return addr ? (void*)(size_t)addr : NULL;
+    }
+    if (addr < userland->mem.addr || (addr - userland->mem.addr) >= userland->mem.size) {
+        return NULL;
+    }
+    return ((uint8_t*)userland->mem.data) + (addr - userland->mem.addr);
+}
+
+PUBLIC uint64_t rvvm_user_host_ptr(const void* ptr)
+{
+    if (!ptr) {
+        return 0;
+    }
+    if (!userland) {
+        return (uint64_t)(size_t)ptr;
+    }
+    const uint8_t* data = (const uint8_t*)userland->mem.data;
+    const uint8_t* p    = (const uint8_t*)ptr;
+    if (p < data || (size_t)(p - data) >= userland->mem.size) {
+        return 0;
+    }
+    return userland->mem.addr + (uint64_t)(p - data);
+}
+
+/* ============================================================
+ * Guest virtual memory allocator
+ *
+ * Guest memory is a private buffer owned by the userland machine, so brk() and
+ * mmap() carve ranges out of it instead of calling into the host VMA layer:
+ * the host address of a guest mapping means nothing to the guest, and the MMU
+ * can only serve guest memory from that one contiguous buffer.
+ * ============================================================ */
+
+// Past the guest image and its brk heap, where mmap()ed ranges start
+#define GUEST_MMAP_BASE  0x11000000UL
+#define GUEST_STACK_SIZE 0x4000000UL // 64 MiB
+#define GUEST_PAGE_SIZE  0x1000UL
+
+typedef struct {
+    rvvm_addr_t addr;
+    size_t      size;
+} guest_range_t;
+
+#define GUEST_FREE_MAX 64
+
+static spinlock_t    guest_lock       = SPINLOCK_INIT;
+static guest_range_t guest_free[GUEST_FREE_MAX];
+static size_t        guest_free_num   = 0;
+static rvvm_addr_t   guest_bump       = GUEST_MMAP_BASE;
+static rvvm_addr_t   guest_mmap_end   = 0;
+static rvvm_addr_t   guest_stack_base = 0;
+static rvvm_addr_t   guest_stack_top  = 0;
+static rvvm_addr_t   guest_brk_start  = 0;
+static rvvm_addr_t   guest_brk_end    = GUEST_MMAP_BASE;
+static rvvm_addr_t   guest_brk_ptr    = 0;
+
+static void guest_vm_init(void)
+{
+    guest_stack_top  = (userland->mem.addr + userland->mem.size) & ~(rvvm_addr_t)(GUEST_PAGE_SIZE - 1);
+    guest_stack_base = guest_stack_top - GUEST_STACK_SIZE;
+    guest_mmap_end   = guest_stack_base;
+    guest_bump       = GUEST_MMAP_BASE;
+    guest_free_num   = 0;
+}
+
+// Hand out @size bytes of guest address space, zeroed like a fresh mapping
+static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, bool fixed)
+{
+    size = align_size_up(size, GUEST_PAGE_SIZE);
+    if (!size) {
+        return false;
+    }
+
+    if (fixed) {
+        if (hint < GUEST_MMAP_BASE || hint + size > guest_mmap_end) {
+            return false;
+        }
+        memset(to_ptr(hint), 0, size);
+        *out = hint;
+        return true;
+    }
+
+    // First fit in the free list
+    for (size_t i = 0; i < guest_free_num; ++i) {
+        if (guest_free[i].size >= size) {
+            rvvm_addr_t addr = guest_free[i].addr;
+            guest_free[i].addr += size;
+            guest_free[i].size -= size;
+            if (!guest_free[i].size) {
+                guest_free[i] = guest_free[--guest_free_num];
+            }
+            memset(to_ptr(addr), 0, size);
+            *out = addr;
+            return true;
+        }
+    }
+
+    // Then a hint above the bump pointer, then the bump pointer itself
+    if (hint >= guest_bump && hint >= GUEST_MMAP_BASE && hint + size <= guest_mmap_end) {
+        memset(to_ptr(hint), 0, size);
+        *out = hint;
+        return true;
+    }
+    if (guest_bump + size > guest_mmap_end) {
+        return false;
+    }
+    rvvm_addr_t addr = guest_bump;
+    guest_bump += size;
+    memset(to_ptr(addr), 0, size);
+    *out = addr;
+    return true;
+}
+
+static void guest_range_free(rvvm_addr_t addr, size_t size)
+{
+    rvvm_addr_t end = align_size_up(addr + size, GUEST_PAGE_SIZE);
+    addr            = align_size_down(addr, GUEST_PAGE_SIZE);
+    size            = end - addr;
+    if (addr < GUEST_MMAP_BASE || addr + size > guest_mmap_end || !size) {
+        return;
+    }
+    for (size_t i = 0; i < guest_free_num; ++i) {
+        if (guest_free[i].addr + guest_free[i].size == addr) {
+            guest_free[i].size += size;
+            return;
+        }
+        if (addr + size == guest_free[i].addr) {
+            guest_free[i].addr = addr;
+            guest_free[i].size += size;
+            return;
+        }
+    }
+    if (guest_free_num < GUEST_FREE_MAX) {
+        guest_free[guest_free_num].addr = addr;
+        guest_free[guest_free_num].size = size;
+        guest_free_num++;
+    }
 }
 
 // Return last errno like a syscall interface
@@ -504,7 +687,7 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
         const char* pch = "guest PC: ";
         while (*pch) *p++ = *pch++;
         user_fault_hex(&p, rvvm_read_cpu_reg(cpu, RVVM_REGID_PC));
-        /* Dump the faulting instruction bytes (guest mem == host mem) */
+        /* Dump the faulting instruction bytes */
         {
             size_t pc = rvvm_read_cpu_reg(cpu, RVVM_REGID_PC);
             uint8_t* ip = (uint8_t*)to_ptr(pc);
@@ -524,6 +707,7 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
     }
 #ifndef ANDROID
     (void)!write(2, buf, (size_t)(p - buf));
+    stacktrace_print();
 #else
     if (p < buf + sizeof(buf)) *p = '\0';
     __android_log_write(ANDROID_LOG_INFO, "RVVM-HOSTFAULT", buf);
@@ -687,35 +871,23 @@ static int guest_read_str(rvvm_hart_t* cpu, uint64_t guest_addr, char* host_buf,
 /* Main execution loop (Run the user CPU, handle syscalls) */
 static void* rvvm_user_thread_wrap(void* arg);
 
-#define BRK_HEAP_SIZE 0x40000000
-
 static spinlock_t brk_lock = {0};
-static uint8_t* brk_buffer = NULL;
-static uint8_t* brk_ptr = NULL;
 
 // We can't touch the native brk heap since it would likely blow up the process
-static void* rvvm_sys_brk(void* addr)
+static rvvm_addr_t rvvm_sys_brk(rvvm_addr_t brk_new)
 {
-    uint8_t* brk_new = addr;
-    uint8_t* brk_ret = NULL;
-    DO_ONCE({
-        brk_buffer = vma_alloc(NULL, BRK_HEAP_SIZE, VMA_RDWR);
-        brk_ptr = brk_buffer;
-        rvvm_info("sys_brk: heap buffer %p .. %p (%lx bytes)", brk_buffer,
-                  brk_buffer ? brk_buffer + BRK_HEAP_SIZE : NULL, (long)BRK_HEAP_SIZE);
-    });
-
     spin_lock(&brk_lock);
-    if (brk_new >= brk_buffer && brk_new < (brk_buffer + BRK_HEAP_SIZE)) {
-        if (brk_new > brk_ptr) {
+    if (guest_brk_start && brk_new >= guest_brk_start && brk_new <= guest_brk_end) {
+        if (brk_new > guest_brk_ptr) {
             // Newly allocated brk memory should be zeroed
-            memset(brk_ptr, 0, brk_new - brk_ptr);
+            memset(to_ptr(guest_brk_ptr), 0, brk_new - guest_brk_ptr);
         }
-        brk_ptr = brk_new;
+        guest_brk_ptr = brk_new;
     } else if (brk_new) {
-        rvvm_warn("invalid brk %p, current %p, off %ld!", brk_new, brk_ptr, brk_new - brk_buffer);
+        rvvm_warn("invalid brk %llx, heap %llx..%llx!", (unsigned long long)brk_new,
+                  (unsigned long long)guest_brk_start, (unsigned long long)guest_brk_end);
     }
-    brk_ret = brk_ptr;
+    rvvm_addr_t brk_ret = guest_brk_ptr;
     spin_unlock(&brk_lock);
     return brk_ret;
 }
@@ -900,93 +1072,104 @@ static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
 #define MAP_ANON MAP_ANONYMOUS
 #endif
 
-static spinlock_t mmap_lock = {0};
+/* Guest structs that embed pointers need conversion before being handed to the
+ * host libc: writev() dereferences iov_base, and it holds a guest address.
+ * This used to work because guest memory was identity-mapped onto the host. */
 
-static inline int rvvm_sys_prot(int prot)
+#define IOV_STACK_MAX 16
+#define IOV_HARD_MAX  1024
+
+// Translate a guest iovec array into a host one; may return @stack_buf
+static struct iovec* rvvm_iovec_from_guest(const struct uapi_iovec* giov, size_t count, struct iovec* stack_buf)
 {
-    int ret = PROT_NONE;
-    if (prot & UAPI_PROT_READ)  ret |= PROT_READ;
-    if (prot & UAPI_PROT_WRITE) ret |= PROT_WRITE;
-    // No real PROT_EXEC, since rvvm-user reads code when translating
-    if (prot & UAPI_PROT_EXEC)  ret |= PROT_READ;
-    return ret;
+    struct iovec* hiov = stack_buf;
+    if (count > IOV_STACK_MAX) {
+        hiov = safe_new_arr(struct iovec, count);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        hiov[i].iov_base = to_ptr(giov[i].base);
+        hiov[i].iov_len  = giov[i].len;
+    }
+    return hiov;
 }
 
-static rvvm_addr_t rvvm_sys_mmap(void* addr, size_t size, int prot, int flags, int fd, uint64_t offset)
+static void rvvm_iovec_release(struct iovec* hiov, struct iovec* stack_buf)
+{
+    if (hiov != stack_buf) {
+        free(hiov);
+    }
+}
+
+// Translate a guest msghdr (and the iovec array it points to) into host form
+static void rvvm_msghdr_from_guest(struct msghdr* host, const struct uapi_msghdr* guest,
+                                   struct iovec* iov_buf, size_t iov_count)
+{
+    memset(host, 0, sizeof(*host));
+    host->msg_name       = guest->name ? to_ptr(guest->name) : NULL;
+    host->msg_namelen    = guest->namelen;
+    host->msg_iov        = iov_buf;
+    host->msg_iovlen     = EVAL_MIN(guest->iovlen, iov_count);
+    host->msg_control    = guest->control ? to_ptr(guest->control) : NULL;
+    host->msg_controllen = guest->controllen;
+    host->msg_flags      = guest->flags;
+}
+
+#define UAPI_MREMAP_MAYMOVE 1
+
+static rvvm_addr_t rvvm_sys_mmap(rvvm_addr_t addr, size_t size, int prot, int flags, int fd, uint64_t offset)
 {
     /* NOTE: %llx, not %lx - on Windows host `long` is 32-bit, so %lx silently
      * prints only the low half of a 64-bit address and makes hints look bogus. */
     rvvm_info("sys_mmap(addr=%llx size=%llx prot=%x flags=%x fd=%d off=%llx)",
-              (long long)(size_t)addr, (long long)size, prot, flags, fd, (long long)offset);
+              (long long)addr, (long long)size, prot, flags, fd, (long long)offset);
     if (flags & UAPI_MAP_ILLEGAL) {
         return -UAPI_EINVAL;
     }
+    if (!size) {
+        return -UAPI_EINVAL;
+    }
 
-    spin_lock(&mmap_lock);
-
-    /* Route anonymous mappings through the portable VMA layer, which handles
-     * non-granular fixed addresses (ptr_diff centering) that raw POSIX mmap /
-     * VirtualAlloc cannot express. File-backed mappings keep using raw fd. */
-    if ((flags & UAPI_MAP_ANON) || fd < 0) {
-        // Permission bits are mandatory: VMA_NONE maps to PROT_NONE / PAGE_NOACCESS
-        uint32_t vma_flags = 0;
-        if (prot & UAPI_PROT_READ)  vma_flags |= VMA_READ;
-        if (prot & UAPI_PROT_WRITE) vma_flags |= VMA_WRITE;
-        if (prot & UAPI_PROT_EXEC)  vma_flags |= VMA_EXEC;
-        if (flags & UAPI_MAP_FIXED) vma_flags |= VMA_FIXED;
-        void* vret = vma_mmap(addr, size, vma_flags, NULL, 0);
-        if (!vret) {
-            /* Surface the exact parameters of a failed anonymous mapping: a
-             * guest-side malloc() failure only reports ENOMEM, the interesting
-             * part (hint address / size / flags) lives here. */
-            rvvm_warn("sys_mmap: anon map failed -> ENOMEM (addr=%llx size=%llx prot=%x flags=%x fixed=%d)",
-                      (long long)(size_t)addr, (long long)size, prot, flags, !!(flags & UAPI_MAP_FIXED));
-            spin_unlock(&mmap_lock);
-            return -UAPI_ENOMEM;
-        }
-        rvvm_info("sys_mmap: anon -> %p (hint=%llx size=%llx prot=%x flags=%x fixed=%d)",
-                  vret, (long long)(size_t)addr, (long long)size, prot, flags,
+    spin_lock(&guest_lock);
+    rvvm_addr_t ret = 0;
+    if (!guest_range_alloc(&ret, addr, size, !!(flags & (UAPI_MAP_FIXED | UAPI_MAP_FIXED_NOREPLACE)))) {
+        spin_unlock(&guest_lock);
+        /* Surface the exact parameters of a failed mapping: a guest-side
+         * malloc() failure only reports ENOMEM, the interesting part (hint
+         * address / size / flags) lives here. */
+        rvvm_warn("sys_mmap: guest map failed -> ENOMEM (addr=%llx size=%llx prot=%x flags=%x fixed=%d)",
+                  (long long)addr, (long long)size, prot, flags,
                   !!(flags & UAPI_MAP_FIXED));
-        spin_unlock(&mmap_lock);
-        return (rvvm_addr_t)(size_t)vret;
+        return -UAPI_ENOMEM;
+    }
+    spin_unlock(&guest_lock);
+
+    if (!(flags & UAPI_MAP_ANON) && fd >= 0) {
+        /* File-backed mapping: the guest can only see its own buffer, so read
+         * the requested window in. Write-back to the file is not emulated. */
+        ssize_t rd = pread(fd, to_ptr(ret), size, (off_t)offset);
+        if (rd < 0) {
+            rvvm_warn("sys_mmap: pread failed (fd=%d off=%llx size=%llx)",
+                      fd, (long long)offset, (long long)size);
+            int err = last_errno();
+            spin_lock(&guest_lock);
+            guest_range_free(ret, size);
+            spin_unlock(&guest_lock);
+            return err;
+        }
     }
 
-    int mmap_flags = 0;
-    if (flags & UAPI_MAP_SHARED) mmap_flags |= MAP_SHARED;
-    if (flags & UAPI_MAP_PRIVATE) mmap_flags |= MAP_PRIVATE;
-    if (flags & UAPI_MAP_ANON) mmap_flags |= MAP_ANON;
-
-    if (flags & UAPI_MAP_FIXED_NOREPLACE) {
-#ifdef __linux__
-        mmap_flags |= MAP_FIXED_NOREPLACE;
-#else
-        mmap_flags |= MAP_FIXED;
-#endif
-    }
-
-    if (flags & UAPI_MAP_FIXED) {
-        // This flag has destructive semantics...
-        mmap_flags |= MAP_FIXED;
-#ifndef __linux__
-        munmap(addr, size);
-#endif
-    }
-
-    rvvm_addr_t ret = errno_ret((size_t)mmap(addr, size, rvvm_sys_prot(prot), mmap_flags, fd, offset));
-    spin_unlock(&mmap_lock);
+    rvvm_info("sys_mmap: -> %llx (hint=%llx size=%llx prot=%x flags=%x fixed=%d)",
+              (long long)ret, (long long)addr, (long long)size, prot, flags,
+              !!(flags & UAPI_MAP_FIXED));
     return ret;
 }
 
-static int rvvm_sys_munmap(void* addr, size_t size)
+static int rvvm_sys_munmap(rvvm_addr_t addr, size_t size)
 {
-    spin_lock(&mmap_lock);
-    /* Anonymous VMAs live in the portable VMA layer, which also emulates
-     * partial unmap (decommit) that raw VirtualFree(MEM_RELEASE) cannot.
-     * File-backed views / foreign pointers fail vma_free() and fall through
-     * to the raw munmap() below. */
-    bool freed = vma_free(addr, size);
-    spin_unlock(&mmap_lock);
-    return freed ? 0 : errno_ret(munmap(addr, size));
+    spin_lock(&guest_lock);
+    guest_range_free(addr, size);
+    spin_unlock(&guest_lock);
+    return 0;
 }
 
 extern uint64_t __thread_selfid(void);
@@ -1297,13 +1480,22 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 }
                 case 65: // readv
-                    // TODO: struct conversion(?)
-                    a0 = errno_ret(readv(a0, to_ptr(a1), a2));
+                case 66: { // writev
+                    // The iovec array is converted: iov_base is a guest address
+                    if (a2 > IOV_HARD_MAX) {
+                        a0 = -UAPI_EINVAL;
+                        break;
+                    }
+                    struct iovec  stack_iov[IOV_STACK_MAX] = {0};
+                    struct iovec* hiov = rvvm_iovec_from_guest(to_ptr(a1), a2, stack_iov);
+                    if (a7 == 65) {
+                        a0 = errno_ret(readv(a0, hiov, a2));
+                    } else {
+                        a0 = errno_ret(writev(a0, hiov, a2));
+                    }
+                    rvvm_iovec_release(hiov, stack_iov);
                     break;
-                case 66: // writev
-                    // TODO: struct conversion(?)
-                    a0 = errno_ret(writev(a0, to_ptr(a1), a2));
-                    break;
+                }
                 case 67: // pread64
                     a0 = errno_ret(pread(a0, to_ptr(a1), a2, a3));
                     break;
@@ -1689,28 +1881,62 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(shutdown(a0, a1));
                     break;
                 case 211: // sendmsg
-                    // TODO: struct conversion(?)
-                    rvvm_info("sys_sendmsg(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(sendmsg(a0, to_ptr(a1), a2));
+                case 212: { // recvmsg
+                    // struct msghdr embeds three guest pointers plus an iovec array
+                    rvvm_info("sys_%smsg(%ld, %lx, %lx)", a7 == 211 ? "send" : "recv", a0, a1, a2);
+                    const struct uapi_msghdr* gmsg = to_ptr(a1);
+                    if (gmsg->iovlen > IOV_HARD_MAX) {
+                        a0 = -UAPI_EINVAL;
+                        break;
+                    }
+                    struct iovec  stack_iov[IOV_STACK_MAX] = {0};
+                    struct iovec* hiov = rvvm_iovec_from_guest(to_ptr(gmsg->iov), gmsg->iovlen, stack_iov);
+                    struct msghdr hmsg = {0};
+                    rvvm_msghdr_from_guest(&hmsg, gmsg, hiov, gmsg->iovlen);
+                    if (a7 == 211) {
+                        a0 = errno_ret(sendmsg(a0, &hmsg, a2));
+                    } else {
+                        a0 = errno_ret(recvmsg(a0, &hmsg, a2));
+                    }
+                    rvvm_iovec_release(hiov, stack_iov);
                     break;
-                case 212: // recvmsg
-                    // TODO: struct conversion(?)
-                    rvvm_info("sys_recvmsg(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(recvmsg(a0, to_ptr(a1), a2));
-                    break;
+                }
                 case 214: // brk
                     rvvm_info("sys_brk(%lx)", a0);
-                    a0 = (size_t)rvvm_sys_brk(to_ptr(a0));
+                    a0 = (size_t)rvvm_sys_brk(a0);
                     break;
                 case 215: // munmap
                     rvvm_info("sys_munmap(%lx, %lx)", a0, a1);
-                    a0 = rvvm_sys_munmap(to_ptr(a0), a1);
+                    a0 = rvvm_sys_munmap(a0, a1);
                     break;
 #ifdef __linux__
-                case 216: // mremap
+                case 216: { // mremap
                     rvvm_info("sys_mremap(%lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4);
-                    a0 = errno_ret((size_t)mremap(to_ptr(a0), a1, a2, a3, to_ptr(a4)));
+                    /* Growing in place is only valid while nothing is mapped
+                     * right after the old range, which this allocator does not
+                     * track - only honour the relocating form. */
+                    if (!(a3 & UAPI_MREMAP_MAYMOVE)) {
+                        a0 = -UAPI_ENOMEM;
+                        break;
+                    }
+                    rvvm_addr_t new_addr = 0;
+                    spin_lock(&guest_lock);
+                    bool ok = guest_range_alloc(&new_addr, 0, a2, false);
+                    spin_unlock(&guest_lock);
+                    if (!ok) {
+                        a0 = -UAPI_ENOMEM;
+                        break;
+                    }
+                    memcpy(to_ptr(new_addr), to_ptr(a0), EVAL_MIN(a1, a2));
+                    if (a2 > a1) {
+                        memset(to_ptr(new_addr + a1), 0, a2 - a1);
+                    }
+                    spin_lock(&guest_lock);
+                    guest_range_free(a0, a1);
+                    spin_unlock(&guest_lock);
+                    a0 = new_addr;
                     break;
+                }
 #endif
                 case 220: // clone
                     rvvm_info("sys_clone(%lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4);
@@ -1735,19 +1961,23 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 }
                 case 222: // mmap
-                    a0 = rvvm_sys_mmap(to_ptr(a0), a1, a2, a3, a4, a5);
+                    a0 = rvvm_sys_mmap(a0, a1, a2, a3, a4, a5);
                     break;
                 case 223: // fadvise64_64 - ignore
                     a0 = 0;
                     break;
                 case 226: // mprotect
                     rvvm_info("sys_mprotect(%lx, %lx, %x)", a0, a1, a2);
-                    a0 = errno_ret(mprotect(to_ptr(a0), a1, a2));
+                    /* Guest code is interpreted rather than executed natively,
+                     * so guest page protections are not enforced. Changing the
+                     * host protection of the shared guest buffer would only
+                     * break the emulator's own access to it. */
+                    a0 = 0;
                     break;
 #ifdef __linux__
                 case 233: // madvise
                     rvvm_info("sys_madvise(%lx, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(madvise(to_ptr(a0), a1, a2));
+                    a0 = 0;
                     break;
                 case 242: // accept4
                     // TODO: struct conversion(?)
@@ -1936,7 +2166,8 @@ static void* rvvm_user_thread_wrap(void* arg)
 }
 
 // Jump into _start after setting up the context
-static void jump_start(void* entry, void* stack_top)
+// Both @entry and @stack_top are guest addresses
+static void jump_start(size_t entry, size_t stack_top)
 {
 #ifdef RVVM_USER_TEST_RISCV
     register size_t a0 __asm__("a0") = (size_t) entry;
@@ -1960,7 +2191,6 @@ static void jump_start(void* entry, void* stack_top)
         :
     );
 #else
-    userland = rvvm_create_userland("rv64");
     atomic_store_uint32(&userland_exit_reported, 0);
 
     rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
@@ -1972,15 +2202,6 @@ static void jump_start(void* entry, void* stack_top)
 
     rvvm_user_thread_wrap(thread);
     userland_main_thread = NULL;
-
-    /* Guest threads wind down asynchronously: wait for them to leave
-     * the machine before freeing it. On timeout, leak the machine
-     * instead of leaving a running vCPU on freed memory. */
-    if (userland_threads_gone(1000)) {
-        rvvm_free_machine(userland);
-    } else {
-        rvvm_warn("Guest threads linger after exit, leaking userland machine");
-    }
 #endif
 }
 
@@ -2044,7 +2265,7 @@ static void* stack_put_str(void* stack, const char* str)
 #define UAPI_AT_EXECFN        31
 #define UAPI_AT_SYSINFO_EHDR  33 // vDSO location; RISC-V specific!
 
-static char* rvvm_user_init_stack(void* stack, exec_desc_t* desc)
+static rvvm_addr_t rvvm_user_init_stack(void* stack, exec_desc_t* desc)
 {
     /*
      * Stack layout (upside down):
@@ -2074,12 +2295,12 @@ static char* rvvm_user_init_stack(void* stack, exec_desc_t* desc)
 
     for (size_t i = envc; i--;) {
         stack = stack_put_str(stack, desc->envp[i]);
-        string_ptrs[desc->argc + 1 + i] = (size_t)stack;
+        string_ptrs[desc->argc + 1 + i] = (uapi_size_t)to_addr(stack);
     }
 
     for (size_t i = desc->argc; i--;) {
         stack = stack_put_str(stack, desc->argv[i]);
-        string_ptrs[i] = (size_t)stack;
+        string_ptrs[i] = (uapi_size_t)to_addr(stack);
     }
 
     // 5. random bytes
@@ -2110,8 +2331,8 @@ static char* rvvm_user_init_stack(void* stack, exec_desc_t* desc)
         UAPI_AT_CLKTCK,        100,
         UAPI_AT_SECURE,        0,
         UAPI_AT_BASE_PLATFORM, 0,
-        UAPI_AT_RANDOM,        (size_t)random_bytes,
-        UAPI_AT_EXECFN,        (size_t)execfn,
+        UAPI_AT_RANDOM,        (uapi_size_t)to_addr(random_bytes),
+        UAPI_AT_EXECFN,        (uapi_size_t)to_addr(execfn),
         UAPI_AT_NULL,
     };
     stack = stack_put_mem(stack, auxv, sizeof(auxv));
@@ -2123,10 +2344,8 @@ static char* rvvm_user_init_stack(void* stack, exec_desc_t* desc)
     // 1. argc
     stack = stack_put_size(stack, desc->argc);
 
-    return stack;
+    return to_addr(stack);
 }
-
-#define STACK_SIZE 0x4000000
 
 extern char** environ;
 
@@ -2160,11 +2379,26 @@ int rvvm_user_linux(int argc, char** argv, char** envp)
     elf_unload_file(&elf);
     elf_unload_file(&interp);
     memset(siga, 0, sizeof(siga));
-    spin_lock(&brk_lock);
-    if (brk_buffer) {
-        brk_ptr = brk_buffer;
+
+    /* Guest memory lives in a dedicated buffer owned by the userland machine,
+     * so it must exist before the ELF loader (which copies the image into it)
+     * and before anything calls to_ptr(). */
+    if (!userland) {
+        userland = rvvm_create_userland("rv64");
+        if (!userland) {
+            rvvm_error("Failed to create the userland machine");
+            return -1;
+        }
     }
-    spin_unlock(&brk_lock);
+    guest_vm_init();
+    /* Host pointer standing for guest address 0. Deliberately computed with
+     * integer math: the result points below the allocation and must never be
+     * dereferenced on its own, only as (window + guest_addr). */
+    uint8_t* window = (uint8_t*)((size_t)userland->mem.data - (size_t)userland->mem.addr);
+    elf.guest_window    = window;
+    interp.guest_window = window;
+    guest_brk_start     = 0;
+    guest_brk_ptr       = 0;
 
     stacktrace_init();
     user_fault_handler_install();
@@ -2215,9 +2449,23 @@ int rvvm_user_linux(int argc, char** argv, char** envp)
     rvvm_info("Loaded ELF %s at base %lx, entry %lx,\n%ld PHDRs at %lx",
               argv[0], (size_t)elf.base, elf.entry, elf.phnum, elf.phdr);
 
+    /* The brk heap starts right past the image and runs up to where mmap()ed
+     * ranges begin - exactly what ELF_USERLAND_HEAP_MARGIN reserved. */
+    guest_brk_start = align_size_up(to_addr(elf.base) + elf.buf_size, GUEST_PAGE_SIZE);
+    guest_brk_ptr   = guest_brk_start;
+
     if (elf.interp_path) {
         rvvm_info("ELF interpreter at %s", elf.interp_path);
         file = rvopen(wrap_path(path_buf, elf.interp_path), 0);
+        if (file) {
+            // A relocatable interpreter needs a guest address picked upfront
+            spin_lock(&guest_lock);
+            bool placed = guest_range_alloc(&interp.load_addr, 0, rvfilesize(file), false);
+            spin_unlock(&guest_lock);
+            if (!placed) {
+                interp.load_addr = 0;
+            }
+        }
         success = file && elf_load_file(file, &interp);
         rvclose(file);
         if (!success) {
@@ -2244,29 +2492,39 @@ int rvvm_user_linux(int argc, char** argv, char** envp)
         .argc = argc,
         .argv = argv,
         .envp = envp,
-        .base = (size_t)elf.base,
+        .base = elf.base ? to_addr(elf.base) : 0,
         .entry = elf.entry,
-        .interp_base = (size_t)interp.base,
+        .interp_base = interp.base ? to_addr(interp.base) : 0,
         .interp_entry = interp.entry,
         .phdr = elf.phdr,
         .phnum = elf.phnum,
     };
 
-    uint8_t* stack_buffer = safe_calloc(STACK_SIZE, 1);
-    void* stack_top = rvvm_user_init_stack(stack_buffer + STACK_SIZE, &desc);
+    // The stack lives in guest memory too, so the guest can name pointers to it
+    uint8_t* stack_buffer = to_ptr(guest_stack_base);
+    memset(stack_buffer, 0, GUEST_STACK_SIZE);
+    size_t stack_top = rvvm_user_init_stack(stack_buffer + GUEST_STACK_SIZE, &desc);
 
-    rvvm_info("Stack top at %p", stack_top);
+    rvvm_info("Stack top at %lx", (size_t)stack_top);
 
     if (elf.interp_path) {
-        jump_start((void*)interp.entry, stack_top);
+        jump_start(interp.entry, stack_top);
     } else {
-        jump_start((void*)elf.entry, stack_top);
+        jump_start(elf.entry, stack_top);
     }
 
     /* Cleanup Android NDK API proxy */
     cmdpost_cleanup();
 
-    free(stack_buffer);
+    /* Guest threads wind down asynchronously: wait for them to leave the
+     * machine before freeing it. On timeout, leak the machine instead of
+     * leaving a running vCPU on freed memory. */
+    if (userland_threads_gone(1000)) {
+        rvvm_free_machine(userland);
+        userland = NULL;
+    } else {
+        rvvm_warn("Guest threads linger after exit, leaking userland machine");
+    }
     return 0;
 }
 
