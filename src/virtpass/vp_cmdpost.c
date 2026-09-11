@@ -536,7 +536,14 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                         if (dst) {
                             memcpy(dst, g_motion_events, sizeof(cmdpost_GameActivityMotionEvent) * copy_count);
                             guest_buf->motionEventsCount = copy_count;
-                            CMDLOG("Guest swapped input: %d motion events (capacity %d)", copy_count, capacity);
+                            int32_t max_pointers = 0;
+                            for (int32_t i = 0; i < copy_count; i++) {
+                                if (g_motion_events[i].pointerCount > max_pointers) {
+                                    max_pointers = g_motion_events[i].pointerCount;
+                                }
+                            }
+                            CMDLOG("Guest swapped input: %d motion events (capacity %d, max pointers %d)",
+                                   copy_count, capacity, max_pointers);
                         }
                     }
                     cmdpost_clear_motion_events();
