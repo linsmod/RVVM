@@ -118,6 +118,26 @@ static bool   g_minimized    = false;
 #define LAUNCH_CTRL_H   28
 #define LAUNCH_CTRL_GAP  8
 
+/*
+ * Combo box geometry. The height passed to CreateWindowA() for a
+ * CBS_DROPDOWNLIST combo is the TOTAL height: the closed static box plus the
+ * dropped list area. Windows shrinks the window to the static box when the
+ * list is closed and expands it again on drop.
+ *
+ * Passing just the static height (22) leaves a zero-height list area, so
+ * CB_SHOWDROPDOWN / a click on the arrow really does drop the list - the
+ * ComboLBox window exists and CB_GETDROPPEDSTATE reports TRUE - but the list
+ * has no pixels to show, which looks exactly like "the dropdown does not
+ * open". The list area must be part of the created height.
+ */
+#define LAUNCH_COMBO_EDIT_H  22   /* closed static box (system picks ~this) */
+#define LAUNCH_COMBO_LIST_H  180  /* dropped list area                     */
+#define LAUNCH_COMBO_H       (LAUNCH_COMBO_EDIT_H + LAUNCH_COMBO_LIST_H)
+
+/* Row the buttons live on: below the combo's static box, NOT below the
+ * dropped list (the list is a popup and floats over them when open). */
+#define LAUNCH_BTN_Y         (LAUNCH_MARGIN + LAUNCH_COMBO_EDIT_H + LAUNCH_CTRL_GAP)
+
 /* Known sample guests; used when the assets directory holds no .exe files
  * (e.g. the assets haven't been built yet). */
 static const char* LAUNCHER_DEFAULT_GUESTS[] = {
@@ -820,6 +840,86 @@ static void set_title(const char* suffix)
 /* Window procedure                                                    */
 /* ------------------------------------------------------------------ */
 
+/* TEMP DEBUG: input/notifications trace. Remove after diagnosis. */
+static bool g_dbg_dropped_prev = false;
+static int  g_dbg_paint_count  = 0;
+
+static const char* dbg_cls(HWND h)
+{
+    static char buf[64];
+    if (!h) return "(null)";
+    buf[0] = '\0';
+    GetClassNameA(h, buf, sizeof(buf));
+    return buf;
+}
+
+static void dbg_trace(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_PARENTNOTIFY:
+        winhost_log("DBG PARENTNOTIFY ev=%u child=%s id=%d",
+                    (unsigned)LOWORD(wParam), dbg_cls((HWND)lParam),
+                    (int)GetDlgCtrlID((HWND)lParam));
+        break;
+    case WM_COMMAND:
+        winhost_log("DBG COMMAND id=%d notify=%u src=%s fromCombo=%d",
+                    (int)LOWORD(wParam), (unsigned)HIWORD(wParam),
+                    dbg_cls((HWND)lParam),
+                    (int)(g_combo != NULL && (HWND)lParam == g_combo));
+        break;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK: {
+        POINT pt;
+        HWND  hit;
+        pt.x = (short)LOWORD(lParam);
+        pt.y = (short)HIWORD(lParam);
+        ClientToScreen(hwnd, &pt);
+        hit = WindowFromPoint(pt);
+        winhost_log("DBG %s client=%d,%d hit=%s isCombo=%d isMain=%d",
+                    msg == WM_LBUTTONDOWN ? "LBTNDOWN" :
+                    (msg == WM_LBUTTONDBLCLK ? "LBTNDBLCLK" : "LBTNUP"),
+                    (int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam),
+                    dbg_cls(hit), (int)(hit == g_combo), (int)(hit == g_hwnd));
+        break;
+    }
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+        winhost_log("DBG %s focus=%s",
+                    msg == WM_SETFOCUS ? "SETFOCUS" : "KILLFOCUS",
+                    dbg_cls(GetFocus()));
+        break;
+    case WM_ACTIVATE:
+        winhost_log("DBG ACTIVATE state=%u minimized=%u",
+                    (unsigned)LOWORD(wParam), (unsigned)HIWORD(wParam));
+        break;
+    case WM_CAPTURECHANGED:
+        winhost_log("DBG CAPTURECHANGED newCapture=%s", dbg_cls((HWND)lParam));
+        break;
+    case WM_MOUSEACTIVATE:
+        winhost_log("DBG MOUSEACTIVATE topLevel=%s hitCode=%u",
+                    dbg_cls((HWND)wParam), (unsigned)LOWORD(lParam));
+        break;
+    case WM_TIMER:
+        if (wParam == SENSOR_TIMER_ID && g_combo) {
+            bool d = SendMessageA(g_combo, CB_GETDROPPEDSTATE, 0, 0) != 0;
+            if (d != g_dbg_dropped_prev) {
+                g_dbg_dropped_prev = d;
+                winhost_log("DBG combo dropped=%d comboLBox=0x%p",
+                            (int)d, (void*)FindWindowA("ComboLBox", NULL));
+            }
+        }
+        break;
+    case WM_PAINT:
+        if (g_launcher_idle && (++g_dbg_paint_count % 30) == 0) {
+            winhost_log("DBG paint#%d (idle view repainted)", g_dbg_paint_count);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 /* Launcher helpers are defined further down (Public API section) but win_proc
  * calls them from WM_COMMAND / WM_APP_GUEST_EXIT. Forward declarations. */
 static void launcher_ui_idle(void);
@@ -828,6 +928,7 @@ static void launcher_stop(void);
 
 static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    dbg_trace(hwnd, msg, wParam, lParam);
     switch (msg) {
     /*
      * Architecture note: the Win32 window is ONLY a presentation surface
@@ -1221,9 +1322,11 @@ static void launcher_ui_create(void)
     if (g_combo || !g_hwnd) return;
     if (g_guest_count == 0) launcher_scan_guests();
 
+    /* Total height (static box + dropped list), see LAUNCH_COMBO_H. */
     g_combo = CreateWindowA("COMBOBOX", "",
-                            WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST,
-                            LAUNCH_MARGIN, LAUNCH_MARGIN, 260, 22,
+                            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP |
+                            CBS_DROPDOWNLIST,
+                            LAUNCH_MARGIN, LAUNCH_MARGIN, 260, LAUNCH_COMBO_H,
                             g_hwnd, (HMENU)(INT_PTR)IDC_COMBO, hinst, NULL);
     if (g_combo) {
         for (i = 0; i < g_guest_count; i++) {
@@ -1234,15 +1337,15 @@ static void launcher_ui_create(void)
 
     g_btn_run  = CreateWindowA("BUTTON", "Run",
                                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               LAUNCH_MARGIN, LAUNCH_MARGIN + 22 + LAUNCH_CTRL_GAP, 80, LAUNCH_CTRL_H,
+                               LAUNCH_MARGIN, LAUNCH_BTN_Y, 80, LAUNCH_CTRL_H,
                                g_hwnd, (HMENU)(INT_PTR)IDC_RUN, hinst, NULL);
     g_btn_stop = CreateWindowA("BUTTON", "Stop",
                                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               LAUNCH_MARGIN + 88,   LAUNCH_MARGIN + 22 + LAUNCH_CTRL_GAP, 80, LAUNCH_CTRL_H,
+                               LAUNCH_MARGIN + 88,   LAUNCH_BTN_Y, 80, LAUNCH_CTRL_H,
                                g_hwnd, (HMENU)(INT_PTR)IDC_STOP, hinst, NULL);
     g_btn_exit = CreateWindowA("BUTTON", "Exit",
                                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               LAUNCH_MARGIN + 176,  LAUNCH_MARGIN + 22 + LAUNCH_CTRL_GAP, 80, LAUNCH_CTRL_H,
+                               LAUNCH_MARGIN + 176,  LAUNCH_BTN_Y, 80, LAUNCH_CTRL_H,
                                g_hwnd, (HMENU)(INT_PTR)IDC_EXIT, hinst, NULL);
 }
 
@@ -1409,7 +1512,12 @@ bool win32_host_init(const char* title, int win_w, int win_h,
     r.left = 0; r.top = 0; r.right = g_win_w; r.bottom = g_win_h;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
 
-    g_hwnd = CreateWindowExA(0, wc.lpszClassName, title, WS_OVERLAPPEDWINDOW,
+    /* WS_CLIPCHILDREN: the launcher's idle WM_PAINT fills the whole client
+     * area, and the guest view blits the scaled panel over it. Without it the
+     * parent paints straight over the dropdown and the buttons, erasing them
+     * until they happen to repaint (visible as a flicker / "dead" controls). */
+    g_hwnd = CreateWindowExA(0, wc.lpszClassName, title,
+                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT,
                              r.right - r.left, r.bottom - r.top,
                              NULL, NULL, wc.hInstance, NULL);
