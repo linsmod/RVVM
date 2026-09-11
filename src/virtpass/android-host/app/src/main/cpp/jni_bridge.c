@@ -52,29 +52,45 @@ static const ASensor* g_light = NULL;
 static ASensorEventQueue* g_event_queue = NULL;
 static ALooper* g_looper = NULL;
 
-/* Window from Android */
+/* Window from Android (Layer 2: the viewport) */
 static ANativeWindow* g_native_window = NULL;
 
-/* Device configuration pushed from the Java Configuration object.
- * The public NDK AConfiguration only carries quantised values, and the
- * exact dp/density figures live on the Java side. */
-static struct {
-    int32_t width_dp;
-    int32_t height_dp;
-    int32_t density_dpi;
-    int32_t orientation;
-    int32_t screen_size;
-    int32_t screen_long;
-    int32_t screen_round;
-} g_display_cfg = {
-    .width_dp     = 640,
-    .height_dp    = 480,
-    .density_dpi  = ACONFIGURATION_DENSITY_MEDIUM,
-    .orientation  = ACONFIGURATION_ORIENTATION_LAND,
-    .screen_size  = ACONFIGURATION_SCREENSIZE_NORMAL,
-    .screen_long  = ACONFIGURATION_SCREENLONG_NO,
-    .screen_round = ACONFIGURATION_SCREENROUND_NO,
-};
+/* ------------------------------------------------------------------
+ * Two-layer display model (mirrors the win32 host).
+ *
+ * Layer 1 - the virtual panel - is host-owned and guest-invisible: the guest
+ * can only observe it through the public NDK ABI (window size and
+ * AConfiguration). Layer 2 - the real SurfaceView - is merely a viewport and
+ * may resize at any time without ever reaching the guest. Keeping the two
+ * apart is what stops a surface resize from moving the geometry the guest is
+ * already rendering into (that mismatch was what made the unlock copy run off
+ * the end of the guest pixel buffer).
+ * ------------------------------------------------------------------ */
+static int32_t g_virt_w   = 0;                              /* panel, px */
+static int32_t g_virt_h   = 0;
+static int32_t g_virt_ppi = ACONFIGURATION_DENSITY_MEDIUM;  /* host-private */
+
+/* Guest-visible surface geometry. Latched from the panel on first use and
+ * afterwards changed only by the guest's ANativeWindow_setBuffersGeometry,
+ * exactly like the win32 host's g_init -> g_surf hand-off. */
+static int32_t g_init_w   = 0;   /* panel snapshot taken at latch time */
+static int32_t g_init_h   = 0;
+static int32_t g_surf_w   = 0;
+static int32_t g_surf_h   = 0;
+static int32_t g_surf_fmt = WINDOW_FORMAT_RGBA_8888;
+
+/* Geometry last pushed to the real surface (skips redundant calls). */
+static int32_t g_applied_w   = 0;
+static int32_t g_applied_h   = 0;
+static int32_t g_applied_fmt = 0;
+
+/* Guards all of the above. Held for short reads/writes only, never across an
+ * ANativeWindow_lock()/unlockAndPost() pair. */
+static pthread_mutex_t g_surf_cs = PTHREAD_MUTEX_INITIALIZER;
+
+/* Provisional panel used until the first real surface size is known. */
+#define VP_PANEL_DEFAULT_W 640
+#define VP_PANEL_DEFAULT_H 480
 
 /* GameActivity state */
 static int32_t g_lifecycle_cmd_queue[32];
@@ -246,10 +262,66 @@ static void on_sensor_data(float x, float y, float z, int type, int64_t timestam
 /* Locked window buffer info (kept between lock and unlock) */
 static ANativeWindow_Buffer g_locked_buffer;
 
+/* The buffer descriptor handed back on WINDOW_LOCK uses the shared guest-ABI
+ * type cmdpost_ANativeWindow_Buffer (vp_cmdpost.h), the same one the win32 host
+ * uses. Note `bits` is a 64-bit pointer here because the guest is riscv64:
+ * writing this structure as a flat int32_t array shifts every following field
+ * down by four bytes and corrupts width/height/stride/format. Address it by
+ * field name only. */
+
+/* Latch the panel from the first real surface size we ever see. Caller holds
+ * g_surf_cs. Once the guest has observed a geometry the panel is frozen:
+ * moving it afterwards would desynchronise the guest buffer from the bytes we
+ * copy on unlock. Mirrors the win32 host, where the virtual panel defaults to
+ * the window size and then stays put across resizes. */
+static void panel_latch_locked(void)
+{
+    int32_t w, h;
+
+    if (g_surf_w > 0 && g_surf_h > 0) return;   /* guest already saw it */
+    if (g_virt_w > 0 && g_virt_h > 0) return;   /* already latched      */
+    if (!g_native_window) return;
+
+    w = ANativeWindow_getWidth(g_native_window);
+    h = ANativeWindow_getHeight(g_native_window);
+    if (w <= 0 || h <= 0) return;
+
+    g_virt_w = w;
+    g_virt_h = h;
+    g_init_w = w;
+    g_init_h = h;
+    LOGI("Virtual panel latched: %dx%d", w, h);
+}
+
+/* Effective guest geometry. Caller holds g_surf_cs. Latches the panel into the
+ * guest surface on first use; after that the value is stable, so the guest
+ * allocates its pixel buffer once instead of chasing a moving target. */
+static void guest_geometry_locked(int32_t* w, int32_t* h, int32_t* fmt)
+{
+    if (g_surf_w <= 0 || g_surf_h <= 0) {
+        int32_t pw = (g_virt_w > 0) ? g_virt_w
+                  : (g_init_w > 0) ? g_init_w : VP_PANEL_DEFAULT_W;
+        int32_t ph = (g_virt_h > 0) ? g_virt_h
+                  : (g_init_h > 0) ? g_init_h : VP_PANEL_DEFAULT_H;
+        g_surf_w = pw;
+        g_surf_h = ph;
+        LOGI("Guest surface latched to panel: %dx%d", pw, ph);
+    }
+    if (g_surf_fmt != WINDOW_FORMAT_RGBA_8888 &&
+        g_surf_fmt != WINDOW_FORMAT_RGB_565) {
+        g_surf_fmt = WINDOW_FORMAT_RGBA_8888;
+    }
+    if (w)   *w   = g_surf_w;
+    if (h)   *h   = g_surf_h;
+    if (fmt) *fmt = g_surf_fmt;
+}
+
 /* Window lock callback (called from vp_cmdpost)
  * Fills geometry only; the guest renders into its own buffer (identity-mapped
  * guest/host addresses) and we copy pixels on unlock. Never expose the host
- * surface pointer to the guest. */
+ * surface pointer to the guest. The geometry handed to the guest is the
+ * virtual panel, never the live viewport, so a surface resize cannot move the
+ * buffer the guest is mid-frame on. */
 static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
 {
     (void)window;
@@ -260,6 +332,22 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
         return -1;
     }
 
+    int32_t gw, gh, gf;
+
+    pthread_mutex_lock(&g_surf_cs);
+    panel_latch_locked();
+    guest_geometry_locked(&gw, &gh, &gf);
+    /* Push the panel geometry onto the real surface so lock() hands back a
+     * buffer we can copy the guest frame into one-for-one. */
+    if (g_applied_w != gw || g_applied_h != gh || g_applied_fmt != gf) {
+        if (ANativeWindow_setBuffersGeometry(g_native_window, gw, gh, gf) == 0) {
+            g_applied_w   = gw;
+            g_applied_h   = gh;
+            g_applied_fmt = gf;
+        }
+    }
+    pthread_mutex_unlock(&g_surf_cs);
+
     ANativeWindow_Buffer buffer;
     ARect dirty;
 
@@ -268,14 +356,15 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
         g_locked_buffer = buffer;
         if (outBuffer) {
             /* outBuffer points into guest memory; geometry only, bits stays 0 */
-            int32_t* dst = (int32_t*)outBuffer;
-            dst[0] = 0;               /* bits: guest supplies its own buffer */
-            dst[1] = buffer.width;
-            dst[2] = buffer.height;
-            dst[3] = buffer.stride;
-            dst[4] = buffer.format;
+            cmdpost_ANativeWindow_Buffer* dst = (cmdpost_ANativeWindow_Buffer*)outBuffer;
+            dst->bits   = NULL;       /* guest supplies its own buffer       */
+            dst->width  = gw;         /* guest geometry == virtual panel     */
+            dst->height = gh;
+            dst->stride = gw;         /* guest stride == panel width         */
+            dst->format = gf;
 
-            LOGI("Window locked: %dx%d stride=%d format=%d",
+            LOGI("Window locked: guest %dx%d stride=%d fmt=%d (surface %dx%d stride=%d fmt=%d)",
+                 gw, gh, gw, gf,
                  buffer.width, buffer.height, buffer.stride, buffer.format);
         }
     }
@@ -293,24 +382,54 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
         return -1;
     }
 
+    int32_t gw, gh, gf;
+
+    pthread_mutex_lock(&g_surf_cs);
+    guest_geometry_locked(&gw, &gh, &gf);
+    pthread_mutex_unlock(&g_surf_cs);
+
     if (guestPixels && g_locked_buffer.bits) {
-        size_t bpp = (g_locked_buffer.format == WINDOW_FORMAT_RGB_565) ? 2 : 4;
-        size_t copy_size = (size_t)g_locked_buffer.stride * g_locked_buffer.height * bpp;
-        LOGI("Unlock: copying %zu bytes from guest pixbuf %p -> %p",
-             copy_size, guestPixels, g_locked_buffer.bits);
-        {
-            /* Row-by-row copy with progress traces to bisect the fault */
-            uint8_t* src = (uint8_t*)guestPixels;
-            uint8_t* dst = (uint8_t*)g_locked_buffer.bits;
-            size_t row = (size_t)g_locked_buffer.stride * bpp;
-            for (int32_t y = 0; y < g_locked_buffer.height; y++) {
-                memcpy(dst + (size_t)y * row, src + (size_t)y * row, row);
-                if ((y & 255) == 255) {
-                    LOGI("Unlock: copied %d/%d rows", y + 1, g_locked_buffer.height);
+        size_t sbpp = (gf == WINDOW_FORMAT_RGB_565) ? 2 : 4;
+        size_t dbpp = (g_locked_buffer.format == WINDOW_FORMAT_RGB_565) ? 2 : 4;
+
+        /* Copy only what BOTH sides agree on. The guest buffer is panel-sized
+         * (g_surf_w x g_surf_h); the surface buffer is whatever the platform
+         * granted for the lock. Clamping here means a surface that ignored our
+         * geometry can never turn this into an out-of-bounds access. */
+        int32_t cols = (gw < g_locked_buffer.width)  ? gw : g_locked_buffer.width;
+        int32_t rows = (gh < g_locked_buffer.height) ? gh : g_locked_buffer.height;
+        if (cols < 0) cols = 0;
+        if (rows < 0) rows = 0;
+
+        size_t sstride = (size_t)gw * sbpp;                     /* guest row pitch   */
+        size_t dstride = (size_t)g_locked_buffer.stride * dbpp; /* surface row pitch */
+        size_t srow    = (size_t)cols * sbpp;
+        size_t drow    = (size_t)cols * dbpp;
+
+        LOGI("Unlock: panel %dx%d fmt=%d -> surface %dx%d stride=%d fmt=%d (copy %dx%d)",
+             gw, gh, gf,
+             g_locked_buffer.width, g_locked_buffer.height,
+             g_locked_buffer.stride, g_locked_buffer.format, cols, rows);
+
+        uint8_t* src = (uint8_t*)guestPixels;
+        uint8_t* dst = (uint8_t*)g_locked_buffer.bits;
+        if (srow == drow) {
+            for (int32_t y = 0; y < rows; y++) {
+                memcpy(dst + (size_t)y * dstride, src + (size_t)y * sstride, srow);
+            }
+        } else {
+            /* Pixel-format mismatch (e.g. an RGBA panel into an RGB_565
+             * surface): copy the low bytes of each pixel. */
+            size_t px = (sbpp < dbpp) ? sbpp : dbpp;
+            for (int32_t y = 0; y < rows; y++) {
+                uint8_t* s = src + (size_t)y * sstride;
+                uint8_t* d = dst + (size_t)y * dstride;
+                for (int32_t x = 0; x < cols; x++) {
+                    memcpy(d + (size_t)x * dbpp, s + (size_t)x * sbpp, px);
                 }
             }
         }
-        LOGI("Unlock: copy done");
+        LOGI("Unlock: copy done (%d rows)", rows);
     } else {
         /* Lock succeeded but there is no frame to copy (guest pixbuf missing,
          * or the surface buffer pointer was invalidated by a window change).
@@ -327,67 +446,128 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
     return result;
 }
 
-/* Window size callback (called from vp_cmdpost) */
+/* Window size callback (called from vp_cmdpost).
+ * Reports the virtual panel, not the viewport: this is the number the guest
+ * caches, so it must not move when the surface is resized. */
 static void on_window_size(int64_t* width, int64_t* height)
 {
-    if (g_native_window) {
-        *width  = (int64_t)ANativeWindow_getWidth(g_native_window);
-        *height = (int64_t)ANativeWindow_getHeight(g_native_window);
-    } else {
-        *width = 0;
-        *height = 0;
-    }
+    int32_t gw = 0, gh = 0;
+
+    pthread_mutex_lock(&g_surf_cs);
+    panel_latch_locked();
+    guest_geometry_locked(&gw, &gh, NULL);
+    pthread_mutex_unlock(&g_surf_cs);
+
+    *width  = (int64_t)gw;
+    *height = (int64_t)gh;
 }
 
 /* Window set-buffers-geometry callback (called from vp_cmdpost).
- * The guest's ANativeWindow_setBuffersGeometry is a stub that forwards here,
- * so the real surface matches the guest's pixel format (avoids buffer
- * overrun when the guest writes RGBA_8888 into an RGB_565 surface). */
+ * The guest's ANativeWindow_setBuffersGeometry is a stub that forwards here.
+ * A concrete width/height redefines the guest surface - the only path by which
+ * the guest moves its own geometry, exactly like win32 - while the usual
+ * (0, 0, format) call only selects the pixel format and leaves the panel
+ * untouched. The real surface is re-applied lazily at the next lock. */
 static int32_t on_window_set_buf(int32_t width, int32_t height, int32_t format)
 {
-    if (!g_native_window) {
-        LOGE("Window not initialized (set buf %dx%d fmt=%d)", width, height, format);
-        return -1;
+    pthread_mutex_lock(&g_surf_cs);
+    if (width > 0 && height > 0) {
+        g_surf_w = width;
+        g_surf_h = height;
+        if (g_virt_w <= 0 || g_virt_h <= 0) {
+            g_virt_w = width;
+            g_virt_h = height;
+        }
     }
+    if (format == WINDOW_FORMAT_RGBA_8888 || format == WINDOW_FORMAT_RGB_565) {
+        g_surf_fmt = format;
+    }
+    g_applied_w   = 0;   /* force a re-apply against the real surface */
+    g_applied_h   = 0;
+    g_applied_fmt = 0;
+    pthread_mutex_unlock(&g_surf_cs);
 
-    int32_t result = ANativeWindow_setBuffersGeometry(g_native_window,
-                                                      width, height, format);
-    if (result == 0) {
-        LOGI("Window geometry set: %dx%d format=%d", width, height, format);
-    } else {
-        LOGE("ANativeWindow_setBuffersGeometry(%dx%d fmt=%d) failed: %d",
-             width, height, format, result);
+    LOGI("Window geometry set: %dx%d format=%d (guest geometry %s)",
+         width, height, format,
+         (width > 0 && height > 0) ? "redefined" : "unchanged");
+    return 0;
+}
+
+/* Quantise a physical PPI to the nearest public NDK density bucket. The exact
+ * PPI stays host-private; only these buckets are exposed to the guest. */
+static int32_t density_bucket_for_ppi(int32_t ppi)
+{
+    static const int32_t buckets[] = {
+        ACONFIGURATION_DENSITY_LOW,     /* 120 */
+        ACONFIGURATION_DENSITY_MEDIUM,  /* 160 */
+        ACONFIGURATION_DENSITY_TV,      /* 213 */
+        ACONFIGURATION_DENSITY_HIGH,    /* 240 */
+        ACONFIGURATION_DENSITY_XHIGH,   /* 320 */
+        ACONFIGURATION_DENSITY_XXHIGH,  /* 480 */
+        ACONFIGURATION_DENSITY_XXXHIGH, /* 640 */
+    };
+    size_t i, best = 0;
+    int32_t best_d = -1;
+
+    if (ppi <= 0) return ACONFIGURATION_DENSITY_MEDIUM;
+    for (i = 0; i < sizeof(buckets) / sizeof(buckets[0]); i++) {
+        int32_t d = ppi - buckets[i];
+        if (d < 0) d = -d;
+        if (best_d < 0 || d < best_d) {
+            best_d = d;
+            best   = i;
+        }
     }
-    return result;
+    return buckets[best];
 }
 
 /* Device configuration callback (called from vp_cmdpost).
- * Serves the values pushed by nativeSetDisplayConfig(). */
+ * Everything is derived from the virtual panel, never from the real device:
+ * the guest must observe a stable host-owned display, the same way the win32
+ * host synthesises it from its surface size and virtual PPI. */
 static int32_t on_config_get(int32_t field, int32_t* outValue)
 {
+    int32_t w, h, ppi, width_dp, height_dp, long_dp, short_dp;
+
     if (!outValue) return -1;
+
+    pthread_mutex_lock(&g_surf_cs);
+    panel_latch_locked();
+    guest_geometry_locked(&w, &h, NULL);
+    ppi = (g_virt_ppi > 0) ? g_virt_ppi : ACONFIGURATION_DENSITY_MEDIUM;
+    pthread_mutex_unlock(&g_surf_cs);
+
+    width_dp  = w * 160 / ppi;
+    height_dp = h * 160 / ppi;
+    long_dp   = (width_dp >= height_dp) ? width_dp : height_dp;
+    short_dp  = (width_dp >= height_dp) ? height_dp : width_dp;
 
     switch (field) {
     case VP_ACONFIG_QUERY_ORIENTATION:
-        *outValue = g_display_cfg.orientation;
+        *outValue = (w >= h) ? ACONFIGURATION_ORIENTATION_LAND
+                             : ACONFIGURATION_ORIENTATION_PORT;
         return 0;
     case VP_ACONFIG_QUERY_DENSITY:
-        *outValue = g_display_cfg.density_dpi;
+        *outValue = density_bucket_for_ppi(ppi);
         return 0;
     case VP_ACONFIG_QUERY_SCREEN_SIZE:
-        *outValue = g_display_cfg.screen_size;
+        *outValue = (short_dp < 320) ? ACONFIGURATION_SCREENSIZE_SMALL
+                  : (short_dp < 480) ? ACONFIGURATION_SCREENSIZE_NORMAL
+                  : (short_dp < 720) ? ACONFIGURATION_SCREENSIZE_LARGE
+                                     : ACONFIGURATION_SCREENSIZE_XLARGE;
         return 0;
     case VP_ACONFIG_QUERY_SCREEN_LONG:
-        *outValue = g_display_cfg.screen_long;
+        *outValue = (long_dp * 5 >= short_dp * 8) ? ACONFIGURATION_SCREENLONG_YES
+                                                  : ACONFIGURATION_SCREENLONG_NO;
         return 0;
     case VP_ACONFIG_QUERY_SCREEN_ROUND:
-        *outValue = g_display_cfg.screen_round;
+        *outValue = ACONFIGURATION_SCREENROUND_NO;
         return 0;
     case VP_ACONFIG_QUERY_SCREEN_WIDTH_DP:
-        *outValue = g_display_cfg.width_dp;
+        *outValue = width_dp;
         return 0;
     case VP_ACONFIG_QUERY_SCREEN_HEIGHT_DP:
-        *outValue = g_display_cfg.height_dp;
+        *outValue = height_dp;
         return 0;
     default:
         return -1;
@@ -657,8 +837,14 @@ Java_com_rvvm_android_RvvmNative_nativeGetVersion(JNIEnv* env, jobject thiz)
     return (*env)->NewStringUTF(env, "1.0.0");
 }
 
-/* Push the real device configuration from the Java Configuration object.
- * Called by MainActivity on start and on configuration changes. */
+/* Real device configuration pushed from the Java Configuration object.
+ * Called by MainActivity on start and on configuration changes.
+ *
+ * Only the physical density is consumed: it becomes the private PPI of the
+ * virtual panel. The dp/orientation/size figures are deliberately ignored -
+ * the guest derives those from the panel instead, so the real device
+ * configuration never leaks into the guest's ABI (matching the win32 host,
+ * which synthesises AConfiguration from its own panel + PPI). */
 JNIEXPORT void JNICALL
 Java_com_rvvm_android_RvvmNative_nativeSetDisplayConfig(
     JNIEnv* env, jobject thiz,
@@ -667,17 +853,21 @@ Java_com_rvvm_android_RvvmNative_nativeSetDisplayConfig(
 {
     (void)env;
     (void)thiz;
+    (void)widthDp;
+    (void)heightDp;
+    (void)orientation;
+    (void)screenSize;
+    (void)screenLong;
+    (void)screenRound;
 
-    g_display_cfg.width_dp     = (int32_t)widthDp;
-    g_display_cfg.height_dp    = (int32_t)heightDp;
-    g_display_cfg.density_dpi  = (int32_t)densityDpi;
-    g_display_cfg.orientation  = (int32_t)orientation;
-    g_display_cfg.screen_size  = (int32_t)screenSize;
-    g_display_cfg.screen_long  = (int32_t)screenLong;
-    g_display_cfg.screen_round = (int32_t)screenRound;
+    pthread_mutex_lock(&g_surf_cs);
+    if (densityDpi > 0) {
+        g_virt_ppi = (int32_t)densityDpi;
+    }
+    pthread_mutex_unlock(&g_surf_cs);
 
-    LOGI("Display config: %dx%d dp, density=%d, orient=%d, size=%d, long=%d, round=%d",
-         widthDp, heightDp, densityDpi, orientation, screenSize, screenLong, screenRound);
+    LOGI("Display config: density=%d (real %dx%d dp ignored; panel-owned)",
+         densityDpi, widthDp, heightDp);
 }
 
 JNIEXPORT void JNICALL
@@ -712,9 +902,19 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
 
     if (new_window) {
         g_native_window = new_window;
-        LOGI("Native window set: %dx%d",
+
+        /* Freeze the virtual panel at the first surface size we ever see. From
+         * here on the surface is only a viewport: later resizes repaint, they
+         * do not move the geometry the guest renders into. */
+        pthread_mutex_lock(&g_surf_cs);
+        panel_latch_locked();
+        int32_t pw = g_virt_w;
+        int32_t ph = g_virt_h;
+        pthread_mutex_unlock(&g_surf_cs);
+
+        LOGI("Native window set: %dx%d (panel %dx%d)",
              ANativeWindow_getWidth(g_native_window),
-             ANativeWindow_getHeight(g_native_window));
+             ANativeWindow_getHeight(g_native_window), pw, ph);
     } else {
         LOGI("Native window cleared");
     }

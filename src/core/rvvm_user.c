@@ -515,7 +515,12 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
             user_fault_hex(&p, rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + i));
         }
     }
+#ifndef ANDROID
     (void)!write(2, buf, (size_t)(p - buf));
+#else
+    if (p < buf + sizeof(buf)) *p = '\0';
+    __android_log_write(ANDROID_LOG_INFO, "RVVM-HOSTFAULT", buf);
+#endif
     _Exit(128 + sig);
 }
 
