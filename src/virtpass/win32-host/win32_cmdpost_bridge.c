@@ -77,13 +77,25 @@ static HWND            g_hwnd       = NULL;
 
 /* Guest virtual TTY (libvterm) rendering state. g_tty_vt is host-owned
  * (created on first launch, reset per launch) and injected into rvvm_user via
- * rvvm_user_set_tty0(); g_tty_dirty gates the (paint-time throttled) repaint,
- * g_tty_keep makes WM_PAINT redraw the frozen last screen after guest exit. */
+ * rvvm_user_set_tty0(); g_tty_dirty gates repainting the retained layer. */
 #define TTY_ROWS 24
 #define TTY_COLS 80
 static VTerm*   g_tty_vt    = NULL;
 static bool     g_tty_dirty = false;
-static bool     g_tty_keep  = false;
+/* True once the guest has written anything to fd 1/2 this launch. The
+ * composition buffer is rebuilt every frame, so the TTY layer must be
+ * re-blitted every frame too - a one-shot paint would be covered by the
+ * next panel blit. Also keeps the last screen visible after guest exit:
+ * the VTerm survives, dirty stays false and the layer content freezes. */
+static bool     g_tty_seen  = false;
+/* Retained TTY layer: the cell grid is rendered here only on dirty, every
+ * frame just blits the bitmap onto the composition surface. */
+static HDC      g_tty_layer_dc   = NULL;
+static HBITMAP  g_tty_layer_bmp  = NULL;
+static HBITMAP  g_tty_layer_def  = NULL; /* DC's stock 1x1 bitmap, to restore */
+static bool     g_tty_layer_ok   = false;
+static int      g_tty_layer_w    = 0;
+static int      g_tty_layer_h    = 0;
 
 /* TTY cell rendering: fonts [cjk][bold], created once (tty_init_fonts). */
 static HFONT tty_fonts[2][2];
@@ -97,6 +109,7 @@ static bool     tty_is_cjk(uint32_t cp);
 static int      tty_utf16(uint32_t cp, wchar_t* out);
 static void     tty_fill_rect_bg(HDC cdc, int x0, int y0, int x1, int y1, COLORREF col);
 static void     tty_paint(HDC cdc);
+static void     tty_layer_free(void);
 static bool            g_cs_ready   = false;
 static CRITICAL_SECTION g_surf_cs;
 
@@ -1203,6 +1216,12 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             SelectObject(wdc, ob);
             SelectObject(wdc, op);
             DeleteObject(br);
+            /* After a guest exits, keep its frozen last screen visible over
+             * the picker background. Child controls (combo + buttons) are
+             * separate windows and always draw above this. */
+            if (g_tty_vt && g_tty_seen) {
+                tty_paint(wdc);
+            }
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -1254,12 +1273,10 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     DeleteObject(pen);
                 }
             }
-            /* Guest virtual TTY overlay: draw the libvterm screen matrix on top
-             * of the panel. Throttled to paint time (g_tty_dirty) so guest output
-             * bursts don't trigger one redraw per write. Drawn in the top-left so
-             * it is visible over the letterboxed panel; swap to the panel rect if
-             * you want it composited inside the virtual display. */
-            if (g_tty_vt && (g_tty_dirty || g_tty_keep)) {
+            /* Guest virtual TTY overlay: blit the retained layer over the
+             * panel every frame (the composition buffer is rebuilt from
+             * scratch each paint, so a one-shot draw would be covered). */
+            if (g_tty_vt && g_tty_seen) {
                 tty_paint(cdc);
             }
 
@@ -1386,12 +1403,10 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             g_guest_thread = NULL;
         }
         /* rvvm_user_linux_ex() freed the machine; the VTerm is host-owned and
-         * survives the guest, so keep g_tty_vt and redraw the frozen last
-         * screen on every subsequent paint. */
+         * survives the guest, so keep g_tty_vt and the frozen last screen
+         * (g_tty_seen stays set, dirty stays clear => no re-render). */
         g_guest_machine = NULL;
-        if (g_tty_vt) {
-            g_tty_dirty = true;
-            g_tty_keep  = true;
+        if (g_tty_vt && g_tty_seen) {
             InvalidateRect(hwnd, NULL, FALSE);
         }
         {
@@ -1457,7 +1472,8 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             vterm_free(g_tty_vt);
             g_tty_vt    = NULL;
             g_tty_dirty = false;
-            g_tty_keep  = false;
+            g_tty_seen  = false;
+            tty_layer_free();
         }
         PostQuitMessage(0);
         return 0;
@@ -1527,6 +1543,7 @@ static void host_tty_cb(void* userdata, int fd, void* tty)
     (void)userdata; (void)fd;
     g_tty_vt    = (VTerm*)tty;
     g_tty_dirty = true;
+    g_tty_seen  = true; /* guest produced TTY output this launch */
     if (g_hwnd) {
         InvalidateRect(g_hwnd, NULL, FALSE);
     }
@@ -1631,6 +1648,172 @@ static void tty_fill_rect_bg(HDC cdc, int x0, int y0, int x1, int y1, COLORREF c
     RECT rc = { x0, y0, x1, y1 };
     FillRect(cdc, &rc, br);
     DeleteObject(br);
+}
+
+/* Release the retained TTY layer bitmap (window teardown, no guest running). */
+static void tty_layer_free(void)
+{
+    if (g_tty_layer_dc) {
+        if (g_tty_layer_bmp) {
+            /* Deselect before delete: DeleteObject fails on a bitmap that is
+             * still selected into a DC. */
+            SelectObject(g_tty_layer_dc, g_tty_layer_def);
+            DeleteObject(g_tty_layer_bmp);
+            g_tty_layer_bmp = NULL;
+        }
+        DeleteDC(g_tty_layer_dc);
+        g_tty_layer_dc = NULL;
+    }
+    g_tty_layer_ok = false;
+}
+
+/* Render the TTY cell grid into the retained layer bitmap. Called only when
+ * g_tty_dirty; every frame afterwards just blits the layer (tty_paint). */
+static void tty_layer_render(void)
+{
+    VTermScreen* scr = vterm_obtain_screen(g_tty_vt);
+    vterm_screen_flush_damage(scr);
+
+    tty_init_fonts();
+
+    /* Measure the monospace cell size, then (re)create the layer at exactly
+     * the grid's pixel extent. */
+    HDC ref = GetDC(NULL);
+    SelectObject(ref, tty_fonts[0][0]);
+    SIZE ch;
+    GetTextExtentPoint32A(ref, "M", 1, &ch);
+    int cw = ch.cx, chh = ch.cy;
+    int w  = cw * TTY_COLS, h = chh * TTY_ROWS;
+    g_tty_layer_w = w;
+    g_tty_layer_h = h;
+
+    if (!g_tty_layer_dc) {
+        g_tty_layer_dc  = CreateCompatibleDC(NULL);
+        g_tty_layer_def = (HBITMAP)GetCurrentObject(g_tty_layer_dc, OBJ_BITMAP);
+    }
+    /* Recreate the bitmap each render: the cell size can change if the font
+     * does, and this runs at most once per output burst. */
+    if (g_tty_layer_bmp) {
+        SelectObject(g_tty_layer_dc, g_tty_layer_def);
+        DeleteObject(g_tty_layer_bmp);
+        g_tty_layer_bmp = NULL;
+    }
+    g_tty_layer_bmp = CreateCompatibleBitmap(ref, w, h);
+    ReleaseDC(NULL, ref);
+    if (!g_tty_layer_dc || !g_tty_layer_bmp) {
+        g_tty_layer_ok = false;
+        return;
+    }
+    SelectObject(g_tty_layer_dc, g_tty_layer_bmp);
+    HDC cdc = g_tty_layer_dc;
+    g_tty_layer_ok = true;
+
+    /* Opaque backdrop (the default background color). */
+    RECT back = { 0, 0, w, h };
+    FillRect(cdc, &back, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    SetBkMode(cdc, TRANSPARENT);
+
+    /* Walk the grid and paint same-styled runs of cells. Every run is drawn
+     * at col * cw, so text advance never accumulates error across
+     * double-width or fallback-font cells. */
+    wchar_t wbuf[2 * TTY_COLS];
+    for (int r = 0; r < TTY_ROWS; r++) {
+        VTermPos pos;
+        pos.row = r;
+        int c = 0;
+        while (c < TTY_COLS) {
+            VTermScreenCell cell;
+            pos.col = c;
+            if (!vterm_screen_get_cell(scr, pos, &cell)) {
+                c++;
+                continue;
+            }
+            /* Double-width gap cell: the lead char (drawn at c-1) covers it. */
+            if (cell.chars[0] == (uint32_t)-1) {
+                c++;
+                continue;
+            }
+            /* Erased cell: no glyph, but a non-default pen bg (SGR set before
+             * erase) still needs painting. */
+            COLORREF bg;
+            bool has_bg = tty_cell_bg(scr, &cell, &bg);
+            if (!cell.chars[0]) {
+                if (has_bg) {
+                    tty_fill_rect_bg(cdc, c * cw, r * chh, (c + 1) * cw, (r + 1) * chh, bg);
+                }
+                c++;
+                continue;
+            }
+
+            COLORREF fg       = tty_cell_fg(scr, &cell);
+            bool     bold     = cell.attrs.bold != 0;
+            bool     cjk      = tty_is_cjk(cell.chars[0]);
+            bool     dwidth   = cell.width == 2;
+            int      run_x    = c;
+            int      run_w    = dwidth ? 2 : 1;
+            int      n        = 0;
+
+            n += tty_utf16(cell.chars[0], wbuf + n);
+            for (int i = 1; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i]; i++) {
+                n += tty_utf16(cell.chars[i], wbuf + n);
+            }
+
+            /* Width-1 runs extend while style and width match; double-width
+             * chars always stand alone. */
+            if (!dwidth) {
+                while (run_x + run_w < TTY_COLS) {
+                    VTermScreenCell nx;
+                    pos.col = run_x + run_w;
+                    if (!vterm_screen_get_cell(scr, pos, &nx) ||
+                        !nx.chars[0] || nx.chars[0] == (uint32_t)-1 ||
+                        nx.width == 2) {
+                        break;
+                    }
+                    bool nx_cjk = tty_is_cjk(nx.chars[0]);
+                    COLORREF nbg;
+                    bool nx_has_bg = tty_cell_bg(scr, &nx, &nbg);
+                    if (nx_cjk != cjk || nx.attrs.bold != cell.attrs.bold ||
+                        tty_cell_fg(scr, &nx) != fg ||
+                        nx_has_bg != has_bg || (nx_has_bg && nbg != bg)) {
+                        break;
+                    }
+                    n += tty_utf16(nx.chars[0], wbuf + n);
+                    for (int i = 1; i < VTERM_MAX_CHARS_PER_CELL && nx.chars[i]; i++) {
+                        n += tty_utf16(nx.chars[i], wbuf + n);
+                    }
+                    run_w++;
+                }
+            }
+
+            int x0 = run_x * cw, x1 = (run_x + run_w) * cw;
+            if (has_bg) {
+                tty_fill_rect_bg(cdc, x0, r * chh, x1, (r + 1) * chh, bg);
+            }
+            SelectObject(cdc, tty_fonts[cjk][bold]);
+            SetTextColor(cdc, fg);
+            TextOutW(cdc, x0, r * chh, wbuf, n);
+            c = run_x + run_w;
+        }
+    }
+    g_tty_dirty = false;
+}
+
+/* Blit the retained TTY layer onto @cdc (composition DC while running, window
+ * DC in the launcher idle view). Renders the layer first when dirty. The
+ * caller gates on g_tty_vt + g_tty_seen. Thread-safety: the VTerm only
+ * mutates while a guest is running; layer blits happen on the UI thread
+ * under g_surf_cs, and after guest exit the screen is frozen anyway. */
+static void tty_paint(HDC cdc)
+{
+    if (g_tty_dirty) {
+        tty_layer_render();
+    }
+    if (g_tty_layer_ok && g_tty_layer_dc) {
+        /* The layer bitmap stays selected into g_tty_layer_dc from
+         * tty_layer_render; a plain blit needs no per-frame selection. */
+        BitBlt(cdc, 0, 0, g_tty_layer_w, g_tty_layer_h,
+               g_tty_layer_dc, 0, 0, SRCCOPY);
+    }
 }
 
 
@@ -2202,8 +2385,8 @@ bool win32_host_start_guest(int argc, char** argv)
     } else {
         vterm_screen_reset(vterm_obtain_screen(g_tty_vt), true);
     }
-    g_tty_dirty = true;
-    g_tty_keep  = false;
+    g_tty_dirty = true;  /* fresh empty screen renders into the layer */
+    g_tty_seen  = false; /* no guest output yet this launch */
     rvvm_user_set_tty0(g_guest_machine, g_tty_vt);
     rvvm_user_set_tty_callback(g_guest_machine, host_tty_cb, NULL);
 
