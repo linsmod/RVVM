@@ -393,12 +393,19 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
             (const vpgl_EGLint*)vpgl_gptr(args[3]));
         break;
     }
-    case EGL_FN_SWAPBUFFERS:
+    case EGL_FN_SWAPBUFFERS: {
         /* Real present: the system compositor takes it from here. */
         *ret = (int64_t)p_eglSwapBuffers(
             (vpgl_EGLDisplay)(uintptr_t)args[0],
             (vpgl_EGLSurface)(uintptr_t)args[1]);
+        /* The GL present path: a successful swap means a frame is on the
+         * surface, the same cue the CPU unlock path gives the UI. */
+        if (*ret == 1) {
+            extern void jni_guest_first_frame(void);
+            jni_guest_first_frame();
+        }
         break;
+    }
     default:
         vpgl_dispatch_egl_generic(fn_id, args, ret);
         break;

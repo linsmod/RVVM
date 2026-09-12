@@ -147,6 +147,11 @@ ssize_t android_io_callback(int fd, const void* buf, size_t count)
             memcpy(sbuf, data, copy);
             sbuf[copy] = '\0';
             __android_log_print(ANDROID_LOG_INFO, "RVVM-GUEST", "%s", sbuf);
+
+            /* Forward the raw bytes to the JNI console bridge, which buffers
+             * them into lines for the app UI and its log file. */
+            extern void jni_guest_output(const char* data, size_t count);
+            jni_guest_output(data, count);
         }
         return count;
     } else {

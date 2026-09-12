@@ -281,6 +281,144 @@ static rvvm_machine_t* g_guest_machine = NULL;
 /* Guest exit callback (Java object reference, held by global ref) */
 static jobject g_exit_listener = NULL;
 
+/* ============================================================
+ * Guest console I/O: native -> Java bridge
+ * ============================================================
+ * The guest's stdout/stderr arrive here from rvvm_user's io callback
+ * (jni_guest_output), are buffered into lines, and handed to the Java
+ * ConsoleListener: MainActivity renders them in the on-surface overlay and
+ * persists them to a log file. jni_guest_first_frame() marks the moment the
+ * first frame actually reached the screen, which switches the overlay off
+ * until the guest exits.
+ *
+ * A pending line is also flushed when the guest exits, so output that does
+ * not end with a newline is not lost.
+ * ============================================================ */
+static jobject    g_console_listener = NULL;
+static jmethodID  g_console_output_mid = NULL;
+static jmethodID  g_console_first_frame_mid = NULL;
+
+static pthread_mutex_t g_console_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char            g_console_buf[2048];
+static size_t          g_console_len = 0;
+
+/* One per guest run: set when a frame has been presented, cleared in
+ * nativeRunElf(). Read from the guest thread, written from the UI thread
+ * (clear) and the guest thread (set); volatile is enough for this pattern. */
+static volatile int g_first_frame_sent = 0;
+
+/* JNIEnv for the calling thread, attaching it first when needed. The caller
+ * must detach when *attached comes back non-zero. */
+static JNIEnv* console_env(int* attached)
+{
+    JNIEnv* env = NULL;
+    *attached = 0;
+    if (!g_jvm) return NULL;
+    if ((*g_jvm)->GetEnv(g_jvm, (void**)&env, JNI_VERSION_1_6) == JNI_OK) {
+        return env;
+    }
+    if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) == JNI_OK) {
+        *attached = 1;
+        return env;
+    }
+    return NULL;
+}
+
+/* Guest bytes are not guaranteed to be text, and NewStringUTF expects
+ * modified UTF-8. Keep printable ASCII + tabs, replace everything else - the
+ * console is for diagnostics, not for binary payload. */
+static char console_sanitise(char c)
+{
+    unsigned char u = (unsigned char)c;
+    if (u == '\t') return c;
+    if (u < 0x20 || u > 0x7e) return '?';
+    return c;
+}
+
+static void console_flush_line_locked(void)
+{
+    JNIEnv* env;
+    int attached;
+    jstring line;
+
+    if (!g_console_len || !g_console_listener) {
+        g_console_len = 0;
+        return;
+    }
+    g_console_buf[g_console_len] = '\0';
+
+    env = console_env(&attached);
+    if (!env) { g_console_len = 0; return; }
+
+    for (size_t i = 0; i < g_console_len; i++) {
+        g_console_buf[i] = console_sanitise(g_console_buf[i]);
+    }
+    line = (*env)->NewStringUTF(env, g_console_buf);
+    if (line) {
+        (*env)->CallVoidMethod(env, g_console_listener, g_console_output_mid, line);
+        (*env)->DeleteLocalRef(env, line);
+    }
+    if (attached) {
+        (*g_jvm)->DetachCurrentThread(g_jvm);
+    }
+    g_console_len = 0;
+}
+
+/* Called by rvvm_user's io callback for every write to fd 1/2. Splits the
+ * stream into lines before crossing into Java. */
+void jni_guest_output(const char* data, size_t count)
+{
+    if (!g_console_listener || !data || !count) return;
+
+    pthread_mutex_lock(&g_console_mutex);
+    for (size_t i = 0; i < count; i++) {
+        char c = data[i];
+        if (c == '\n') {
+            console_flush_line_locked();
+        } else if (c == '\r') {
+            /* CR alone never ends a guest line; LF does. */
+        } else if (g_console_len >= sizeof(g_console_buf) - 1) {
+            console_flush_line_locked();   /* oversized line: emit as-is */
+            g_console_buf[g_console_len++] = c;
+        } else {
+            g_console_buf[g_console_len++] = c;
+        }
+    }
+    pthread_mutex_unlock(&g_console_mutex);
+}
+
+/* Mark the first presented frame. Called from both present paths: the CPU
+ * unlock here in jni_bridge.c and eglSwapBuffers in android_gl_host.c. */
+void jni_guest_first_frame(void)
+{
+    JNIEnv* env;
+    int attached;
+
+    if (g_first_frame_sent) return;
+    g_first_frame_sent = 1;
+
+    pthread_mutex_lock(&g_console_mutex);
+    console_flush_line_locked();   /* flush whatever precedes the first frame */
+    pthread_mutex_unlock(&g_console_mutex);
+
+    if (!g_console_listener || !g_console_first_frame_mid) return;
+    env = console_env(&attached);
+    if (!env) return;
+    (*env)->CallVoidMethod(env, g_console_listener, g_console_first_frame_mid);
+    if (attached) {
+        (*g_jvm)->DetachCurrentThread(g_jvm);
+    }
+}
+
+/* Flush a trailing partial line and drop the frame flag for the next run. */
+static void console_reset(void)
+{
+    pthread_mutex_lock(&g_console_mutex);
+    console_flush_line_locked();
+    pthread_mutex_unlock(&g_console_mutex);
+    g_first_frame_sent = 0;
+}
+
 /* Defined with the window callbacks below; called from the guest thread once
  * the guest is gone. */
 static void surf_finish_pending_lock(void);
@@ -668,6 +806,12 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
 
     /* Drop the reference taken in on_window_lock(). */
     surf_drop_locked();
+
+    /* The CPU present path: once a frame is actually on the surface the
+     * rendered content takes over from the console overlay. */
+    if (result == 0) {
+        jni_guest_first_frame();
+    }
 
     return result;
 }
@@ -1351,6 +1495,10 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
     
     LOGI("Starting guest: %s (argc=%d)", g_guest_elf_path, g_guest_argc);
 
+    /* New run: flush the previous guest's trailing partial line and let the
+     * first frame of THIS guest re-hide the console overlay. */
+    console_reset();
+
     /* The previous guest's exit ran cmdpost_cleanup(), which NULLed every
      * host-side callback (audio backend included). Restore them before this
      * guest starts, or it probes a dead proxy and exits(1) at its first
@@ -1508,6 +1656,34 @@ static void on_guest_exit(int exit_code)
         }
         if (attached == JNI_EDETACHED) {
             (*g_jvm)->DetachCurrentThread(g_jvm);
+        }
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeSetConsoleListener(JNIEnv* env, jobject thiz, jobject listener)
+{
+    (void)thiz;
+
+    if (g_console_listener) {
+        (*env)->DeleteGlobalRef(env, g_console_listener);
+        g_console_listener = NULL;
+        g_console_output_mid = NULL;
+        g_console_first_frame_mid = NULL;
+    }
+
+    if (listener) {
+        jclass clazz = (*env)->GetObjectClass(env, listener);
+        g_console_listener = (*env)->NewGlobalRef(env, listener);
+        g_console_output_mid = (*env)->GetMethodID(env, clazz, "onOutput", "(Ljava/lang/String;)V");
+        g_console_first_frame_mid = (*env)->GetMethodID(env, clazz, "onFirstFrame", "()V");
+        (*env)->DeleteLocalRef(env, clazz);
+        if (!g_console_output_mid || !g_console_first_frame_mid) {
+            LOGE("ConsoleListener method lookup failed");
+            (*env)->DeleteGlobalRef(env, g_console_listener);
+            g_console_listener = NULL;
+        } else {
+            LOGI("Guest console listener registered");
         }
     }
 }

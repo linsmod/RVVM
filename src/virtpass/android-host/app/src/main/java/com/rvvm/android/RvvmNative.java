@@ -164,4 +164,23 @@ public class RvvmNative {
     public interface ExitListener {
         void onExit(int exitCode);
     }
+
+    /**
+     * Set a listener that receives the guest's console output (stdout/stderr).
+     * Lines are delivered on the guest thread as they are written.
+     * @param listener Output listener, or null to clear
+     */
+    public static native void nativeSetConsoleListener(ConsoleListener listener);
+
+    /**
+      * Listener for the guest's console I/O. onOutput receives one line per
+      * call (line breaks normalized); onFirstFrame fires once per guest run
+      * when the first frame has actually reached the screen - either through
+      * the CPU unlock path or a successful eglSwapBuffers - which is the UI's
+      * cue to hand the surface over to the rendered content.
+      */
+    public interface ConsoleListener {
+        void onOutput(String line);
+        void onFirstFrame();
+    }
 }

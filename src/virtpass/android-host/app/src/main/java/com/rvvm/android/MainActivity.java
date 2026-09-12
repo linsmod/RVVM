@@ -10,16 +10,25 @@ import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.GestureDetector;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.View;
+import android.view.ViewGroup;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.HorizontalScrollView;
+import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
+import android.widget.Toast;
 
+import java.io.BufferedWriter;
 import java.io.File;
+import java.io.FileWriter;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -72,6 +81,39 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private Button stopButton;
     private Spinner guestAppSpinner;
 
+    // Guest console overlay, drawn on top of the SurfaceView. Visible before
+    // the guest renders its first frame and again after it exits; hidden once
+    // a frame has actually reached the surface.
+    private HorizontalScrollView logOverlayScroll;  // X axis + tap-to-toggle
+    private ScrollView logOverlayVScroll;           // Y axis
+    private TextView logOverlayText;
+    private final StringBuilder logBuffer = new StringBuilder();
+
+    // Overlay text mode. Monospace always; tap toggles wrapping.
+    private boolean logWrapText = true;
+
+    // True from Run until the next cold start: while set, the console overlay
+    // is shown whenever the guest is not actively rendering frames. Keeping
+    // the overlay up even with no output yet (a placeholder line shows) is
+    // what gives the tap-to-toggle-wrap gesture a stable target - a guest
+    // that prints nothing would otherwise leave nothing to tap.
+    private boolean consoleActive = false;
+
+    // The run's log file. Opened in runGuestElf (UI thread), written from the
+    // guest thread (onOutput), closed when the guest exits - hence the lock.
+    private final Object logFileLock = new Object();
+    private BufferedWriter logWriter;
+    private File logFile;
+
+    // Set once the first presented frame arrived (CPU unlock or GL swap).
+    private boolean guestRendering = false;
+
+    // Tail kept in the overlay text, so an endless guest cannot grow it
+    // without bound.
+    private static final int LOG_MAX_CHARS = 64 * 1024;
+    private static final int LOG_MAX_FILES = 20;
+    private static final String LOG_PLACEHOLDER = "[console] waiting for guest output...\n";
+
     // Guest app list: .exe files from assets
     private String[] guestApps;
     private String selectedGuestApp;
@@ -88,6 +130,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private boolean isSurfaceReady = false;
     private boolean hasAutoStarted = false;
 
+    // Exit code of the most recent guest, delivered by the native exit
+    // callback. The callback fires on the guest thread while the guest is
+    // still winding down, so it only records the value; the exit-monitor
+    // thread publishes it to the UI once nativeIsGuestRunning() has cleared.
+    private volatile int lastExitCode = -1;
+
     // Assets file name of the guest currently launched, or null when none runs.
     // Remembered so an Intent asking for the same guest is not torn down.
     private String currentGuestApp;
@@ -101,6 +149,30 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         statusText = findViewById(R.id.statusText);
         sensorDataText = findViewById(R.id.sensorDataText);
         surfaceView = findViewById(R.id.surfaceView);
+        logOverlayScroll = findViewById(R.id.logOverlayScroll);
+        logOverlayVScroll = findViewById(R.id.logOverlayVScroll);
+        logOverlayText = findViewById(R.id.logOverlayText);
+
+        // Tap the overlay (a tap, not a scroll) to toggle word wrap; the
+        // current mode is confirmed with a toast. Monospace is always on.
+        //
+        // The tap is detected on the inner ScrollView: it is the view that
+        // actually owns the touch stream (a scrolling view consumes every
+        // gesture in onTouchEvent), so an OnClickListener on either scroller
+        // never fires. The listener returns false so the normal drag/fling
+        // handling of both scrollers is left untouched.
+        final GestureDetector logTapDetector = new GestureDetector(this,
+                new GestureDetector.SimpleOnGestureListener() {
+                    @Override
+                    public boolean onSingleTapUp(MotionEvent e) {
+                        toggleLogWrap();
+                        return true;
+                    }
+                });
+        logOverlayVScroll.setOnTouchListener((v, event) -> {
+            logTapDetector.onTouchEvent(event);
+            return false;
+        });
         runButton = findViewById(R.id.runButton);
         suspendButton = findViewById(R.id.suspendButton);
         stopButton = findViewById(R.id.stopButton);
@@ -175,6 +247,29 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             // Initialize native library
             RvvmNative.nativeInit();
             isInitialized = true;
+
+            // Record the guest's exit code as it fires (guest thread). The UI
+            // is updated by the guest-exit-monitor, not here: the callback
+            // runs while the guest thread has not finished unwinding yet.
+            RvvmNative.nativeSetExitCallback(code -> {
+                lastExitCode = code;
+                Log.i(TAG, "Guest exit callback: code " + code);
+            });
+
+            // Guest console I/O: rendered in the overlay and persisted to a
+            // file. Both callbacks fire on the guest thread; anything that
+            // touches a view hops to the UI thread first.
+            RvvmNative.nativeSetConsoleListener(new RvvmNative.ConsoleListener() {
+                @Override
+                public void onOutput(String line) {
+                    handleGuestOutput(line);
+                }
+
+                @Override
+                public void onFirstFrame() {
+                    handleFirstFrame();
+                }
+            });
 
             // Push the real screen metrics (the AConfiguration source of truth)
             pushDisplayConfig();
@@ -298,6 +393,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         String elfPath = elfFile.getAbsolutePath();
         statusText.setText("Running: " + elfName + "\nPath: " + elfPath);
 
+        // New run: clear the console overlay and start a fresh log file. The
+        // overlay stays visible (showing the guest's early output) until the
+        // first presented frame arrives, then hides; on exit it comes back.
+        clearGuestConsole();
+        openGuestLogFile(elfName);
+
         replayGuestStartupState();
 
         boolean started = RvvmNative.nativeRunElf(elfPath, null);
@@ -311,14 +412,27 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         }
         updateButtonStates();
 
-        // Monitor guest exit: poll the flag and re-enable buttons when the
-        // guest thread finishes (e.g. test_audio exits after 1 second).
+        // Monitor guest exit: poll the flag and report the outcome when the
+        // guest thread finishes (e.g. test_audio exits after 1 second). The
+        // exit code itself arrives earlier through the native exit callback
+        // (lastExitCode); polling is still what says the guest is really gone,
+        // because nativeIsGuestRunning() only clears after the guest thread
+        // has fully unwound - flipping buttons in onExit would be premature.
         new Thread(() -> {
             while (RvvmNative.nativeIsGuestRunning()) {
                 try { Thread.sleep(100); } catch (InterruptedException e) { return; }
             }
+            int code = lastExitCode;
             runOnUiThread(() -> {
                 currentGuestApp = null;
+                closeGuestLogFile();
+                // The guest is gone: bring the console overlay back over the
+                // last frame (or the black surface), showing the tail of its
+                // output next to the exit status.
+                guestRendering = false;
+                updateLogOverlay();
+                statusText.setText("Guest exited: " + elfName + " (exit " + code + ")");
+                Log.i(TAG, "Guest exited: " + elfName + " (exit " + code + ")");
                 updateButtonStates();
             });
         }, "guest-exit-monitor").start();
@@ -360,7 +474,10 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         Log.i(TAG, "Stopping guest");
         RvvmNative.nativeStopGuest();
         currentGuestApp = null;
-        statusText.setText("Guest stopped");
+        // Provisional: the stop is asynchronous (the guest unwinds like a
+        // normal exit), so the guest-exit-monitor lands the final state with
+        // the actual exit code in a moment.
+        statusText.setText("Guest stopping...");
         updateButtonStates();
     }
 
@@ -589,6 +706,165 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         // Not used
     }
 
+    // --- Guest console overlay ------------------------------------------------
+    //
+    // Three states, driven by two signals:
+    //   running, no frame yet  -> overlay visible, showing guest output
+    //   first frame arrived    -> overlay hidden, the surface shows the render
+    //   guest exited           -> overlay visible again over the last frame
+    //
+    // Output is also appended to a per-run log file under files/logs/.
+
+    /** Clears the overlay text (guest (re)start). UI thread only. */
+    private void clearGuestConsole() {
+        logBuffer.setLength(0);
+        // Placeholder keeps the overlay renderable (and tappable) from the
+        // first moment; real output lines replace it as they arrive.
+        logBuffer.append(LOG_PLACEHOLDER);
+        logOverlayText.setText(logBuffer);
+        consoleActive = true;
+        guestRendering = false;
+        updateLogOverlay();
+    }
+
+    /** Opens a fresh log file for this run: logs/<guest>-<timestamp>.log. */
+    private void openGuestLogFile(String guestName) {
+        synchronized (logFileLock) {
+            closeGuestLogFileLocked();
+            try {
+                File dir = new File(getFilesDir(), "logs");
+                if (!dir.exists() && !dir.mkdirs()) {
+                    Log.w(TAG, "Could not create logs dir; file logging disabled");
+                    return;
+                }
+                pruneGuestLogs(dir);
+
+                String stamp = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss",
+                        java.util.Locale.US).format(new java.util.Date());
+                String base = guestName.endsWith(".exe")
+                        ? guestName.substring(0, guestName.length() - 4) : guestName;
+                logFile = new File(dir, base + "-" + stamp + ".log");
+                logWriter = new BufferedWriter(new FileWriter(logFile));
+                Log.i(TAG, "Guest log: " + logFile.getAbsolutePath());
+            } catch (IOException e) {
+                Log.w(TAG, "Guest log file disabled: " + e.getMessage());
+                logWriter = null;
+                logFile = null;
+            }
+        }
+    }
+
+    /** Closes the current log file. Safe to call from any thread. */
+    private void closeGuestLogFile() {
+        synchronized (logFileLock) {
+            closeGuestLogFileLocked();
+        }
+    }
+
+    /** Caller holds logFileLock. */
+    private void closeGuestLogFileLocked() {
+        if (logWriter != null) {
+            try { logWriter.flush(); logWriter.close(); }
+            catch (IOException e) { Log.w(TAG, "Closing guest log failed: " + e.getMessage()); }
+            logWriter = null;
+        }
+    }
+
+    /** Keep only the newest LOG_MAX_FILES logs. Called with no writer open. */
+    private void pruneGuestLogs(File dir) {
+        File[] files = dir.listFiles((d, name) -> name.endsWith(".log"));
+        if (files == null || files.length <= LOG_MAX_FILES) return;
+        java.util.Arrays.sort(files,
+                (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+        for (int i = LOG_MAX_FILES; i < files.length; i++) {
+            if (!files[i].delete()) {
+                Log.w(TAG, "Could not prune old guest log: " + files[i].getName());
+            }
+        }
+    }
+
+    /** One console line from the guest. Guest thread. */
+    private void handleGuestOutput(String line) {
+        synchronized (logFileLock) {
+            if (logWriter != null) {
+                try {
+                    logWriter.write(line);
+                    logWriter.newLine();
+                    logWriter.flush();
+                } catch (IOException e) {
+                    Log.w(TAG, "Guest log write failed: " + e.getMessage());
+                    closeGuestLogFileLocked();
+                }
+            }
+        }
+
+        // Overlay text is a tail; the actual history lives in the file.
+        runOnUiThread(() -> {
+            // First real line replaces the placeholder.
+            if (LOG_PLACEHOLDER.contentEquals(logBuffer)) {
+                logBuffer.setLength(0);
+            }
+            logBuffer.append(line).append('\n');
+            int over = logBuffer.length() - LOG_MAX_CHARS;
+            if (over > 0) {
+                int cut = logBuffer.indexOf("\n", over);
+                logBuffer.delete(0, (cut >= 0) ? cut + 1 : over);
+            }
+            logOverlayText.setText(logBuffer);
+            updateLogOverlay();
+            logOverlayVScroll.post(() ->
+                    logOverlayVScroll.fullScroll(View.FOCUS_DOWN));
+        });
+    }
+
+    /** The first presented frame is on the surface. Guest thread. */
+    private void handleFirstFrame() {
+        runOnUiThread(() -> {
+            guestRendering = true;
+            updateLogOverlay();
+        });
+    }
+
+    /** Show the overlay while a console session is live and no frame has
+     *  taken over the surface. */
+    private void updateLogOverlay() {
+        boolean show = consoleActive && !guestRendering;
+        logOverlayScroll.setVisibility(show ? View.VISIBLE : View.GONE);
+    }
+
+    /** Tap on the overlay: toggle word wrap, confirm with a toast. */
+    private void toggleLogWrap() {
+        logWrapText = !logWrapText;
+        Log.i(TAG, "Log wrap toggled: " + (logWrapText ? "on" : "off"));
+        applyLogWrapMode();
+    }
+
+    /**
+     * Apply the wrap mode. Wrapping needs the text view to fill the overlay
+     * width; single-line mode lets it extend past the surface width, with the
+     * outer HorizontalScrollView providing the sideways scroll.
+     */
+    private void applyLogWrapMode() {
+        logOverlayText.setHorizontallyScrolling(!logWrapText);
+
+        ViewGroup.LayoutParams tvLp = logOverlayText.getLayoutParams();
+        ViewGroup.LayoutParams svLp = logOverlayVScroll.getLayoutParams();
+        int width = logWrapText ? ViewGroup.LayoutParams.MATCH_PARENT
+                                : ViewGroup.LayoutParams.WRAP_CONTENT;
+        tvLp.width = width;
+        svLp.width = width;
+        logOverlayText.setLayoutParams(tvLp);
+        logOverlayVScroll.setLayoutParams(svLp);
+
+        // Keep the tail in view after the re-layout.
+        logOverlayVScroll.post(() ->
+                logOverlayVScroll.fullScroll(View.FOCUS_DOWN));
+
+        Toast.makeText(this,
+                logWrapText ? R.string.log_wrap_on : R.string.log_wrap_off,
+                Toast.LENGTH_SHORT).show();
+    }
+
     private String getSensorName(int type) {
         switch (type) {
             case Sensor.TYPE_ACCELEROMETER:
@@ -675,6 +951,10 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         if (RvvmNative.nativeIsGuestRunning()) {
             RvvmNative.nativeStopGuest();
         }
+        // Stop the console bridge before the native side goes away, so no
+        // callback can reach this half-torn-down Activity.
+        RvvmNative.nativeSetConsoleListener(null);
+        closeGuestLogFile();
         // Cleanup native resources
         if (isInitialized) {
             RvvmNative.nativeDestroy();

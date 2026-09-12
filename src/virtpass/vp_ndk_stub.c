@@ -29,6 +29,21 @@
  * same header the host dispatch compiles against.
  */
 
+/*
+ * stdio buffering for the host console. The guest's stdout goes to the
+ * emulator's in-memory fd, which musl treats like a regular file: printf
+ * output then sits in the 4 KB stdio buffer and reaches the host in coarse
+ * blocks instead of as it is printed. Line-buffering stdout (unbuffered
+ * stderr) makes every printf appear on the host console overlay in real
+ * time. Runs before main in every guest linked against this stub.
+ */
+__attribute__((constructor))
+static void vp_stub_init_stdio(void)
+{
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+}
+
 /* GameActivity input constants */
 #define AMOTION_EVENT_ACTION_DOWN         0
 #define AMOTION_EVENT_ACTION_UP           1
