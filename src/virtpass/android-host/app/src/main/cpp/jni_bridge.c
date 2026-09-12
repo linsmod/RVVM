@@ -325,6 +325,23 @@ static volatile int g_first_frame_sent = 0;
  * the TextureView canvas. With tty0 active rvvm_user routes fd 1/2 into the
  * VTerm, so the old io_callback console bridge no longer sees stdout: the
  * TextureView console replaces the text overlay.
+ *
+ * NOTE on in-place '\r' updates (progress lines): these are governed by the
+ * GUEST's stdio, not by this renderer. fd 1/2 is answered as a tty
+ * (user_tty_ioctl -> TCGETS), so guest stdio is line buffered and '\r' does
+ * not flush. The one-second loop of guest-samples/test_audio.c
+ * ("wrote N / M frames\r", no fflush) therefore sat in the guest's stdio
+ * buffer and arrived as a single burst at the trailing "\n    Done: ..." -
+ * measured with a write/snapshot probe: 1051 ms during which not one write
+ * reached the VTerm, then every '\r' at once. Having nothing to draw for that
+ * second looks exactly like dropped rows, but ONLCR -> libvterm -> snapshot
+ * -> drawTty were correct throughout, as was the final screen. How live such
+ * a line looks depends only on writes/second vs the guest stdio buffer size
+ * (test_audio prints once per AAudio burst: burst=2048 -> ~24 writes/s, under
+ * the buffer, nothing flushed mid-loop; burst=120 -> hundreds of writes, the
+ * buffer overflows repeatedly and the line updates live). The win32 host only
+ * looks better because its WASAPI burst is smaller. A guest that wants live
+ * progress must fflush (test_tty.c does). Do not "fix" this in the renderer.
  * ============================================================ */
 #define TTY_ROWS 24
 #define TTY_COLS 80
