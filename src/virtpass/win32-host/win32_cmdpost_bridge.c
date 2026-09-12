@@ -84,6 +84,19 @@ static HWND            g_hwnd       = NULL;
 static VTerm*   g_tty_vt    = NULL;
 static bool     g_tty_dirty = false;
 static bool     g_tty_keep  = false;
+
+/* TTY cell rendering: fonts [cjk][bold], created once (tty_init_fonts). */
+static HFONT tty_fonts[2][2];
+static bool  tty_fonts_ready = false;
+
+/* Helpers (defined near host_tty_cb) */
+static void     tty_init_fonts(void);
+static COLORREF tty_cell_fg(const VTermScreen* scr, const VTermScreenCell* cell);
+static bool     tty_cell_bg(const VTermScreen* scr, const VTermScreenCell* cell, COLORREF* out);
+static bool     tty_is_cjk(uint32_t cp);
+static int      tty_utf16(uint32_t cp, wchar_t* out);
+static void     tty_fill_rect_bg(HDC cdc, int x0, int y0, int x1, int y1, COLORREF col);
+static void     tty_paint(HDC cdc);
 static bool            g_cs_ready   = false;
 static CRITICAL_SECTION g_surf_cs;
 
@@ -1247,55 +1260,7 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
              * it is visible over the letterboxed panel; swap to the panel rect if
              * you want it composited inside the virtual display. */
             if (g_tty_vt && (g_tty_dirty || g_tty_keep)) {
-                VTermScreen* scr = vterm_obtain_screen(g_tty_vt);
-                vterm_screen_flush_damage(scr);
-
-                LOGFONT lf = { 0 };
-                lf.lfHeight = 16; lf.lfWidth = 0; lf.lfWeight = FW_NORMAL;
-                lf.lfCharSet = ANSI_CHARSET;
-                lf.lfFaceName[0] = 'L'; lf.lfFaceName[1] = 'u';
-                lf.lfFaceName[2] = 'c'; lf.lfFaceName[3] = 'i';
-                lf.lfFaceName[4] = 'd'; lf.lfFaceName[5] = 'a';
-                lf.lfFaceName[6] = ' '; lf.lfFaceName[7] = 'C';
-                lf.lfFaceName[8] = 'o'; lf.lfFaceName[9] = 'n';
-                lf.lfFaceName[10] = 's'; lf.lfFaceName[11] = 'o';
-                lf.lfFaceName[12] = 'l'; lf.lfFaceName[13] = 'e';
-                HFONT font = CreateFontIndirectA(&lf);
-                HGDIOBJ old_font = SelectObject(cdc, font);
-                SIZE ch;
-                GetTextExtentPoint32A(cdc, "M", 1, &ch);
-                int cw = ch.cx, chh = ch.cy;
-
-                /* Opaque backdrop so text is readable over the panel. */
-                RECT tty_bg = { 0, 0, cw * TTY_COLS, chh * TTY_ROWS };
-                FillRect(cdc, &tty_bg, (HBRUSH)GetStockObject(BLACK_BRUSH));
-                SetBkMode(cdc, TRANSPARENT);
-                SetTextColor(cdc, RGB(220, 220, 220));
-
-                char line[TTY_COLS + 1];
-                for (int r = 0; r < TTY_ROWS; r++) {
-                    int len = 0;
-                    for (int c = 0; c < TTY_COLS; c++) {
-                        /* Per-cell grid read: get_chars() would return a packed,
-                         * right-trimmed text stream with LF separators instead. */
-                        VTermPos pos = { r, c };
-                        VTermScreenCell cell;
-                        uint32_t cp = ' ';
-                        if (vterm_screen_get_cell(scr, pos, &cell) && cell.chars[0]) {
-                            cp = cell.chars[0];
-                        }
-                        if (cp == (uint32_t)-1 || cp == ' ') { line[len++] = ' '; }
-                        else if (cp < 0x20 || cp > 0x7E) { line[len++] = '.'; }
-                        else { line[len++] = (char)cp; }
-                    }
-                    while (len > 0 && line[len - 1] == ' ') len--; /* trim trailing */
-                    if (len > 0) {
-                        TextOutA(cdc, 0, r * chh, line, len);
-                    }
-                }
-                SelectObject(cdc, old_font);
-                DeleteObject(font);
-                g_tty_dirty = false; /* keep mode: stays repainted every paint */
+                tty_paint(cdc);
             }
 
             BitBlt(wdc, 0, 0, rc.right, rc.bottom, cdc, 0, 0, SRCCOPY);
@@ -1566,6 +1531,108 @@ static void host_tty_cb(void* userdata, int fd, void* tty)
         InvalidateRect(g_hwnd, NULL, FALSE);
     }
 }
+
+/* --- TTY cell rendering helpers (color + Unicode) ---
+ *
+ * Each libvterm cell carries up to VTERM_MAX_CHARS_PER_CELL codepoints, a
+ * single/double width flag, and indexed/RGB fg/bg colors. The renderer walks
+ * the grid and merges runs of same-styled cells into one TextOutW call; run
+ * origins are placed by column (col * cw) instead of relying on the GDI text
+ * advance, so double-width cells and CJK fallback fonts cannot cause drift.
+ */
+
+/* Fonts: [cjk][bold], created once (array lives next to the TTY state).
+ * CJK-capable face is used for CJK runs - GDI has no font linking in
+ * TextOutW, so Lucida Console alone would render boxes for CJK codepoints. */
+static void tty_init_fonts(void)
+{
+    if (tty_fonts_ready) {
+        return;
+    }
+    for (int cjk = 0; cjk < 2; cjk++) {
+        for (int bold = 0; bold < 2; bold++) {
+            LOGFONTW lf;
+            memset(&lf, 0, sizeof(lf));
+            lf.lfHeight         = 16;
+            lf.lfWeight         = bold ? FW_BOLD : FW_NORMAL;
+            lf.lfCharSet        = cjk ? DEFAULT_CHARSET : ANSI_CHARSET;
+            if (cjk) {
+                memcpy(lf.lfFaceName, L"Microsoft YaHei", sizeof(L"Microsoft YaHei"));
+            } else {
+                memcpy(lf.lfFaceName, L"Lucida Console", sizeof(L"Lucida Console"));
+            }
+            tty_fonts[cjk][bold] = CreateFontIndirectW(&lf);
+        }
+    }
+    tty_fonts_ready = true;
+}
+
+/* Resolve a cell color to a COLORREF. Default-color flags survive until
+ * convert_color_to_rgb() resets them, so they must be tested first. */
+static COLORREF tty_cell_fg(const VTermScreen* scr, const VTermScreenCell* cell)
+{
+    VTermColor c = cell->fg;
+    if (!VTERM_COLOR_IS_DEFAULT_FG(&c)) {
+        vterm_screen_convert_color_to_rgb(scr, &c);
+        return RGB(c.rgb.red, c.rgb.green, c.rgb.blue);
+    }
+    return RGB(220, 220, 220);
+}
+
+static bool tty_cell_bg(const VTermScreen* scr, const VTermScreenCell* cell, COLORREF* out)
+{
+    VTermColor c = cell->bg;
+    if (VTERM_COLOR_IS_DEFAULT_BG(&c)) {
+        return false; /* transparent: the black backdrop shows through */
+    }
+    vterm_screen_convert_color_to_rgb(scr, &c);
+    *out = RGB(c.rgb.red, c.rgb.green, c.rgb.blue);
+    return true;
+}
+
+static bool tty_is_cjk(uint32_t cp)
+{
+    return (cp >= 0x2E80 && cp <= 0x9FFF) ||   /* CJK radicals..Yi, kana, hangul jamo */
+           (cp >= 0xAC00 && cp <= 0xD7AF) ||   /* hangul syllables */
+           (cp >= 0xF900 && cp <= 0xFAFF) ||   /* CJK compat ideographs */
+           (cp >= 0xFF00 && cp <= 0xFF60) ||   /* fullwidth forms */
+           (cp >= 0x20000 && cp <= 0x3FFFD);   /* CJK ext B.. */
+}
+
+/* UCS-4 -> UTF-16, returns the number of wchar_t units written (0 to skip) */
+static int tty_utf16(uint32_t cp, wchar_t* out)
+{
+    if (cp == 0 || cp == (uint32_t)-1) {
+        return 0;
+    }
+    if (cp < 0x20 || cp == 0x7F) {
+        out[0] = L'.'; /* unprintable control */
+        return 1;
+    }
+    if (cp < 0x10000) {
+        if (cp >= 0xD800 && cp < 0xE000) {
+            return 0; /* lone surrogate */
+        }
+        out[0] = (wchar_t)cp;
+        return 1;
+    }
+    if (cp > 0x10FFFF) {
+        return 0;
+    }
+    cp -= 0x10000;
+    out[0] = (wchar_t)(0xD800 + (cp >> 10));
+    out[1] = (wchar_t)(0xDC00 + (cp & 0x3FF));
+    return 2;
+}
+
+static void tty_fill_rect_bg(HDC cdc, int x0, int y0, int x1, int y1, COLORREF col)
+{
+    HBRUSH br = CreateSolidBrush(col);
+    RECT rc = { x0, y0, x1, y1 };
+    FillRect(cdc, &rc, br);
+    DeleteObject(br);
+}
+
 
 /* Guest environment.
  *
@@ -2127,6 +2194,9 @@ bool win32_host_start_guest(int argc, char** argv)
     if (!g_tty_vt) {
         g_tty_vt = vterm_new(TTY_ROWS, TTY_COLS);
         if (g_tty_vt) {
+            /* UTF-8 is OFF by default in libvterm; without it CJK/emoji get
+             * mangled into latin1 before reaching the cells. */
+            vterm_set_utf8(g_tty_vt, 1);
             vterm_screen_reset(vterm_obtain_screen(g_tty_vt), true);
         }
     } else {

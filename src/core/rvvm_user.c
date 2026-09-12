@@ -565,6 +565,7 @@ static void user_tty_init(rvvm_userland_t* ctx)
     VTermScreen* screen = vterm_obtain_screen(vt);
     // No screen callbacks needed: the host renders by calling
     // vterm_screen_flush_damage() + vterm_screen_get_chars() on demand.
+    vterm_set_utf8(vt, 1); // UTF-8 off by default in libvterm
     vterm_screen_reset(screen, true);
     ctx->tty_vt     = vt;
     ctx->tty_screen = screen;
