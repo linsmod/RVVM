@@ -38,6 +38,7 @@ import java.io.FileWriter;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.HashMap;
 
 /**
  * Main Activity for RVVM Android host app.
@@ -154,6 +155,24 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private final Paint ttyBgPaint = new Paint();
     private final Paint ttyUnderlinePaint = new Paint();
 
+    // Terminal font. Typeface.MONOSPACE is only a generic family: on plenty of
+    // devices it is mapped to a proportional face (or resolves per character
+    // through fallback), which is exactly what made the console look ragged and
+    // smeared on some phones and fine on others. JetBrains Mono is bundled as
+    // an asset so every device renders the identical grid; the system monospace
+    // files below are only a ladder for the case the asset is missing.
+    private static final String TTY_FONT_ASSET = "fonts/JetBrainsMono-Regular.ttf";
+    private static final String[] TTY_FONT_FILES = {
+            "/system/fonts/NotoSansMono-Regular.ttf",
+            "/system/fonts/DroidSansMono.ttf",
+            "/system/fonts/CutiveMono.ttf",
+            "/system/fonts/DejaVuSansMono.ttf",
+    };
+    private Typeface ttyFont;                               // resolved on first use
+    private final HashMap<Integer, Float> ttyGlyphWidths = new HashMap<>();
+    private float ttyGlyphWidthSize = -1f;                  // size the cache is for
+    private final char[] ttyGlyph = new char[2];            // one code point, no alloc
+
     // 30 Hz poll: snapshot + redraw only when the native serial changed.
     private final Runnable ttyTick = new Runnable() {
         @Override public void run() {
@@ -187,10 +206,86 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private void startTtyLoop() {
         if (ttyRunning) return;
         ttyRunning = true;
-        ttyTextPaint.setTypeface(Typeface.MONOSPACE);
+        ttyTextPaint.setTypeface(ttyFont());
+        // Hinting on, subpixel accumulation off: the grid snaps every origin to
+        // a whole pixel (see drawTty), so stems land on pixel boundaries - the
+        // fractional size/advance left in place before is what blurred them.
+        ttyTextPaint.setAntiAlias(true);
+        ttyTextPaint.setHinting(Paint.HINTING_ON);
+        ttyTextPaint.setSubpixelText(false);
         ttyUnderlinePaint.setStyle(Paint.Style.STROKE);
         ttySerial = -1;
         ttyView.post(ttyTick);
+    }
+
+    /** Terminal font, resolved on first use (the asset load needs the Activity). */
+    private Typeface ttyFont() {
+        if (ttyFont == null) {
+            ttyFont = loadTtyFont();
+        }
+        return ttyFont;
+    }
+
+    /** Bundled asset first, then known system monospace files, then the generic
+     *  family. Every candidate is measured before it is accepted. */
+    private Typeface loadTtyFont() {
+        Typeface asset = loadTtyFontAsset(TTY_FONT_ASSET);
+        if (asset != null && isMonospaced(asset)) {
+            return asset;
+        }
+        Typeface first = asset;
+        for (String path : TTY_FONT_FILES) {
+            Typeface tf = loadTtyFontFile(path);
+            if (tf == null) {
+                continue;
+            }
+            if (isMonospaced(tf)) {
+                return tf;
+            }
+            if (first == null) {
+                first = tf;
+            }
+        }
+        Typeface generic = Typeface.MONOSPACE;
+        return isMonospaced(generic) ? generic : (first != null ? first : generic);
+    }
+
+    private Typeface loadTtyFontAsset(String name) {
+        try {
+            return Typeface.createFromAsset(getAssets(), name);
+        } catch (Exception e) {
+            Log.w(TAG, "No bundled TTY font " + name + ": " + e);
+            return null;
+        }
+    }
+
+    private static Typeface loadTtyFontFile(String path) {
+        if (!new File(path).isFile()) {
+            return null;
+        }
+        try {
+            return Typeface.createFromFile(path);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** True when the probe glyphs all share one advance: catches OEM "monospace"
+     *  mappings that really are proportional fonts. */
+    private static boolean isMonospaced(Typeface tf) {
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setTypeface(tf);
+        p.setTextSize(100f);
+        float ref = p.measureText("M");
+        if (ref <= 0f) {
+            return false;
+        }
+        for (String probe : new String[]{"i", "l", ".", "W", "0", "g", " "}) {
+            if (Math.abs(p.measureText(probe) - ref) > ref * 0.01f) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private void stopTtyLoop() {
@@ -212,83 +307,119 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             /* Fit the 80x24 grid by measuring the real monospace advance.
              * At the 100px probe size the advance is adv100, so the size
              * that fits TTY_COLS cells is 100 * availW / (cols * adv100);
-             * the height cap works directly on lineH = 1.2 * size. */
+             * the height cap works directly on lineH = 1.2 * size. The size
+             * is then floored to a whole pixel - a fractional text size is
+             * what smeared the glyphs on low-density screens. */
             ttyTextPaint.setTextSize(100f);
             float adv100 = ttyTextPaint.measureText("M");
             float maxByWidth = 100f * (w - 2 * TTY_PAD) / (TTY_COLS * adv100);
             float maxByHeight = (h - 2 * TTY_PAD) / (TTY_ROWS * 1.2f);
-            float size = Math.min(100f, Math.min(maxByWidth, maxByHeight));
+            float size = (float) Math.floor(Math.min(100f, Math.min(maxByWidth, maxByHeight)));
             size = Math.max(size, 9f);
             ttyTextPaint.setTextSize(size);
+            if (ttyGlyphWidthSize != size) {
+                ttyGlyphWidths.clear();
+                ttyGlyphWidthSize = size;
+            }
 
-            float adv = ttyTextPaint.measureText("M");
-            float lineH = size * 1.2f;
-            float gridW = adv * TTY_COLS, gridH = lineH * TTY_ROWS;
-            float ox = (w - gridW) / 2f, oy = (h - gridH) / 2f;
-            float ascent = ttyTextPaint.ascent();
+            // Whole-pixel grid: cellW may differ from the raw advance by a
+            // fraction, so glyphs are centered in their cell instead of being
+            // appended to a run - that keeps the columns exact even if the
+            // font that answered is not really monospaced.
+            float cellW = Math.max(1f, (float) Math.round(ttyTextPaint.measureText("M")));
+            float cellH = (float) Math.round(size * 1.2f);
+            float gridW = cellW * TTY_COLS, gridH = cellH * TTY_ROWS;
+            float ox = (float) Math.floor((w - gridW) / 2f);
+            float oy = (float) Math.floor((h - gridH) / 2f);
+
+            /* TEMP DIAG: one line per repaint, so the frame the renderer was
+             * asked to draw can be matched against the native screen dump. */
+            Log.i(TAG, "tty draw: canvas " + w + "x" + h + " size=" + size +
+                    " cell=" + cellW + "x" + cellH + " origin=(" + ox + "," + oy +
+                    ") grid=" + gridW + "x" + gridH + " serial=" + ttySerial);
+
+            Paint.FontMetrics fm = ttyTextPaint.getFontMetrics();
+            float baselineOff = (float) Math.round((cellH - (fm.descent - fm.ascent)) / 2f - fm.ascent);
 
             ttyUnderlinePaint.setStyle(Paint.Style.STROKE);
             ttyUnderlinePaint.setStrokeWidth(Math.max(1f, size / 14f));
 
-            int lastFg = 0, lastBg = 0, lastFlags = -1;
-            float runX = 0;
-            StringBuilder run = null;
-
             for (int r = 0; r < TTY_ROWS; r++) {
-                float y0 = oy + r * lineH;
-                float baseline = y0 - ascent;
+                float y0 = oy + r * cellH;
+                float baseline = y0 + baselineOff;
 
+                // Background: merged per run of equal colour, black skipped.
+                int bgStart = -1, bgColor = 0;
                 for (int c = 0; c <= TTY_COLS; c++) {
-                    int fg = 0, bg = 0, flags = 0;
-                    String ch = null;
-                    if (c < TTY_COLS) {
-                        int i = (r * TTY_COLS + c) * TTY_CELL;
-                        int cp = ttyCells[i];
-                        fg = ttyCells[i + 1];
-                        bg = ttyCells[i + 2];
-                        flags = ttyCells[i + 3];
-                        if (cp > 0 && cp != (int) ' ') {
-                            ch = new String(Character.toChars(cp));
+                    int bg = (c < TTY_COLS) ? ttyCells[(r * TTY_COLS + c) * TTY_CELL + 2] : 0;
+                    boolean painted = c < TTY_COLS && (bg & 0x00FFFFFF) != 0;
+                    if (!painted || (bgStart >= 0 && bg != bgColor)) {
+                        if (bgStart >= 0) {
+                            ttyBgPaint.setColor(bgColor);
+                            canvas.drawRect(ox + bgStart * cellW, y0,
+                                    ox + c * cellW, y0 + cellH, ttyBgPaint);
+                            bgStart = -1;
                         }
+                    }
+                    if (painted && bgStart < 0) {
+                        bgStart = c;
+                        bgColor = bg;
+                    }
+                }
+
+                // Glyphs: one draw per cell. A missing glyph still falls back
+                // to a proportional face, so each one is placed on the grid -
+                // centered when it fits, horizontally squeezed when it does not
+                // (wide/CJK and fallback glyphs) - rather than appended to a run.
+                for (int c = 0; c < TTY_COLS; c++) {
+                    int i = (r * TTY_COLS + c) * TTY_CELL;
+                    int cp = ttyCells[i];
+                    if (cp <= 0 || cp == (int) ' ' || cp > Character.MAX_CODE_POINT
+                            || (cp >= Character.MIN_SURROGATE && cp <= Character.MAX_SURROGATE)) {
+                        continue;   // blank cell or an unpaired surrogate
+                    }
+                    int flags = ttyCells[i + 3];
+                    boolean wide = (flags & 8) != 0 && c + 1 < TTY_COLS;
+                    int len = Character.toChars(cp, ttyGlyph, 0);
+
+                    float target = cellW * (wide ? 2 : 1);
+                    float gw = ttyGlyphWidths.containsKey(cp)
+                            ? ttyGlyphWidths.get(cp)
+                            : measureGlyph(cp, len);
+                    float x = ox + c * cellW;
+                    if (gw > target && gw > 0f) {
+                        ttyTextPaint.setTextScaleX(target / gw);
+                    } else if (gw > 0f) {
+                        x += (target - gw) / 2f;   // zero-width: keep the origin
                     }
 
-                    boolean sameRun = ch != null && run != null
-                            && fg == lastFg && bg == lastBg && flags == lastFlags;
-                    if (run != null && !sameRun) {
-                        // Draw the finished run: background then text.
-                        float endX = c * adv;
-                        if (lastBg != 0xFF000000) {
-                            ttyBgPaint.setColor(lastBg);
-                            canvas.drawRect(runX, y0, endX, y0 + lineH, ttyBgPaint);
-                        }
-                        ttyTextPaint.setColor(lastFg);
-                        ttyTextPaint.setFakeBoldText((lastFlags & 1) != 0);
-                        canvas.drawText(run.toString(), runX, baseline, ttyTextPaint);
-                        if ((lastFlags & 2) != 0) {
-                            ttyUnderlinePaint.setColor(lastFg);
-                            canvas.drawLine(runX, y0 + lineH * 0.95f,
-                                    endX, y0 + lineH * 0.95f, ttyUnderlinePaint);
-                        }
-                        run = null;
+                    ttyTextPaint.setColor(ttyCells[i + 1]);
+                    ttyTextPaint.setFakeBoldText((flags & 1) != 0);
+                    canvas.drawText(ttyGlyph, 0, len, x, baseline, ttyTextPaint);
+                    ttyTextPaint.setTextScaleX(1f);   // next measure must be unscaled
+
+                    if ((flags & 2) != 0) {
+                        ttyUnderlinePaint.setColor(ttyCells[i + 1]);
+                        canvas.drawLine(x, y0 + cellH - 1f,
+                                x + target, y0 + cellH - 1f, ttyUnderlinePaint);
                     }
-                    if (ch != null) {
-                        if (run == null) {
-                            run = new StringBuilder();
-                            runX = c * adv;
-                        }
-                        run.append(ch);
-                        if ((flags & 8) != 0 && c + 1 < TTY_COLS) {
-                            // Wide glyph: reserve the next (gap) cell too.
-                            run.append(' ');
-                            c++;
-                        }
-                        lastFg = fg; lastBg = bg; lastFlags = flags;
+                    if (wide) {
+                        c++;    // the wide glyph's filler cell
                     }
                 }
             }
         } finally {
             ttyView.unlockCanvasAndPost(canvas);
         }
+    }
+
+    /** Natural advance of one code point at the current text size, cached:
+     *  the grid is redrawn on every guest output burst, and measureText is the
+     *  expensive half of the render. Text scale must be 1 here. */
+    private float measureGlyph(int cp, int len) {
+        float w = ttyTextPaint.measureText(ttyGlyph, 0, len);
+        ttyGlyphWidths.put(cp, w);
+        return w;
     }
 
     // Exit code of the most recent guest, delivered by the native exit
@@ -313,6 +444,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         logOverlayScroll = findViewById(R.id.logOverlayScroll);
         logOverlayVScroll = findViewById(R.id.logOverlayVScroll);
         logOverlayText = findViewById(R.id.logOverlayText);
+        // The XML monospace attribute has the same OEM problem as the TTY
+        // canvas did; the resolved terminal font is used for both.
+        logOverlayText.setTypeface(ttyFont());
 
         // Tap the overlay (a tap, not a scroll) to toggle word wrap; the
         // current mode is confirmed with a toast. Monospace is always on.
