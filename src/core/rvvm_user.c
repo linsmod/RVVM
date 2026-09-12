@@ -1500,6 +1500,22 @@ static void* rvvm_user_thread_wrap(void* arg)
             break;
         }
         rvvm_addr_t cause = rvvm_run_user_thread(cpu);
+        if (atomic_load_uint32(&thread->finished)) {
+            /*
+             * A stop/exit request kicked this vCPU out of the interpreter (see
+             * userland_process_exit(): every thread is marked finished and
+             * queued for a hart pause). As with the suspend case below, the
+             * cause we got back describes whatever state the hart was in when
+             * it was interrupted, not a fresh trap - and the guest registers
+             * (a0 in particular, which SYS_ANDROID_CALL aliases as both its
+             * sub-command input and its return value) may hold leftovers from
+             * the previous dispatch. Dispatching that would execute a phantom
+             * syscall with a garbage number. Nothing observable is lost by
+             * dropping it: the process is being torn down, so no guest can
+             * read the result. Unwind instead of handling the trap.
+             */
+            break;
+        }
         if (atomic_load_uint32(&uctx()->userland_suspend)) {
             /*
              * A suspend request kicked this vCPU out of the interpreter. The
