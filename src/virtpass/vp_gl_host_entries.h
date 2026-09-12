@@ -1,0 +1,186 @@
+/*
+ * GENERATED FILE - produced by tools/gen_gl_abi.py - DO NOT EDIT BY HAND.
+ *
+ * Source of truth: NDK sysroot headers GLES2/gl2.h + EGL/egl.h (parsed).
+ * Regenerate with:  python tools/gen_gl_abi.py
+ *
+ * Phase 3 ABI notes:
+ *  - fn_id macros are the single source of truth shared by the guest stubs,
+ *    src/virtpass/vp_cmdpost.c and the win32 host GL dispatch.
+ *  - gl_call.args has 9 slots (glCompressedTexSubImage2D needs 9; the
+ *    original Phase 3 plan said 6 - widened before first deployment, so this
+ *    is an internal ABI change with zero consumers).
+ *  - Floats travel bit-packed through the int64_t slots; pointers travel as
+ *    guest virtual addresses. Guest memory is NOT mapped into the host, so
+ *    the host dispatch translates every data pointer argument with
+ *    rvvm_user_guest_ptr() and, for calls that hand back a host-owned string
+ *    (glGetString/eglQueryString), copies it through the guest scratch
+ *    buffer offered in args[GL_CALL_RETBUF_SLOT].
+ */
+
+#ifndef VPGL_HOST_ENTRIES_H
+#define VPGL_HOST_ENTRIES_H
+
+#include "virtpass/vp_gl_host_types.h"
+
+/* ---- resolved entry points (NULL until the backend loads) ---- */
+vpgl_PFN_eglChooseConfig p_eglChooseConfig;
+vpgl_PFN_eglCreateContext p_eglCreateContext;
+vpgl_PFN_eglCreatePbufferSurface p_eglCreatePbufferSurface;
+vpgl_PFN_eglCreateWindowSurface p_eglCreateWindowSurface;
+vpgl_PFN_eglDestroyContext p_eglDestroyContext;
+vpgl_PFN_eglDestroySurface p_eglDestroySurface;
+vpgl_PFN_eglGetConfigAttrib p_eglGetConfigAttrib;
+vpgl_PFN_eglGetDisplay p_eglGetDisplay;
+vpgl_PFN_eglGetError p_eglGetError;
+vpgl_PFN_eglInitialize p_eglInitialize;
+vpgl_PFN_eglMakeCurrent p_eglMakeCurrent;
+vpgl_PFN_eglQueryString p_eglQueryString;
+vpgl_PFN_eglQuerySurface p_eglQuerySurface;
+vpgl_PFN_eglSwapBuffers p_eglSwapBuffers;
+vpgl_PFN_eglTerminate p_eglTerminate;
+
+vpgl_PFN_glActiveTexture p_glActiveTexture;
+vpgl_PFN_glAttachShader p_glAttachShader;
+vpgl_PFN_glBindAttribLocation p_glBindAttribLocation;
+vpgl_PFN_glBindBuffer p_glBindBuffer;
+vpgl_PFN_glBindFramebuffer p_glBindFramebuffer;
+vpgl_PFN_glBindRenderbuffer p_glBindRenderbuffer;
+vpgl_PFN_glBindTexture p_glBindTexture;
+vpgl_PFN_glBlendColor p_glBlendColor;
+vpgl_PFN_glBlendEquation p_glBlendEquation;
+vpgl_PFN_glBlendEquationSeparate p_glBlendEquationSeparate;
+vpgl_PFN_glBlendFunc p_glBlendFunc;
+vpgl_PFN_glBlendFuncSeparate p_glBlendFuncSeparate;
+vpgl_PFN_glBufferData p_glBufferData;
+vpgl_PFN_glBufferSubData p_glBufferSubData;
+vpgl_PFN_glCheckFramebufferStatus p_glCheckFramebufferStatus;
+vpgl_PFN_glClear p_glClear;
+vpgl_PFN_glClearColor p_glClearColor;
+vpgl_PFN_glClearDepthf p_glClearDepthf;
+vpgl_PFN_glClearStencil p_glClearStencil;
+vpgl_PFN_glColorMask p_glColorMask;
+vpgl_PFN_glCompileShader p_glCompileShader;
+vpgl_PFN_glCompressedTexImage2D p_glCompressedTexImage2D;
+vpgl_PFN_glCompressedTexSubImage2D p_glCompressedTexSubImage2D;
+vpgl_PFN_glCopyTexImage2D p_glCopyTexImage2D;
+vpgl_PFN_glCopyTexSubImage2D p_glCopyTexSubImage2D;
+vpgl_PFN_glCreateProgram p_glCreateProgram;
+vpgl_PFN_glCreateShader p_glCreateShader;
+vpgl_PFN_glCullFace p_glCullFace;
+vpgl_PFN_glDeleteBuffers p_glDeleteBuffers;
+vpgl_PFN_glDeleteFramebuffers p_glDeleteFramebuffers;
+vpgl_PFN_glDeleteProgram p_glDeleteProgram;
+vpgl_PFN_glDeleteRenderbuffers p_glDeleteRenderbuffers;
+vpgl_PFN_glDeleteShader p_glDeleteShader;
+vpgl_PFN_glDeleteTextures p_glDeleteTextures;
+vpgl_PFN_glDepthFunc p_glDepthFunc;
+vpgl_PFN_glDepthMask p_glDepthMask;
+vpgl_PFN_glDepthRangef p_glDepthRangef;
+vpgl_PFN_glDetachShader p_glDetachShader;
+vpgl_PFN_glDisable p_glDisable;
+vpgl_PFN_glDisableVertexAttribArray p_glDisableVertexAttribArray;
+vpgl_PFN_glDrawArrays p_glDrawArrays;
+vpgl_PFN_glDrawElements p_glDrawElements;
+vpgl_PFN_glEnable p_glEnable;
+vpgl_PFN_glEnableVertexAttribArray p_glEnableVertexAttribArray;
+vpgl_PFN_glFinish p_glFinish;
+vpgl_PFN_glFlush p_glFlush;
+vpgl_PFN_glFramebufferRenderbuffer p_glFramebufferRenderbuffer;
+vpgl_PFN_glFramebufferTexture2D p_glFramebufferTexture2D;
+vpgl_PFN_glFrontFace p_glFrontFace;
+vpgl_PFN_glGenBuffers p_glGenBuffers;
+vpgl_PFN_glGenerateMipmap p_glGenerateMipmap;
+vpgl_PFN_glGenFramebuffers p_glGenFramebuffers;
+vpgl_PFN_glGenRenderbuffers p_glGenRenderbuffers;
+vpgl_PFN_glGenTextures p_glGenTextures;
+vpgl_PFN_glGetActiveAttrib p_glGetActiveAttrib;
+vpgl_PFN_glGetActiveUniform p_glGetActiveUniform;
+vpgl_PFN_glGetAttachedShaders p_glGetAttachedShaders;
+vpgl_PFN_glGetAttribLocation p_glGetAttribLocation;
+vpgl_PFN_glGetBooleanv p_glGetBooleanv;
+vpgl_PFN_glGetBufferParameteriv p_glGetBufferParameteriv;
+vpgl_PFN_glGetError p_glGetError;
+vpgl_PFN_glGetFloatv p_glGetFloatv;
+vpgl_PFN_glGetFramebufferAttachmentParameteriv p_glGetFramebufferAttachmentParameteriv;
+vpgl_PFN_glGetIntegerv p_glGetIntegerv;
+vpgl_PFN_glGetProgramiv p_glGetProgramiv;
+vpgl_PFN_glGetProgramInfoLog p_glGetProgramInfoLog;
+vpgl_PFN_glGetRenderbufferParameteriv p_glGetRenderbufferParameteriv;
+vpgl_PFN_glGetShaderiv p_glGetShaderiv;
+vpgl_PFN_glGetShaderInfoLog p_glGetShaderInfoLog;
+vpgl_PFN_glGetShaderPrecisionFormat p_glGetShaderPrecisionFormat;
+vpgl_PFN_glGetShaderSource p_glGetShaderSource;
+vpgl_PFN_glGetString p_glGetString;
+vpgl_PFN_glGetTexParameterfv p_glGetTexParameterfv;
+vpgl_PFN_glGetTexParameteriv p_glGetTexParameteriv;
+vpgl_PFN_glGetUniformfv p_glGetUniformfv;
+vpgl_PFN_glGetUniformiv p_glGetUniformiv;
+vpgl_PFN_glGetUniformLocation p_glGetUniformLocation;
+vpgl_PFN_glGetVertexAttribfv p_glGetVertexAttribfv;
+vpgl_PFN_glGetVertexAttribiv p_glGetVertexAttribiv;
+vpgl_PFN_glGetVertexAttribPointerv p_glGetVertexAttribPointerv;
+vpgl_PFN_glHint p_glHint;
+vpgl_PFN_glIsBuffer p_glIsBuffer;
+vpgl_PFN_glIsEnabled p_glIsEnabled;
+vpgl_PFN_glIsFramebuffer p_glIsFramebuffer;
+vpgl_PFN_glIsProgram p_glIsProgram;
+vpgl_PFN_glIsRenderbuffer p_glIsRenderbuffer;
+vpgl_PFN_glIsShader p_glIsShader;
+vpgl_PFN_glIsTexture p_glIsTexture;
+vpgl_PFN_glLineWidth p_glLineWidth;
+vpgl_PFN_glLinkProgram p_glLinkProgram;
+vpgl_PFN_glPixelStorei p_glPixelStorei;
+vpgl_PFN_glPolygonOffset p_glPolygonOffset;
+vpgl_PFN_glReadPixels p_glReadPixels;
+vpgl_PFN_glReleaseShaderCompiler p_glReleaseShaderCompiler;
+vpgl_PFN_glRenderbufferStorage p_glRenderbufferStorage;
+vpgl_PFN_glSampleCoverage p_glSampleCoverage;
+vpgl_PFN_glScissor p_glScissor;
+vpgl_PFN_glShaderBinary p_glShaderBinary;
+vpgl_PFN_glShaderSource p_glShaderSource;
+vpgl_PFN_glStencilFunc p_glStencilFunc;
+vpgl_PFN_glStencilFuncSeparate p_glStencilFuncSeparate;
+vpgl_PFN_glStencilMask p_glStencilMask;
+vpgl_PFN_glStencilMaskSeparate p_glStencilMaskSeparate;
+vpgl_PFN_glStencilOp p_glStencilOp;
+vpgl_PFN_glStencilOpSeparate p_glStencilOpSeparate;
+vpgl_PFN_glTexImage2D p_glTexImage2D;
+vpgl_PFN_glTexParameterf p_glTexParameterf;
+vpgl_PFN_glTexParameterfv p_glTexParameterfv;
+vpgl_PFN_glTexParameteri p_glTexParameteri;
+vpgl_PFN_glTexParameteriv p_glTexParameteriv;
+vpgl_PFN_glTexSubImage2D p_glTexSubImage2D;
+vpgl_PFN_glUniform1f p_glUniform1f;
+vpgl_PFN_glUniform1fv p_glUniform1fv;
+vpgl_PFN_glUniform1i p_glUniform1i;
+vpgl_PFN_glUniform1iv p_glUniform1iv;
+vpgl_PFN_glUniform2f p_glUniform2f;
+vpgl_PFN_glUniform2fv p_glUniform2fv;
+vpgl_PFN_glUniform2i p_glUniform2i;
+vpgl_PFN_glUniform2iv p_glUniform2iv;
+vpgl_PFN_glUniform3f p_glUniform3f;
+vpgl_PFN_glUniform3fv p_glUniform3fv;
+vpgl_PFN_glUniform3i p_glUniform3i;
+vpgl_PFN_glUniform3iv p_glUniform3iv;
+vpgl_PFN_glUniform4f p_glUniform4f;
+vpgl_PFN_glUniform4fv p_glUniform4fv;
+vpgl_PFN_glUniform4i p_glUniform4i;
+vpgl_PFN_glUniform4iv p_glUniform4iv;
+vpgl_PFN_glUniformMatrix2fv p_glUniformMatrix2fv;
+vpgl_PFN_glUniformMatrix3fv p_glUniformMatrix3fv;
+vpgl_PFN_glUniformMatrix4fv p_glUniformMatrix4fv;
+vpgl_PFN_glUseProgram p_glUseProgram;
+vpgl_PFN_glValidateProgram p_glValidateProgram;
+vpgl_PFN_glVertexAttrib1f p_glVertexAttrib1f;
+vpgl_PFN_glVertexAttrib1fv p_glVertexAttrib1fv;
+vpgl_PFN_glVertexAttrib2f p_glVertexAttrib2f;
+vpgl_PFN_glVertexAttrib2fv p_glVertexAttrib2fv;
+vpgl_PFN_glVertexAttrib3f p_glVertexAttrib3f;
+vpgl_PFN_glVertexAttrib3fv p_glVertexAttrib3fv;
+vpgl_PFN_glVertexAttrib4f p_glVertexAttrib4f;
+vpgl_PFN_glVertexAttrib4fv p_glVertexAttrib4fv;
+vpgl_PFN_glVertexAttribPointer p_glVertexAttribPointer;
+vpgl_PFN_glViewport p_glViewport;
+
+#endif /* VPGL_HOST_ENTRIES_H */

@@ -55,7 +55,7 @@ static inline long virtpass_syscall(long nr, long a0, long a1, long a2,
 
 /* Float <-> int64 bit packing (GLES2 has no double params).
  * Only packing is needed guest-side: no GLES2 core function returns a float,
- * unpacking happens host-side via w32gl_arg_f(). */
+ * unpacking happens host-side via vpgl_arg_f(). */
 static inline int64_t glstub_packf(float v)
 {
     union { float f; uint32_t u; } cvt;

@@ -12,7 +12,7 @@ Outputs (all marked GENERATED - do not edit by hand):
                                       prototypes
   src/virtpass/vp_gl_stub.c           guest stubs (142 functions)
   src/virtpass/win32-host/win32_gl_backend.h
-                                      host types (w32gl_*), PFN typedefs,
+                                      host types (vpgl_*), PFN typedefs,
                                       resolved procs
   src/virtpass/win32-host/win32_gl_dispatch_tables.h
                                       host generic dispatch switches
@@ -34,8 +34,9 @@ NDK_SYSROOT = os.environ.get(
 )
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GUEST_INC_DIR = os.path.join(REPO_ROOT, "include", "virtpass")
-GUEST_SRC_DIR = os.path.join(REPO_ROOT, "src", "virtpass")
-HOST_DIR = os.path.join(REPO_ROOT, "src", "virtpass", "win32-host")
+SRC_DIR = os.path.join(REPO_ROOT, "src", "virtpass")
+GUEST_SRC_DIR = SRC_DIR
+HOST_DIR = os.path.join(SRC_DIR, "win32-host")
 
 GL2_H = os.path.join(NDK_SYSROOT, "GLES2", "gl2.h")
 EGL_H = os.path.join(NDK_SYSROOT, "EGL", "egl.h")
@@ -96,10 +97,10 @@ GL_CALL_RETBUF_CAP = 8192
 ARG_OVERRIDES = {
     # glShaderSource passes an array of `count` guest string pointers; the
     # host needs an array of translated host pointers instead.
-    ("glShaderSource", 2): "w32gl_translate_shader_srcs(a, (int)a[1])",
+    ("glShaderSource", 2): "vpgl_translate_shader_srcs(a, (int)a[1])",
     # eglChooseConfig's `configs` is declared void* but points at an array of
     # EGLConfig the implementation writes into - a guest buffer, not a handle.
-    ("eglChooseConfig", 2): "(w32gl_EGLConfig*)w32gl_gptr(a[2])",
+    ("eglChooseConfig", 2): "(vpgl_EGLConfig*)vpgl_gptr(a[2])",
 }
 
 # Pointer arguments that are *either* a guest address (client-side array) or
@@ -278,7 +279,7 @@ def guest_marshal_expr(fn, idx, name, t):
     glVertexAttribPointer/glDrawElements overload their pointer argument as
     either a client array address or a buffer byte offset, and only the guest
     knows which it meant. Those go through GLSTUB_OFFSET_PTR(), which tags the
-    address form so the host never has to guess (see w32gl_gptr_or_off).
+    address form so the host never has to guess (see vpgl_gptr_or_off).
     """
     if t.is_pointer():
         if (fn["name"], idx) in OFFSET_PTR_ARGS:
@@ -314,23 +315,23 @@ def guest_return_expr(fn):
 # ---------------------------------------------------------------------------
 
 def host_type(t):
-    """Type as written in host-side PFN declarations (w32gl_* typedefs)."""
+    """Type as written in host-side PFN declarations (vpgl_* typedefs)."""
     stars = t.ptr
     if stars == 0 and (t.base in IMPLICIT_PTR or t.base in NATIVE_TYPES):
         stars = 1  # opaque handles are pointers even when written without *
     if stars:
         if t.base in IMPLICIT_PTR or t.base in NATIVE_TYPES:
-            h = "w32gl_void"
+            h = "vpgl_void"
         else:
-            h = "w32gl_" + t.base
+            h = "vpgl_" + t.base
         return "%s%s%s" % ("const " if t.const else "", h, "*" * stars)
     if t.base == "void":
         return "void"
-    return "w32gl_" + t.base
+    return "vpgl_" + t.base
 
 
 def host_pfn(fn):
-    return "w32gl_PFN_" + fn["name"]
+    return "vpgl_PFN_" + fn["name"]
 
 
 def host_arg_expr(fn, idx, t):
@@ -339,16 +340,16 @@ def host_arg_expr(fn, idx, t):
         return override
     if not t.is_pointer():
         if t.is_float():
-            return "w32gl_arg_f(a[%d])" % idx
+            return "vpgl_arg_f(a[%d])" % idx
         # 32-bit ints: cast (int64 -> uint32/int32 handled by C conversion)
         return "(%s)a[%d]" % (host_type(t), idx)
     if t.base in IMPLICIT_PTR or t.base in NATIVE_TYPES:
         # Opaque host handle: produced by the host, handed back untouched.
         return "(%s)(uintptr_t)a[%d]" % (host_type(t), idx)
     if (fn["name"], idx) in OFFSET_PTR_ARGS:
-        return "(%s)w32gl_gptr_or_off(a[%d])" % (host_type(t), idx)
+        return "(%s)vpgl_gptr_or_off(a[%d])" % (host_type(t), idx)
     # Guest data pointer: translate before the host dereferences it.
-    return "(%s)w32gl_gptr(a[%d])" % (host_type(t), idx)
+    return "(%s)vpgl_gptr(a[%d])" % (host_type(t), idx)
 
 
 def host_call_expr(fn):
@@ -364,11 +365,11 @@ def host_call_expr(fn):
             raise ValueError(
                 "%s returns a pointer; add it to STRING_RET_FNS or teach the "
                 "host dispatch how to translate the result" % fn["name"])
-        return "*ret = w32gl_string_out(a, (const char*)%s);" % call
+        return "*ret = vpgl_string_out(a, (const char*)%s);" % call
     if r.is_pointer():
         return "*ret = (int64_t)(intptr_t)%s;" % call
     if r.is_float():
-        return "*ret = w32gl_pack_f(%s);" % call
+        return "*ret = vpgl_pack_f(%s);" % call
     if r.is_int64():
         return "*ret = (int64_t)%s;" % call
     if r.base in INT32_UNSIGNED:
@@ -740,7 +741,7 @@ static inline long virtpass_syscall(long nr, long a0, long a1, long a2,
 
 /* Float <-> int64 bit packing (GLES2 has no double params).
  * Only packing is needed guest-side: no GLES2 core function returns a float,
- * unpacking happens host-side via w32gl_arg_f(). */
+ * unpacking happens host-side via vpgl_arg_f(). */
 static inline int64_t glstub_packf(float v)
 {
     union { float f; uint32_t u; } cvt;
@@ -847,70 +848,72 @@ static char glstub_retbuf[GL_CALL_RETBUF_CAP];
     return "\n".join(out)
 
 
-def gen_host_backend_header(gl_fns, egl_fns):
+def gen_host_types_header(gl_fns, egl_fns):
+    """Shared host-side types: vpgl_-prefixed mirrors of the real EGL/GLES
+    types, the PFN typedefs and the p_* entry-point declarations. Both host
+    backends (win32, android) include this and define the p_* storage; the
+    dispatch tables are emitted separately so the argument-translation rules
+    stay in exactly one place."""
     out = []
     out.append(GENERATED_BANNER.format(nargs=GL_CALL_MAX_ARGS))
-    out.append("#ifndef WIN32_GL_BACKEND_H")
-    out.append("#define WIN32_GL_BACKEND_H")
+    out.append("#ifndef VPGL_HOST_TYPES_H")
+    out.append("#define VPGL_HOST_TYPES_H")
     out.append("")
     out.append("#include <stdint.h>")
     out.append("#include <stddef.h>")
     out.append("#include <stdbool.h>")
     out.append("")
     out.append("/*")
-    out.append(" * Host-side GL/EGL function types matching the real EGL/GLES DLLs")
-    out.append(" * (SwiftShader / ANGLE from the Android SDK emulator directory).")
-    out.append(" * Export names were verified undecorated -> plain cdecl, no")
-    out.append(" * WINAPI. All types are w32gl_-prefixed so this header never")
-    out.append(" * collides with real GL/EGL headers.")
+    out.append(" * Host-side GL/EGL function types matching the real EGL/GLES")
+    out.append(" * implementations (win32: SwiftShader / ANGLE from the Android SDK")
+    out.append(" * emulator directory; android: the system libEGL/libGLESv2).")
+    out.append(" * All types are vpgl_-prefixed so this header never collides with")
+    out.append(" * real GL/EGL headers.")
     out.append(" */")
     out.append("")
-    out.append("#define w32gl_APIENTRY /* cdecl */")
+    out.append("#define vpgl_APIENTRY")
     out.append("")
     out.append("/* ---- type definitions ---- */")
-    out.append("typedef void          w32gl_void;")
-    out.append("typedef char          w32gl_char;")
-    out.append("typedef unsigned int  w32gl_GLenum;")
-    out.append("typedef unsigned int  w32gl_GLuint;")
-    out.append("typedef unsigned int  w32gl_GLbitfield;")
-    out.append("typedef int           w32gl_GLint;")
-    out.append("typedef int           w32gl_GLsizei;")
-    out.append("typedef char          w32gl_GLchar;")
-    out.append("typedef unsigned char w32gl_GLboolean;")
-    out.append("typedef signed char   w32gl_GLbyte;")
-    out.append("typedef unsigned char w32gl_GLubyte;")
-    out.append("typedef short         w32gl_GLshort;")
-    out.append("typedef unsigned short w32gl_GLushort;")
-    out.append("typedef float         w32gl_GLfloat;")
-    out.append("typedef float         w32gl_GLclampf;")
-    out.append("typedef ptrdiff_t     w32gl_GLintptr;")
-    out.append("typedef ptrdiff_t     w32gl_GLsizeiptr;")
-    out.append("typedef void*         w32gl_EGLDisplay;")
-    out.append("typedef void*         w32gl_EGLSurface;")
-    out.append("typedef void*         w32gl_EGLContext;")
-    out.append("typedef void*         w32gl_EGLConfig;")
-    out.append("typedef int           w32gl_EGLint;")
-    out.append("typedef unsigned int  w32gl_EGLBoolean;")
-    out.append("typedef unsigned int  w32gl_EGLenum;")
+    out.append("typedef void          vpgl_void;")
+    out.append("typedef char          vpgl_char;")
+    out.append("typedef unsigned int  vpgl_GLenum;")
+    out.append("typedef unsigned int  vpgl_GLuint;")
+    out.append("typedef unsigned int  vpgl_GLbitfield;")
+    out.append("typedef int           vpgl_GLint;")
+    out.append("typedef int           vpgl_GLsizei;")
+    out.append("typedef char          vpgl_GLchar;")
+    out.append("typedef unsigned char vpgl_GLboolean;")
+    out.append("typedef signed char   vpgl_GLbyte;")
+    out.append("typedef unsigned char vpgl_GLubyte;")
+    out.append("typedef short         vpgl_GLshort;")
+    out.append("typedef unsigned short vpgl_GLushort;")
+    out.append("typedef float         vpgl_GLfloat;")
+    out.append("typedef float         vpgl_GLclampf;")
+    out.append("typedef ptrdiff_t     vpgl_GLintptr;")
+    out.append("typedef ptrdiff_t     vpgl_GLsizeiptr;")
+    out.append("typedef void*         vpgl_EGLDisplay;")
+    out.append("typedef void*         vpgl_EGLSurface;")
+    out.append("typedef void*         vpgl_EGLContext;")
+    out.append("typedef void*         vpgl_EGLConfig;")
+    out.append("typedef int           vpgl_EGLint;")
+    out.append("typedef unsigned int  vpgl_EGLBoolean;")
+    out.append("typedef unsigned int  vpgl_EGLenum;")
+    out.append("/* Native window handle behind EGLNativeWindowType. The win32 host")
+    out.append(" * never constructs one (its window surface downgrades to a pbuffer),")
+    out.append(" * but the android host passes its real ANativeWindow through here. */")
+    out.append("typedef void*         vpgl_EGLNativeWindowType;")
     out.append("")
     out.append("/* EGL attribute tokens the host dispatch inspects directly (surface")
     out.append(" * attributes are a guest array it walks itself). */")
-    out.append("#define w32gl_EGL_NONE   0x3038")
-    out.append("#define w32gl_EGL_WIDTH  0x3057")
-    out.append("#define w32gl_EGL_HEIGHT 0x3056")
+    out.append("#define vpgl_EGL_NONE   0x3038")
+    out.append("#define vpgl_EGL_WIDTH  0x3057")
+    out.append("#define vpgl_EGL_HEIGHT 0x3056")
     out.append("")
-
-    # Shared ABI block: same fn_id macros / syscall numbers / gl_call struct
-    # as the guest header (project convention duplicates ABI constants on
-    # both sides; the generator keeps them in sync).
-    out.append(fn_id_defs(gl_fns, egl_fns))
-    out.append("")
-    out.append(gl_call_struct())
 
     def pfn(fn):
         params = ", ".join("%s %s" % (host_type(t), n or "p%d" % i)
                            for i, (t, n) in enumerate(fn["params"])) or "void"
-        return "typedef %s (w32gl_APIENTRY *%s)(%s);" % (
+        return "typedef %s (vpgl_APIENTRY *%s)(%s);" % (
             host_type(fn["ret"]), host_pfn(fn), params)
 
     out.append("/* ---- EGL function pointer types ---- */")
@@ -927,6 +930,47 @@ def gen_host_backend_header(gl_fns, egl_fns):
     out.append("")
     for fn in gl_fns:
         out.append("extern %s p_%s;" % (host_pfn(fn), fn["name"]))
+    out.append("")
+    out.append("/* The fn_id macros and the gl_call struct live in virtpass/vp_gl.h:")
+    out.append(" * hosts include that header, the same one the guest and")
+    out.append(" * vp_cmdpost.c compile, rather than a second copy of the ABI. */")
+    out.append("#endif /* VPGL_HOST_TYPES_H */")
+    out.append("")
+    return "\n".join(out)
+
+
+def gen_host_entries_header(gl_fns, egl_fns):
+    """Definitions of the p_* entry-point storage. Include from exactly one TU
+    per host binary (the backend loader); every other TU sees the extern
+    declarations from vp_gl_host_types.h."""
+    out = []
+    out.append(GENERATED_BANNER.format(nargs=GL_CALL_MAX_ARGS))
+    out.append("#ifndef VPGL_HOST_ENTRIES_H")
+    out.append("#define VPGL_HOST_ENTRIES_H")
+    out.append("")
+    out.append('#include "virtpass/vp_gl_host_types.h"')
+    out.append("")
+    out.append("/* ---- resolved entry points (NULL until the backend loads) ---- */")
+    for fn in egl_fns:
+        out.append("%s p_%s;" % (host_pfn(fn), fn["name"]))
+    out.append("")
+    for fn in gl_fns:
+        out.append("%s p_%s;" % (host_pfn(fn), fn["name"]))
+    out.append("")
+    out.append("#endif /* VPGL_HOST_ENTRIES_H */")
+    out.append("")
+    return "\n".join(out)
+
+
+def gen_win32_backend_header(gl_fns, egl_fns):
+    """win32-specific backend lifecycle. The types come from the shared
+    vp_gl_host_types.h; this header only adds the DLL loading API."""
+    out = []
+    out.append(GENERATED_BANNER.format(nargs=GL_CALL_MAX_ARGS))
+    out.append("#ifndef WIN32_GL_BACKEND_H")
+    out.append("#define WIN32_GL_BACKEND_H")
+    out.append("")
+    out.append('#include "virtpass/vp_gl_host_types.h"')
     out.append("")
     out.append("""/* ---- backend lifecycle -------------------------------------------- */
 
@@ -968,16 +1012,17 @@ def gen_host_dispatch_tables(gl_fns, egl_fns):
     out = []
     out.append(GENERATED_BANNER.format(nargs=GL_CALL_MAX_ARGS))
     out.append("/*")
-    out.append(" * Generic dispatch switches, included from win32_gl_dispatch.c.")
+    out.append(" * Generic dispatch switches, included from each host's dispatch TU")
+    out.append(" * (win32-host/win32_gl_dispatch.c, android-host .../android_gl_host.c).")
     out.append(" * Do not include from anywhere else (defines static functions).")
     out.append(" * `a` is the const int64_t* args array, `ret` the int64_t* out.")
-    out.append(" * Guest data pointers are translated by the w32gl_gptr*() helpers")
-    out.append(" * defined in win32_gl_dispatch.c above this include.")
+    out.append(" * Guest data pointers are translated by the vpgl_gptr*() helpers")
+    out.append(" * defined in the including TU above this include.")
     out.append(" */")
     out.append("")
 
     out.append("/* fn_id -> name, for the RVVM_GL_TRACE call log */")
-    out.append("static const char* w32gl_egl_name(uint32_t fn_id)")
+    out.append("static const char* vpgl_egl_name(uint32_t fn_id)")
     out.append("{")
     out.append("    switch (fn_id) {")
     for fn in egl_fns:
@@ -987,7 +1032,7 @@ def gen_host_dispatch_tables(gl_fns, egl_fns):
     out.append("    }")
     out.append("}")
     out.append("")
-    out.append("static const char* w32gl_gl_name(uint32_t fn_id)")
+    out.append("static const char* vpgl_gl_name(uint32_t fn_id)")
     out.append("{")
     out.append("    switch (fn_id) {")
     for fn in gl_fns:
@@ -998,7 +1043,7 @@ def gen_host_dispatch_tables(gl_fns, egl_fns):
     out.append("}")
     out.append("")
 
-    out.append("static void w32gl_dispatch_egl_generic(uint32_t fn_id, const int64_t* a, int64_t* ret)")
+    out.append("static void vpgl_dispatch_egl_generic(uint32_t fn_id, const int64_t* a, int64_t* ret)")
     out.append("{")
     out.append("    switch (fn_id) {")
     for fn in egl_fns:
@@ -1012,7 +1057,7 @@ def gen_host_dispatch_tables(gl_fns, egl_fns):
     out.append("}")
     out.append("")
 
-    out.append("static void w32gl_dispatch_gl_generic(uint32_t fn_id, const int64_t* a, int64_t* ret)")
+    out.append("static void vpgl_dispatch_gl_generic(uint32_t fn_id, const int64_t* a, int64_t* ret)")
     out.append("{")
     out.append("    switch (fn_id) {")
     for fn in gl_fns:
@@ -1068,10 +1113,17 @@ def main():
         (os.path.join(GUEST_INC_DIR, "vp_gl.h"),
          gen_guest_header(gl_fns, egl_fns, egl_host_fns)),
         (os.path.join(GUEST_SRC_DIR, "vp_gl_stub.c"), gen_guest_source(gl_fns, egl_fns)),
-        (os.path.join(HOST_DIR, "win32_gl_backend.h"),
-         gen_host_backend_header(gl_fns, egl_host_fns)),
-        (os.path.join(HOST_DIR, "win32_gl_dispatch_tables.h"),
+        # Host-side shared headers (both the win32 and the android host
+        # include these; the argument-translation tables exist once).
+        (os.path.join(SRC_DIR, "vp_gl_host_types.h"),
+         gen_host_types_header(gl_fns, egl_host_fns)),
+        (os.path.join(SRC_DIR, "vp_gl_dispatch_tables.h"),
          gen_host_dispatch_tables(gl_fns, egl_host_fns)),
+        (os.path.join(SRC_DIR, "vp_gl_host_entries.h"),
+         gen_host_entries_header(gl_fns, egl_host_fns)),
+        # win32-only backend lifecycle API
+        (os.path.join(HOST_DIR, "win32_gl_backend.h"),
+         gen_win32_backend_header(gl_fns, egl_host_fns)),
     ]
     for path, content in outs:
         with open(path, "w", encoding="utf-8", newline="\n") as f:

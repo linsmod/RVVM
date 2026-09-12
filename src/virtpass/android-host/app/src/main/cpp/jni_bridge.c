@@ -28,6 +28,9 @@
 /* Include vp_cmdpost API */
 #include "virtpass/vp_cmdpost.h"
 
+/* System EGL/GLES backend (marshalled GL dispatch) */
+#include "android_gl_host.h"
+
 /* Include rvvm-user API */
 #include "rvvm_user.h"
 
@@ -869,6 +872,11 @@ static void jni_register_cmdpost_callbacks(void)
     /* Real AAudio backend: the pump thread in vp_aaudio_android.c bridges the
      * guest's SPSC ring to AAudioStream. */
     cmdpost_set_audio_callbacks(android_aaudio_ops());
+
+    /* System EGL/GLES backend for the marshalled GL calls. Loads the system
+     * libraries on first use and re-installs the dispatch callbacks; on
+     * failure the guest falls back to CPU rendering like on win32. */
+    android_gl_host_init();
 }
 
 JNIEXPORT void JNICALL
@@ -1157,6 +1165,11 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
         g_applied_h   = 0;
         g_applied_fmt = 0;
     }
+
+    /* The GL backend only reads this at eglCreateWindowSurface time, and an
+     * EGLSurface holds the window for its own lifetime, so handing over the
+     * pointer (not a reference) is enough here. */
+    android_gl_set_native_window(new_window);
     pw = g_virt_w;
     ph = g_virt_h;
     pthread_mutex_unlock(&g_surf_cs);
