@@ -89,6 +89,7 @@ static void print_help(const char* prog)
         "Usage:\n"
         "  %s [options] <guest-elf> [guest args...]\n"
         "  %s                (no guest: show the Android-style launcher picker)\n"
+        "  %s <assets-dir>   (a directory is taken as the picker's guest folder)\n"
         "\n"
         "Options:\n"
         "  --display SPEC   Layer-1 virtual panel geometry: \"WxH\", \"@PPI\" or\n"
@@ -107,7 +108,7 @@ static void print_help(const char* prog)
         "\n"
         "Exit status: the guest's exit code in direct mode (1 on a host error);\n"
         "in launcher mode the window stays open across guests.\n",
-        prog, prog);
+        prog, prog, prog);
 }
 
 int main(int argc, char** argv)
@@ -161,6 +162,21 @@ int main(int argc, char** argv)
             return 0;
         }
         break; /* first non-option argument: the guest ELF */
+    }
+
+    /* A directory is not a guest ELF. Handing over the assets folder is an easy
+     * mistake to make (it is exactly what the Android host gets passed): rvopen()
+     * cannot open a directory, so the guest fails to load, exits with -1 at once
+     * and drags the window down with it. Treat it as the picker's guest folder
+     * instead of killing the session. */
+    if (i < argc) {
+        DWORD attr = GetFileAttributesA(argv[i]);
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            snprintf(assets_dir, sizeof(assets_dir), "%s", argv[i]);
+            printf("'%s' is a directory, not a guest ELF - showing the launcher picker\n",
+                   argv[i]);
+            i = argc; /* no guest: launcher mode, see below */
+        }
     }
 
     if (!win32_host_init("RVVM WinHost", win_w, win_h, virt_w, virt_h, virt_ppi,

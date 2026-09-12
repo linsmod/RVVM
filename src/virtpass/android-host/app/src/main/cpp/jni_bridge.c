@@ -278,6 +278,10 @@ static rvvm_machine_t* g_guest_machine = NULL;
 /* Guest exit callback (Java object reference, held by global ref) */
 static jobject g_exit_listener = NULL;
 
+/* Defined with the window callbacks below; called from the guest thread once
+ * the guest is gone. */
+static void surf_finish_pending_lock(void);
+
 /* Guest thread function */
 static void* guest_thread_func(void* arg)
 {
@@ -302,6 +306,13 @@ static void* guest_thread_func(void* arg)
     int result = rvvm_user_linux_ex(machine, g_guest_argc, g_guest_argv, NULL);
     
     LOGI("Guest thread finished with code: %d", result);
+
+    /* The guest is gone: if it died between ANativeWindow_lock() and
+     * ANativeWindow_unlockAndPost() (a Stop landing mid-frame), the surface is
+     * still locked and would refuse every lock from the next guest. Release it
+     * here, where no guest code can run anymore. */
+    surf_finish_pending_lock();
+
     /* rvvm_user_linux_ex() owns and has just freed the machine */
     g_guest_machine = NULL;
     g_guest_running = 0;
@@ -366,6 +377,11 @@ static int32_t g_log_gw = -1, g_log_gh = -1, g_log_gf = -1;
 /* Set while "no window" has already been reported for the current surface. */
 static int g_no_window_logged = 0;
 
+/* Set while a failed ANativeWindow_lock() has already been reported for the
+ * current guest. Lock failures are per-frame (the guest keeps retrying), so
+ * without this the first wedge would flood logcat. */
+static int g_lock_fail_logged = 0;
+
 static void log_frame_geometry(int32_t gw, int32_t gh, int32_t gf,
                                const ANativeWindow_Buffer* buf, int32_t cols, int32_t rows)
 {
@@ -394,6 +410,44 @@ static void surf_drop_locked(void)
     if (w) {
         ANativeWindow_release(w);
     }
+}
+
+/* Close a window lock the guest never closed itself.
+ *
+ * Android's Surface remembers the buffer ANativeWindow_lock() handed out and
+ * refuses every later lock() with
+ *   Surface::lock failed, already locked (INVALID_OPERATION)
+ * until that buffer is handed back through ANativeWindow_unlockAndPost(). The
+ * Surface outlives the guest, so a guest killed between lock and unlock wedges
+ * the window for every guest started afterwards: they run, every frame's lock
+ * fails, nothing is ever drawn, and the screen keeps showing the last frame of
+ * the previous guest. Stop lands in that window most of the time for a software
+ * renderer, which clears the whole frame in between the two calls.
+ *
+ * unlockAndPost (rather than ANativeWindow_release) is the only NDK way to end
+ * the lock and give the slot back to the surface. The abandoned buffer still
+ * holds its previous frame, so one stale frame may be shown until the next
+ * guest posts - the alternative is a window that never updates again.
+ *
+ * Must be called when no guest can touch the lock anymore (guest thread wound
+ * down), so nothing is posting behind our back. */
+static void surf_finish_pending_lock(void)
+{
+    ANativeWindow* w;
+
+    pthread_mutex_lock(&g_surf_cs);
+    w = g_locked_window;
+    g_locked_window = NULL;
+    memset(&g_locked_buffer, 0, sizeof(g_locked_buffer));
+    pthread_mutex_unlock(&g_surf_cs);
+
+    if (!w) {
+        return;
+    }
+
+    LOGW("Guest died holding the window lock; posting the abandoned buffer to release it");
+    ANativeWindow_unlockAndPost(w);
+    ANativeWindow_release(w);
 }
 
 /* The buffer descriptor handed back on WINDOW_LOCK uses the shared guest-ABI
@@ -501,6 +555,14 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
     int32_t result = ANativeWindow_lock(w, &buffer, &dirty);
     if (result != 0) {
         ANativeWindow_release(w);
+        /* Reported once per guest: the guest retries every frame, and the usual
+         * cause is a lock left outstanding by the guest before it (see
+         * surf_finish_pending_lock()), which fails every frame until the
+         * surface is recreated. */
+        if (!g_lock_fail_logged) {
+            g_lock_fail_logged = 1;
+            LOGW("Window lock failed (%d): nothing will be drawn until the surface is released", result);
+        }
         return result;
     }
 
@@ -1142,6 +1204,16 @@ Java_com_rvvm_android_RvvmNative_nativeClearLifecycleCmds(JNIEnv* env, jobject t
     (void)thiz;
     g_lifecycle_cmd_count = 0;
     g_lifecycle_cmd_read = 0;
+
+    /* Called right before the machine is handed to the next guest, so drop
+     * what the *guest* still has queued too: pending commands and input belong
+     * to the previous guest (a stale TERM_WINDOW/DESTROY would take the new one
+     * down on its very first poll, a stale touch would be delivered as if the
+     * user had just tapped). The seed state for the new guest is then queued
+     * explicitly by the Java side. */
+    cmdpost_clear_lifecycle_cmds();
+    cmdpost_clear_motion_events();
+    cmdpost_clear_key_events();
 }
 
 JNIEXPORT void JNICALL
@@ -1276,6 +1348,14 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
      * just the first guest the process ever ran. */
     g_log_gw = g_log_gh = g_log_gf = -1;
     g_no_window_logged = 0;
+    g_lock_fail_logged = 0;
+
+    /* Safety net for a window wedged by a guest that died holding a lock before
+     * this guest ever started (or by a run that failed to create its thread):
+     * starting a guest with the surface still locked would let it render
+     * nothing at all. Normally a no-op - the previous guest's thread already
+     * released the lock on its way out. */
+    surf_finish_pending_lock();
     
     /* Fresh userland instance per guest, so nothing leaks between runs. */
     g_guest_machine = rvvm_user_create();

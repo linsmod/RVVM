@@ -24,45 +24,10 @@
 #include <fcntl.h>
 #include "virtpass/vp_android.h"
 /*
- * Custom syscall numbers for Android NDK API proxying.
- * These are in a private range (0x10000+) that doesn't conflict
- * with Linux RISC-V syscall numbers (which go up to ~439).
+ * Custom syscall numbers for Android NDK API proxying come from
+ * virtpass/vp_syscall.h (included through virtpass/vp_android.h above), the
+ * same header the host dispatch compiles against.
  */
-#define SYS_ANDROID_BASE          0x10000
-#define SYS_ANDROID_CALL          0x10022
-
-/* Sub-commands passed in a0 for SYS_ANDROID_CALL */
-#define SYS_ANDROID_SENSOR_INIT   (SYS_ANDROID_BASE + 1)
-#define SYS_ANDROID_SENSOR_GET    (SYS_ANDROID_BASE + 2)
-#define SYS_ANDROID_SENSOR_ENABLE (SYS_ANDROID_BASE + 3)
-#define SYS_ANDROID_SENSOR_READ   (SYS_ANDROID_BASE + 4)
-#define SYS_ANDROID_WINDOW_INIT   (SYS_ANDROID_BASE + 5)
-#define SYS_ANDROID_INPUT_INIT    (SYS_ANDROID_BASE + 6)
-#define SYS_ANDROID_LIFECYCLE     (SYS_ANDROID_BASE + 7)
-#define SYS_ANDROID_CONFIG        (SYS_ANDROID_BASE + 8)
-#define SYS_ANDROID_LOOPER_INIT   (SYS_ANDROID_BASE + 9)
-#define SYS_ANDROID_ASSET_OPEN    (SYS_ANDROID_BASE + 10)
-
-/* Window lock/unlock (Phase 1: Software Rendering) */
-#define SYS_ANDROID_WINDOW_LOCK      (SYS_ANDROID_BASE + 11)
-#define SYS_ANDROID_WINDOW_UNLOCK    (SYS_ANDROID_BASE + 12)
-#define SYS_ANDROID_WINDOW_GET_SIZE  (SYS_ANDROID_BASE + 13)
-#define SYS_ANDROID_WINDOW_SET_BUF   (SYS_ANDROID_BASE + 14)
-
-/* GameActivity (Phase 2: Lifecycle + Input) */
-#define SYS_ANDROID_GAME_CREATE      (SYS_ANDROID_BASE + 20)
-#define SYS_ANDROID_GAME_DESTROY     (SYS_ANDROID_BASE + 21)
-#define SYS_ANDROID_GAME_POLL_CMD    (SYS_ANDROID_BASE + 22)
-#define SYS_ANDROID_GAME_SWAP_INPUT  (SYS_ANDROID_BASE + 23)
-#define SYS_ANDROID_GAME_CLEAR_INPUT (SYS_ANDROID_BASE + 24)
-
-/* Choreographer (Phase 4: display vsync source) */
-#define SYS_ANDROID_CHOREOGRAPHER_INIT (SYS_ANDROID_BASE + 25)
-#define SYS_ANDROID_CHOREOGRAPHER_WAIT (SYS_ANDROID_BASE + 26)
-/* fd wakeup (方案 B): guest hands the host the write end of the pipe that the
- * Looper polls, and asks for exactly one vsync at a time. */
-#define SYS_ANDROID_CHOREOGRAPHER_SET_FD (SYS_ANDROID_BASE + 27)
-#define SYS_ANDROID_CHOREOGRAPHER_REQUEST_VSYNC (SYS_ANDROID_BASE + 28)
 
 /* GameActivity input constants */
 #define AMOTION_EVENT_ACTION_DOWN         0
@@ -1267,7 +1232,16 @@ void android_app_destroy(android_app* app)
 int32_t android_app_read_cmd(android_app* app)
 {
     (void)app;
-    return (int32_t)virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_GAME_POLL_CMD, 0, 0, 0, 0, 0, 0);
+    int32_t cmd = (int32_t)virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_GAME_POLL_CMD, 0, 0, 0, 0, 0, 0);
+
+    /* "Nothing pending" travels as a non-negative sentinel so the per-frame
+     * poll does not trip rvvm-user's "negative syscall result" warning; the
+     * NDK contract this function exposes is still -1. Hosts that answer -1
+     * directly (older builds, the Win32 host) keep working unchanged. */
+    if (cmd == VP_GAME_CMD_NONE) {
+        return -1;
+    }
+    return cmd;
 }
 
 /*

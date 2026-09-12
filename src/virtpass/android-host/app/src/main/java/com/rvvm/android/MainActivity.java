@@ -1,6 +1,7 @@
 package com.rvvm.android;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.content.res.AssetManager;
 import android.content.res.Configuration;
 import android.hardware.Sensor;
@@ -30,6 +31,14 @@ import java.io.InputStream;
 public class MainActivity extends Activity implements SensorEventListener, SurfaceHolder.Callback2 {
 
     private static final String TAG = "RVVM-MainActivity";
+
+    /**
+     * Intent extra naming the guest app to run, for example:
+     *   adb shell am start -n com.rvvm.android/.MainActivity --es guest test_render.exe
+     * The value is matched against the *.exe entries in assets (the ".exe"
+     * suffix is optional), overriding the default "first entry" selection.
+     */
+    public static final String EXTRA_GUEST_APP = "guest";
 
     // Lifecycle commands forwarded to the guest. These are the APP_CMD_* values
     // from include/virtpass/vp_android.h - they are the wire format of the
@@ -79,6 +88,10 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private boolean isSurfaceReady = false;
     private boolean hasAutoStarted = false;
 
+    // Assets file name of the guest currently launched, or null when none runs.
+    // Remembered so an Intent asking for the same guest is not torn down.
+    private String currentGuestApp;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -109,6 +122,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             @Override
             public void onNothingSelected(AdapterView<?> parent) {}
         });
+
+        // Honor an explicit "which guest to run" Intent before the auto-start
+        // path picks its default. The launch itself happens in
+        // maybeAutoStartGuest() once the surface is ready, so only the
+        // selection is applied here.
+        applyGuestSelectionFromIntent(getIntent());
 
         // Setup surface holder
         surfaceHolder = surfaceView.getHolder();
@@ -278,9 +297,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         // Run the ELF
         String elfPath = elfFile.getAbsolutePath();
         statusText.setText("Running: " + elfName + "\nPath: " + elfPath);
-        
+
+        replayGuestStartupState();
+
         boolean started = RvvmNative.nativeRunElf(elfPath, null);
         if (started) {
+            currentGuestApp = elfName;
             statusText.setText("Guest started: " + elfName);
             Log.i(TAG, "Guest started: " + elfPath);
         } else {
@@ -295,8 +317,40 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             while (RvvmNative.nativeIsGuestRunning()) {
                 try { Thread.sleep(100); } catch (InterruptedException e) { return; }
             }
-            runOnUiThread(this::updateButtonStates);
+            runOnUiThread(() -> {
+                currentGuestApp = null;
+                updateButtonStates();
+            });
         }, "guest-exit-monitor").start();
+    }
+
+    /**
+     * Re-deliver the lifecycle state a freshly started guest has to observe.
+     *
+     * Lifecycle reaches the guest as *transitions* only (onStart, onResume,
+     * surfaceCreated, focus). A guest launched after those already happened -
+     * the normal case when switching targets inside this singleTask Activity,
+     * or a Run after a previous guest exited - therefore misses all of them:
+     * android_app ends up with window == NULL and no activityState bits, and a
+     * GameActivity-style loop correctly concludes it has nothing to draw on and
+     * never presents a single frame, even though the surface is right there
+     * (this is why "run a guest, then run test_game_activity" showed a black
+     * screen while a direct launch worked).
+     *
+     * Called before the guest thread exists, so the queue is cleared of the
+     * previous guest's leftovers and seeded with the commands this guest would
+     * have seen on a cold start: START -> RESUME -> INIT_WINDOW -> focus.
+     */
+    private void replayGuestStartupState() {
+        RvvmNative.nativeClearLifecycleCmds();
+        postLifecycleCmd(APP_CMD_START);
+        postLifecycleCmd(APP_CMD_RESUME);
+        if (isSurfaceReady) {
+            postLifecycleCmd(APP_CMD_INIT_WINDOW);
+            if (hasWindowFocus()) {
+                postLifecycleCmd(APP_CMD_GAINED_FOCUS);
+            }
+        }
     }
 
     private void stopGuestElf() {
@@ -305,8 +359,78 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         }
         Log.i(TAG, "Stopping guest");
         RvvmNative.nativeStopGuest();
+        currentGuestApp = null;
         statusText.setText("Guest stopped");
         updateButtonStates();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // The launcher Activity is singleTask, so a repeated
+        // "am start --es guest ..." lands here instead of onCreate: reselect the
+        // requested guest and relaunch if it differs from the running one.
+        if (applyGuestSelectionFromIntent(intent)) {
+            startSelectedGuestIfNeeded();
+        }
+    }
+
+    /**
+     * Resolve an Intent's EXTRA_GUEST_APP against the assets *.exe list and
+     * select it in the spinner. Returns true when the request was honored.
+     */
+    private boolean applyGuestSelectionFromIntent(Intent intent) {
+        if (intent == null || guestApps == null || guestApps.length == 0) {
+            return false;
+        }
+        String requested = intent.getStringExtra(EXTRA_GUEST_APP);
+        if (requested == null || requested.trim().isEmpty()) {
+            return false;
+        }
+        requested = requested.trim();
+        // Accept both "test_render" and "test_render.exe".
+        String withSuffix = requested.endsWith(".exe") ? requested : requested + ".exe";
+        for (int i = 0; i < guestApps.length; i++) {
+            if (guestApps[i].equalsIgnoreCase(requested) || guestApps[i].equalsIgnoreCase(withSuffix)) {
+                selectedGuestApp = guestApps[i];
+                guestAppSpinner.setSelection(i);
+                statusText.setText("Selected guest: " + guestApps[i]);
+                Log.i(TAG, "Intent selected guest app: " + guestApps[i]);
+                return true;
+            }
+        }
+        Log.w(TAG, "Intent requested unknown guest app: " + requested);
+        return false;
+    }
+
+    /**
+     * Launch the selected guest unless that exact guest is already running.
+     * Stopping is asynchronous (the guest thread clears the running flag only
+     * after it unwinds), so switching targets waits for the old guest to retire
+     * before launching the new one.
+     */
+    private void startSelectedGuestIfNeeded() {
+        if (!isInitialized || selectedGuestApp == null || selectedGuestApp.isEmpty()) {
+            return;
+        }
+        if (!RvvmNative.nativeIsGuestRunning()) {
+            runGuestElf();
+            return;
+        }
+        if (selectedGuestApp.equals(currentGuestApp)) {
+            Log.i(TAG, "Guest already running: " + currentGuestApp);
+            return;
+        }
+        Log.i(TAG, "Switching guest: " + currentGuestApp + " -> " + selectedGuestApp);
+        RvvmNative.nativeStopGuest();
+        currentGuestApp = null;
+        new Thread(() -> {
+            while (RvvmNative.nativeIsGuestRunning()) {
+                try { Thread.sleep(50); } catch (InterruptedException e) { return; }
+            }
+            runOnUiThread(this::runGuestElf);
+        }, "guest-switch").start();
     }
 
     /**

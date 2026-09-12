@@ -51,6 +51,7 @@
 #define IDC_STOP    103
 #define IDC_EXIT    104
 #define IDC_SUSPEND 105
+#define IDC_KILL    106
 
 /* How long win32_host_shutdown() waits for the guest thread to unwind. Kept
  * below the ~5s budget Windows grants a CTRL_CLOSE_EVENT handler so a
@@ -62,8 +63,9 @@
  * two; anything still alive after this is not going to exit on its own. */
 #define STOP_GRACE_MS 1500
 
-/* Exit code reported for a host-forced stop (128 + SIGKILL). It is not a guest
- * exit code: the guest was taken down by the host, not by its own sys_exit. */
+/* Exit code reported for a host-forced stop (128 + SIGKILL): the Stop watchdog
+ * expiring, or the Kill button. It is not a guest exit code: the guest was taken
+ * down by the host, not by its own sys_exit. */
 #define STOP_FORCED_EXIT_CODE 137
 
 /* ------------------------------------------------------------------ */
@@ -182,6 +184,15 @@ static bool   g_minimized    = false;
 #define LAUNCH_COMBO_Y   (LAUNCH_MARGIN + LAUNCH_TITLE_H + LAUNCH_CTRL_GAP)
 #define LAUNCH_BTN_Y     (LAUNCH_COMBO_Y + LAUNCH_COMBO_EDIT_H + LAUNCH_CTRL_GAP)
 
+/*
+ * Button row of the picker: Run / Stop / Kill / Suspend / Exit, left to right.
+ * Run, Stop and Kill end up the same width and pitch; Suspend is wider because
+ * its "Suspend" / "Resume" label is, and Exit follows it.
+ */
+#define LAUNCH_BTN_W     80
+#define LAUNCH_BTN_STEP  (LAUNCH_BTN_W + LAUNCH_CTRL_GAP)
+#define LAUNCH_SUSP_W    88
+
 /* Known sample guests; used when the assets directory holds no .exe files
  * (e.g. the assets haven't been built yet). */
 static const char* LAUNCHER_DEFAULT_GUESTS[] = {
@@ -200,6 +211,7 @@ static HWND g_btn_run   = NULL;      /* Run  button           */
 static HWND g_btn_stop  = NULL;      /* Stop button           */
 static HWND g_btn_exit  = NULL;      /* Exit button           */
 static HWND g_btn_susp  = NULL;      /* Suspend/Resume toggle */
+static HWND g_btn_kill  = NULL;      /* Kill (stop without waiting) */
 
 /* Guest switch requested while another guest is still running: the old one is
  * torn down cooperatively and this pick is booted from WM_APP_GUEST_EXIT. */
@@ -978,6 +990,7 @@ static void launcher_ui_idle(void);
 static void launcher_launch(void);
 static void launcher_launch_sel(int sel);
 static void launcher_stop(void);
+static void launcher_kill(void);
 static void launcher_toggle_suspend(void);
 
 static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1013,6 +1026,7 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         switch (LOWORD(wParam)) {
         case IDC_RUN:  launcher_launch();       return 0;
         case IDC_STOP: launcher_stop();         return 0;
+        case IDC_KILL: launcher_kill();         return 0;
         case IDC_SUSPEND: launcher_toggle_suspend(); return 0;
         case IDC_EXIT: PostMessageA(hwnd, WM_CLOSE, 0, 0); return 0;
         default: break;
@@ -1412,18 +1426,22 @@ static void launcher_scan_guests(void)
     winhost_log("launcher: %d guest(s) in %s", g_guest_count, g_assets_dir);
 }
 
-/* Put the Suspend control back into its idle state: label "Suspend", enabled
- * only while a guest is actually running. Called on boot and on guest exit so a
- * suspend left over from the previous guest can never leak into the next one. */
-static void launcher_suspend_ui_reset(void)
+/* Put the guest-only controls back into their idle state: the Suspend toggle
+ * shows "Suspend" again and, like Kill, is enabled only while a guest is
+ * actually running. Called on boot and on guest exit so a suspend or a hot Kill
+ * left over from the previous guest can never leak into the next one. */
+static void launcher_run_controls_ui_reset(void)
 {
-    if (!g_btn_susp) return;
-    SetWindowTextA(g_btn_susp, "Suspend");
-    EnableWindow(g_btn_susp, g_guest_thread != NULL);
+    bool running = g_guest_thread != NULL;
+    if (g_btn_susp) {
+        SetWindowTextA(g_btn_susp, "Suspend");
+        EnableWindow(g_btn_susp, running);
+    }
+    if (g_btn_kill) EnableWindow(g_btn_kill, running);
 }
 
-/* Create the dropdown + Run/Stop/Suspend/Exit buttons as children of the host
- * window. */
+/* Create the dropdown + Run/Stop/Kill/Suspend/Exit buttons as children of the
+ * host window. */
 static void launcher_ui_create(void)
 {
     int i;
@@ -1447,23 +1465,37 @@ static void launcher_ui_create(void)
 
     g_btn_run  = CreateWindowA("BUTTON", "Run",
                                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               LAUNCH_MARGIN, LAUNCH_BTN_Y, 80, LAUNCH_CTRL_H,
+                               LAUNCH_MARGIN + LAUNCH_BTN_STEP * 0, LAUNCH_BTN_Y,
+                               LAUNCH_BTN_W, LAUNCH_CTRL_H,
                                g_hwnd, (HMENU)(INT_PTR)IDC_RUN, hinst, NULL);
     g_btn_stop = CreateWindowA("BUTTON", "Stop",
                                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               LAUNCH_MARGIN + 88,   LAUNCH_BTN_Y, 80, LAUNCH_CTRL_H,
+                               LAUNCH_MARGIN + LAUNCH_BTN_STEP * 1, LAUNCH_BTN_Y,
+                               LAUNCH_BTN_W, LAUNCH_CTRL_H,
                                g_hwnd, (HMENU)(INT_PTR)IDC_STOP, hinst, NULL);
-    g_btn_exit = CreateWindowA("BUTTON", "Exit",
+    /* Kill: next to Stop because both take the guest down - Stop cooperatively
+     * (with a grace period), Kill immediately. Disabled while no guest is
+     * running, like Suspend; see launcher_run_controls_ui_reset(). */
+    g_btn_kill = CreateWindowA("BUTTON", "Kill",
                                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               LAUNCH_MARGIN + 176,  LAUNCH_BTN_Y, 80, LAUNCH_CTRL_H,
-                               g_hwnd, (HMENU)(INT_PTR)IDC_EXIT, hinst, NULL);
+                               LAUNCH_MARGIN + LAUNCH_BTN_STEP * 2, LAUNCH_BTN_Y,
+                               LAUNCH_BTN_W, LAUNCH_CTRL_H,
+                               g_hwnd, (HMENU)(INT_PTR)IDC_KILL, hinst, NULL);
     /* Suspend/Resume toggle. Disabled while no guest is running: there is
      * nothing to suspend, and it is re-enabled by launcher_ui_running(). */
     g_btn_susp = CreateWindowA("BUTTON", "Suspend",
                                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               LAUNCH_MARGIN + 264,  LAUNCH_BTN_Y, 88, LAUNCH_CTRL_H,
+                               LAUNCH_MARGIN + LAUNCH_BTN_STEP * 3, LAUNCH_BTN_Y,
+                               LAUNCH_SUSP_W, LAUNCH_CTRL_H,
                                g_hwnd, (HMENU)(INT_PTR)IDC_SUSPEND, hinst, NULL);
+    g_btn_exit = CreateWindowA("BUTTON", "Exit",
+                               WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                               LAUNCH_MARGIN + LAUNCH_BTN_STEP * 3 +
+                                   LAUNCH_SUSP_W + LAUNCH_CTRL_GAP, LAUNCH_BTN_Y,
+                               LAUNCH_BTN_W, LAUNCH_CTRL_H,
+                               g_hwnd, (HMENU)(INT_PTR)IDC_EXIT, hinst, NULL);
     if (g_btn_susp) EnableWindow(g_btn_susp, FALSE);
+    if (g_btn_kill) EnableWindow(g_btn_kill, FALSE);
 }
 
 /* Enter the guest-running view. The picker controls stay visible: the parent
@@ -1473,7 +1505,7 @@ static void launcher_ui_create(void)
 static void launcher_ui_running(void)
 {
     g_launcher_idle = false;
-    launcher_suspend_ui_reset();
+    launcher_run_controls_ui_reset();
     vsync_clock_start();
 }
 
@@ -1498,7 +1530,7 @@ static void launcher_ui_idle(void)
 
     vsync_clock_stop();
 
-    launcher_suspend_ui_reset();
+    launcher_run_controls_ui_reset();
 
     g_launcher_idle = true;
     if (g_hwnd) { InvalidateRect(g_hwnd, NULL, TRUE); set_title("launcher"); }
@@ -1589,7 +1621,7 @@ static void launcher_stop(void)
      * it first: it then exits the normal way. */
     if (guest_suspended()) {
         guest_resume();
-        launcher_suspend_ui_reset();
+        launcher_run_controls_ui_reset();
         if (!g_minimized) vsync_clock_start();
         winhost_log("Stop: resuming the suspended guest first");
     }
@@ -1601,6 +1633,30 @@ static void launcher_stop(void)
         g_stop_watchdog = true;
     }
     winhost_log("Stop requested: teardown lifecycle queued (%d ms grace)", STOP_GRACE_MS);
+}
+
+/* Kill button. Takes the running guest down *now*, skipping the cooperative
+ * teardown grace period Stop waits out: same termination path as the Stop
+ * watchdog, i.e. rvvm_user_stop() pauses every guest vCPU and marks every guest
+ * thread finished, so the guest still unwinds through its own exit path and
+ * WM_APP_GUEST_EXIT brings the picker back. (This is deliberately not
+ * TerminateThread() on a thread that is inside guest interpreter code.)
+ *
+ * Any cooperative teardown a previous Stop queued is superseded: its pending
+ * watchdog is disarmed here so it cannot fire against the *next* guest that the
+ * picker boots. A parked (suspended) guest needs no explicit resume -
+ * rvvm_user_stop() wakes the parked vCPUs as part of the exit path itself. */
+static void launcher_kill(void)
+{
+    if (!g_guest_thread || !g_guest_machine) return;
+
+    if (g_stop_watchdog) {
+        KillTimer(g_hwnd, STOP_TIMER_ID);
+        g_stop_watchdog = false;
+    }
+
+    winhost_log("Kill: forcing rvvm_user_stop() now (no grace period)");
+    rvvm_user_stop(g_guest_machine, STOP_FORCED_EXIT_CODE);
 }
 
 /* Suspend/Resume toggle. Suspending the vCPUs also parks the frame clock: a

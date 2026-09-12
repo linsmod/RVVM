@@ -230,8 +230,10 @@ void cmdpost_init_sensor_ringbuf(sensor_ringbuf_t* ringbuf);
 /* Push a sensor event from the host side */
 void cmdpost_push_sensor_event(const sensor_event_t* event);
 
-/* Unified Android NDK API proxy syscall: sub-command passed in a0 */
-#define SYS_ANDROID_CALL   0x10022
+/* Unified Android NDK API proxy syscall (sub-command passed in a0). The
+ * numbers themselves live in virtpass/vp_syscall.h, shared verbatim with the
+ * guest stub. */
+#include "virtpass/vp_syscall.h"
 
 /* Handle Android NDK API proxy syscall */
 int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,

@@ -36,43 +36,12 @@
 #include "core/rvvm_user.h"
 
 /* ============================================================
- * Custom syscall numbers (must match vp_ndk_stub)
+ * Custom syscall numbers (must match the guest stub)
+ *
+ * Both sides now compile the same header, virtpass/vp_syscall.h, so there is
+ * nothing left to keep in sync by hand.
  * ============================================================ */
-#define SYS_ANDROID_BASE          0x10000
-#define SYS_ANDROID_CALL          0x10022
-
-/* Sub-commands passed in a0 for SYS_ANDROID_CALL */
-#define SYS_ANDROID_SENSOR_INIT   (SYS_ANDROID_BASE + 1)
-#define SYS_ANDROID_SENSOR_GET    (SYS_ANDROID_BASE + 2)
-#define SYS_ANDROID_SENSOR_ENABLE (SYS_ANDROID_BASE + 3)
-#define SYS_ANDROID_SENSOR_READ   (SYS_ANDROID_BASE + 4)
-#define SYS_ANDROID_WINDOW_INIT   (SYS_ANDROID_BASE + 5)
-#define SYS_ANDROID_INPUT_INIT    (SYS_ANDROID_BASE + 6)
-#define SYS_ANDROID_LIFECYCLE     (SYS_ANDROID_BASE + 7)
-#define SYS_ANDROID_CONFIG        (SYS_ANDROID_BASE + 8)
-#define SYS_ANDROID_LOOPER_INIT   (SYS_ANDROID_BASE + 9)
-#define SYS_ANDROID_ASSET_OPEN    (SYS_ANDROID_BASE + 10)
-
-/* Window lock/unlock (Phase 1: Software Rendering) */
-#define SYS_ANDROID_WINDOW_LOCK      (SYS_ANDROID_BASE + 11)
-#define SYS_ANDROID_WINDOW_UNLOCK    (SYS_ANDROID_BASE + 12)
-#define SYS_ANDROID_WINDOW_GET_SIZE  (SYS_ANDROID_BASE + 13)
-#define SYS_ANDROID_WINDOW_SET_BUF   (SYS_ANDROID_BASE + 14)
-
-/* GameActivity (Phase 2: Lifecycle + Input) */
-#define SYS_ANDROID_GAME_CREATE      (SYS_ANDROID_BASE + 20)
-#define SYS_ANDROID_GAME_DESTROY     (SYS_ANDROID_BASE + 21)
-#define SYS_ANDROID_GAME_POLL_CMD    (SYS_ANDROID_BASE + 22)
-#define SYS_ANDROID_GAME_SWAP_INPUT  (SYS_ANDROID_BASE + 23)
-#define SYS_ANDROID_GAME_CLEAR_INPUT (SYS_ANDROID_BASE + 24)
-
-/* Choreographer (Phase 4: display vsync source) */
-#define SYS_ANDROID_CHOREOGRAPHER_INIT (SYS_ANDROID_BASE + 25)
-#define SYS_ANDROID_CHOREOGRAPHER_WAIT (SYS_ANDROID_BASE + 26)
-/* fd wakeup (方案 B): the guest hands us the write end of the pipe its Looper
- * polls, and asks for exactly one vsync at a time. */
-#define SYS_ANDROID_CHOREOGRAPHER_SET_FD (SYS_ANDROID_BASE + 27)
-#define SYS_ANDROID_CHOREOGRAPHER_REQUEST_VSYNC (SYS_ANDROID_BASE + 28)
+#include "virtpass/vp_syscall.h"
 
 /* Marshalled GL/EGL calls (Phase 3: hardware GL proxy) */
 #define SYS_GL_CALL_BASE   0x10020
@@ -593,7 +562,7 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                         CMDLOG("Guest polled lifecycle cmd: %d", cmd);
                         return cmd;
                     }
-                    return -1;  /* No command available */
+                    return VP_GAME_CMD_NONE;  /* Nothing pending; see above */
                 }
 
                 case SYS_ANDROID_GAME_SWAP_INPUT: {
