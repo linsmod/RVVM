@@ -58,6 +58,15 @@ typedef void (*rvvm_user_tty_callback)(void* userdata, int fd, void* tty);
 
 void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback callback, void* userdata);
 
+// Attach a host-owned virtual TTY (a libvterm `VTerm*`, opaque here) to the
+// machine. Guest fd 1/2 output is fed into it (with ONLCR emulation) instead
+// of the host fd; pair with rvvm_user_set_tty_callback() so the host gets
+// repaint notifications. Ownership stays with the host: the VTerm survives
+// guest exit (keeping the last screen renderable) and rvvm_user never frees
+// it. Without this call rvvm_user creates and owns an internal VTerm, freed
+// with the machine. Must be called before rvvm_user_linux_ex().
+void rvvm_user_set_tty0(rvvm_machine_t* machine, void* tty);
+
 // Create a userland machine instance without starting it.
 //
 // This is the multi-instance entry point: everything the guest needs (memory,

@@ -187,6 +187,7 @@ typedef int32_t  uapi_long_t;
 #define UAPI_EBUSY   16
 #define UAPI_EEXIST  17
 #define UAPI_EINVAL  22
+#define UAPI_ENOTTY  25
 #define UAPI_ENOSYS  38
 
 // RISC-V UAPI struct definitions & conversions
@@ -527,6 +528,7 @@ typedef struct rvvm_userland {
     // host renders the screen itself instead of writing raw bytes to a tty.
     void*                    tty_vt;        // VTerm* (opaque here)
     void*                    tty_screen;    // VTermScreen* (opaque here)
+    bool                     tty_owned;     // internally created, free with the machine
     rvvm_user_tty_callback   tty_cb;
     void*                    tty_userdata;
 } rvvm_userland_t;
@@ -566,22 +568,96 @@ static void user_tty_init(rvvm_userland_t* ctx)
     vterm_screen_reset(screen, true);
     ctx->tty_vt     = vt;
     ctx->tty_screen = screen;
+    ctx->tty_owned  = true;
 }
 
-// Feed guest output on fd 1/2 through libvterm. No-op unless a host registered
-// a tty callback (so platforms that simply write to a real tty are unaffected).
+// Feed guest output on fd 1/2 through libvterm. No-op unless a virtual TTY
+// exists - either injected by the host via rvvm_user_set_tty0() or created
+// on demand when a host registered a tty callback (so platforms that simply
+// write to a real tty are unaffected).
 static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t count)
 {
-    if (!ctx->tty_cb || !buf || !count) {
+    if (!ctx->tty_vt && !ctx->tty_cb) {
         return;
     }
     user_tty_init(ctx);
-    if (!ctx->tty_vt) {
+    if (!ctx->tty_vt || !buf || !count) {
         return;
     }
-    vterm_input_write((VTerm*)ctx->tty_vt, buf, count);
+    /* ONLCR emulation: guest stdio emits bare LF, a real tty's line
+     * discipline turns it into CRLF before the terminal sees it, and
+     * libvterm's LF only moves down without returning the carriage. */
+    const uint8_t* p = buf;
+    size_t start = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (p[i] != '\n') {
+            continue;
+        }
+        vterm_input_write((VTerm*)ctx->tty_vt, (const char*)p + start, i - start);
+        vterm_input_write((VTerm*)ctx->tty_vt, "\r\n", 2);
+        start = i + 1;
+    }
+    if (start < count) {
+        vterm_input_write((VTerm*)ctx->tty_vt, (const char*)p + start, count - start);
+    }
     // Notify the host; it decides when to flush/render (throttling is its job).
     ctx->tty_cb(ctx->tty_userdata, fd, ctx->tty_vt);
+}
+
+/*
+ * Minimal termios/winsize answers for the virtual TTY. Guest libc probes
+ * fd 1/2 with ioctl(TCGETS) for isatty(); without an answer stdio fully
+ * buffers stdout and nothing shows up until exit. Struct layouts and
+ * ioctl numbers follow the asm-generic guest ABI, not the host's.
+ */
+#define UAPI_TCGETS     0x5401
+#define UAPI_TCSETS     0x5402
+#define UAPI_TCSETSW    0x5403
+#define UAPI_TCSETSF    0x5404
+#define UAPI_TIOCGWINSZ 0x5413
+#define UAPI_TIOCSWINSZ 0x5414
+
+// asm-generic struct termios: 4 flag words + c_line + c_cc[32] + 2 speeds
+typedef struct __attribute__((packed)) {
+    uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
+    uint8_t  c_line;
+    uint8_t  c_cc[32];
+    uint32_t c_ispeed, c_ospeed;
+} uapi_termios_t;
+
+typedef struct {
+    uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel;
+} uapi_winsize_t;
+
+static int64_t user_tty_ioctl(uint64_t cmd, void* arg)
+{
+    switch (cmd) {
+        case UAPI_TCGETS: {
+            uapi_termios_t t;
+            memset(&t, 0, sizeof(t));
+            t.c_iflag = 0x100 | 0x400;      // ICRNL | IXON
+            t.c_oflag = 0x1 | 0x4;          // OPOST | ONLCR (matches user_tty_write LF->CRLF)
+            t.c_cflag = 0x30 | 0x80 | 0xF;  // CS8 | CREAD | B38400
+            t.c_lflag = 0x1 | 0x2 | 0x8 | 0x10 | 0x20 | 0x8000; // ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN
+            t.c_cc[6] = 1;                  // VMIN
+            t.c_ispeed = t.c_ospeed = 0xF;  // B38400
+            memcpy(arg, &t, sizeof(t));
+            return 0;
+        }
+        case UAPI_TIOCGWINSZ: {
+            uapi_winsize_t ws = { VTERM_ROWS, VTERM_COLS, 0, 0 };
+            memcpy(arg, &ws, sizeof(ws));
+            return 0;
+        }
+        case UAPI_TCSETS:
+        case UAPI_TCSETSW:
+        case UAPI_TCSETSF:
+        case UAPI_TIOCSWINSZ:
+            // Guest termios changes: accept and ignore, the virtual TTY
+            // keeps its fixed state.
+            return 0;
+    }
+    return -UAPI_ENOTTY;
 }
 
 void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback callback, void* userdata)
@@ -592,6 +668,20 @@ void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback 
     }
     ctx->tty_cb       = callback;
     ctx->tty_userdata = userdata;
+}
+
+void rvvm_user_set_tty0(rvvm_machine_t* machine, void* tty)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (!ctx) {
+        return;
+    }
+    // Host-owned VTerm replaces (and must not leak) an internally created one
+    if (ctx->tty_vt && ctx->tty_owned) {
+        vterm_free((VTerm*)ctx->tty_vt);
+    }
+    ctx->tty_vt    = tty;
+    ctx->tty_owned = false;
 }
 
 /*
@@ -1699,6 +1789,13 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 29: // ioctl
                     // TODO: I sure hope not many ioctl() interfaces need struct conversion...
                     rvvm_info("sys_ioctl(%ld, %lx, %lx)", a0, a1, a2);
+                    if ((a0 == 1 || a0 == 2) && uctx()->tty_vt) {
+                        // Virtual TTY rendered by the host: answer the termios
+                        // probes guest libc makes for isatty() itself instead
+                        // of forwarding them to the host fd.
+                        a0 = user_tty_ioctl(a1, a2 ? to_ptr(a2) : NULL);
+                        break;
+                    }
                     a0 = errno_ret(ioctl(a0, a1, a2));
                     break;
                 case 32: // flock
@@ -1827,7 +1924,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         // the screen itself, so don't also write raw bytes to the
                         // host fd (that would double the output).
                         user_tty_write(uctx(), a0, wbuf, a2);
-                        if (uctx()->tty_cb) {
+                        if (uctx()->tty_vt) {
                             a0 = (ssize_t)a2;
                             break;
                         }
@@ -1857,7 +1954,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         for (int i = 0; i < (int)a2; i++) {
                             // Feed each segment to the virtual TTY parser.
                             user_tty_write(uctx(), a0, hiov[i].iov_base, hiov[i].iov_len);
-                            if (uctx()->tty_cb) {
+                            if (uctx()->tty_vt) {
                                 total += (ssize_t)hiov[i].iov_len;
                                 continue;
                             }
@@ -2792,7 +2889,7 @@ static void userland_destroy(rvvm_machine_t* machine)
     }
     machine->userdata = NULL;
     vector_free(ctx->userland_threads);
-    if (ctx->tty_vt) {
+    if (ctx->tty_vt && ctx->tty_owned) {
         vterm_free((VTerm*)ctx->tty_vt);
     }
     rvvm_free_machine(machine);

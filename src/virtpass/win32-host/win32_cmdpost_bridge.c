@@ -75,13 +75,15 @@
 
 static HWND            g_hwnd       = NULL;
 
-/* Guest virtual TTY (libvterm) rendering state. g_tty_vt is set by the tty
- * callback that rvvm_user fires on guest fd 1/2 output; g_tty_dirty gates the
- * (already throttled to paint-time) screen repaint. */
+/* Guest virtual TTY (libvterm) rendering state. g_tty_vt is host-owned
+ * (created on first launch, reset per launch) and injected into rvvm_user via
+ * rvvm_user_set_tty0(); g_tty_dirty gates the (paint-time throttled) repaint,
+ * g_tty_keep makes WM_PAINT redraw the frozen last screen after guest exit. */
 #define TTY_ROWS 24
 #define TTY_COLS 80
 static VTerm*   g_tty_vt    = NULL;
 static bool     g_tty_dirty = false;
+static bool     g_tty_keep  = false;
 static bool            g_cs_ready   = false;
 static CRITICAL_SECTION g_surf_cs;
 
@@ -1244,12 +1246,9 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
              * bursts don't trigger one redraw per write. Drawn in the top-left so
              * it is visible over the letterboxed panel; swap to the panel rect if
              * you want it composited inside the virtual display. */
-            if (g_tty_vt && g_tty_dirty) {
+            if (g_tty_vt && (g_tty_dirty || g_tty_keep)) {
                 VTermScreen* scr = vterm_obtain_screen(g_tty_vt);
-                uint32_t cells[TTY_ROWS * TTY_COLS];
-                VTermRect rect = { 0, 0, TTY_ROWS, TTY_COLS };
                 vterm_screen_flush_damage(scr);
-                vterm_screen_get_chars(scr, cells, TTY_ROWS * TTY_COLS, rect);
 
                 LOGFONT lf = { 0 };
                 lf.lfHeight = 16; lf.lfWidth = 0; lf.lfWeight = FW_NORMAL;
@@ -1277,8 +1276,15 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 for (int r = 0; r < TTY_ROWS; r++) {
                     int len = 0;
                     for (int c = 0; c < TTY_COLS; c++) {
-                        uint32_t cp = cells[r * TTY_COLS + c];
-                        if (cp == 0 || cp == ' ') { line[len++] = ' '; }
+                        /* Per-cell grid read: get_chars() would return a packed,
+                         * right-trimmed text stream with LF separators instead. */
+                        VTermPos pos = { r, c };
+                        VTermScreenCell cell;
+                        uint32_t cp = ' ';
+                        if (vterm_screen_get_cell(scr, pos, &cell) && cell.chars[0]) {
+                            cp = cell.chars[0];
+                        }
+                        if (cp == (uint32_t)-1 || cp == ' ') { line[len++] = ' '; }
                         else if (cp < 0x20 || cp > 0x7E) { line[len++] = '.'; }
                         else { line[len++] = (char)cp; }
                     }
@@ -1289,7 +1295,7 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 }
                 SelectObject(cdc, old_font);
                 DeleteObject(font);
-                g_tty_dirty = false;
+                g_tty_dirty = false; /* keep mode: stays repainted every paint */
             }
 
             BitBlt(wdc, 0, 0, rc.right, rc.bottom, cdc, 0, 0, SRCCOPY);
@@ -1414,12 +1420,15 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             CloseHandle(g_guest_thread);
             g_guest_thread = NULL;
         }
-        /* rvvm_user_linux_ex() frees the machine (and its libvterm VTerm) before
-         * the guest thread posts this message; drop the handle so no stale pointer
-         * survives, and clear the TTY render state for the same reason. */
+        /* rvvm_user_linux_ex() freed the machine; the VTerm is host-owned and
+         * survives the guest, so keep g_tty_vt and redraw the frozen last
+         * screen on every subsequent paint. */
         g_guest_machine = NULL;
-        g_tty_vt       = NULL;
-        g_tty_dirty    = false;
+        if (g_tty_vt) {
+            g_tty_dirty = true;
+            g_tty_keep  = true;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         {
             char title[48];
             snprintf(title, sizeof(title), "guest exited (%d)", g_guest_rc);
@@ -1475,6 +1484,15 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             EnterCriticalSection(&g_surf_cs);
             cmp_surface_release_locked();
             LeaveCriticalSection(&g_surf_cs);
+        }
+        /* Host-owned VTerm: free it only when no guest can still be writing
+         * into it; otherwise rvvm_user's ctx holds a live pointer until the
+         * machine unwinds, and the process is going away anyway. */
+        if (!g_guest_machine && g_tty_vt) {
+            vterm_free(g_tty_vt);
+            g_tty_vt    = NULL;
+            g_tty_dirty = false;
+            g_tty_keep  = false;
         }
         PostQuitMessage(0);
         return 0;
@@ -2104,9 +2122,19 @@ bool win32_host_start_guest(int argc, char** argv)
     /* Route guest fd 1/2 through libvterm so CR / ANSI escapes render correctly
      * (the win32 host's stdout is a real tty today, but the renderer below draws
      * the parsed screen matrix, which is what makes in-place updates consistent
-     * across hosts). rvvm_user owns the VTerm; we just keep a pointer to it. */
-    g_tty_vt    = NULL;
-    g_tty_dirty = false;
+     * across hosts). The VTerm is host-owned: created once and reset per launch,
+     * so the last screen stays renderable after the guest exits. */
+    if (!g_tty_vt) {
+        g_tty_vt = vterm_new(TTY_ROWS, TTY_COLS);
+        if (g_tty_vt) {
+            vterm_screen_reset(vterm_obtain_screen(g_tty_vt), true);
+        }
+    } else {
+        vterm_screen_reset(vterm_obtain_screen(g_tty_vt), true);
+    }
+    g_tty_dirty = true;
+    g_tty_keep  = false;
+    rvvm_user_set_tty0(g_guest_machine, g_tty_vt);
     rvvm_user_set_tty_callback(g_guest_machine, host_tty_cb, NULL);
 
     g_guest_argv = (char**)calloc((size_t)argc + 1, sizeof(char*));
