@@ -121,6 +121,13 @@ try {
         Write-Host "`n==> python tools/gen_gl_abi.py" -ForegroundColor Cyan
         & python (Join-Path $RVVM_ROOT 'tools\gen_gl_abi.py')
         if ($LASTEXITCODE -ne 0) { throw "gen_gl_abi.py failed (exit $LASTEXITCODE) - is Python 3 on PATH?" }
+
+        # The guest and host must agree on the fn_id space: an entry point
+        # resolved in the guest (eglGetProcAddress) still needs its guest stub
+        # generated, but must not consume a fn_id, or every later id shifts.
+        Write-Host "`n==> python tools/audit_gl_ptr.py --check" -ForegroundColor Cyan
+        & python (Join-Path $RVVM_ROOT 'tools\audit_gl_ptr.py') --check
+        if ($LASTEXITCODE -ne 0) { throw "audit_gl_ptr.py found unclassified pointer params" }
     }
 
     if ($Clean -and $makeTarget -ne 'android-clean') {

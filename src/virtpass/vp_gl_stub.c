@@ -78,6 +78,182 @@ static inline int64_t glstub_packf(float v)
  * it must outlive the stub's own stack frame. */
 static char glstub_retbuf[GL_CALL_RETBUF_CAP];
 
+/* glVertexAttribPointer/glDrawElements accept either a guest address (client
+ * array) or a byte offset into the bound buffer object, and the host cannot
+ * tell the two apart from the value alone. The stub therefore marks the
+ * address form by setting the top bit, which no real offset or guest address
+ * uses; the host clears it after translating. An offset passes through
+ * unmarked and reaches the GL implementation unchanged. */
+#define GLSTUB_OFFSET_PTR_TAG  ((int64_t)1 << 62)
+#define GLSTUB_OFFSET_PTR(p)                                    \
+    (((p) && (uintptr_t)(p) < GLSTUB_OFFSET_PTR_TAG)            \
+         ? ((int64_t)(uintptr_t)(p) | GLSTUB_OFFSET_PTR_TAG)    \
+         : (int64_t)(uintptr_t)(p))
+
+typedef void (*glstub_proc_t)(void);
+
+typedef struct { const char* name; glstub_proc_t proc; } glstub_proc_entry;
+
+static const glstub_proc_entry glstub_procs[] = {
+    { "glActiveTexture", (glstub_proc_t)&glActiveTexture },
+    { "glAttachShader", (glstub_proc_t)&glAttachShader },
+    { "glBindAttribLocation", (glstub_proc_t)&glBindAttribLocation },
+    { "glBindBuffer", (glstub_proc_t)&glBindBuffer },
+    { "glBindFramebuffer", (glstub_proc_t)&glBindFramebuffer },
+    { "glBindRenderbuffer", (glstub_proc_t)&glBindRenderbuffer },
+    { "glBindTexture", (glstub_proc_t)&glBindTexture },
+    { "glBlendColor", (glstub_proc_t)&glBlendColor },
+    { "glBlendEquation", (glstub_proc_t)&glBlendEquation },
+    { "glBlendEquationSeparate", (glstub_proc_t)&glBlendEquationSeparate },
+    { "glBlendFunc", (glstub_proc_t)&glBlendFunc },
+    { "glBlendFuncSeparate", (glstub_proc_t)&glBlendFuncSeparate },
+    { "glBufferData", (glstub_proc_t)&glBufferData },
+    { "glBufferSubData", (glstub_proc_t)&glBufferSubData },
+    { "glCheckFramebufferStatus", (glstub_proc_t)&glCheckFramebufferStatus },
+    { "glClear", (glstub_proc_t)&glClear },
+    { "glClearColor", (glstub_proc_t)&glClearColor },
+    { "glClearDepthf", (glstub_proc_t)&glClearDepthf },
+    { "glClearStencil", (glstub_proc_t)&glClearStencil },
+    { "glColorMask", (glstub_proc_t)&glColorMask },
+    { "glCompileShader", (glstub_proc_t)&glCompileShader },
+    { "glCompressedTexImage2D", (glstub_proc_t)&glCompressedTexImage2D },
+    { "glCompressedTexSubImage2D", (glstub_proc_t)&glCompressedTexSubImage2D },
+    { "glCopyTexImage2D", (glstub_proc_t)&glCopyTexImage2D },
+    { "glCopyTexSubImage2D", (glstub_proc_t)&glCopyTexSubImage2D },
+    { "glCreateProgram", (glstub_proc_t)&glCreateProgram },
+    { "glCreateShader", (glstub_proc_t)&glCreateShader },
+    { "glCullFace", (glstub_proc_t)&glCullFace },
+    { "glDeleteBuffers", (glstub_proc_t)&glDeleteBuffers },
+    { "glDeleteFramebuffers", (glstub_proc_t)&glDeleteFramebuffers },
+    { "glDeleteProgram", (glstub_proc_t)&glDeleteProgram },
+    { "glDeleteRenderbuffers", (glstub_proc_t)&glDeleteRenderbuffers },
+    { "glDeleteShader", (glstub_proc_t)&glDeleteShader },
+    { "glDeleteTextures", (glstub_proc_t)&glDeleteTextures },
+    { "glDepthFunc", (glstub_proc_t)&glDepthFunc },
+    { "glDepthMask", (glstub_proc_t)&glDepthMask },
+    { "glDepthRangef", (glstub_proc_t)&glDepthRangef },
+    { "glDetachShader", (glstub_proc_t)&glDetachShader },
+    { "glDisable", (glstub_proc_t)&glDisable },
+    { "glDisableVertexAttribArray", (glstub_proc_t)&glDisableVertexAttribArray },
+    { "glDrawArrays", (glstub_proc_t)&glDrawArrays },
+    { "glDrawElements", (glstub_proc_t)&glDrawElements },
+    { "glEnable", (glstub_proc_t)&glEnable },
+    { "glEnableVertexAttribArray", (glstub_proc_t)&glEnableVertexAttribArray },
+    { "glFinish", (glstub_proc_t)&glFinish },
+    { "glFlush", (glstub_proc_t)&glFlush },
+    { "glFramebufferRenderbuffer", (glstub_proc_t)&glFramebufferRenderbuffer },
+    { "glFramebufferTexture2D", (glstub_proc_t)&glFramebufferTexture2D },
+    { "glFrontFace", (glstub_proc_t)&glFrontFace },
+    { "glGenBuffers", (glstub_proc_t)&glGenBuffers },
+    { "glGenerateMipmap", (glstub_proc_t)&glGenerateMipmap },
+    { "glGenFramebuffers", (glstub_proc_t)&glGenFramebuffers },
+    { "glGenRenderbuffers", (glstub_proc_t)&glGenRenderbuffers },
+    { "glGenTextures", (glstub_proc_t)&glGenTextures },
+    { "glGetActiveAttrib", (glstub_proc_t)&glGetActiveAttrib },
+    { "glGetActiveUniform", (glstub_proc_t)&glGetActiveUniform },
+    { "glGetAttachedShaders", (glstub_proc_t)&glGetAttachedShaders },
+    { "glGetAttribLocation", (glstub_proc_t)&glGetAttribLocation },
+    { "glGetBooleanv", (glstub_proc_t)&glGetBooleanv },
+    { "glGetBufferParameteriv", (glstub_proc_t)&glGetBufferParameteriv },
+    { "glGetError", (glstub_proc_t)&glGetError },
+    { "glGetFloatv", (glstub_proc_t)&glGetFloatv },
+    { "glGetFramebufferAttachmentParameteriv", (glstub_proc_t)&glGetFramebufferAttachmentParameteriv },
+    { "glGetIntegerv", (glstub_proc_t)&glGetIntegerv },
+    { "glGetProgramiv", (glstub_proc_t)&glGetProgramiv },
+    { "glGetProgramInfoLog", (glstub_proc_t)&glGetProgramInfoLog },
+    { "glGetRenderbufferParameteriv", (glstub_proc_t)&glGetRenderbufferParameteriv },
+    { "glGetShaderiv", (glstub_proc_t)&glGetShaderiv },
+    { "glGetShaderInfoLog", (glstub_proc_t)&glGetShaderInfoLog },
+    { "glGetShaderPrecisionFormat", (glstub_proc_t)&glGetShaderPrecisionFormat },
+    { "glGetShaderSource", (glstub_proc_t)&glGetShaderSource },
+    { "glGetString", (glstub_proc_t)&glGetString },
+    { "glGetTexParameterfv", (glstub_proc_t)&glGetTexParameterfv },
+    { "glGetTexParameteriv", (glstub_proc_t)&glGetTexParameteriv },
+    { "glGetUniformfv", (glstub_proc_t)&glGetUniformfv },
+    { "glGetUniformiv", (glstub_proc_t)&glGetUniformiv },
+    { "glGetUniformLocation", (glstub_proc_t)&glGetUniformLocation },
+    { "glGetVertexAttribfv", (glstub_proc_t)&glGetVertexAttribfv },
+    { "glGetVertexAttribiv", (glstub_proc_t)&glGetVertexAttribiv },
+    { "glGetVertexAttribPointerv", (glstub_proc_t)&glGetVertexAttribPointerv },
+    { "glHint", (glstub_proc_t)&glHint },
+    { "glIsBuffer", (glstub_proc_t)&glIsBuffer },
+    { "glIsEnabled", (glstub_proc_t)&glIsEnabled },
+    { "glIsFramebuffer", (glstub_proc_t)&glIsFramebuffer },
+    { "glIsProgram", (glstub_proc_t)&glIsProgram },
+    { "glIsRenderbuffer", (glstub_proc_t)&glIsRenderbuffer },
+    { "glIsShader", (glstub_proc_t)&glIsShader },
+    { "glIsTexture", (glstub_proc_t)&glIsTexture },
+    { "glLineWidth", (glstub_proc_t)&glLineWidth },
+    { "glLinkProgram", (glstub_proc_t)&glLinkProgram },
+    { "glPixelStorei", (glstub_proc_t)&glPixelStorei },
+    { "glPolygonOffset", (glstub_proc_t)&glPolygonOffset },
+    { "glReadPixels", (glstub_proc_t)&glReadPixels },
+    { "glReleaseShaderCompiler", (glstub_proc_t)&glReleaseShaderCompiler },
+    { "glRenderbufferStorage", (glstub_proc_t)&glRenderbufferStorage },
+    { "glSampleCoverage", (glstub_proc_t)&glSampleCoverage },
+    { "glScissor", (glstub_proc_t)&glScissor },
+    { "glShaderBinary", (glstub_proc_t)&glShaderBinary },
+    { "glShaderSource", (glstub_proc_t)&glShaderSource },
+    { "glStencilFunc", (glstub_proc_t)&glStencilFunc },
+    { "glStencilFuncSeparate", (glstub_proc_t)&glStencilFuncSeparate },
+    { "glStencilMask", (glstub_proc_t)&glStencilMask },
+    { "glStencilMaskSeparate", (glstub_proc_t)&glStencilMaskSeparate },
+    { "glStencilOp", (glstub_proc_t)&glStencilOp },
+    { "glStencilOpSeparate", (glstub_proc_t)&glStencilOpSeparate },
+    { "glTexImage2D", (glstub_proc_t)&glTexImage2D },
+    { "glTexParameterf", (glstub_proc_t)&glTexParameterf },
+    { "glTexParameterfv", (glstub_proc_t)&glTexParameterfv },
+    { "glTexParameteri", (glstub_proc_t)&glTexParameteri },
+    { "glTexParameteriv", (glstub_proc_t)&glTexParameteriv },
+    { "glTexSubImage2D", (glstub_proc_t)&glTexSubImage2D },
+    { "glUniform1f", (glstub_proc_t)&glUniform1f },
+    { "glUniform1fv", (glstub_proc_t)&glUniform1fv },
+    { "glUniform1i", (glstub_proc_t)&glUniform1i },
+    { "glUniform1iv", (glstub_proc_t)&glUniform1iv },
+    { "glUniform2f", (glstub_proc_t)&glUniform2f },
+    { "glUniform2fv", (glstub_proc_t)&glUniform2fv },
+    { "glUniform2i", (glstub_proc_t)&glUniform2i },
+    { "glUniform2iv", (glstub_proc_t)&glUniform2iv },
+    { "glUniform3f", (glstub_proc_t)&glUniform3f },
+    { "glUniform3fv", (glstub_proc_t)&glUniform3fv },
+    { "glUniform3i", (glstub_proc_t)&glUniform3i },
+    { "glUniform3iv", (glstub_proc_t)&glUniform3iv },
+    { "glUniform4f", (glstub_proc_t)&glUniform4f },
+    { "glUniform4fv", (glstub_proc_t)&glUniform4fv },
+    { "glUniform4i", (glstub_proc_t)&glUniform4i },
+    { "glUniform4iv", (glstub_proc_t)&glUniform4iv },
+    { "glUniformMatrix2fv", (glstub_proc_t)&glUniformMatrix2fv },
+    { "glUniformMatrix3fv", (glstub_proc_t)&glUniformMatrix3fv },
+    { "glUniformMatrix4fv", (glstub_proc_t)&glUniformMatrix4fv },
+    { "glUseProgram", (glstub_proc_t)&glUseProgram },
+    { "glValidateProgram", (glstub_proc_t)&glValidateProgram },
+    { "glVertexAttrib1f", (glstub_proc_t)&glVertexAttrib1f },
+    { "glVertexAttrib1fv", (glstub_proc_t)&glVertexAttrib1fv },
+    { "glVertexAttrib2f", (glstub_proc_t)&glVertexAttrib2f },
+    { "glVertexAttrib2fv", (glstub_proc_t)&glVertexAttrib2fv },
+    { "glVertexAttrib3f", (glstub_proc_t)&glVertexAttrib3f },
+    { "glVertexAttrib3fv", (glstub_proc_t)&glVertexAttrib3fv },
+    { "glVertexAttrib4f", (glstub_proc_t)&glVertexAttrib4f },
+    { "glVertexAttrib4fv", (glstub_proc_t)&glVertexAttrib4fv },
+    { "glVertexAttribPointer", (glstub_proc_t)&glVertexAttribPointer },
+    { "glViewport", (glstub_proc_t)&glViewport },
+    { "eglChooseConfig", (glstub_proc_t)&eglChooseConfig },
+    { "eglCreateContext", (glstub_proc_t)&eglCreateContext },
+    { "eglCreatePbufferSurface", (glstub_proc_t)&eglCreatePbufferSurface },
+    { "eglCreateWindowSurface", (glstub_proc_t)&eglCreateWindowSurface },
+    { "eglDestroyContext", (glstub_proc_t)&eglDestroyContext },
+    { "eglDestroySurface", (glstub_proc_t)&eglDestroySurface },
+    { "eglGetConfigAttrib", (glstub_proc_t)&eglGetConfigAttrib },
+    { "eglGetDisplay", (glstub_proc_t)&eglGetDisplay },
+    { "eglGetError", (glstub_proc_t)&eglGetError },
+    { "eglInitialize", (glstub_proc_t)&eglInitialize },
+    { "eglMakeCurrent", (glstub_proc_t)&eglMakeCurrent },
+    { "eglQueryString", (glstub_proc_t)&eglQueryString },
+    { "eglQuerySurface", (glstub_proc_t)&eglQuerySurface },
+    { "eglSwapBuffers", (glstub_proc_t)&eglSwapBuffers },
+    { "eglTerminate", (glstub_proc_t)&eglTerminate },
+};
+
 uint32_t eglChooseConfig(void* dpy, const int32_t* attrib_list, void* configs, int32_t config_size, int32_t* num_config)
 {
     GLSTUB_CALL(EGL_FN_CHOOSECONFIG, 5);
@@ -168,10 +344,15 @@ int32_t eglGetError(void)
 
 void* eglGetProcAddress(const char* procname)
 {
-    GLSTUB_CALL(EGL_FN_GETPROCADDRESS, 1);
-    _c.args[0] = (int64_t)(uintptr_t)procname;
-    GLSTUB_DO(SYS_EGL_CALL);
-    return (void*)(uintptr_t)_c.ret;
+    const char* name = (const char*)procname;
+    if (name) {
+        for (size_t i = 0; i < sizeof(glstub_procs) / sizeof(glstub_procs[0]); i++) {
+            if (strcmp(name, glstub_procs[i].name) == 0) {
+                return (void*)(uintptr_t)glstub_procs[i].proc;
+            }
+        }
+    }
+    return (void*)0;
 }
 
 uint32_t eglInitialize(void* dpy, int32_t* major, int32_t* minor)
@@ -592,7 +773,7 @@ void glDrawElements(uint32_t mode, int32_t count, uint32_t type, const void* ind
     _c.args[0] = (int64_t)(uint32_t)mode;
     _c.args[1] = (int64_t)(int32_t)count;
     _c.args[2] = (int64_t)(uint32_t)type;
-    _c.args[3] = (int64_t)(uintptr_t)indices;
+    _c.args[3] = GLSTUB_OFFSET_PTR(indices);
     GLSTUB_DO(SYS_GL_CALL);
 }
 
@@ -1483,7 +1664,7 @@ void glVertexAttribPointer(uint32_t index, int32_t size, uint32_t type, uint8_t 
     _c.args[2] = (int64_t)(uint32_t)type;
     _c.args[3] = (int64_t)(uint32_t)normalized;
     _c.args[4] = (int64_t)(int32_t)stride;
-    _c.args[5] = (int64_t)(uintptr_t)pointer;
+    _c.args[5] = GLSTUB_OFFSET_PTR(pointer);
     GLSTUB_DO(SYS_GL_CALL);
 }
 

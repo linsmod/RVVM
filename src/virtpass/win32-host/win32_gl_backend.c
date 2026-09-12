@@ -20,7 +20,8 @@ w32gl_PFN_eglDestroySurface p_eglDestroySurface;
 w32gl_PFN_eglGetConfigAttrib p_eglGetConfigAttrib;
 w32gl_PFN_eglGetDisplay p_eglGetDisplay;
 w32gl_PFN_eglGetError p_eglGetError;
-w32gl_PFN_eglGetProcAddress p_eglGetProcAddress;
+/* No p_eglGetProcAddress: it is resolved in the guest (see win32_gl_dispatch.h
+ * and PROC_ADDRESS_FN in tools/gen_gl_abi.py). */
 w32gl_PFN_eglInitialize p_eglInitialize;
 w32gl_PFN_eglMakeCurrent p_eglMakeCurrent;
 w32gl_PFN_eglQueryString p_eglQueryString;
@@ -352,7 +353,8 @@ bool win32_gl_backend_load(void)
     LOAD(GetConfigAttrib);
     LOAD(GetDisplay);
     LOAD(GetError);
-    LOAD(GetProcAddress);
+    /* eglGetProcAddress is not loaded: the guest stub answers it from its own
+     * entry points, so no host function address ever reaches the guest. */
     LOAD(Initialize);
     LOAD(MakeCurrent);
     LOAD(QueryString);

@@ -67,6 +67,10 @@ EGL_WHITELIST = [
     "eglMakeCurrent",
     "eglSwapBuffers",
     "eglQuerySurface",
+    # Resolved in the guest (see PROC_ADDRESS_FN): the host would hand back an
+    # address in the host GL DLL that the guest cannot call. Listing it here
+    # still generates the guest stub, while no EGL_FN_* / host dispatch entry
+    # is emitted for it.
     "eglGetProcAddress",
     # Returns a host constant string; the host copies it into the guest
     # scratch buffer offered in args[GL_CALL_RETBUF_SLOT].
@@ -111,6 +115,17 @@ OFFSET_PTR_ARGS = {
 # glstub_retbuf via args[GL_CALL_RETBUF_SLOT], the host copies the string
 # there and answers with that guest address.
 STRING_RET_FNS = {"glGetString", "eglQueryString"}
+
+# Pointer-returning functions whose result the guest must NOT receive as a raw
+# host address. eglGetProcAddress hands back an executable address in the host
+# GL DLL; the guest cannot jump there. Resolve it in the guest instead, by
+# matching the requested name against the generated entry points.
+#
+# The guest stub answers with a pointer into its own dispatch table, so a
+# caller that does `fn = eglGetProcAddress("glFoo"); fn(...)` lands on the
+# marshalling stub for glFoo. A name outside the generated set returns NULL,
+# exactly as a real EGL implementation would for an unsupported entry point.
+PROC_ADDRESS_FN = "eglGetProcAddress"
 
 # ---------------------------------------------------------------------------
 # Type tables
@@ -257,9 +272,17 @@ def guest_decl_type(t):
     return GUEST_TYPES.get(t.base, t.base)
 
 
-def guest_marshal_expr(name, t):
-    """Expression storing parameter `name` of guest type t into args[idx]."""
+def guest_marshal_expr(fn, idx, name, t):
+    """Expression storing parameter `name` of guest type t into args[idx].
+
+    glVertexAttribPointer/glDrawElements overload their pointer argument as
+    either a client array address or a buffer byte offset, and only the guest
+    knows which it meant. Those go through GLSTUB_OFFSET_PTR(), which tags the
+    address form so the host never has to guess (see w32gl_gptr_or_off).
+    """
     if t.is_pointer():
+        if (fn["name"], idx) in OFFSET_PTR_ARGS:
+            return "GLSTUB_OFFSET_PTR(%s)" % name
         return "(int64_t)(uintptr_t)%s" % name
     if t.is_float():
         return "glstub_packf(%s)" % name
@@ -539,12 +562,51 @@ def gl2_const_defs():
 #define GL_ELEMENT_ARRAY_BUFFER 0x8893
 #define GL_STATIC_DRAW         0x88E4
 #define GL_STREAM_DRAW         0x88E0
+#define GL_DYNAMIC_DRAW        0x88E8
 #define GL_FRAMEBUFFER         0x8D40
 #define GL_RENDERBUFFER        0x8D41
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+#define GL_COLOR_ATTACHMENT0   0x8CE0
+#define GL_DEPTH_ATTACHMENT    0x8D00
+#define GL_DEPTH_COMPONENT16   0x81A5
+
+#define GL_DEPTH_TEST          0x0B71
+#define GL_BLEND               0x0BE2
+#define GL_CULL_FACE           0x0B44
+#define GL_SCISSOR_TEST        0x0C11
+#define GL_TEXTURE_2D          0x0DE1
+#define GL_TEXTURE0            0x84C0
+
+#define GL_TEXTURE_MIN_FILTER  0x2801
+#define GL_TEXTURE_MAG_FILTER  0x2800
+#define GL_TEXTURE_WRAP_S      0x2802
+#define GL_TEXTURE_WRAP_T      0x2803
+#define GL_NEAREST             0x2600
+#define GL_LINEAR              0x2601
+#define GL_CLAMP_TO_EDGE       0x812F
+
+#define GL_RGBA8               0x8058
+#define GL_FRAMEBUFFER_BINDING 0x8CA6
+#define GL_VIEWPORT            0x0BA2
+#define GL_MAX_TEXTURE_SIZE    0x0D33
+#define GL_NUM_COMPRESSED_TEXTURE_FORMATS 0x86A2
+
+#define GL_COLOR_CLEAR_VALUE   0x0C22
+#define GL_ACTIVE_UNIFORMS     0x8B86
+#define GL_ACTIVE_ATTRIBUTES   0x8B89
+#define GL_ATTACHED_SHADERS    0x8B85
+#define GL_INFO_LOG_LENGTH     0x8B84
 """
 
 
-def fn_id_defs(gl_fns, egl_fns):
+def fn_id_defs(gl_fns, egl_host_fns):
+    """fn_id constants for the calls that actually round-trip to the host.
+
+    `egl_host_fns` - not `egl_fns` - drives the numbering: a function resolved
+    in the guest (eglGetProcAddress) has no fn_id, and numbering the full
+    guest list would shift every later id out of step with the host dispatch
+    tables, silently dispatching each call to its neighbour.
+    """
     out = []
     out.append("/* ============================================================")
     out.append(" * Function IDs (single source of truth)")
@@ -555,7 +617,7 @@ def fn_id_defs(gl_fns, egl_fns):
         out.append("#define GL_FN_%s %d" % (fn["name"][2:].upper(), GL_FN_BASE + i))
     out.append("")
     out.append("#define EGL_FN_BASE 0x%03X" % EGL_FN_BASE)
-    for i, fn in enumerate(egl_fns):
+    for i, fn in enumerate(egl_host_fns):
         out.append("#define EGL_FN_%s 0x%03X" % (fn["name"][3:].upper(), EGL_FN_BASE + i))
     out.append("")
     out.append("#define GL_CALL_MAX_ARGS %d" % GL_CALL_MAX_ARGS)
@@ -619,7 +681,7 @@ def guest_prototypes(gl_fns, egl_fns):
     return "\n".join(out)
 
 
-def gen_guest_header(gl_fns, egl_fns):
+def gen_guest_header(gl_fns, egl_fns, egl_host_fns):
     parts = [GENERATED_BANNER.format(nargs=GL_CALL_MAX_ARGS)]
     parts.append("#ifndef VIRTPASS_GL")
     parts.append("#define VIRTPASS_GL")
@@ -629,7 +691,7 @@ def gen_guest_header(gl_fns, egl_fns):
     parts.append(gl2_type_defs())
     parts.append(gl2_const_defs())
     parts.append(egl_type_defs())
-    parts.append(fn_id_defs(gl_fns, egl_fns))
+    parts.append(fn_id_defs(gl_fns, egl_host_fns))
     parts.append(gl_call_struct())
     parts.append(guest_prototypes(gl_fns, egl_fns))
     parts.append("")
@@ -700,7 +762,36 @@ static inline int64_t glstub_packf(float v)
  * answers with this guest address and the caller reads it after the call, so
  * it must outlive the stub's own stack frame. */
 static char glstub_retbuf[GL_CALL_RETBUF_CAP];
+
+/* glVertexAttribPointer/glDrawElements accept either a guest address (client
+ * array) or a byte offset into the bound buffer object, and the host cannot
+ * tell the two apart from the value alone. The stub therefore marks the
+ * address form by setting the top bit, which no real offset or guest address
+ * uses; the host clears it after translating. An offset passes through
+ * unmarked and reaches the GL implementation unchanged. */
+#define GLSTUB_OFFSET_PTR_TAG  ((int64_t)1 << 62)
+#define GLSTUB_OFFSET_PTR(p)                                    \\
+    (((p) && (uintptr_t)(p) < GLSTUB_OFFSET_PTR_TAG)            \\
+         ? ((int64_t)(uintptr_t)(p) | GLSTUB_OFFSET_PTR_TAG)    \\
+         : (int64_t)(uintptr_t)(p))
 """)
+
+    # eglGetProcAddress must not hand the guest a host function address: the
+    # guest cannot jump into the host GL DLL. Answer from the guest's own
+    # entry points so `eglGetProcAddress("glFoo")` yields the marshalling stub
+    # for glFoo, and an unknown name yields NULL like a real implementation.
+    out.append("typedef void (*glstub_proc_t)(void);")
+    out.append("")
+    out.append("typedef struct { const char* name; glstub_proc_t proc; } glstub_proc_entry;")
+    out.append("")
+    out.append("static const glstub_proc_entry glstub_procs[] = {")
+    for fn in gl_fns:
+        out.append('    { "%s", (glstub_proc_t)&%s },' % (fn["name"], fn["name"]))
+    for fn in egl_fns:
+        if fn["name"] != PROC_ADDRESS_FN:
+            out.append('    { "%s", (glstub_proc_t)&%s },' % (fn["name"], fn["name"]))
+    out.append("};")
+    out.append("")
 
     def emit(fn, syscall_nr):
         names = [n or "p%d" % i for i, (t, n) in enumerate(fn["params"])]
@@ -708,11 +799,29 @@ static char glstub_retbuf[GL_CALL_RETBUF_CAP];
                            for (t, _), nm in zip(fn["params"], names)) or "void"
         out.append("%s %s(%s)" % (guest_decl_type(fn["ret"]), fn["name"], params))
         out.append("{")
+        if fn["name"] == PROC_ADDRESS_FN:
+            # Resolved entirely in the guest: the result is a pointer into our
+            # own entry points, never a host address.
+            out.append("    const char* name = (const char*)%s;" % names[0])
+            out.append("    if (name) {")
+            out.append("        for (size_t i = 0; i < "
+                       "sizeof(glstub_procs) / sizeof(glstub_procs[0]); i++) {")
+            out.append("            if (strcmp(name, glstub_procs[i].name) == 0) {")
+            out.append("                return (%s)(uintptr_t)glstub_procs[i].proc;"
+                       % guest_decl_type(fn["ret"]))
+            out.append("            }")
+            out.append("        }")
+            out.append("    }")
+            out.append("    return (%s)0;" % guest_decl_type(fn["ret"]))
+            out.append("}")
+            out.append("")
+            return
         out.append("    GLSTUB_CALL(%s, %d);"
                    % ("GL_FN_" + fn["name"][2:].upper() if fn["name"].startswith("gl")
                       else "EGL_FN_" + fn["name"][3:].upper(), len(fn["params"])))
         for i, (t, _) in enumerate(fn["params"]):
-            out.append("    _c.args[%d] = %s;" % (i, guest_marshal_expr(names[i], t)))
+            out.append("    _c.args[%d] = %s;"
+                       % (i, guest_marshal_expr(fn, i, names[i], t)))
         if fn["name"] in STRING_RET_FNS:
             out.append("    _c.args[GL_CALL_RETBUF_SLOT] = "
                        "(int64_t)(uintptr_t)glstub_retbuf;")
@@ -783,6 +892,12 @@ def gen_host_backend_header(gl_fns, egl_fns):
     out.append("typedef int           w32gl_EGLint;")
     out.append("typedef unsigned int  w32gl_EGLBoolean;")
     out.append("typedef unsigned int  w32gl_EGLenum;")
+    out.append("")
+    out.append("/* EGL attribute tokens the host dispatch inspects directly (surface")
+    out.append(" * attributes are a guest array it walks itself). */")
+    out.append("#define w32gl_EGL_NONE   0x3038")
+    out.append("#define w32gl_EGL_WIDTH  0x3057")
+    out.append("#define w32gl_EGL_HEIGHT 0x3056")
     out.append("")
 
     # Shared ABI block: same fn_id macros / syscall numbers / gl_call struct
@@ -932,6 +1047,11 @@ def main():
     if missing:
         sys.exit("EGL whitelist entries not found in egl.h: %s" % sorted(missing))
 
+    # eglGetProcAddress is answered in the guest, so it needs no host-side
+    # entry point, no fn_id and no PFN: the host dispatch tables only carry
+    # the calls that actually round-trip.
+    egl_host_fns = [fn for fn in egl_fns if fn["name"] != PROC_ADDRESS_FN]
+
     # basic sanity: every param/ret type must be known on the guest side
     known = set(GUEST_TYPES) | IMPLICIT_PTR | NATIVE_TYPES
     for fn in gl_fns + egl_fns:
@@ -945,10 +1065,13 @@ def main():
     os.makedirs(HOST_DIR, exist_ok=True)
 
     outs = [
-        (os.path.join(GUEST_INC_DIR, "vp_gl.h"), gen_guest_header(gl_fns, egl_fns)),
+        (os.path.join(GUEST_INC_DIR, "vp_gl.h"),
+         gen_guest_header(gl_fns, egl_fns, egl_host_fns)),
         (os.path.join(GUEST_SRC_DIR, "vp_gl_stub.c"), gen_guest_source(gl_fns, egl_fns)),
-        (os.path.join(HOST_DIR, "win32_gl_backend.h"), gen_host_backend_header(gl_fns, egl_fns)),
-        (os.path.join(HOST_DIR, "win32_gl_dispatch_tables.h"), gen_host_dispatch_tables(gl_fns, egl_fns)),
+        (os.path.join(HOST_DIR, "win32_gl_backend.h"),
+         gen_host_backend_header(gl_fns, egl_host_fns)),
+        (os.path.join(HOST_DIR, "win32_gl_dispatch_tables.h"),
+         gen_host_dispatch_tables(gl_fns, egl_host_fns)),
     ]
     for path, content in outs:
         with open(path, "w", encoding="utf-8", newline="\n") as f:

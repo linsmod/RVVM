@@ -61,6 +61,12 @@ typedef int           w32gl_EGLint;
 typedef unsigned int  w32gl_EGLBoolean;
 typedef unsigned int  w32gl_EGLenum;
 
+/* EGL attribute tokens the host dispatch inspects directly (surface
+ * attributes are a guest array it walks itself). */
+#define w32gl_EGL_NONE   0x3038
+#define w32gl_EGL_WIDTH  0x3057
+#define w32gl_EGL_HEIGHT 0x3056
+
 /* ============================================================
  * Function IDs (single source of truth)
  * ============================================================ */
@@ -219,13 +225,12 @@ typedef unsigned int  w32gl_EGLenum;
 #define EGL_FN_GETCONFIGATTRIB 0x106
 #define EGL_FN_GETDISPLAY 0x107
 #define EGL_FN_GETERROR 0x108
-#define EGL_FN_GETPROCADDRESS 0x109
-#define EGL_FN_INITIALIZE 0x10A
-#define EGL_FN_MAKECURRENT 0x10B
-#define EGL_FN_QUERYSTRING 0x10C
-#define EGL_FN_QUERYSURFACE 0x10D
-#define EGL_FN_SWAPBUFFERS 0x10E
-#define EGL_FN_TERMINATE 0x10F
+#define EGL_FN_INITIALIZE 0x109
+#define EGL_FN_MAKECURRENT 0x10A
+#define EGL_FN_QUERYSTRING 0x10B
+#define EGL_FN_QUERYSURFACE 0x10C
+#define EGL_FN_SWAPBUFFERS 0x10D
+#define EGL_FN_TERMINATE 0x10E
 
 #define GL_CALL_MAX_ARGS 9
 /* gl_call.args[] slot carrying the guest scratch buffer for the
@@ -276,7 +281,6 @@ typedef w32gl_EGLBoolean (w32gl_APIENTRY *w32gl_PFN_eglDestroySurface)(w32gl_voi
 typedef w32gl_EGLBoolean (w32gl_APIENTRY *w32gl_PFN_eglGetConfigAttrib)(w32gl_void* dpy, w32gl_void* config, w32gl_EGLint attribute, w32gl_EGLint* value);
 typedef w32gl_void* (w32gl_APIENTRY *w32gl_PFN_eglGetDisplay)(w32gl_void* display_id);
 typedef w32gl_EGLint (w32gl_APIENTRY *w32gl_PFN_eglGetError)(void);
-typedef w32gl_void* (w32gl_APIENTRY *w32gl_PFN_eglGetProcAddress)(const w32gl_char* procname);
 typedef w32gl_EGLBoolean (w32gl_APIENTRY *w32gl_PFN_eglInitialize)(w32gl_void* dpy, w32gl_EGLint* major, w32gl_EGLint* minor);
 typedef w32gl_EGLBoolean (w32gl_APIENTRY *w32gl_PFN_eglMakeCurrent)(w32gl_void* dpy, w32gl_void* draw, w32gl_void* read, w32gl_void* ctx);
 typedef const w32gl_char* (w32gl_APIENTRY *w32gl_PFN_eglQueryString)(w32gl_void* dpy, w32gl_EGLint name);
@@ -438,7 +442,6 @@ extern w32gl_PFN_eglDestroySurface p_eglDestroySurface;
 extern w32gl_PFN_eglGetConfigAttrib p_eglGetConfigAttrib;
 extern w32gl_PFN_eglGetDisplay p_eglGetDisplay;
 extern w32gl_PFN_eglGetError p_eglGetError;
-extern w32gl_PFN_eglGetProcAddress p_eglGetProcAddress;
 extern w32gl_PFN_eglInitialize p_eglInitialize;
 extern w32gl_PFN_eglMakeCurrent p_eglMakeCurrent;
 extern w32gl_PFN_eglQueryString p_eglQueryString;

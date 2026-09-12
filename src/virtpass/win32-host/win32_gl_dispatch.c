@@ -33,12 +33,20 @@ static void* w32gl_gptr(int64_t v)
 
 /* glVertexAttribPointer/glDrawElements overload their pointer argument: it is
  * a guest address for a client-side array, but a byte offset into the bound
- * buffer object for VBO rendering. Offsets are not mappable guest addresses,
- * so fall back to the raw value in that case. */
+ * buffer object for VBO rendering. The value alone cannot distinguish the two
+ * (a large VBO offset is still a number inside the guest address window), so
+ * the guest stub tags the address form with GLSTUB_OFFSET_PTR_TAG. Here we
+ * strip the tag, translate, and pass bare offsets through unchanged. */
+#define W32GL_OFFSET_PTR_TAG ((int64_t)1 << 62)
+
 static void* w32gl_gptr_or_off(int64_t v)
 {
-    void* p = w32gl_gptr(v);
-    return p ? p : (void*)(uintptr_t)v;
+    if (v & W32GL_OFFSET_PTR_TAG) {
+        return w32gl_gptr(v & ~W32GL_OFFSET_PTR_TAG);
+    }
+    /* Untagged: a byte offset into the bound buffer object (or 0, which GL
+     * reads as offset 0 for VBO draws and as "no data" for client arrays). */
+    return (void*)(uintptr_t)v;
 }
 
 /* glShaderSource passes `count` guest string pointers. Build the array of
@@ -151,16 +159,54 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
          * guest's window surface with an offscreen pbuffer instead. The
          * native win handle (args[2]) is dropped, the attribute list is
          * args[3] and is a guest pointer like every other data argument. */
+        const w32gl_EGLint* attribs = (const w32gl_EGLint*)w32gl_gptr(args[3]);
+
+        /* Layer-1 size for the presenter. A guest may carry it in the surface
+         * attributes; otherwise it sets it later via SET_BUF or the panel
+         * default applies. */
+        if (attribs) {
+            int32_t sw = 0, sh = 0;
+            for (const w32gl_EGLint* a = attribs;
+                 a[0] != w32gl_EGL_NONE; a += 2) {
+                if (a[0] == w32gl_EGL_WIDTH)  sw = a[1];
+                if (a[0] == w32gl_EGL_HEIGHT) sh = a[1];
+            }
+            present_gl_set_surface_size(sw, sh);
+        }
+
         *ret = (int64_t)(intptr_t)p_eglCreatePbufferSurface(
             (w32gl_EGLDisplay)(uintptr_t)args[0],
             (w32gl_EGLConfig)(uintptr_t)args[1],
-            (const w32gl_EGLint*)w32gl_gptr(args[3]));
+            attribs);
         break;
     }
     case EGL_FN_SWAPBUFFERS:
+        /* The first swap marks the GL path live. A guest that only ever makes
+         * pbuffer surfaces never calls eglCreateWindowSurface, so hooking the
+         * flag to that entry point alone would leave every frame unpresented. */
+        if (!g_gl_active) { g_gl_active = true; printf("[winhost] GL mode active (pbuffer)\n"); }
         present_gl_frame();
         *ret = 1;
         break;
+    case EGL_FN_CREATEPBUFFERSURFACE: {
+        /* Also carry the surface size. A pbuffer-only guest never reaches the
+         * window-surface path, so this is where its layer-1 size shows up. */
+        const w32gl_EGLint* attribs = (const w32gl_EGLint*)w32gl_gptr(args[2]);
+        if (attribs) {
+            int32_t sw = 0, sh = 0;
+            for (const w32gl_EGLint* a = attribs;
+                 a[0] != w32gl_EGL_NONE; a += 2) {
+                if (a[0] == w32gl_EGL_WIDTH)  sw = a[1];
+                if (a[0] == w32gl_EGL_HEIGHT) sh = a[1];
+            }
+            if (sw > 0 && sh > 0) {
+                if (!g_gl_active) { g_gl_active = true; printf("[winhost] GL mode active (pbuffer)\n"); }
+                present_gl_set_surface_size(sw, sh);
+            }
+        }
+        w32gl_dispatch_egl_generic(fn_id, args, ret);
+        break;
+    }
     default:
         w32gl_dispatch_egl_generic(fn_id, args, ret);
         break;

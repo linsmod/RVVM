@@ -83,7 +83,16 @@ static HBITMAP         g_dib_back   = NULL;  /* back buffer: guest writes here *
 static uint8_t*        g_dib_back_bits = NULL;
 static BITMAPINFO      g_bmi;
 
-/* Guest surface geometry (as reported to the guest) */
+/* Guest surface geometry (as reported to the guest).
+ *
+ * Three nested layers, each owned by a different party:
+ *   L3 OS window      g_win_w/h  - pure viewport; scales the panel to fit
+ *   L2 virtual panel  g_virt_w/h - host-owned display; the composition surface
+ *   L1 content        g_surf_w/h - the surface the guest draws into
+ *
+ * L2 -> L1 is 1:1: the guest's surface is placed at the panel origin and the
+ * rest of the panel stays background. L3 -> L2 is the only scaling step, so
+ * the guest controls its own resolution without the host resampling twice. */
 static int32_t g_surf_w   = 0;
 static int32_t g_surf_h   = 0;
 static int32_t g_surf_fmt = WINDOW_FORMAT_RGBA_8888;
@@ -438,8 +447,14 @@ static int surf_bpp(void)
     return (g_surf_fmt == WINDOW_FORMAT_RGB_565) ? 2 : 4;
 }
 
-/* Caller holds g_surf_cs */
-static void surf_recreate_locked(int32_t w, int32_t h)
+/* Caller holds g_surf_cs.
+ *
+ * The DIB is the L2 composition surface: it is panel-sized, and a guest
+ * surface smaller than the panel occupies its top-left corner with the rest
+ * left as background. Sizing it to the panel (rather than to the guest
+ * surface) is what keeps L2 and L1 distinct; sizing it to the surface would
+ * make the panel collapse onto the content. */
+static void surf_recreate_locked(int32_t panel_w, int32_t panel_h)
 {
     void* bits = NULL;
 
@@ -453,12 +468,12 @@ static void surf_recreate_locked(int32_t w, int32_t h)
         g_dib_back = NULL;
         g_dib_back_bits = NULL;
     }
-    if (w <= 0 || h <= 0) return;
+    if (panel_w <= 0 || panel_h <= 0) return;
 
     ZeroMemory(&g_bmi, sizeof(g_bmi));
     g_bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    g_bmi.bmiHeader.biWidth       = w;
-    g_bmi.bmiHeader.biHeight      = -h; /* top-down rows */
+    g_bmi.bmiHeader.biWidth       = panel_w;
+    g_bmi.bmiHeader.biHeight      = -panel_h; /* top-down rows */
     g_bmi.bmiHeader.biPlanes      = 1;
     g_bmi.bmiHeader.biBitCount    = 32;
     g_bmi.bmiHeader.biCompression = BI_RGB;
@@ -473,7 +488,29 @@ static void surf_recreate_locked(int32_t w, int32_t h)
         g_dib_back_bits = (uint8_t*)bits;
         ReleaseDC(NULL, hdc);
     }
-    if (!g_dib_bits || !g_dib_back_bits) winhost_log("CreateDIBSection(%dx%d) failed", (int)w, (int)h);
+    if (!g_dib_bits || !g_dib_back_bits) {
+        winhost_log("CreateDIBSection(%dx%d) failed", (int)panel_w, (int)panel_h);
+        return;
+    }
+
+    /* A fresh panel starts blank; the guest surface only covers its corner,
+     * so anything left showing would otherwise be stale pixels. */
+    memset(g_dib_bits, 0, (size_t)panel_w * (size_t)panel_h * 4u);
+    memset(g_dib_back_bits, 0, (size_t)panel_w * (size_t)panel_h * 4u);
+}
+
+/* Layer-2 -> layer-1 placement. The guest surface sits at the panel origin.
+ *
+ * EGL window coordinates put the origin at the bottom-left, and glReadPixels
+ * (0,0,w,h) returns that corner. The DIB is top-down, so writing those rows in
+ * order lands the surface at the top-left of the panel - the correct rendering
+ * of "an unscaled surface pinned to the origin", not an arbitrary choice. */
+static void content_rect_locked(int32_t* x, int32_t* y, int32_t* w, int32_t* h)
+{
+    *x = 0;
+    *y = 0;
+    *w = (g_surf_w > 0) ? g_surf_w : 0;
+    *h = (g_surf_h > 0) ? g_surf_h : 0;
 }
 
 /* Present is done exclusively on the UI thread in WM_PAINT; the guest
@@ -516,27 +553,50 @@ static void present_frame_impl(const uint8_t* rows, int32_t w, int32_t h,
     (void)src_fmt; /* conversion always uses the current surface format */
     EnterCriticalSection(&g_surf_cs);
     if (src_bpp <= 0) src_bpp = surf_bpp(); /* 0: source matches the surface */
-    if (!rows || !g_dib_back_bits || g_surf_w != w || g_surf_h != h) {
+    if (!rows || !g_dib_back_bits || g_virt_w <= 0 || g_virt_h <= 0) {
         LeaveCriticalSection(&g_surf_cs);
         return;
     }
-    {
+
+    /* The frame is the guest's L1 surface; the DIB is the L2 panel. Copy 1:1
+     * into the content rect (panel origin), cropping anything that would fall
+     * outside the panel rather than writing past the DIB. */
+    int32_t cx, cy, cw, ch;
+    content_rect_locked(&cx, &cy, &cw, &ch);
+    if (cw > w) cw = w;
+    if (ch > h) ch = h;
+    if (cx + cw > g_virt_w) cw = g_virt_w - cx;
+    if (cy + ch > g_virt_h) ch = g_virt_h - cy;
+
+    if (cw > 0 && ch > 0) {
         /* The source pitch belongs to the caller's buffer. Hard-coding four
          * bytes per pixel (as this used to) silently mis-strides RGB_565
          * frames; the GL path always hands over 4-byte RGBA and says so. */
         size_t src_pitch = (size_t)w * (size_t)src_bpp;
-        size_t dst_pitch = (size_t)w * 4u;
-        for (int32_t y = 0; y < h; y++) {
+        size_t dst_pitch = (size_t)g_virt_w * 4u;
+        for (int32_t y = 0; y < ch; y++) {
             int32_t sy = rows_bottom_up ? (h - 1 - y) : y;
-            convert_row(g_dib_back_bits + (size_t)y * dst_pitch,
+            convert_row(g_dib_back_bits + (size_t)(cy + y) * dst_pitch
+                            + (size_t)cx * 4u,
                         rows + (size_t)sy * src_pitch,
-                        w, g_surf_fmt);
+                        cw, g_surf_fmt);
         }
     }
     { HBITMAP tb = g_dib; uint8_t* tp = g_dib_bits;
       g_dib = g_dib_back; g_dib_bits = g_dib_back_bits;
       g_dib_back = tb; g_dib_back_bits = tp; }
     if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+
+    /* Log once per distinct geometry: without the first frame as a baseline,
+     * a frame that never reaches the window is indistinguishable from one
+     * that was sized outside the panel. */
+    static int32_t lg_w = -1, lg_h = -1, lg_pw = -1, lg_ph = -1;
+    if (w != lg_w || h != lg_h || g_virt_w != lg_pw || g_virt_h != lg_ph) {
+        lg_w = w; lg_h = h; lg_pw = g_virt_w; lg_ph = g_virt_h;
+        winhost_log("panel %dx%d <- content %dx%d at (%d,%d) [%dx%d used]",
+                    (int)g_virt_w, (int)g_virt_h, (int)w, (int)h,
+                    (int)cx, (int)cy, (int)cw, (int)ch);
+    }
     LeaveCriticalSection(&g_surf_cs);
 }
 
@@ -546,9 +606,42 @@ void present_frame(const uint8_t* rows, int32_t w, int32_t h,
     present_frame_impl(rows, w, h, src_fmt, 0, rows_bottom_up);
 }
 
+void present_gl_set_surface_size(int32_t cw, int32_t ch)
+{
+    if (cw <= 0 || ch <= 0) return;
+    EnterCriticalSection(&g_surf_cs);
+    /* Layer 1 only. The panel (L2) is host-owned and unaffected: a surface
+     * smaller than the panel simply occupies less of it. */
+    g_surf_w = cw;
+    g_surf_h = ch;
+    if (!g_dib_bits) {
+        surf_recreate_locked((g_virt_w > 0) ? g_virt_w : g_init_w,
+                             (g_virt_h > 0) ? g_virt_h : g_init_h);
+    }
+    LeaveCriticalSection(&g_surf_cs);
+}
+
 void present_gl_frame(void)
 {
-    if (!g_gl_active || !g_dib_back_bits) return;
+    if (!g_gl_active) return;
+
+    /* The GL path never calls ANativeWindow_lock, so on a pure-EGL guest the
+     * panel DIB may not exist yet. Build it here rather than dropping the
+     * frame: a guest that only uses EGL should still reach the screen. */
+    EnterCriticalSection(&g_surf_cs);
+    if (!g_dib_bits || !g_dib_back_bits) {
+        int32_t pw = (g_virt_w > 0) ? g_virt_w : g_init_w;
+        int32_t ph = (g_virt_h > 0) ? g_virt_h : g_init_h;
+        surf_recreate_locked(pw, ph);
+    }
+    if (!g_surf_w || !g_surf_h) {
+        /* No SET_BUF was ever seen: adopt the panel as the guest surface so
+         * the readback has a defined size. */
+        g_surf_w = (g_virt_w > 0) ? g_virt_w : g_init_w;
+        g_surf_h = (g_virt_h > 0) ? g_virt_h : g_init_h;
+    }
+    LeaveCriticalSection(&g_surf_cs);
+
     static uint8_t* rb = NULL; static int32_t rb_w = 0, rb_h = 0;
     EnterCriticalSection(&g_surf_cs);
     if (rb_w != g_surf_w || rb_h != g_surf_h) {
@@ -578,11 +671,16 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
 
     EnterCriticalSection(&g_surf_cs);
     if (g_surf_w <= 0) {
-        /* First lock before any SET_BUF: default to the window size */
-        g_surf_w = g_init_w;
-        g_surf_h = g_init_h;
+        /* First lock before any SET_BUF: default to the panel geometry */
+        g_surf_w = (g_virt_w > 0) ? g_virt_w : g_init_w;
+        g_surf_h = (g_virt_h > 0) ? g_virt_h : g_init_h;
     }
-    if (!g_dib_bits) surf_recreate_locked(g_surf_w, g_surf_h);
+    /* The composition surface is panel-sized (L2); the guest surface (L1) only
+     * occupies its corner - see surf_recreate_locked(). */
+    if (!g_dib_bits) {
+        surf_recreate_locked((g_virt_w > 0) ? g_virt_w : g_init_w,
+                             (g_virt_h > 0) ? g_virt_h : g_init_h);
+    }
     buf->width  = g_surf_w;
     buf->height = g_surf_h;
     buf->stride = g_surf_w;    /* pixels, matches guest expectation */
@@ -658,7 +756,15 @@ static int32_t on_window_set_buf(int32_t width, int32_t height, int32_t format)
     g_surf_w   = width;
     g_surf_h   = height;
     g_surf_fmt = format;
-    surf_recreate_locked(width, height);
+    /* Layer 1 only: the guest picked a content size. The composition surface
+     * stays panel-sized, so the new content simply occupies a (possibly
+     * different) corner of the existing panel - rebuilding the DIB here is
+     * what used to collapse L2 onto L1. Create it if this is the first thing
+     * the guest did, before any lock or GL present. */
+    if (!g_dib_bits) {
+        surf_recreate_locked((g_virt_w > 0) ? g_virt_w : g_init_w,
+                             (g_virt_h > 0) ? g_virt_h : g_init_h);
+    }
     LeaveCriticalSection(&g_surf_cs);
     return 0;
 }
@@ -844,8 +950,11 @@ static void queue_mouse_motion(int action, LPARAM lp)
     if (cw <= 0 || ch <= 0) return;
 
     EnterCriticalSection(&g_surf_cs);
-    sw = (g_surf_w > 0) ? g_surf_w : g_init_w;
-    sh = (g_surf_h > 0) ? g_surf_h : g_init_h;
+    /* Input is delivered in layer-1 (content) coordinates: invert the same
+     * layer-3 -> layer-2 transform WM_PAINT applies, then the 1:1 placement
+     * of the content rect inside the panel carries the point to the guest. */
+    sw = (g_virt_w > 0) ? g_virt_w : g_init_w;
+    sh = (g_virt_h > 0) ? g_virt_h : g_init_h;
     LeaveCriticalSection(&g_surf_cs);
 
     /* Undo the letterbox transform: window pixel -> panel pixel */
@@ -1077,24 +1186,26 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             /* Letterbox background: the whole client area is black, the panel
              * goes on top inside the centred contain-fit rectangle. */
             FillRect(cdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-            if (g_dib && g_surf_w > 0 && g_surf_h > 0) {
+            if (g_dib && g_virt_w > 0 && g_virt_h > 0) {
                 /* The window is just a viewport onto the virtual panel: scale
                  * it uniformly to fit and centre it. The panel is never
                  * cropped and never distorted; window size and panel size are
-                 * decoupled. */
+                 * decoupled. The DIB is panel-sized, so this is the only
+                 * scaling step in the chain (the guest surface inside the
+                 * panel is composited 1:1). */
                 vp_view v;
                 HDC mdc;
                 HGDIOBJ old;
-                viewport_fit(rc.right, rc.bottom, g_surf_w, g_surf_h, &v);
+                viewport_fit(rc.right, rc.bottom, g_virt_w, g_virt_h, &v);
                 mdc = CreateCompatibleDC(cdc);
                 old = SelectObject(mdc, g_dib);
-                if (v.dw == g_surf_w && v.dh == g_surf_h) {
+                if (v.dw == g_virt_w && v.dh == g_virt_h) {
                     BitBlt(cdc, v.dx, v.dy, v.dw, v.dh, mdc, 0, 0, SRCCOPY);
                 } else {
                     SetStretchBltMode(cdc, HALFTONE);
                     SetBrushOrgEx(cdc, 0, 0, NULL);
                     StretchBlt(cdc, v.dx, v.dy, v.dw, v.dh,
-                               mdc, 0, 0, g_surf_w, g_surf_h, SRCCOPY);
+                               mdc, 0, 0, g_virt_w, g_virt_h, SRCCOPY);
                 }
                 SelectObject(mdc, old);
                 DeleteDC(mdc);
@@ -1351,18 +1462,99 @@ static void host_guest_exit_cb(int exit_code)
     winhost_log("guest exit callback: code %d", exit_code);
 }
 
+/* Guest environment.
+ *
+ * The guest gets a deliberately narrow view of the host: its own prefix plus
+ * the RVVM_GL_* bring-up switches (test sizes, GL backend tracing) that are
+ * meant to be settable from the shell that launched the WinHost. The whole
+ * host environ is not forwarded - the guest would inherit unrelated variables
+ * and the set would differ per machine.
+ *
+ * The entries must outlive the guest thread, hence file scope and strdup'd
+ * copies collected in guest_env_build()/guest_env_free(). */
+#define GUEST_ENV_PREFIX "RVVM_USER_PREFIX="
+static char** g_guest_envp = NULL;
+
+/* Host variables handed to the guest, by prefix. */
+static const char* guest_env_forward_prefixes[] = {
+    "RVVM_GL_",
+};
+
+static bool guest_env_forwarded(const char* name)
+{
+    for (size_t i = 0;
+         i < sizeof(guest_env_forward_prefixes) / sizeof(guest_env_forward_prefixes[0]);
+         i++) {
+        size_t n = strlen(guest_env_forward_prefixes[i]);
+        if (strncmp(name, guest_env_forward_prefixes[i], n) == 0) return true;
+    }
+    return false;
+}
+
+static void guest_env_free(void)
+{
+    if (!g_guest_envp) return;
+    for (char** e = g_guest_envp; *e; e++) free(*e);
+    free(g_guest_envp);
+    g_guest_envp = NULL;
+}
+
+/* Copy the forwarded host variables into a NULL-terminated array of
+ * "NAME=value" strings, and expose the same prefix to our own getenv. */
+static bool guest_env_build(void)
+{
+    size_t cap = 8, n = 0;
+    char** env = (char**)calloc(cap, sizeof(char*));
+    if (!env) return false;
+
+    /* Assets resolve relative to CWD; keep the prefix visible to the host too
+     * so anything reading it locally sees the same value. */
+    static char env_prefix[] = GUEST_ENV_PREFIX;
+    putenv(env_prefix);
+    env[n++] = _strdup(env_prefix);
+
+    {
+        /* environ is the live host block; _wenviron is the wide variant, so
+         * read the narrow one and match on name. */
+        extern char** environ;
+        for (char** e = environ; e && *e; e++) {
+            const char* eq = strchr(*e, '=');
+            if (!eq || eq == *e) continue;
+            size_t name_len = (size_t)(eq - *e);
+            char name[128];
+            if (name_len >= sizeof(name)) continue;
+            memcpy(name, *e, name_len);
+            name[name_len] = '\0';
+            if (!guest_env_forwarded(name)) continue;
+
+            if (n + 2 > cap) {
+                size_t ncap = cap * 2;
+                char** grown = (char**)realloc(env, ncap * sizeof(char*));
+                if (!grown) { guest_env_free(); free(env); return false; }
+                env = grown;
+                cap = ncap;
+            }
+            env[n] = _strdup(*e);
+            if (!env[n]) { guest_env_free(); return false; }
+            n++;
+        }
+    }
+
+    env[n] = NULL;
+    g_guest_envp = env;
+    return true;
+}
+
 static DWORD WINAPI guest_thread_main(LPVOID arg)
 {
-    static char* envp[] = { NULL };
-    static char env_prefix[] = "RVVM_USER_PREFIX="; /* putenv needs a persistent string */
     rvvm_machine_t* machine = g_guest_machine;
     (void)arg;
 
-    /* Same pattern as jni_bridge.c: assets resolve relative to CWD */
-    putenv(env_prefix);
+    guest_env_build();
 
     {
-        int rc = rvvm_user_linux_ex(machine, g_guest_argc, g_guest_argv, envp);
+        int rc = rvvm_user_linux_ex(machine, g_guest_argc, g_guest_argv,
+                                    g_guest_envp);
         /* 0 = guest-driven exit: host_guest_exit_cb() already recorded the
          * real exit code. Nonzero = the guest never started (ELF load
          * failure), the callback never fired, so propagate the error. */
@@ -1382,6 +1574,7 @@ static DWORD WINAPI guest_thread_main(LPVOID arg)
         g_guest_argv = NULL;
         g_guest_argc = 0;
     }
+    guest_env_free();
 
     PostMessage(g_hwnd, WM_APP_GUEST_EXIT, 0, 0);
     return 0;
@@ -1520,9 +1713,12 @@ static void launcher_ui_idle(void)
     }
 
     EnterCriticalSection(&g_surf_cs);
-    surf_recreate_locked(g_init_w, g_init_h);
-    g_surf_w = g_init_w;
-    g_surf_h = g_init_h;
+    /* Blank the panel (L2) and reset the content size (L1) to the panel, so
+     * the next guest starts on a clean surface. */
+    surf_recreate_locked((g_virt_w > 0) ? g_virt_w : g_init_w,
+                         (g_virt_h > 0) ? g_virt_h : g_init_h);
+    g_surf_w = (g_virt_w > 0) ? g_virt_w : g_init_w;
+    g_surf_h = (g_virt_h > 0) ? g_virt_h : g_init_h;
     /* The geometry the previous guest negotiated (SET_BUF) must not leak into
      * the next one: until it calls SET_BUF itself it gets the host default. */
     g_surf_fmt = WINDOW_FORMAT_RGBA_8888;

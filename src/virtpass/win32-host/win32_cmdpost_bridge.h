@@ -71,4 +71,10 @@ void present_frame(const uint8_t* rows, int32_t w, int32_t h,
                    int32_t src_fmt, bool rows_bottom_up);
 void present_gl_frame(void);
 
+/* A pure-EGL guest never calls ANativeWindow_setBuffersGeometry, so the host
+ * would present at whatever default it holds. eglCreateWindowSurface reports
+ * the surface attributes here instead, which is the size the guest actually
+ * renders at (layer 1). cw/ch <= 0 leaves the current value alone. */
+void present_gl_set_surface_size(int32_t cw, int32_t ch);
+
 #endif /* WIN32_CMDPOST_BRIDGE_H */

@@ -103,8 +103,40 @@ typedef long             GLsizeiptr;  /* khronos_ssize_t  */
 #define GL_ELEMENT_ARRAY_BUFFER 0x8893
 #define GL_STATIC_DRAW         0x88E4
 #define GL_STREAM_DRAW         0x88E0
+#define GL_DYNAMIC_DRAW        0x88E8
 #define GL_FRAMEBUFFER         0x8D40
 #define GL_RENDERBUFFER        0x8D41
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+#define GL_COLOR_ATTACHMENT0   0x8CE0
+#define GL_DEPTH_ATTACHMENT    0x8D00
+#define GL_DEPTH_COMPONENT16   0x81A5
+
+#define GL_DEPTH_TEST          0x0B71
+#define GL_BLEND               0x0BE2
+#define GL_CULL_FACE           0x0B44
+#define GL_SCISSOR_TEST        0x0C11
+#define GL_TEXTURE_2D          0x0DE1
+#define GL_TEXTURE0            0x84C0
+
+#define GL_TEXTURE_MIN_FILTER  0x2801
+#define GL_TEXTURE_MAG_FILTER  0x2800
+#define GL_TEXTURE_WRAP_S      0x2802
+#define GL_TEXTURE_WRAP_T      0x2803
+#define GL_NEAREST             0x2600
+#define GL_LINEAR              0x2601
+#define GL_CLAMP_TO_EDGE       0x812F
+
+#define GL_RGBA8               0x8058
+#define GL_FRAMEBUFFER_BINDING 0x8CA6
+#define GL_VIEWPORT            0x0BA2
+#define GL_MAX_TEXTURE_SIZE    0x0D33
+#define GL_NUM_COMPRESSED_TEXTURE_FORMATS 0x86A2
+
+#define GL_COLOR_CLEAR_VALUE   0x0C22
+#define GL_ACTIVE_UNIFORMS     0x8B86
+#define GL_ACTIVE_ATTRIBUTES   0x8B89
+#define GL_ATTACHED_SHADERS    0x8B85
+#define GL_INFO_LOG_LENGTH     0x8B84
 
 /* ============================================================
  * EGL core types (opaque handles travel as uintptr values)
@@ -337,13 +369,12 @@ typedef uint32_t EGLenum;
 #define EGL_FN_GETCONFIGATTRIB 0x106
 #define EGL_FN_GETDISPLAY 0x107
 #define EGL_FN_GETERROR 0x108
-#define EGL_FN_GETPROCADDRESS 0x109
-#define EGL_FN_INITIALIZE 0x10A
-#define EGL_FN_MAKECURRENT 0x10B
-#define EGL_FN_QUERYSTRING 0x10C
-#define EGL_FN_QUERYSURFACE 0x10D
-#define EGL_FN_SWAPBUFFERS 0x10E
-#define EGL_FN_TERMINATE 0x10F
+#define EGL_FN_INITIALIZE 0x109
+#define EGL_FN_MAKECURRENT 0x10A
+#define EGL_FN_QUERYSTRING 0x10B
+#define EGL_FN_QUERYSURFACE 0x10C
+#define EGL_FN_SWAPBUFFERS 0x10D
+#define EGL_FN_TERMINATE 0x10E
 
 #define GL_CALL_MAX_ARGS 9
 /* gl_call.args[] slot carrying the guest scratch buffer for the

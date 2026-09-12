@@ -39,7 +39,6 @@ static const char* w32gl_egl_name(uint32_t fn_id)
     case EGL_FN_GETCONFIGATTRIB: return "eglGetConfigAttrib";
     case EGL_FN_GETDISPLAY: return "eglGetDisplay";
     case EGL_FN_GETERROR: return "eglGetError";
-    case EGL_FN_GETPROCADDRESS: return "eglGetProcAddress";
     case EGL_FN_INITIALIZE: return "eglInitialize";
     case EGL_FN_MAKECURRENT: return "eglMakeCurrent";
     case EGL_FN_QUERYSTRING: return "eglQueryString";
@@ -228,9 +227,6 @@ static void w32gl_dispatch_egl_generic(uint32_t fn_id, const int64_t* a, int64_t
         break;
     case EGL_FN_GETERROR:
         if (p_eglGetError) { *ret = (int64_t)(int32_t)((w32gl_PFN_eglGetError)p_eglGetError)(); }
-        break;
-    case EGL_FN_GETPROCADDRESS:
-        if (p_eglGetProcAddress) { *ret = (int64_t)(intptr_t)((w32gl_PFN_eglGetProcAddress)p_eglGetProcAddress)((const w32gl_char*)w32gl_gptr(a[0])); }
         break;
     case EGL_FN_INITIALIZE:
         if (p_eglInitialize) { *ret = (int64_t)(uint32_t)((w32gl_PFN_eglInitialize)p_eglInitialize)((w32gl_void*)(uintptr_t)a[0], (w32gl_EGLint*)w32gl_gptr(a[1]), (w32gl_EGLint*)w32gl_gptr(a[2])); }

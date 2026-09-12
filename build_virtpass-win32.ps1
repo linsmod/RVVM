@@ -102,6 +102,13 @@ try {
         Write-Host "`n==> python tools/gen_gl_abi.py" -ForegroundColor Cyan
         & python (Join-Path $RVVM_ROOT 'tools\gen_gl_abi.py')
         if ($LASTEXITCODE -ne 0) { throw "gen_gl_abi.py failed (exit $LASTEXITCODE) - is Python 3 on PATH?" }
+
+        # Every GL/EGL pointer argument must land in a known classification.
+        # The audit exits non-zero on one it cannot account for, which is the
+        # signal that a newly added entry point needs an explicit rule.
+        Write-Host "`n==> python tools/audit_gl_ptr.py --check" -ForegroundColor Cyan
+        & python (Join-Path $RVVM_ROOT 'tools\audit_gl_ptr.py') --check
+        if ($LASTEXITCODE -ne 0) { throw "audit_gl_ptr.py found unclassified pointer params" }
     }
 
     if ($Clean) {
