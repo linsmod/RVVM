@@ -371,8 +371,7 @@ static void uapi_sigaction_convert(struct uapi_sigaction* dst, const struct siga
 */
 
 static rvvm_machine_t* userland; // Emulated RVVM process context
-static rvvm_user_io_callback io_callback = NULL; // Custom I/O callback
-static rvvm_user_exit_callback exit_callback = NULL; // Guest exit callback
+
 
 // Short cast rvvm_addr_t -> void*
 static void* to_ptr(rvvm_addr_t addr)
@@ -455,36 +454,117 @@ typedef struct {
 
 #define GUEST_FREE_MAX 64
 
-static spinlock_t    guest_lock       = SPINLOCK_INIT;
-static guest_range_t guest_free[GUEST_FREE_MAX];
-static size_t        guest_free_num   = 0;
-static rvvm_addr_t   guest_bump       = GUEST_MMAP_BASE;
-static rvvm_addr_t   guest_mmap_end   = 0;
-static rvvm_addr_t   guest_stack_base = 0;
-static rvvm_addr_t   guest_stack_top  = 0;
-static rvvm_addr_t   guest_brk_start  = 0;
-static rvvm_addr_t   guest_brk_end    = GUEST_MMAP_BASE;
-static rvvm_addr_t   guest_brk_ptr    = 0;
+typedef struct {
+    rvvm_hart_t* cpu;
+    uint32_t* child_settid;
+    uint32_t* child_cleartid;
+    uint32_t tid;
+    uint32_t finished; // Set by userland shutdown to stop this vCPU
+} rvvm_user_thread_t;
 
+/* ============================================================
+ * Userland instance context
+ *
+ * This module keeps all of its per-guest state on file-scope statics, which
+ * makes it a de-facto singleton: a second guest would fight the first one for
+ * the address-space allocator, the thread registry and the callbacks.
+ *
+ * rvvm_userland_t is where that state belongs instead - one instance per
+ * rvvm_machine_t, attached through the machine's userdata slot. The fields
+ * mirror the file-scope globals one-for-one, so migrating them is a mechanical
+ * rename rather than a redesign.
+ *
+ * Staged migration: the struct is introduced and attached to the machine here,
+ * while the globals it shadows are still the ones in use, so this step changes
+ * no behaviour. Later steps move one group at a time into the context.
+ * ============================================================ */
+
+typedef struct rvvm_userland {
+    // Machine this context belongs to; identical to rvvm_machine_t::userdata
+    rvvm_machine_t* machine;
+
+    // --- Configuration & callbacks (group A) ---
+    rvvm_user_io_callback    io_callback;
+    rvvm_user_exit_callback  exit_callback;
+    const char*              prefix_path;
+    bool                     fake_root;
+    int                      fake_uid;
+    int                      fake_gid;
+
+    // --- Guest virtual memory allocator (group B) ---
+    spinlock_t    guest_lock;
+    guest_range_t guest_free[GUEST_FREE_MAX];
+    size_t        guest_free_num;
+    rvvm_addr_t   guest_bump;
+    rvvm_addr_t   guest_mmap_end;
+    rvvm_addr_t   guest_stack_base;
+    rvvm_addr_t   guest_stack_top;
+    rvvm_addr_t   guest_brk_start;
+    rvvm_addr_t   guest_brk_end;
+    rvvm_addr_t   guest_brk_ptr;
+    spinlock_t    brk_lock;
+
+    // --- Guest process image (group C) ---
+    struct uapi_sigaction siga[64];
+    elf_desc_t            elf;
+    elf_desc_t            interp;
+
+    // --- Thread registry & lifecycle (group D) ---
+    spinlock_t                    userland_threads_lock;
+    vector_t(rvvm_user_thread_t*) userland_threads;
+    rvvm_user_thread_t*           userland_main_thread;
+    uint32_t                      userland_exit_reported;
+    uint32_t                      userland_suspend;
+    uint32_t                      userland_parked;
+} rvvm_userland_t;
+
+// Context attached to a userland machine, NULL for a non-userland machine
+static inline rvvm_userland_t* rvvm_userland_ctx(rvvm_machine_t* machine)
+{
+    return machine ? (rvvm_userland_t*)machine->userdata : NULL;
+}
+
+/*
+ * Context of the guest the calling thread is running, for the deep helpers that
+ * have no hart to reach the machine through. Set once per guest thread when it
+ * enters the wrap loop - guest threads are 1:1 with host threads and a hart
+ * never migrates between them - so a plain TLS variable is enough.
+ */
+#ifndef THREAD_LOCAL
+#define THREAD_LOCAL
+#endif
+static THREAD_LOCAL rvvm_userland_t* tls_userland = NULL;
+
+static inline rvvm_userland_t* uctx(void)
+{
+    return tls_userland;
+}
+
+// Reset the guest address-space allocator for a fresh run (rvvm_user_linux)
 static void guest_vm_init(void)
 {
-    guest_stack_top  = (userland->mem.addr + userland->mem.size) & ~(rvvm_addr_t)(GUEST_PAGE_SIZE - 1);
-    guest_stack_base = guest_stack_top - GUEST_STACK_SIZE;
-    guest_mmap_end   = guest_stack_base;
-    guest_bump       = GUEST_MMAP_BASE;
-    guest_free_num   = 0;
+    rvvm_userland_t* ctx = uctx();
+    ctx->guest_stack_top  = (userland->mem.addr + userland->mem.size) & ~(rvvm_addr_t)(GUEST_PAGE_SIZE - 1);
+    ctx->guest_stack_base = ctx->guest_stack_top - GUEST_STACK_SIZE;
+    ctx->guest_mmap_end   = ctx->guest_stack_base;
+    ctx->guest_bump       = GUEST_MMAP_BASE;
+    ctx->guest_brk_start  = 0;
+    ctx->guest_brk_end    = GUEST_MMAP_BASE;
+    ctx->guest_brk_ptr    = 0;
+    ctx->guest_free_num   = 0;
 }
 
 // Hand out @size bytes of guest address space, zeroed like a fresh mapping
 static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, bool fixed)
 {
+    rvvm_userland_t* ctx = uctx();
     size = align_size_up(size, GUEST_PAGE_SIZE);
     if (!size) {
         return false;
     }
 
     if (fixed) {
-        if (hint < GUEST_MMAP_BASE || hint + size > guest_mmap_end) {
+        if (hint < GUEST_MMAP_BASE || hint + size > ctx->guest_mmap_end) {
             return false;
         }
         memset(to_ptr(hint), 0, size);
@@ -493,13 +573,13 @@ static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, b
     }
 
     // First fit in the free list
-    for (size_t i = 0; i < guest_free_num; ++i) {
-        if (guest_free[i].size >= size) {
-            rvvm_addr_t addr = guest_free[i].addr;
-            guest_free[i].addr += size;
-            guest_free[i].size -= size;
-            if (!guest_free[i].size) {
-                guest_free[i] = guest_free[--guest_free_num];
+    for (size_t i = 0; i < ctx->guest_free_num; ++i) {
+        if (ctx->guest_free[i].size >= size) {
+            rvvm_addr_t addr = ctx->guest_free[i].addr;
+            ctx->guest_free[i].addr += size;
+            ctx->guest_free[i].size -= size;
+            if (!ctx->guest_free[i].size) {
+                ctx->guest_free[i] = ctx->guest_free[--ctx->guest_free_num];
             }
             memset(to_ptr(addr), 0, size);
             *out = addr;
@@ -508,16 +588,16 @@ static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, b
     }
 
     // Then a hint above the bump pointer, then the bump pointer itself
-    if (hint >= guest_bump && hint >= GUEST_MMAP_BASE && hint + size <= guest_mmap_end) {
+    if (hint >= ctx->guest_bump && hint >= GUEST_MMAP_BASE && hint + size <= ctx->guest_mmap_end) {
         memset(to_ptr(hint), 0, size);
         *out = hint;
         return true;
     }
-    if (guest_bump + size > guest_mmap_end) {
+    if (ctx->guest_bump + size > ctx->guest_mmap_end) {
         return false;
     }
-    rvvm_addr_t addr = guest_bump;
-    guest_bump += size;
+    rvvm_addr_t addr = ctx->guest_bump;
+    ctx->guest_bump += size;
     memset(to_ptr(addr), 0, size);
     *out = addr;
     return true;
@@ -525,27 +605,28 @@ static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, b
 
 static void guest_range_free(rvvm_addr_t addr, size_t size)
 {
+    rvvm_userland_t* ctx = uctx();
     rvvm_addr_t end = align_size_up(addr + size, GUEST_PAGE_SIZE);
     addr            = align_size_down(addr, GUEST_PAGE_SIZE);
     size            = end - addr;
-    if (addr < GUEST_MMAP_BASE || addr + size > guest_mmap_end || !size) {
+    if (addr < GUEST_MMAP_BASE || addr + size > ctx->guest_mmap_end || !size) {
         return;
     }
-    for (size_t i = 0; i < guest_free_num; ++i) {
-        if (guest_free[i].addr + guest_free[i].size == addr) {
-            guest_free[i].size += size;
+    for (size_t i = 0; i < ctx->guest_free_num; ++i) {
+        if (ctx->guest_free[i].addr + ctx->guest_free[i].size == addr) {
+            ctx->guest_free[i].size += size;
             return;
         }
-        if (addr + size == guest_free[i].addr) {
-            guest_free[i].addr = addr;
-            guest_free[i].size += size;
+        if (addr + size == ctx->guest_free[i].addr) {
+            ctx->guest_free[i].addr = addr;
+            ctx->guest_free[i].size += size;
             return;
         }
     }
-    if (guest_free_num < GUEST_FREE_MAX) {
-        guest_free[guest_free_num].addr = addr;
-        guest_free[guest_free_num].size = size;
-        guest_free_num++;
+    if (ctx->guest_free_num < GUEST_FREE_MAX) {
+        ctx->guest_free[ctx->guest_free_num].addr = addr;
+        ctx->guest_free[ctx->guest_free_num].size = size;
+        ctx->guest_free_num++;
     }
 }
 
@@ -566,23 +647,17 @@ static rvvm_addr_t errno_ret(int64_t val)
     }
 }
 
-PUBLIC void rvvm_user_set_io_callback(rvvm_user_io_callback callback)
+PUBLIC void rvvm_user_set_io_callback(rvvm_machine_t* machine, rvvm_user_io_callback callback)
 {
-    io_callback = callback;
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (ctx) ctx->io_callback = callback;
 }
 
-PUBLIC void rvvm_user_set_exit_callback(rvvm_user_exit_callback callback)
+PUBLIC void rvvm_user_set_exit_callback(rvvm_machine_t* machine, rvvm_user_exit_callback callback)
 {
-    exit_callback = callback;
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (ctx) ctx->exit_callback = callback;
 }
-
-// This is for debugging sake
-static elf_desc_t elf = {
-    .base = NULL,
-};
-static elf_desc_t interp = {
-    .base = NULL,
-};
 
 static bool proc_mem_readable(const void* addr, size_t size)
 {
@@ -595,16 +670,18 @@ static bool proc_mem_readable(const void* addr, size_t size)
 }
 
 #ifndef __riscv
-static const char* prefix_path = "/home/lekkit/stuff/userland/debian";
+#define USERLAND_DEFAULT_PREFIX "/home/lekkit/stuff/userland/debian"
 #else
-static const char* prefix_path = NULL;
+#define USERLAND_DEFAULT_PREFIX NULL
 #endif
 
-static bool fake_root = true;
+// Defaults applied when a userland context is created (see rvvm_user_linux)
+#define USERLAND_DEFAULT_FAKE_ROOT true
 
 static bool path_bypass(const char* path)
 {
-    return prefix_path == NULL
+    const char* prefix = uctx()->prefix_path;
+    return prefix == NULL
         || rvvm_strfind(path, "/dev") == path
         || rvvm_strfind(path, "/sys") == path
         || rvvm_strfind(path, "/proc") == path
@@ -614,20 +691,22 @@ static bool path_bypass(const char* path)
 
 static bool path_wrapped(const char* path)
 {
-    return prefix_path == NULL
-        || rvvm_strfind(path, prefix_path) == path
+    const char* prefix = uctx()->prefix_path;
+    return prefix == NULL
+        || rvvm_strfind(path, prefix) == path
         || path_bypass(path);
 }
 
 static const char* wrap_path(char* buffer, const char* path)
 {
-    if (prefix_path && path) {
+    const char* prefix = uctx()->prefix_path;
+    if (prefix && path) {
         if (path_bypass(path)) {
             return path;
         }
 
         if (rvvm_strfind(path, "/") == path) {
-            size_t prefix_len = rvvm_strlcpy(buffer, prefix_path, UAPI_PATH_MAX);
+            size_t prefix_len = rvvm_strlcpy(buffer, prefix, UAPI_PATH_MAX);
             rvvm_strlcpy(buffer + prefix_len, path, UAPI_PATH_MAX - prefix_len);
             return buffer;
         }
@@ -637,8 +716,9 @@ static const char* wrap_path(char* buffer, const char* path)
 
 static size_t unwrap_path(char* buffer, const char* path, size_t size)
 {
-    if (prefix_path && rvvm_strfind(path, prefix_path) == path) {
-        size_t len = rvvm_strlen(prefix_path) + 1;
+    const char* prefix = uctx()->prefix_path;
+    if (prefix && rvvm_strfind(path, prefix) == path) {
+        size_t len = rvvm_strlen(prefix) + 1;
         size_t off = rvvm_strlcpy(buffer, "/", size);
         return rvvm_strlcpy(buffer + off, path + len, size - off);
     }
@@ -646,15 +726,18 @@ static size_t unwrap_path(char* buffer, const char* path, size_t size)
     return rvvm_strlcpy(buffer, path, UAPI_PATH_MAX);
 }
 
-static struct uapi_sigaction siga[64] = {0};
-
 void sig_handler(int signal)
 {
     rvvm_info("Received signal %d", signal);
 }
 
 // Debug: current running hart, for host fault diagnostics
-static rvvm_hart_t* current_user_hart = NULL;
+// Hart running on the calling thread, for the fault handler (guest threads are
+// 1:1 with host threads). Same THREAD_LOCAL guard as fpu_lib.c.
+#ifndef THREAD_LOCAL
+#define THREAD_LOCAL
+#endif
+static THREAD_LOCAL rvvm_hart_t* current_user_hart = NULL;
 
 static void user_fault_hex(char** p, uint64_t val)
 {
@@ -726,14 +809,6 @@ static void user_fault_handler_install(void)
     sigaction(SIGBUS, &sa, NULL);
 }
 
-typedef struct {
-    rvvm_hart_t* cpu;
-    uint32_t* child_settid;
-    uint32_t* child_cleartid;
-    uint32_t tid;
-    uint32_t finished; // Set by userland shutdown to stop this vCPU
-} rvvm_user_thread_t;
-
 /* ============================================================
  * Guest thread registry & userland shutdown
  *
@@ -748,24 +823,15 @@ typedef struct {
  * the main thread, matching Linux semantics).
  * ============================================================ */
 
-static spinlock_t userland_threads_lock = SPINLOCK_INIT;
-static vector_t(rvvm_user_thread_t*) userland_threads = ZERO_INIT;
-static rvvm_user_thread_t* userland_main_thread = NULL;
-static uint32_t userland_exit_reported = 0;
-
 /*
  * Host-side suspend/resume (rvvm_user_suspend()/rvvm_user_resume()).
  *
- * userland_suspend is both the requested state and the futex word the parked
- * vCPUs wait on: while it reads 1 a parked vCPU sits in
- * rvvm_futex_wait(&userland_suspend, 1, ...), so clearing it wakes them all.
- * userland_parked counts the vCPUs that are actually parked, which lets
- * rvvm_user_suspend() be a barrier instead of a fire-and-forget request.
- */
-static uint32_t userland_suspend = 0;
-static uint32_t userland_parked  = 0;
-
-/*
+ * ctx->userland_suspend is both the requested state and the futex word the
+ * parked vCPUs wait on: while it reads 1 a parked vCPU sits in
+ * rvvm_futex_wait(&ctx->userland_suspend, 1, ...), so clearing it wakes them
+ * all. ctx->userland_parked counts the vCPUs that are actually parked, which
+ * lets rvvm_user_suspend() be a barrier instead of a fire-and-forget request.
+ *
  * Bounded wait for the parked vCPUs, so a missed wakeup costs latency but can
  * never turn into a stuck vCPU. The futex wake does the real work.
  */
@@ -785,15 +851,16 @@ static uint32_t userland_parked  = 0;
  */
 static void userland_park_if_suspended(rvvm_user_thread_t* thread)
 {
-    if (likely(atomic_load_uint32(&userland_suspend) == 0)) {
+    rvvm_userland_t* ctx = uctx();
+    if (likely(atomic_load_uint32(&ctx->userland_suspend) == 0)) {
         return;
     }
 
-    atomic_add_uint32(&userland_parked, 1);
-    while (atomic_load_uint32(&userland_suspend) && !atomic_load_uint32(&thread->finished)) {
-        rvvm_futex_wait(&userland_suspend, 1, USERLAND_SUSPEND_POLL_NS);
+    atomic_add_uint32(&ctx->userland_parked, 1);
+    while (atomic_load_uint32(&ctx->userland_suspend) && !atomic_load_uint32(&thread->finished)) {
+        rvvm_futex_wait(&ctx->userland_suspend, 1, USERLAND_SUSPEND_POLL_NS);
     }
-    atomic_sub_uint32(&userland_parked, 1);
+    atomic_sub_uint32(&ctx->userland_parked, 1);
 }
 
 /*
@@ -810,31 +877,35 @@ static void userland_park_if_suspended(rvvm_user_thread_t* thread)
  * parked within USERLAND_SUSPEND_BARRIER_MS; false means at least one thread
  * is stuck in a blocking host syscall and will park once that returns.
  */
-PUBLIC bool rvvm_user_suspend(void)
+PUBLIC bool rvvm_user_suspend(rvvm_machine_t* machine)
 {
-    if (atomic_swap_uint32(&userland_suspend, 1)) {
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (!ctx) {
+        return true; // No guest instance running
+    }
+    if (atomic_swap_uint32(&ctx->userland_suspend, 1)) {
         return true; // Already suspended
     }
 
-    spin_lock(&userland_threads_lock);
-    vector_foreach(userland_threads, i) {
-        rvvm_user_thread_t* thread = vector_at(userland_threads, i);
+    spin_lock(&ctx->userland_threads_lock);
+    vector_foreach(ctx->userland_threads, i) {
+        rvvm_user_thread_t* thread = vector_at(ctx->userland_threads, i);
         if (thread->cpu) {
             // Break out of the interpreter at the next instruction boundary
             riscv_hart_queue_pause(thread->cpu);
         }
     }
-    spin_unlock(&userland_threads_lock);
+    spin_unlock(&ctx->userland_threads_lock);
 
     // Barrier: wait for the vCPUs to actually park. Recomputed every round so a
     // vCPU that registers (clone) or deregisters (exit) concurrently does not
     // make the count impossible to reach.
     for (uint32_t i = 0; i < USERLAND_SUSPEND_BARRIER_MS; ++i) {
         uint32_t total = 0;
-        uint32_t parked = atomic_load_uint32(&userland_parked);
-        spin_lock(&userland_threads_lock);
-        total = vector_size(userland_threads);
-        spin_unlock(&userland_threads_lock);
+        uint32_t parked = atomic_load_uint32(&ctx->userland_parked);
+        spin_lock(&ctx->userland_threads_lock);
+        total = vector_size(ctx->userland_threads);
+        spin_unlock(&ctx->userland_threads_lock);
         if (parked >= total) {
             return true;
         }
@@ -847,37 +918,46 @@ PUBLIC bool rvvm_user_suspend(void)
  * Resume a guest suspended with rvvm_user_suspend(). Wakes every parked vCPU;
  * no-op when the guest is not suspended.
  */
-PUBLIC void rvvm_user_resume(void)
+PUBLIC void rvvm_user_resume(rvvm_machine_t* machine)
 {
-    if (atomic_swap_uint32(&userland_suspend, 0) == 0) {
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (!ctx) {
+        return; // No guest instance running
+    }
+    if (atomic_swap_uint32(&ctx->userland_suspend, 0) == 0) {
         return; // Was not suspended
     }
-    rvvm_futex_wake(&userland_suspend, UINT32_MAX);
+    rvvm_futex_wake(&ctx->userland_suspend, UINT32_MAX);
 }
 
 // True while the guest is suspended (requested; see rvvm_user_suspend())
-PUBLIC bool rvvm_user_is_suspended(void)
+PUBLIC bool rvvm_user_is_suspended(rvvm_machine_t* machine)
 {
-    return atomic_load_uint32(&userland_suspend) != 0;
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    return ctx && atomic_load_uint32(&ctx->userland_suspend) != 0;
 }
 
+// Push/pop the calling guest thread onto its instance's registry. Called from
+// the guest threads themselves, so the context comes from the TLS binding.
 static void userland_thread_register(rvvm_user_thread_t* thread)
 {
-    spin_lock(&userland_threads_lock);
-    vector_push_back(userland_threads, thread);
-    spin_unlock(&userland_threads_lock);
+    rvvm_userland_t* ctx = uctx();
+    spin_lock(&ctx->userland_threads_lock);
+    vector_push_back(ctx->userland_threads, thread);
+    spin_unlock(&ctx->userland_threads_lock);
 }
 
 static void userland_thread_unregister(rvvm_user_thread_t* thread)
 {
-    spin_lock(&userland_threads_lock);
-    vector_foreach_back(userland_threads, i) {
-        if (vector_at(userland_threads, i) == thread) {
-            vector_erase(userland_threads, i);
+    rvvm_userland_t* ctx = uctx();
+    spin_lock(&ctx->userland_threads_lock);
+    vector_foreach_back(ctx->userland_threads, i) {
+        if (vector_at(ctx->userland_threads, i) == thread) {
+            vector_erase(ctx->userland_threads, i);
             break;
         }
     }
-    spin_unlock(&userland_threads_lock);
+    spin_unlock(&ctx->userland_threads_lock);
 }
 
 /*
@@ -886,27 +966,27 @@ static void userland_thread_unregister(rvvm_user_thread_t* thread)
  * the interpreter loop via a hart pause and unwind in their own wrap
  * loop; @self unwinds via its syscall handling path.
  */
-static void userland_process_exit(int code, rvvm_user_thread_t* self)
+static void userland_process_exit(rvvm_userland_t* ctx, int code, rvvm_user_thread_t* self)
 {
-    if (atomic_swap_uint32(&userland_exit_reported, 1) == 0 && exit_callback) {
-        exit_callback(code);
+    if (atomic_swap_uint32(&ctx->userland_exit_reported, 1) == 0 && ctx->exit_callback) {
+        ctx->exit_callback(code);
     }
 
-    spin_lock(&userland_threads_lock);
-    vector_foreach(userland_threads, i) {
-        rvvm_user_thread_t* thread = vector_at(userland_threads, i);
+    spin_lock(&ctx->userland_threads_lock);
+    vector_foreach(ctx->userland_threads, i) {
+        rvvm_user_thread_t* thread = vector_at(ctx->userland_threads, i);
         atomic_store_uint32(&thread->finished, 1);
         if (thread != self && thread->cpu) {
             // Make the vCPU return from the interpreter loop promptly
             riscv_hart_queue_pause(thread->cpu);
         }
     }
-    spin_unlock(&userland_threads_lock);
+    spin_unlock(&ctx->userland_threads_lock);
 
     // Release vCPUs parked by rvvm_user_suspend(): they were told to finish
     // above but cannot see it while suspended, and must unwind like the rest.
-    if (atomic_swap_uint32(&userland_suspend, 0)) {
-        rvvm_futex_wake(&userland_suspend, UINT32_MAX);
+    if (atomic_swap_uint32(&ctx->userland_suspend, 0)) {
+        rvvm_futex_wake(&ctx->userland_suspend, UINT32_MAX);
     }
 }
 
@@ -921,22 +1001,26 @@ static void userland_process_exit(int code, rvvm_user_thread_t* self)
  * loop and unwinds through the normal cleanup. That makes this a clean stop
  * rather than a TerminateThread() on live interpreter state.
  */
-PUBLIC void rvvm_user_stop(int exit_code)
+PUBLIC void rvvm_user_stop(rvvm_machine_t* machine, int exit_code)
 {
-    userland_process_exit(exit_code, NULL);
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (!ctx) {
+        return; // No guest instance running
+    }
+    userland_process_exit(ctx, exit_code, NULL);
 }
 
 /*
  * Wait (bounded) for all guest threads to deregister themselves.
  * Returns true once the registry is empty.
  */
-static bool userland_threads_gone(uint32_t timeout_ms)
+static bool userland_threads_gone(rvvm_userland_t* ctx, uint32_t timeout_ms)
 {
     while (timeout_ms--) {
         bool empty = false;
-        spin_lock(&userland_threads_lock);
-        empty = vector_size(userland_threads) == 0;
-        spin_unlock(&userland_threads_lock);
+        spin_lock(&ctx->userland_threads_lock);
+        empty = vector_size(ctx->userland_threads) == 0;
+        spin_unlock(&ctx->userland_threads_lock);
         if (empty) return true;
         sleep_ms(1);
     }
@@ -1001,24 +1085,23 @@ static int guest_read_str(rvvm_hart_t* cpu, uint64_t guest_addr, char* host_buf,
 /* Main execution loop (Run the user CPU, handle syscalls) */
 static void* rvvm_user_thread_wrap(void* arg);
 
-static spinlock_t brk_lock = {0};
-
 // We can't touch the native brk heap since it would likely blow up the process
 static rvvm_addr_t rvvm_sys_brk(rvvm_addr_t brk_new)
 {
-    spin_lock(&brk_lock);
-    if (guest_brk_start && brk_new >= guest_brk_start && brk_new <= guest_brk_end) {
-        if (brk_new > guest_brk_ptr) {
+    rvvm_userland_t* ctx = uctx();
+    spin_lock(&ctx->brk_lock);
+    if (ctx->guest_brk_start && brk_new >= ctx->guest_brk_start && brk_new <= ctx->guest_brk_end) {
+        if (brk_new > ctx->guest_brk_ptr) {
             // Newly allocated brk memory should be zeroed
-            memset(to_ptr(guest_brk_ptr), 0, brk_new - guest_brk_ptr);
+            memset(to_ptr(ctx->guest_brk_ptr), 0, brk_new - ctx->guest_brk_ptr);
         }
-        guest_brk_ptr = brk_new;
+        ctx->guest_brk_ptr = brk_new;
     } else if (brk_new) {
         rvvm_warn("invalid brk %llx, heap %llx..%llx!", (unsigned long long)brk_new,
-                  (unsigned long long)guest_brk_start, (unsigned long long)guest_brk_end);
+                  (unsigned long long)ctx->guest_brk_start, (unsigned long long)ctx->guest_brk_end);
     }
-    rvvm_addr_t brk_ret = guest_brk_ptr;
-    spin_unlock(&brk_lock);
+    rvvm_addr_t brk_ret = ctx->guest_brk_ptr;
+    spin_unlock(&ctx->brk_lock);
     return brk_ret;
 }
 
@@ -1259,10 +1342,10 @@ static rvvm_addr_t rvvm_sys_mmap(rvvm_addr_t addr, size_t size, int prot, int fl
         return -UAPI_EINVAL;
     }
 
-    spin_lock(&guest_lock);
+    spin_lock(&uctx()->guest_lock);
     rvvm_addr_t ret = 0;
     if (!guest_range_alloc(&ret, addr, size, !!(flags & (UAPI_MAP_FIXED | UAPI_MAP_FIXED_NOREPLACE)))) {
-        spin_unlock(&guest_lock);
+        spin_unlock(&uctx()->guest_lock);
         /* Surface the exact parameters of a failed mapping: a guest-side
          * malloc() failure only reports ENOMEM, the interesting part (hint
          * address / size / flags) lives here. */
@@ -1271,7 +1354,7 @@ static rvvm_addr_t rvvm_sys_mmap(rvvm_addr_t addr, size_t size, int prot, int fl
                   !!(flags & UAPI_MAP_FIXED));
         return -UAPI_ENOMEM;
     }
-    spin_unlock(&guest_lock);
+    spin_unlock(&uctx()->guest_lock);
 
     if (!(flags & UAPI_MAP_ANON) && fd >= 0) {
         /* File-backed mapping: the guest can only see its own buffer, so read
@@ -1281,9 +1364,9 @@ static rvvm_addr_t rvvm_sys_mmap(rvvm_addr_t addr, size_t size, int prot, int fl
             rvvm_warn("sys_mmap: pread failed (fd=%d off=%llx size=%llx)",
                       fd, (long long)offset, (long long)size);
             int err = last_errno();
-            spin_lock(&guest_lock);
+            spin_lock(&uctx()->guest_lock);
             guest_range_free(ret, size);
-            spin_unlock(&guest_lock);
+            spin_unlock(&uctx()->guest_lock);
             return err;
         }
     }
@@ -1296,9 +1379,9 @@ static rvvm_addr_t rvvm_sys_mmap(rvvm_addr_t addr, size_t size, int prot, int fl
 
 static int rvvm_sys_munmap(rvvm_addr_t addr, size_t size)
 {
-    spin_lock(&guest_lock);
+    spin_lock(&uctx()->guest_lock);
     guest_range_free(addr, size);
-    spin_unlock(&guest_lock);
+    spin_unlock(&uctx()->guest_lock);
     return 0;
 }
 
@@ -1313,25 +1396,25 @@ static int rvvm_sys_gettid(void)
 #endif
 }
 
-static int fake_uid = 0;
-static int fake_gid = 0;
-
 static int rvvm_sys_getuid(void)
 {
-    if (fake_root) return fake_uid;
+    rvvm_userland_t* ctx = uctx();
+    if (ctx->fake_root) return ctx->fake_uid;
     return errno_ret(getuid());
 }
 
 static int rvvm_sys_getgid(void)
 {
-    if (fake_root) return fake_gid;
+    rvvm_userland_t* ctx = uctx();
+    if (ctx->fake_root) return ctx->fake_gid;
     return errno_ret(getgid());
 }
 
 static int rvvm_sys_setuid(int uid)
 {
-    if (fake_root) {
-        fake_uid = uid;
+    rvvm_userland_t* ctx = uctx();
+    if (ctx->fake_root) {
+        ctx->fake_uid = uid;
         return 0;
     }
     return errno_ret(setuid(uid));
@@ -1339,8 +1422,9 @@ static int rvvm_sys_setuid(int uid)
 
 static int rvvm_sys_setgid(int gid)
 {
-    if (fake_root) {
-        fake_gid = gid;
+    rvvm_userland_t* ctx = uctx();
+    if (ctx->fake_root) {
+        ctx->fake_gid = gid;
         return 0;
     }
     return errno_ret(setgid(gid));
@@ -1390,6 +1474,8 @@ static void* rvvm_user_thread_wrap(void* arg)
     bool running = true;
 
     current_user_hart = cpu;
+    // Bind this guest thread to its instance context (see uctx())
+    tls_userland = rvvm_userland_ctx(cpu->machine);
 
     userland_thread_register(thread);
 
@@ -1414,7 +1500,7 @@ static void* rvvm_user_thread_wrap(void* arg)
             break;
         }
         rvvm_addr_t cause = rvvm_run_user_thread(cpu);
-        if (atomic_load_uint32(&userland_suspend)) {
+        if (atomic_load_uint32(&uctx()->userland_suspend)) {
             /*
              * A suspend request kicked this vCPU out of the interpreter. The
              * value we got back describes whatever trapped last, not a fresh
@@ -1581,7 +1667,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(fchmodat(a0, wrap_path(path_buf, to_str(a1)), a2, 0));
                     break;
                 case 54: // fchownat
-                    if (fake_root) {
+                    if (uctx()->fake_root) {
                         a0 = 0;
                     } else {
                         rvvm_info("sys_fchownat(%ld, %s, %lx, %lx, %lx)", a0, to_str(a1), a2, a3, a4);
@@ -1589,7 +1675,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     break;
                 case 55: // fchown
-                    if (fake_root) {
+                    if (uctx()->fake_root) {
                         a0 = 0;
                     } else {
                         rvvm_info("sys_fchownat(%ld, %lx, %lx)", a0, a1, a2);
@@ -1617,8 +1703,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(read(a0, to_ptr(a1), a2));
                     break;
                 case 64: { // write
-                    if (io_callback) {
-                        ssize_t ret = io_callback(a0, to_ptr(a1), a2);
+                    if (uctx()->io_callback) {
+                        ssize_t ret = uctx()->io_callback(a0, to_ptr(a1), a2);
                         a0 = errno_ret(ret);
                     } else {
                         a0 = errno_ret(write(a0, to_ptr(a1), a2));
@@ -1693,10 +1779,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 93: // exit
                     rvvm_warn("sys_exit(%ld) @ PC %lx", (long)a0, rvvm_read_cpu_reg(cpu, RVVM_REGID_PC));
-                    if (exit_callback) {
-                        if (thread == userland_main_thread) {
+                    if (uctx()->exit_callback) {
+                        if (thread == uctx()->userland_main_thread) {
                             // Linux semantics: main thread exit terminates the process
-                            userland_process_exit((int)a0, thread);
+                            userland_process_exit(uctx(), (int)a0, thread);
                         } else {
                             // Secondary thread exit: stop this vCPU only
                             atomic_store_uint32(&thread->finished, 1);
@@ -1707,8 +1793,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 94: // exit_group
                     rvvm_warn("sys_exit_group(%ld)", (long)a0);
-                    if (exit_callback) {
-                        userland_process_exit((int)a0, thread);
+                    if (uctx()->exit_callback) {
+                        userland_process_exit(uctx(), (int)a0, thread);
                     } else {
                         _Exit(a0);
                     }
@@ -1804,18 +1890,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
 #endif
                 case 134: { // rt_sigaction
+                    rvvm_userland_t* ctx = uctx();
                     struct sigaction sa = {0};
                     rvvm_info("sys_rt_sigaction(%ld, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    if (a0 < STATIC_ARRAY_SIZE(siga)) {
-                        if (a2) memcpy(to_ptr(a2), &siga[a0], a3);
+                    if (a0 < STATIC_ARRAY_SIZE(ctx->siga)) {
+                        if (a2) memcpy(to_ptr(a2), &ctx->siga[a0], a3);
                         if (a1) {
-                            memcpy(&siga[a0], to_ptr(a1), a3);
+                            memcpy(&ctx->siga[a0], to_ptr(a1), a3);
 
                             // Register a shim signal handler
                             if (a0 != 11) {
-                                memcpy(&sa.sa_mask, &siga[a0].mask, 8);
-                                sa.sa_flags = siga[a0].flags & ~SA_SIGINFO;
-                                sa.sa_handler = to_ptr(siga[a0].handler);
+                                memcpy(&sa.sa_mask, &ctx->siga[a0].mask, 8);
+                                sa.sa_flags = ctx->siga[a0].flags & ~SA_SIGINFO;
+                                sa.sa_handler = to_ptr(ctx->siga[a0].handler);
                                 if (sa.sa_handler != SIG_DFL && sa.sa_handler != SIG_IGN) {
                                     sa.sa_handler = sig_handler;
                                 }
@@ -1888,7 +1975,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(getgroups(a0, to_ptr(a1)));
                     break;
                 case 159: // setgroups
-                    if (fake_root) {
+                    if (uctx()->fake_root) {
                         a0 = 0;
                     } else {
                         a0 = errno_ret(setgroups(a0, to_ptr(a1)));
@@ -2066,9 +2153,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                         break;
                     }
                     rvvm_addr_t new_addr = 0;
-                    spin_lock(&guest_lock);
+                    spin_lock(&uctx()->guest_lock);
                     bool ok = guest_range_alloc(&new_addr, 0, a2, false);
-                    spin_unlock(&guest_lock);
+                    spin_unlock(&uctx()->guest_lock);
                     if (!ok) {
                         a0 = -UAPI_ENOMEM;
                         break;
@@ -2077,9 +2164,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                     if (a2 > a1) {
                         memset(to_ptr(new_addr + a1), 0, a2 - a1);
                     }
-                    spin_lock(&guest_lock);
+                    spin_lock(&uctx()->guest_lock);
                     guest_range_free(a0, a1);
-                    spin_unlock(&guest_lock);
+                    spin_unlock(&uctx()->guest_lock);
                     a0 = new_addr;
                     break;
                 }
@@ -2264,11 +2351,11 @@ static void* rvvm_user_thread_wrap(void* arg)
             void** next_fp = (void*)rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 8);
             do {
                 rvvm_warn(" PC %lx", pc);
-                if (pc >= (size_t)elf.base && pc < (size_t)elf.base + elf.buf_size) {
-                    rvvm_warn("  @ Main binary, reloc: %lx", pc - (size_t)elf.base);
+                if (pc >= (size_t)uctx()->elf.base && pc < (size_t)uctx()->elf.base + uctx()->elf.buf_size) {
+                    rvvm_warn("  @ Main binary, reloc: %lx", pc - (size_t)uctx()->elf.base);
                 }
-                if (pc >= (size_t)interp.base && pc < (size_t)interp.base + interp.buf_size) {
-                    rvvm_warn("  @ Interpreter, reloc: %lx)", pc - (size_t)interp.base);
+                if (pc >= (size_t)uctx()->interp.base && pc < (size_t)uctx()->interp.base + uctx()->interp.buf_size) {
+                    rvvm_warn("  @ Interpreter, reloc: %lx)", pc - (size_t)uctx()->interp.base);
                 }
                 if (next_fp <= fp) break;
                 if (!proc_mem_readable(fp, 8)) {
@@ -2337,21 +2424,22 @@ static void jump_start(size_t entry, size_t stack_top)
         :
     );
 #else
-    atomic_store_uint32(&userland_exit_reported, 0);
+    rvvm_userland_t* ctx = uctx();
+    atomic_store_uint32(&ctx->userland_exit_reported, 0);
     // A new guest starts running: the launcher boots several in one process,
     // so a suspend left over from the previous one must not carry over.
-    atomic_store_uint32(&userland_suspend, 0);
-    atomic_store_uint32(&userland_parked, 0);
+    atomic_store_uint32(&ctx->userland_suspend, 0);
+    atomic_store_uint32(&ctx->userland_parked, 0);
 
     rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
     thread->cpu = rvvm_create_user_thread(userland);
-    userland_main_thread = thread;
+    ctx->userland_main_thread = thread;
 
     rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_X0 + 2, (size_t)stack_top);
     rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_PC,     (size_t)entry);
 
     rvvm_user_thread_wrap(thread);
-    userland_main_thread = NULL;
+    ctx->userland_main_thread = NULL;
 #endif
 }
 
@@ -2509,46 +2597,110 @@ static char* default_envp[] = {
 };
 */
 
-int rvvm_user_linux(int argc, char** argv, char** envp)
+/*
+ * Create a userland instance (machine + its per-instance context) without
+ * running it, so a host can configure it before the guest starts:
+ *
+ *     rvvm_machine_t* m = rvvm_user_create();
+ *     rvvm_user_set_exit_callback(m, on_exit);
+ *     rvvm_user_linux_ex(m, argc, argv, envp);
+ *
+ * The instance owns its whole state (allocator, image, signal table, thread
+ * registry, callbacks), so several instances can run independently in one
+ * process. Returns NULL on failure.
+ */
+PUBLIC rvvm_machine_t* rvvm_user_create(void)
 {
-    char path_buf[UAPI_PATH_MAX] = {0};
-    // Allow overriding/disabling the userland path prefix,
-    // empty RVVM_USER_PREFIX passes host paths through unchanged
-    const char* env_prefix = getenv("RVVM_USER_PREFIX");
-    if (env_prefix) {
-        prefix_path = env_prefix[0] ? env_prefix : NULL;
+    rvvm_machine_t* machine = rvvm_create_userland("rv64");
+    if (!machine) {
+        rvvm_error("Failed to create the userland machine");
+        return NULL;
     }
 
-    /* Launcher-style hosts call rvvm_user_linux() multiple times in one
-     * process. Reset the per-launch state left by the previous guest:
+    rvvm_userland_t* ctx = safe_new_obj(rvvm_userland_t);
+    ctx->machine      = machine;
+    ctx->prefix_path  = USERLAND_DEFAULT_PREFIX;
+    ctx->fake_root    = USERLAND_DEFAULT_FAKE_ROOT;
+    machine->userdata = ctx;
+    return machine;
+}
+
+// Tear down a userland instance: context, thread registry and machine
+static void userland_destroy(rvvm_machine_t* machine)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (!ctx) {
+        return;
+    }
+    machine->userdata = NULL;
+    vector_free(ctx->userland_threads);
+    rvvm_free_machine(machine);
+    safe_free(ctx);
+}
+
+/*
+ * Free an instance created with rvvm_user_create() without running it, or
+ * discard one whose rvvm_user_linux_ex() was declined. Safe on NULL; do not
+ * call it on an instance that rvvm_user_linux_ex() already returned from.
+ */
+PUBLIC void rvvm_user_free(rvvm_machine_t* machine)
+{
+    if (!machine) {
+        return;
+    }
+    if (userland == machine) {
+        userland = NULL;
+        tls_userland = NULL;
+    }
+    userland_destroy(machine);
+}
+
+/*
+ * Run @machine (from rvvm_user_create()) until the guest exits. Blocks the
+ * calling thread. The machine and its context are freed before returning.
+ */
+PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, char** envp)
+{
+    char path_buf[UAPI_PATH_MAX] = {0};
+
+    if (!machine || !rvvm_userland_ctx(machine)) {
+        rvvm_error("Invalid userland machine, use rvvm_user_create()");
+        return -1;
+    }
+    userland = machine;
+
+    // Bind the calling (main) thread too, for the native paths that do not go
+    // through the wrap loop below
+    tls_userland = rvvm_userland_ctx(userland);
+
+    /* Reset this instance's per-launch state (a previous guest may have run on
+     * the same machine):
      *  - a stale elf/interp .base makes elf_load_file() take the objcopy
      *    path (no fresh mapping, entry relocated wrongly -> jump into the
      *    NULL page), and the old image blocks the next fixed VMA mapping;
-     *  - brk_ptr still points at the previous guest's heap end;
-     *  - siga[] carries the previous guest's signal dispositions. */
-    elf_unload_file(&elf);
-    elf_unload_file(&interp);
-    memset(siga, 0, sizeof(siga));
+     *  - siga[] carries the previous guest's signal dispositions.
+     * The brk heap is reset by guest_vm_init() below. */
+    rvvm_userland_t* ctx = uctx();
+    elf_unload_file(&ctx->elf);
+    elf_unload_file(&ctx->interp);
+    memset(ctx->siga, 0, sizeof(ctx->siga));
 
-    /* Guest memory lives in a dedicated buffer owned by the userland machine,
-     * so it must exist before the ELF loader (which copies the image into it)
-     * and before anything calls to_ptr(). */
-    if (!userland) {
-        userland = rvvm_create_userland("rv64");
-        if (!userland) {
-            rvvm_error("Failed to create the userland machine");
-            return -1;
-        }
+    /* Path prefix override: an empty RVVM_USER_PREFIX passes host paths through
+     * unchanged, unset keeps the build-time default. Resolved here, on the
+     * guest thread, rather than in rvvm_user_create(): hosts putenv() right
+     * before launching this thread, so create() would have read a stale value. */
+    const char* env_prefix = getenv("RVVM_USER_PREFIX");
+    if (env_prefix) {
+        ctx->prefix_path = env_prefix[0] ? env_prefix : NULL;
     }
+
     guest_vm_init();
     /* Host pointer standing for guest address 0. Deliberately computed with
      * integer math: the result points below the allocation and must never be
      * dereferenced on its own, only as (window + guest_addr). */
-    uint8_t* window = (uint8_t*)((size_t)userland->mem.data - (size_t)userland->mem.addr);
-    elf.guest_window    = window;
-    interp.guest_window = window;
-    guest_brk_start     = 0;
-    guest_brk_ptr       = 0;
+    uint8_t* window = (uint8_t*)((size_t)machine->mem.data - (size_t)machine->mem.addr);
+    uctx()->elf.guest_window    = window;
+    uctx()->interp.guest_window = window;
 
     stacktrace_init();
     user_fault_handler_install();
@@ -2556,17 +2708,11 @@ int rvvm_user_linux(int argc, char** argv, char** envp)
 #if defined(ANDROID)
     /* Set Android I/O callback before initializing cmdpost */
     extern ssize_t android_io_callback(int fd, const void* buf, size_t count);
-    rvvm_user_set_io_callback(android_io_callback);
+    rvvm_user_set_io_callback(machine, android_io_callback);
 #endif
     
     /* Initialize Android NDK API proxy */
     cmdpost_init();
-    /*elf_desc_t elf = {
-        .base = NULL,
-    };
-    elf_desc_t interp = {
-        .base = NULL,
-    };*/
     rvfile_t* file = rvopen(wrap_path(path_buf, argv[0]), 0);
     if (!file) {
         // drvfs (WSL) sometimes fails opening big files right after host-side
@@ -2578,9 +2724,10 @@ int rvvm_user_linux(int argc, char** argv, char** envp)
     }
     if (!file) {
         rvvm_error("Failed to open ELF file %s (errno %d)", argv[0], errno);
+        rvvm_user_free(machine);
         return -1;
     }
-    bool success = elf_load_file(file, &elf);
+    bool success = elf_load_file(file, &uctx()->elf);
     rvclose(file);
     if (!success) {
         rvvm_error("Failed to load ELF %s (fixed VMA collision?)", argv[0]);
@@ -2594,42 +2741,45 @@ int rvvm_user_linux(int argc, char** argv, char** envp)
             }
             close(maps_fd);
         }
+        rvvm_user_free(machine);
         return -1;
     }
     rvvm_info("Loaded ELF %s at base %lx, entry %lx,\n%ld PHDRs at %lx",
-              argv[0], (size_t)elf.base, elf.entry, elf.phnum, elf.phdr);
+              argv[0], (size_t)uctx()->elf.base, uctx()->elf.entry, uctx()->elf.phnum, uctx()->elf.phdr);
 
     /* The brk heap starts right past the image and runs up to where mmap()ed
      * ranges begin - exactly what ELF_USERLAND_HEAP_MARGIN reserved. */
-    guest_brk_start = align_size_up(to_addr(elf.base) + elf.buf_size, GUEST_PAGE_SIZE);
-    guest_brk_ptr   = guest_brk_start;
+    uctx()->guest_brk_start = align_size_up(to_addr(uctx()->elf.base) + uctx()->elf.buf_size, GUEST_PAGE_SIZE);
+    uctx()->guest_brk_ptr   = uctx()->guest_brk_start;
 
-    if (elf.interp_path) {
-        rvvm_info("ELF interpreter at %s", elf.interp_path);
-        file = rvopen(wrap_path(path_buf, elf.interp_path), 0);
+    if (uctx()->elf.interp_path) {
+        rvvm_info("ELF interpreter at %s", uctx()->elf.interp_path);
+        file = rvopen(wrap_path(path_buf, uctx()->elf.interp_path), 0);
         if (file) {
             // A relocatable interpreter needs a guest address picked upfront
-            spin_lock(&guest_lock);
-            bool placed = guest_range_alloc(&interp.load_addr, 0, rvfilesize(file), false);
-            spin_unlock(&guest_lock);
+            spin_lock(&uctx()->guest_lock);
+            bool placed = guest_range_alloc(&uctx()->interp.load_addr, 0, rvfilesize(file), false);
+            spin_unlock(&uctx()->guest_lock);
             if (!placed) {
-                interp.load_addr = 0;
+                uctx()->interp.load_addr = 0;
             }
         }
-        success = file && elf_load_file(file, &interp);
+        success = file && elf_load_file(file, &uctx()->interp);
         rvclose(file);
         if (!success) {
-            rvvm_error("Failed to load interpreter %s", elf.interp_path);
+            rvvm_error("Failed to load interpreter %s", uctx()->elf.interp_path);
+            rvvm_user_free(machine);
             return -1;
         }
         rvvm_info("Loaded interpreter %s at base %lx, entry %lx,\n%ld PHDRs at %lx",
-                  elf.interp_path, (size_t)interp.base, interp.entry, interp.phnum, interp.phdr);
+                  uctx()->elf.interp_path, (size_t)uctx()->interp.base, uctx()->interp.entry, uctx()->interp.phnum, uctx()->interp.phdr);
     }
 
     if (envp == NULL) {
         envp = environ;
     }
 
+    const char* prefix_path = uctx()->prefix_path;
     if (prefix_path && (!getcwd(path_buf, sizeof(path_buf)) || !path_wrapped(path_buf))) {
         if (chdir(prefix_path)) {
             rvvm_error("Failed to chdir to userland prefix %s", prefix_path);
@@ -2642,25 +2792,25 @@ int rvvm_user_linux(int argc, char** argv, char** envp)
         .argc = argc,
         .argv = argv,
         .envp = envp,
-        .base = elf.base ? to_addr(elf.base) : 0,
-        .entry = elf.entry,
-        .interp_base = interp.base ? to_addr(interp.base) : 0,
-        .interp_entry = interp.entry,
-        .phdr = elf.phdr,
-        .phnum = elf.phnum,
+        .base = uctx()->elf.base ? to_addr(uctx()->elf.base) : 0,
+        .entry = uctx()->elf.entry,
+        .interp_base = uctx()->interp.base ? to_addr(uctx()->interp.base) : 0,
+        .interp_entry = uctx()->interp.entry,
+        .phdr = uctx()->elf.phdr,
+        .phnum = uctx()->elf.phnum,
     };
 
     // The stack lives in guest memory too, so the guest can name pointers to it
-    uint8_t* stack_buffer = to_ptr(guest_stack_base);
+    uint8_t* stack_buffer = to_ptr(uctx()->guest_stack_base);
     memset(stack_buffer, 0, GUEST_STACK_SIZE);
     size_t stack_top = rvvm_user_init_stack(stack_buffer + GUEST_STACK_SIZE, &desc);
 
     rvvm_info("Stack top at %lx", (size_t)stack_top);
 
-    if (elf.interp_path) {
-        jump_start(interp.entry, stack_top);
+    if (uctx()->elf.interp_path) {
+        jump_start(uctx()->interp.entry, stack_top);
     } else {
-        jump_start(elf.entry, stack_top);
+        jump_start(uctx()->elf.entry, stack_top);
     }
 
     /* Cleanup Android NDK API proxy */
@@ -2669,24 +2819,86 @@ int rvvm_user_linux(int argc, char** argv, char** envp)
     /* Guest threads wind down asynchronously: wait for them to leave the
      * machine before freeing it. On timeout, leak the machine instead of
      * leaving a running vCPU on freed memory. */
-    if (userland_threads_gone(1000)) {
-        rvvm_free_machine(userland);
+    if (userland_threads_gone(ctx, 1000)) {
+        tls_userland = NULL;
         userland = NULL;
+        userland_destroy(machine);
     } else {
         rvvm_warn("Guest threads linger after exit, leaking userland machine");
     }
     return 0;
 }
 
+/* Single-instance convenience entry: creates its own userland instance, runs it
+ * and frees it. Equivalent to rvvm_user_create() + rvvm_user_linux_ex(). */
+int rvvm_user_linux(int argc, char** argv, char** envp)
+{
+    rvvm_machine_t* machine = rvvm_user_create();
+    if (!machine) {
+        return -1;
+    }
+    return rvvm_user_linux_ex(machine, argc, argv, envp);
+}
+
 #else
 
 #include "utils.h"
+
+rvvm_machine_t* rvvm_user_create(void)
+{
+    rvvm_warn("Userland emulation not available, define RVVM_USER_TEST");
+    return NULL;
+}
+
+int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, char** envp)
+{
+    UNUSED(machine); UNUSED(argc); UNUSED(argv); UNUSED(envp);
+    rvvm_warn("Userland emulation not available, define RVVM_USER_TEST");
+    return -1;
+}
 
 int rvvm_user_linux(int argc, char** argv, char** envp)
 {
     UNUSED(argc); UNUSED(argv); UNUSED(envp);
     rvvm_warn("Userland emulation not available, define RVVM_USER_TEST");
     return -1;
+}
+
+void rvvm_user_free(rvvm_machine_t* machine)
+{
+    UNUSED(machine);
+}
+
+void rvvm_user_set_io_callback(rvvm_machine_t* machine, rvvm_user_io_callback callback)
+{
+    UNUSED(machine); UNUSED(callback);
+}
+
+void rvvm_user_set_exit_callback(rvvm_machine_t* machine, rvvm_user_exit_callback callback)
+{
+    UNUSED(machine); UNUSED(callback);
+}
+
+void rvvm_user_stop(rvvm_machine_t* machine, int exit_code)
+{
+    UNUSED(machine); UNUSED(exit_code);
+}
+
+bool rvvm_user_suspend(rvvm_machine_t* machine)
+{
+    UNUSED(machine);
+    return true;
+}
+
+void rvvm_user_resume(rvvm_machine_t* machine)
+{
+    UNUSED(machine);
+}
+
+bool rvvm_user_is_suspended(rvvm_machine_t* machine)
+{
+    UNUSED(machine);
+    return false;
 }
 
 #endif

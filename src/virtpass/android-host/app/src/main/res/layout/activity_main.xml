@@ -44,6 +44,15 @@
                 android:layout_marginEnd="4dp" />
 
             <Button
+                android:id="@+id/suspendButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/suspend_guest"
+                android:enabled="false"
+                android:layout_marginEnd="4dp" />
+
+            <Button
                 android:id="@+id/stopButton"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"

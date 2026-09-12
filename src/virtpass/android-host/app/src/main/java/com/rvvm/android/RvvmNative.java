@@ -134,6 +134,24 @@ public class RvvmNative {
     public static native void nativeStopGuest();
 
     /**
+     * Suspend the running guest: park its vCPUs and the frame clock.
+     * No-op when no guest is running or it is already suspended.
+     */
+    public static native void nativeSuspendGuest();
+
+    /**
+     * Resume a guest suspended by {@link #nativeSuspendGuest()}.
+     * No-op when no guest is running or it is not suspended.
+     */
+    public static native void nativeResumeGuest();
+
+    /**
+     * Check whether the running guest is suspended.
+     * @return true if the guest is currently suspended
+     */
+    public static native boolean nativeIsGuestSuspended();
+
+    /**
       * Set a callback invoked when the guest exits.
       * Called on the guest thread after rvvm_user_linux returns.
       * @param callback Listener for guest exit events, or null to clear

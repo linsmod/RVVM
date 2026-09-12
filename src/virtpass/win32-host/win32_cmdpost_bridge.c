@@ -115,12 +115,29 @@ static bool g_light_on = false;  /* handle 3 */
 
 /* Guest thread */
 static HANDLE g_guest_thread = NULL;
+/* Userland machine for the booted guest. Owned (and freed) by the guest thread
+ * once rvvm_user_linux_ex() runs, so the UI thread must only touch it through
+ * the guards below and never while no guest is booted. */
+static rvvm_machine_t* g_guest_machine = NULL;
 static int    g_guest_argc   = 0;
 static char** g_guest_argv   = NULL;
 /* Guest exit code. Written on the guest thread: host_guest_exit_cb() stores
  * the real code at sys_exit time, guest_thread_main() may overwrite it with
- * the rvvm_user_linux() error code if the guest never started. */
+ * the rvvm_user_linux_ex() error code if the guest never started. */
 static int    g_guest_rc     = -1;
+
+/* Host-side suspend/resume guards. The machine handle only exists while a guest
+ * is booted, so every host control call goes through these instead of testing
+ * g_guest_machine at each call site. */
+static bool guest_suspended(void)
+{
+    return g_guest_machine && rvvm_user_is_suspended(g_guest_machine);
+}
+
+static void guest_resume(void)
+{
+    if (g_guest_machine) rvvm_user_resume(g_guest_machine);
+}
 
 /* Visibility edge (Android foreground/background). true while the OS window is
  * minimized. PAUSE/STOP are emitted only on the visible -> minimized edge and
@@ -1124,7 +1141,7 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
              * stays off; launcher_toggle_suspend() re-arms it on resume. */
             g_minimized = false;
             cmdpost_set_choreographer_callback(on_choreographer_wait);
-            if (!rvvm_user_is_suspended()) vsync_clock_start();
+            if (!guest_suspended()) vsync_clock_start();
             queue_lifecycle(APP_CMD_START);
             queue_lifecycle(APP_CMD_RESUME);
         } else {
@@ -1180,9 +1197,9 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
              * WM_APP_GUEST_EXIT follows exactly as on a real guest exit. */
             KillTimer(hwnd, STOP_TIMER_ID);
             g_stop_watchdog = false;
-            if (g_guest_thread) {
+            if (g_guest_machine) {
                 winhost_log("Stop: guest ignored the teardown, forcing rvvm_user_stop()");
-                rvvm_user_stop(STOP_FORCED_EXIT_CODE);
+                rvvm_user_stop(g_guest_machine, STOP_FORCED_EXIT_CODE);
             }
         }
         return 0;
@@ -1202,6 +1219,9 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             CloseHandle(g_guest_thread);
             g_guest_thread = NULL;
         }
+        /* rvvm_user_linux_ex() frees the machine before the guest thread posts
+         * this message; drop the handle so no stale pointer survives. */
+        g_guest_machine = NULL;
         {
             char title[48];
             snprintf(title, sizeof(title), "guest exited (%d)", g_guest_rc);
@@ -1300,7 +1320,7 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
 
 /* rvvm exit hook (rvvm_user_set_exit_callback). Fires on the guest vCPU
  * thread the instant the guest calls sys_exit / sys_exit_group, while
- * rvvm_user_linux() is still unwinding the other vCPUs - so this must not
+ * rvvm_user_linux_ex() is still unwinding the other vCPUs - so this must not
  * touch cmdpost, the surface or the window; the ordered teardown runs later
  * in WM_APP_GUEST_EXIT.
  *
@@ -1311,7 +1331,7 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
  * picker (and Stop would take the window down with the guest). */
 static void host_guest_exit_cb(int exit_code)
 {
-    /* rvvm_user_linux() itself always returns 0 on a guest-driven exit, so
+    /* rvvm_user_linux_ex() itself always returns 0 on a guest-driven exit, so
      * this callback is the only source of the real exit code. */
     g_guest_rc = exit_code;
     winhost_log("guest exit callback: code %d", exit_code);
@@ -1321,13 +1341,14 @@ static DWORD WINAPI guest_thread_main(LPVOID arg)
 {
     static char* envp[] = { NULL };
     static char env_prefix[] = "RVVM_USER_PREFIX="; /* putenv needs a persistent string */
+    rvvm_machine_t* machine = g_guest_machine;
     (void)arg;
 
     /* Same pattern as jni_bridge.c: assets resolve relative to CWD */
     putenv(env_prefix);
 
     {
-        int rc = rvvm_user_linux(g_guest_argc, g_guest_argv, envp);
+        int rc = rvvm_user_linux_ex(machine, g_guest_argc, g_guest_argv, envp);
         /* 0 = guest-driven exit: host_guest_exit_cb() already recorded the
          * real exit code. Nonzero = the guest never started (ELF load
          * failure), the callback never fired, so propagate the error. */
@@ -1335,6 +1356,10 @@ static DWORD WINAPI guest_thread_main(LPVOID arg)
             g_guest_rc = rc;
         }
     }
+
+    /* rvvm_user_linux_ex() owns and has just freed the machine: drop our
+     * handle before the UI thread could touch it again. */
+    g_guest_machine = NULL;
 
     if (g_guest_argv) {
         int i;
@@ -1562,8 +1587,8 @@ static void launcher_stop(void)
     /* A suspended guest cannot poll the teardown, so the cooperative stop would
      * just sit out the grace period and end in a forced rvvm_user_stop(). Wake
      * it first: it then exits the normal way. */
-    if (rvvm_user_is_suspended()) {
-        rvvm_user_resume();
+    if (guest_suspended()) {
+        guest_resume();
         launcher_suspend_ui_reset();
         if (!g_minimized) vsync_clock_start();
         winhost_log("Stop: resuming the suspended guest first");
@@ -1585,13 +1610,13 @@ static void launcher_toggle_suspend(void)
 {
     if (!g_guest_thread) return;
 
-    if (rvvm_user_is_suspended()) {
-        rvvm_user_resume();
+    if (guest_suspended()) {
+        guest_resume();
         SetWindowTextA(g_btn_susp, "Suspend");
         if (!g_minimized) vsync_clock_start();
         winhost_log("Suspend: guest resumed");
     } else {
-        bool parked = rvvm_user_suspend();
+        bool parked = rvvm_user_suspend(g_guest_machine);
         SetWindowTextA(g_btn_susp, "Resume");
         vsync_clock_stop();
         winhost_log("Suspend: vCPUs %s",
@@ -1696,10 +1721,6 @@ bool win32_host_init(const char* title, int win_w, int win_h,
 
     cmdpost_init();
     win32_cmdpost_register_callbacks();
-    /* Guest exit: record the real exit code and route sys_exit through the
-     * graceful unwind instead of rvvm_user.c's _Exit() fallback (see
-     * host_guest_exit_cb). Same role as jni_bridge.c's on_guest_exit. */
-    rvvm_user_set_exit_callback(host_guest_exit_cb);
     vsync_clock_start();
     /* Try to load the GL backend (angle/swiftshader) */
     if (win32_gl_backend_load()) {
@@ -1729,14 +1750,32 @@ bool win32_host_start_guest(int argc, char** argv)
     g_logged_lock  = false;
     g_logged_frame = false;
 
+    /* Fresh userland instance per guest: its context (memory, harts, syscall
+     * state) is fully owned by the machine, so nothing leaks between guests. */
+    g_guest_machine = rvvm_user_create();
+    if (!g_guest_machine) {
+        winhost_log("rvvm_user_create failed");
+        return false;
+    }
+    /* Guest exit: record the real exit code and route sys_exit through the
+     * graceful unwind instead of rvvm_user.c's _Exit() fallback (see
+     * host_guest_exit_cb). Same role as jni_bridge.c's on_guest_exit. */
+    rvvm_user_set_exit_callback(g_guest_machine, host_guest_exit_cb);
+
     g_guest_argv = (char**)calloc((size_t)argc + 1, sizeof(char*));
-    if (!g_guest_argv) return false;
+    if (!g_guest_argv) {
+        rvvm_user_free(g_guest_machine);
+        g_guest_machine = NULL;
+        return false;
+    }
     for (i = 0; i < argc; i++) {
         g_guest_argv[i] = _strdup(argv[i]);
         if (!g_guest_argv[i]) {
             while (--i >= 0) free(g_guest_argv[i]);
             free(g_guest_argv);
             g_guest_argv = NULL;
+            rvvm_user_free(g_guest_machine);
+            g_guest_machine = NULL;
             return false;
         }
     }
@@ -1749,6 +1788,8 @@ bool win32_host_start_guest(int argc, char** argv)
         free(g_guest_argv);
         g_guest_argv = NULL;
         g_guest_argc = 0;
+        rvvm_user_free(g_guest_machine);
+        g_guest_machine = NULL;
         return false;
     }
 
@@ -1781,7 +1822,7 @@ void win32_host_shutdown(void)
     /* A suspended guest is parked in its wrap loop and cannot poll the teardown
      * WM_CLOSE queued, so wake it: it then takes the cooperative path below
      * instead of being forced down. No-op when it was not suspended. */
-    rvvm_user_resume();
+    guest_resume();
 
     /* Stop the audio backend before the guest thread: the WASAPI pump threads
      * must be joined before cmdpost_cleanup() tears down the stream table. */
@@ -1801,7 +1842,7 @@ void win32_host_shutdown(void)
         if (WaitForSingleObject(g_guest_thread, STOP_GRACE_MS) == WAIT_TIMEOUT) {
             winhost_log("guest did not exit within %d ms; forcing rvvm_user_stop()",
                         STOP_GRACE_MS);
-            rvvm_user_stop(STOP_FORCED_EXIT_CODE);
+            rvvm_user_stop(g_guest_machine, STOP_FORCED_EXIT_CODE);
         }
         /* Bounded wait: a guest also stuck in a blocking host syscall must not
          * make a graceful exit hang forever (CTRL_CLOSE_EVENT only grants ~5s

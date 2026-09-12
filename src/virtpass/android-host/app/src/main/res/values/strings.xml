@@ -4,4 +4,6 @@
     <string name="guest_app_label">Guest App:</string>
     <string name="run_guest">Run</string>
     <string name="stop_guest">Stop</string>
+    <string name="suspend_guest">Suspend</string>
+    <string name="resume_guest">Resume</string>
 </resources>

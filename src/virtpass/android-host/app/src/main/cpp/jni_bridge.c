@@ -214,12 +214,66 @@ static int64_t android_vsync_wait(void)
     return frame_time;
 }
 
+/*
+ * Start the AChoreographer vsync source thread. Idempotent: a no-op while the
+ * source already runs, so suspend/resume cycles can call it unconditionally.
+ */
+static void jni_vsync_start(void)
+{
+    if (g_vsync_running) {
+        return;
+    }
+
+    g_vsync_running = 1;
+    if (pthread_create(&g_vsync_thread, NULL, vsync_thread_func, NULL) != 0) {
+        g_vsync_running = 0;
+        LOGE("vsync: failed to start AChoreographer thread, guest will fall back");
+    }
+}
+
+/*
+ * Stop the vsync source thread and wait for it to unwind. Idempotent.
+ * Marks the source as lost so a guest currently blocked on the vsync fd is
+ * released to its own clock instead of waiting for a tick that will not come.
+ */
+static void jni_vsync_stop(void)
+{
+    if (!g_vsync_running) {
+        return;
+    }
+
+    g_vsync_running = 0;
+
+    /* Release a guest blocked in poll() on the vsync fd. */
+    vp_cmdpost_vsync_source_lost();
+
+    /* Wake a thread parked in ALooper_pollOnce(-1) ... */
+    if (g_vsync_looper) {
+        ALooper_wake(g_vsync_looper);
+    }
+    /* ... and one parked in android_vsync_wait(). */
+    pthread_mutex_lock(&g_vsync_mutex);
+    pthread_cond_broadcast(&g_vsync_cond);
+    pthread_mutex_unlock(&g_vsync_mutex);
+
+    pthread_join(g_vsync_thread, NULL);
+    g_vsync_looper = NULL;
+}
+
 /* Guest execution state */
 static pthread_t g_guest_thread;
 static int g_guest_running = 0;
+/* Host-side mirror of the suspend request. rvvm_user_is_suspended() would answer
+ * the same, but only by dereferencing the machine - which the guest thread frees
+ * the instant it exits, while this flag stays valid from any thread (the UI
+ * polls it). */
+static volatile int g_guest_suspended = 0;
 static char g_guest_elf_path[512];
 static int g_guest_argc = 0;
 static char* g_guest_argv[16];
+/* Userland machine for the running guest. Created in nativeRunElf(), freed by
+ * rvvm_user_linux_ex() on the guest thread. */
+static rvvm_machine_t* g_guest_machine = NULL;
 
 /* Guest exit callback (Java object reference, held by global ref) */
 static jobject g_exit_listener = NULL;
@@ -227,11 +281,17 @@ static jobject g_exit_listener = NULL;
 /* Guest thread function */
 static void* guest_thread_func(void* arg)
 {
+    rvvm_machine_t* machine = g_guest_machine;
     (void)arg;
-    
+
+    /* Detach: the launcher runs guest after guest, so this thread must release
+     * its own resources on exit instead of lingering as a joinable zombie
+     * (nothing ever pthread_join()s it). */
+    pthread_detach(pthread_self());
+
     LOGI("Guest thread started, ELF: %s", g_guest_elf_path);
     
-    /* Build argc/argv for rvvm_user_linux() */
+    /* Build argc/argv for rvvm_user_linux_ex() */
     /* argv[0] = ELF path, argv[1..] = guest args */
     g_guest_argv[0] = g_guest_elf_path;
     
@@ -239,10 +299,13 @@ static void* guest_thread_func(void* arg)
      * Debian userland path. Disable it so host paths pass through unchanged. */
     putenv("RVVM_USER_PREFIX=");
     
-    int result = rvvm_user_linux(g_guest_argc, g_guest_argv, NULL);
+    int result = rvvm_user_linux_ex(machine, g_guest_argc, g_guest_argv, NULL);
     
     LOGI("Guest thread finished with code: %d", result);
+    /* rvvm_user_linux_ex() owns and has just freed the machine */
+    g_guest_machine = NULL;
     g_guest_running = 0;
+    g_guest_suspended = 0;
     
     return NULL;
 }
@@ -709,6 +772,43 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved)
 /* Forward declaration */
 static void on_guest_exit(int exit_code);
 
+/* ============================================================
+ * (Re)install every vp_cmdpost callback the guest depends on.
+ *
+ * rvvm_user.c calls cmdpost_cleanup() when a guest exits, which NULLs every
+ * callback and drops the audio backend. A host that reuses the process
+ * (launcher: Run after Run) must therefore reinstall them before each guest -
+ * the same role win32_cmdpost_register_callbacks() plays for the win32 host.
+ * nativeInit() runs this once for the first guest; nativeRunElf() re-runs it
+ * for every later one, so a relaunched guest never probes a dead proxy.
+ * ============================================================ */
+static void jni_register_cmdpost_callbacks(void)
+{
+    extern const vp_audio_ops_t* android_aaudio_ops(void);
+
+    /* Window / surface + configuration */
+    cmdpost_set_window_callbacks(on_window_lock, on_window_unlock);
+    cmdpost_set_window_size_callback(on_window_size);
+    cmdpost_set_window_set_buf_callback(on_window_set_buf);
+    cmdpost_set_config_callback(on_config_get);
+
+    /* GameActivity lifecycle + input */
+    cmdpost_set_game_callbacks(on_game_lifecycle, on_game_input);
+
+    /* Real display vsync as the guest's AChoreographer source. Only re-armed
+     * while its owner thread is alive; otherwise the source stays unavailable
+     * and the guest falls back to its own clock instead of waiting for a tick
+     * that will never come. */
+    if (g_vsync_running) {
+        cmdpost_set_choreographer_callback(android_vsync_wait);
+        g_vsync_warned = 0;
+    }
+
+    /* Real AAudio backend: the pump thread in vp_aaudio_android.c bridges the
+     * guest's SPSC ring to AAudioStream. */
+    cmdpost_set_audio_callbacks(android_aaudio_ops());
+}
+
 JNIEXPORT void JNICALL
 Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
 {
@@ -717,29 +817,14 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
 
     /* Initialize vp_cmdpost */
     cmdpost_init();
-    
-    /* Set window callbacks */
-    cmdpost_set_window_callbacks(on_window_lock, on_window_unlock);
-    cmdpost_set_window_size_callback(on_window_size);
-    cmdpost_set_window_set_buf_callback(on_window_set_buf);
-    cmdpost_set_config_callback(on_config_get);
-    
-    /* Set GameActivity callbacks */
-    cmdpost_set_game_callbacks(on_game_lifecycle, on_game_input);
 
     /* Expose the real display vsync as the guest's AChoreographer source. */
-    cmdpost_set_choreographer_callback(android_vsync_wait);
-    g_vsync_running = 1;
-    if (pthread_create(&g_vsync_thread, NULL, vsync_thread_func, NULL) != 0) {
-        g_vsync_running = 0;
-        cmdpost_set_choreographer_callback(NULL);
-        LOGE("vsync: failed to start AChoreographer thread, guest will fall back");
-    }
+    jni_vsync_start();
 
-    /* Phase 5: register the real AAudio backend. The pump thread in
-     * vp_aaudio_android.c bridges the guest's SPSC ring to AAudioStream. */
-    extern const vp_audio_ops_t* android_aaudio_ops(void);
-    cmdpost_set_audio_callbacks(android_aaudio_ops());
+    /* Install every bridge callback the guest needs: window/config/game, the
+     * vsync source and the real AAudio backend. nativeRunElf() re-runs this
+     * before every later guest - see jni_register_cmdpost_callbacks(). */
+    jni_register_cmdpost_callbacks();
 
     /* Get Android sensor manager (per-package singleton, API 26+) */
     g_sensor_manager = ASensorManager_getInstanceForPackage(NULL);
@@ -764,9 +849,6 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
         g_event_queue = ASensorManager_createEventQueue(g_sensor_manager, g_looper, 0, NULL, NULL);
         LOGI("Event queue created");
     }
-
-    /* Set guest exit callback */
-    rvvm_user_set_exit_callback(on_guest_exit);
 
     LOGI("Native init complete");
 }
@@ -793,26 +875,19 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
         ASensorManager_destroyEventQueue(g_sensor_manager, g_event_queue);
     }
 
-    /* Stop the vsync source before tearing down the bridge. */
-    if (g_vsync_running) {
-        g_vsync_running = 0;
-
-        /* Release a guest blocked in poll() on the vsync fd: it is told the
-         * clock is gone so it degrades instead of waiting forever. */
-        vp_cmdpost_vsync_source_lost();
-
-        /* Wake a thread parked in ALooper_pollOnce(-1) ... */
-        if (g_vsync_looper) {
-            ALooper_wake(g_vsync_looper);
-        }
-        /* ... and one parked in android_vsync_wait(). */
-        pthread_mutex_lock(&g_vsync_mutex);
-        pthread_cond_broadcast(&g_vsync_cond);
-        pthread_mutex_unlock(&g_vsync_mutex);
-
-        pthread_join(g_vsync_thread, NULL);
-        g_vsync_looper = NULL;
+    /* A suspended guest is parked and would never poll again; wake it before
+     * the teardown below so it is not left parked against a torn-down bridge. */
+    if (g_guest_suspended && g_guest_machine) {
+        rvvm_user_resume(g_guest_machine);
+        g_guest_suspended = 0;
     }
+
+    /* Stop the vsync source before tearing down the bridge. */
+    jni_vsync_stop();
+
+    /* Close any AAudio stream the guest did not release itself. */
+    extern void android_aaudio_shutdown(void);
+    android_aaudio_shutdown();
 
     /* Cleanup vp_cmdpost */
     cmdpost_cleanup();
@@ -1190,12 +1265,37 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
     }
     
     LOGI("Starting guest: %s (argc=%d)", g_guest_elf_path, g_guest_argc);
+
+    /* The previous guest's exit ran cmdpost_cleanup(), which NULLed every
+     * host-side callback (audio backend included). Restore them before this
+     * guest starts, or it probes a dead proxy and exits(1) at its first
+     * AAUDIO_QUERY. */
+    jni_register_cmdpost_callbacks();
+
+    /* Per-guest diagnostics: report this guest's first frame/geometry too, not
+     * just the first guest the process ever ran. */
+    g_log_gw = g_log_gh = g_log_gf = -1;
+    g_no_window_logged = 0;
+    
+    /* Fresh userland instance per guest, so nothing leaks between runs. */
+    g_guest_machine = rvvm_user_create();
+    if (!g_guest_machine) {
+        LOGE("Failed to create userland machine");
+        return JNI_FALSE;
+    }
+    /* on_guest_exit re-reads g_exit_listener when it fires, so registering it
+     * once per run covers a listener set before or after this point. */
+    rvvm_user_set_exit_callback(g_guest_machine, on_guest_exit);
     
     /* Start guest thread */
     g_guest_running = 1;
+    g_guest_suspended = 0;
     if (pthread_create(&g_guest_thread, NULL, guest_thread_func, NULL) != 0) {
         LOGE("Failed to create guest thread");
         g_guest_running = 0;
+        g_guest_suspended = 0;
+        rvvm_user_free(g_guest_machine);
+        g_guest_machine = NULL;
         return JNI_FALSE;
     }
     
@@ -1218,10 +1318,75 @@ Java_com_rvvm_android_RvvmNative_nativeStopGuest(JNIEnv* env, jobject thiz)
     
     if (g_guest_running) {
         LOGI("Stopping guest...");
-        /* TODO: Send signal to guest thread to stop */
-        /* For now, we just mark it as not running */
-        g_guest_running = 0;
+        /* A suspended guest is parked and cannot poll for the stop; resume it
+         * first so it unwinds the normal way instead of being forced down. The
+         * frame clock stays off: the guest degrades to its own clock while it
+         * tears down, so there is no point restarting a source we are about to
+         * retire. */
+        if (g_guest_suspended && g_guest_machine) {
+            rvvm_user_resume(g_guest_machine);
+            g_guest_suspended = 0;
+            LOGI("Stop: resumed the suspended guest first");
+        }
+        /* Kick every guest vCPU out of its run loop; the guest unwinds like a
+         * sys_exit_group(0), so on_guest_exit fires and guest_thread_func
+         * clears g_guest_running once rvvm_user_linux_ex() returns. */
+        if (g_guest_machine) {
+            rvvm_user_stop(g_guest_machine, 0);
+        }
     }
+}
+
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeSuspendGuest(JNIEnv* env, jobject thiz)
+{
+    (void)env;
+    (void)thiz;
+
+    if (!g_guest_running || !g_guest_machine || g_guest_suspended) {
+        return;
+    }
+
+    bool parked = rvvm_user_suspend(g_guest_machine);
+    g_guest_suspended = 1;
+
+    /* Park the frame clock too: a parked guest polls neither frames nor
+     * lifecycle commands, so a running clock would only pile up vsync ticks
+     * for it to burn through on resume. Mirrors win32's vsync_clock_stop(). */
+    jni_vsync_stop();
+
+    LOGI("Suspend: vCPUs %s", parked ? "parked"
+                                     : "parking (one is in a blocking syscall)");
+}
+
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeResumeGuest(JNIEnv* env, jobject thiz)
+{
+    (void)env;
+    (void)thiz;
+
+    if (!g_guest_running || !g_guest_machine || !g_guest_suspended) {
+        return;
+    }
+
+    /* Bring the clock back up before the guest: stopping it raised the
+     * source-lost flag, and re-registering the callbacks both clears that flag
+     * and lets the resumed guest use the fd-wakeup path again. */
+    jni_vsync_start();
+    jni_register_cmdpost_callbacks();
+
+    g_guest_suspended = 0;
+    rvvm_user_resume(g_guest_machine);
+    LOGI("Suspend: guest resumed");
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_rvvm_android_RvvmNative_nativeIsGuestSuspended(JNIEnv* env, jobject thiz)
+{
+    (void)env;
+    (void)thiz;
+    /* Reported from the host-side flag, not the machine: see g_guest_suspended. */
+    return g_guest_suspended ? JNI_TRUE : JNI_FALSE;
 }
 
 /* C callback invoked by rvvm_user when the guest exits.
@@ -1266,8 +1431,8 @@ Java_com_rvvm_android_RvvmNative_nativeSetExitCallback(JNIEnv* env, jobject thiz
 
     if (listener) {
         g_exit_listener = (*env)->NewGlobalRef(env, listener);
-        rvvm_user_set_exit_callback(on_guest_exit);
-    } else {
-        rvvm_user_set_exit_callback(NULL);
+        /* The per-run machine is not alive yet (or already gone); on_guest_exit
+         * is registered on it in nativeRunElf() and re-reads g_exit_listener
+         * when it fires, so there is nothing to wire up here. */
     }
 }

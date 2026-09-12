@@ -23,23 +23,49 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <stdint.h>
 #include <stdbool.h>
 
+#include <rvvm/rvvm_base.h> /* rvvm_machine_t handle */
+
 // Callback type for guest I/O redirection
 // Returns number of bytes written, or -1 on error
 typedef ssize_t (*rvvm_user_io_callback)(int fd, const void* buf, size_t count);
 
 // Set custom I/O callback for guest write syscalls
 // If callback returns -1, the syscall will fail with errno
-void rvvm_user_set_io_callback(rvvm_user_io_callback callback);
+void rvvm_user_set_io_callback(rvvm_machine_t* machine, rvvm_user_io_callback callback);
 
 // Callback type for guest exit event
 // Called when the guest exits (sys_exit or sys_exit_group)
 typedef void (*rvvm_user_exit_callback)(int exit_code);
 
 // Set callback invoked when the guest exits
-// Called from the guest thread after rvvm_user_linux returns
-void rvvm_user_set_exit_callback(rvvm_user_exit_callback callback);
+// Called from the guest thread after the guest unwinds
+void rvvm_user_set_exit_callback(rvvm_machine_t* machine, rvvm_user_exit_callback callback);
 
-// Just call this like main(), envp may be NULL
+// Create a userland machine instance without starting it.
+//
+// This is the multi-instance entry point: everything the guest needs (memory,
+// harts, syscall state) hangs off the returned machine, so several instances
+// can coexist in one process. Set callbacks on it, then hand it to
+// rvvm_user_linux_ex() from a dedicated thread.
+//
+// Returns NULL when userland emulation is unavailable (RVVM_USER_TEST not
+// defined) or on allocation failure.
+rvvm_machine_t* rvvm_user_create(void);
+
+// Destroy a machine obtained from rvvm_user_create() and release its context.
+//
+// Do NOT call this on an instance that rvvm_user_linux_ex() has already
+// returned from - that function owns the machine and frees it itself.
+void rvvm_user_free(rvvm_machine_t* machine);
+
+// Run a guest on @machine until it exits. Blocks the calling thread; the
+// machine (and its context) is freed before returning.
+// Just call this like main(), envp may be NULL. Returns the guest exit status.
+int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, char** envp);
+
+// Convenience single-instance entry point: creates a machine, runs the guest
+// on it and returns the guest exit status. Just call this like main(), envp
+// may be NULL.
 int rvvm_user_linux(int argc, char** argv, char** envp);
 
 // Stop a guest from host code (e.g. a GUI thread), for guests that ignore the
@@ -48,12 +74,12 @@ int rvvm_user_linux(int argc, char** argv, char** envp);
 // This is NOT TerminateThread(): every guest vCPU is kicked out of the
 // interpreter and unhooked from its run loop, so the emulator unwinds exactly
 // like a guest sys_exit_group(exit_code) would - the exit callback fires, each
-// guest thread runs its own cleanup, and rvvm_user_linux() returns on its own.
+// guest thread runs its own cleanup, and rvvm_user_linux_ex() returns on its own.
 //
-// Safe to call from any thread while rvvm_user_linux() is running. A no-op
+// Safe to call from any thread while rvvm_user_linux_ex() is running. A no-op
 // when no guest is running. The exit callback, if set, is invoked on the
 // calling thread instead of a guest thread.
-void rvvm_user_stop(int exit_code);
+void rvvm_user_stop(rvvm_machine_t* machine, int exit_code);
 
 // Suspend a running guest from host code (e.g. a GUI thread).
 //
@@ -61,22 +87,22 @@ void rvvm_user_stop(int exit_code);
 // rvvm_user_resume(). This is reversible: nothing is torn down, no exit
 // callback fires, and on resume each vCPU continues exactly where it stopped.
 //
-// Safe to call from any thread while rvvm_user_linux() is running; a no-op (and
-// true) when the guest is already suspended, or when no guest is running.
+// Safe to call from any thread while rvvm_user_linux_ex() is running; a no-op
+// (and true) when the guest is already suspended, or when no guest is running.
 //
 // Blocks (bounded) until every vCPU has parked and returns true. It returns
 // false when a guest thread is stuck in a blocking host syscall - it will park
 // as soon as that syscall returns, so the guest is not left half-paused, just
 // not stopped yet.
-bool rvvm_user_suspend(void);
+bool rvvm_user_suspend(rvvm_machine_t* machine);
 
 // Resume a guest suspended with rvvm_user_suspend(). No-op otherwise.
-void rvvm_user_resume(void);
+void rvvm_user_resume(rvvm_machine_t* machine);
 
 // True while the guest is suspended. Note this reports the requested state:
 // right after rvvm_user_suspend() returns false, the guest is suspended but
 // some vCPU may still be draining a blocking host syscall.
-bool rvvm_user_is_suspended(void);
+bool rvvm_user_is_suspended(rvvm_machine_t* machine);
 
 // Translate a guest virtual address into a host pointer.
 //

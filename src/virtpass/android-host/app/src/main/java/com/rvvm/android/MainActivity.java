@@ -59,6 +59,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private SurfaceView surfaceView;
     private SurfaceHolder surfaceHolder;
     private Button runButton;
+    private Button suspendButton;
     private Button stopButton;
     private Spinner guestAppSpinner;
 
@@ -88,6 +89,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         sensorDataText = findViewById(R.id.sensorDataText);
         surfaceView = findViewById(R.id.surfaceView);
         runButton = findViewById(R.id.runButton);
+        suspendButton = findViewById(R.id.suspendButton);
         stopButton = findViewById(R.id.stopButton);
         guestAppSpinner = findViewById(R.id.guestAppSpinner);
 
@@ -120,6 +122,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
         // Setup buttons
         runButton.setOnClickListener(v -> runGuestElf());
+        suspendButton.setOnClickListener(v -> toggleSuspendGuest());
         stopButton.setOnClickListener(v -> stopGuestElf());
         updateButtonStates();
 
@@ -306,9 +309,36 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         updateButtonStates();
     }
 
+    /**
+     * Pause/resume the guest: the native side parks the guest's vCPUs (and the
+     * frame clock) without tearing anything down, so the guest keeps its state
+     * and continues exactly where it left off on resume.
+     */
+    private void toggleSuspendGuest() {
+        if (!isInitialized || !RvvmNative.nativeIsGuestRunning()) {
+            return;
+        }
+        if (RvvmNative.nativeIsGuestSuspended()) {
+            RvvmNative.nativeResumeGuest();
+            statusText.setText("Guest resumed");
+            Log.i(TAG, "Guest resumed");
+        } else {
+            RvvmNative.nativeSuspendGuest();
+            statusText.setText("Guest suspended");
+            Log.i(TAG, "Guest suspended");
+        }
+        updateButtonStates();
+    }
+
     private void updateButtonStates() {
         boolean running = RvvmNative.nativeIsGuestRunning();
+        // nativeIsGuestSuspended() is only meaningful while a guest runs; it
+        // reports the requested state, so the label flips immediately even when
+        // a vCPU is still unwinding a blocking host syscall.
+        boolean suspended = running && RvvmNative.nativeIsGuestSuspended();
         runButton.setEnabled(!running);
+        suspendButton.setEnabled(running);
+        suspendButton.setText(suspended ? R.string.resume_guest : R.string.suspend_guest);
         stopButton.setEnabled(running);
         guestAppSpinner.setEnabled(!running);
     }

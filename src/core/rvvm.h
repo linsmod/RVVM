@@ -308,6 +308,12 @@ struct randomize_layout rvvm_machine_t {
 
     rvvm_addr_t opts[RVVM_OPTS_ARR_SIZE];
 
+    // Opaque per-mode state owned by whoever created the machine, e.g. the
+    // userland context (rvvm_userland_t) of a userland machine. The core never
+    // reads it, so a mode module can attach its own context without the core
+    // having to know about it. NULL when unused.
+    void* userdata;
+
 #if defined(USE_FDT)
     // FDT nodes for device tree generation
     struct fdt_node* fdt;
