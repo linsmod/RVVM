@@ -21,6 +21,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 // Callback type for guest I/O redirection
 // Returns number of bytes written, or -1 on error
@@ -40,6 +41,42 @@ void rvvm_user_set_exit_callback(rvvm_user_exit_callback callback);
 
 // Just call this like main(), envp may be NULL
 int rvvm_user_linux(int argc, char** argv, char** envp);
+
+// Stop a guest from host code (e.g. a GUI thread), for guests that ignore the
+// cooperative teardown the host normally asks for.
+//
+// This is NOT TerminateThread(): every guest vCPU is kicked out of the
+// interpreter and unhooked from its run loop, so the emulator unwinds exactly
+// like a guest sys_exit_group(exit_code) would - the exit callback fires, each
+// guest thread runs its own cleanup, and rvvm_user_linux() returns on its own.
+//
+// Safe to call from any thread while rvvm_user_linux() is running. A no-op
+// when no guest is running. The exit callback, if set, is invoked on the
+// calling thread instead of a guest thread.
+void rvvm_user_stop(int exit_code);
+
+// Suspend a running guest from host code (e.g. a GUI thread).
+//
+// Every guest vCPU is stopped at an instruction boundary and parked until
+// rvvm_user_resume(). This is reversible: nothing is torn down, no exit
+// callback fires, and on resume each vCPU continues exactly where it stopped.
+//
+// Safe to call from any thread while rvvm_user_linux() is running; a no-op (and
+// true) when the guest is already suspended, or when no guest is running.
+//
+// Blocks (bounded) until every vCPU has parked and returns true. It returns
+// false when a guest thread is stuck in a blocking host syscall - it will park
+// as soon as that syscall returns, so the guest is not left half-paused, just
+// not stopped yet.
+bool rvvm_user_suspend(void);
+
+// Resume a guest suspended with rvvm_user_suspend(). No-op otherwise.
+void rvvm_user_resume(void);
+
+// True while the guest is suspended. Note this reports the requested state:
+// right after rvvm_user_suspend() returns false, the guest is suspended but
+// some vCPU may still be draining a blocking host syscall.
+bool rvvm_user_is_suspended(void);
 
 // Translate a guest virtual address into a host pointer.
 //

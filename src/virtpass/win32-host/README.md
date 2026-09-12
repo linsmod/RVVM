@@ -121,7 +121,7 @@ Build the guests first (`mingw32-make android-assets`, zig/musl - see
 
 Run with **no guest argument** and the host shows a picker instead: a dropdown
 listing the `.exe` guests found in the assets directory plus **Run / Stop /
-Exit** buttons. `--assets <dir>` (or `RVVM_ASSETS`) points at that directory;
+Suspend / Exit** buttons. `--assets <dir>` (or `RVVM_ASSETS`) points at that directory;
 the default is `src\virtpass\android-host\app\src\main\assets`. Known sample
 names are used as a fallback when the directory is missing or empty.
 
@@ -133,10 +133,29 @@ names are used as a fallback when the directory is missing or empty.
 - **Run** boots the selected guest into the existing window (it also sends
   the Android startup lifecycle). When the guest exits, the picker is
   re-shown in the same window so another guest can be run.
-- **Stop** is a cooperative stop: it queues the Android teardown
+- **Stop** is cooperative first: it queues the Android teardown
   (`PAUSE`/`STOP`/`DESTROY`) so a well-behaved guest tears down and exits on
-  its own. The guest thread cannot be force-killed safely, so a guest that
-  ignores lifecycle commands will not stop.
+  its own. If the guest is still alive after `STOP_GRACE_MS` (1500 ms) it never
+  polls its lifecycle commands (`test_render` renders in a loop and ignores
+  `APP_CMD_DESTROY`), so the host takes it down itself via `rvvm_user_stop()`
+  from `src/core/rvvm_user.c`. That is not `TerminateThread()`: it pauses every
+  guest vCPU and marks every guest thread finished, so the guest still unwinds
+  through its normal exit path (`cmdpost_cleanup`, machine free) and the picker
+  comes back exactly as on a real guest exit. A forced stop reports exit code
+  137 (128 + `SIGKILL`).
+- **Suspend** (toggles to **Resume**) parks the guest without tearing it down:
+  `rvvm_user_suspend()` / `rvvm_user_resume()` in `src/core/rvvm_user.c`. Every
+  guest vCPU is kicked out of the interpreter with a hart pause (which also
+  wakes WFI sleepers) and then parks in its wrap loop until resume; on resume it
+  re-enters at the same PC, so nothing is lost and no exit callback fires. The
+  frame clock is stopped while suspended (a parked guest polls neither frames
+  nor lifecycle commands, so a live clock would only pile up vsync ticks).
+  `rvvm_user_suspend()` blocks until the vCPUs have actually parked (bounded
+  `USERLAND_SUSPEND_BARRIER_MS`, 200 ms - a guest blocked in a host syscall can
+  only park once that returns). Pressing **Stop** or closing the window resumes
+  a suspended guest first, so the cooperative teardown still has something
+  polling it. Measured on `test_render`: ~1.9 s CPU per 1.5 s wall while running,
+  **0 ms** while suspended, ~1.8 s again after resume.
 
 Debug switches:
 

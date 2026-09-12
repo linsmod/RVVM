@@ -753,6 +753,114 @@ static vector_t(rvvm_user_thread_t*) userland_threads = ZERO_INIT;
 static rvvm_user_thread_t* userland_main_thread = NULL;
 static uint32_t userland_exit_reported = 0;
 
+/*
+ * Host-side suspend/resume (rvvm_user_suspend()/rvvm_user_resume()).
+ *
+ * userland_suspend is both the requested state and the futex word the parked
+ * vCPUs wait on: while it reads 1 a parked vCPU sits in
+ * rvvm_futex_wait(&userland_suspend, 1, ...), so clearing it wakes them all.
+ * userland_parked counts the vCPUs that are actually parked, which lets
+ * rvvm_user_suspend() be a barrier instead of a fire-and-forget request.
+ */
+static uint32_t userland_suspend = 0;
+static uint32_t userland_parked  = 0;
+
+/*
+ * Bounded wait for the parked vCPUs, so a missed wakeup costs latency but can
+ * never turn into a stuck vCPU. The futex wake does the real work.
+ */
+#define USERLAND_SUSPEND_POLL_NS (100 * 1000000ULL)
+
+/*
+ * How long rvvm_user_suspend() waits for the vCPUs to reach the park point. A
+ * guest blocked in a host syscall (e.g. a read() waiting on input) cannot park
+ * until that returns, so the barrier gives up instead of hanging the caller.
+ */
+#define USERLAND_SUSPEND_BARRIER_MS 200
+
+/*
+ * Park the calling guest thread while the process is suspended. Returns
+ * immediately (one relaxed load) when the guest is not suspended, so it costs
+ * nothing on the hot path.
+ */
+static void userland_park_if_suspended(rvvm_user_thread_t* thread)
+{
+    if (likely(atomic_load_uint32(&userland_suspend) == 0)) {
+        return;
+    }
+
+    atomic_add_uint32(&userland_parked, 1);
+    while (atomic_load_uint32(&userland_suspend) && !atomic_load_uint32(&thread->finished)) {
+        rvvm_futex_wait(&userland_suspend, 1, USERLAND_SUSPEND_POLL_NS);
+    }
+    atomic_sub_uint32(&userland_parked, 1);
+}
+
+/*
+ * Host-initiated suspend: stop every guest vCPU at an instruction boundary and
+ * keep it stopped until rvvm_user_resume().
+ *
+ * Unlike rvvm_user_stop() this is fully reversible - nothing is marked
+ * finished and no state is torn down. Each vCPU is kicked out of the
+ * interpreter with a hart pause (which also wakes WFI sleepers), then parks in
+ * its wrap loop; on resume it re-enters exactly where it left off.
+ *
+ * Safe to call from any thread while rvvm_user_linux() is running, and a no-op
+ * when the guest is already suspended. Returns true if every registered vCPU
+ * parked within USERLAND_SUSPEND_BARRIER_MS; false means at least one thread
+ * is stuck in a blocking host syscall and will park once that returns.
+ */
+PUBLIC bool rvvm_user_suspend(void)
+{
+    if (atomic_swap_uint32(&userland_suspend, 1)) {
+        return true; // Already suspended
+    }
+
+    spin_lock(&userland_threads_lock);
+    vector_foreach(userland_threads, i) {
+        rvvm_user_thread_t* thread = vector_at(userland_threads, i);
+        if (thread->cpu) {
+            // Break out of the interpreter at the next instruction boundary
+            riscv_hart_queue_pause(thread->cpu);
+        }
+    }
+    spin_unlock(&userland_threads_lock);
+
+    // Barrier: wait for the vCPUs to actually park. Recomputed every round so a
+    // vCPU that registers (clone) or deregisters (exit) concurrently does not
+    // make the count impossible to reach.
+    for (uint32_t i = 0; i < USERLAND_SUSPEND_BARRIER_MS; ++i) {
+        uint32_t total = 0;
+        uint32_t parked = atomic_load_uint32(&userland_parked);
+        spin_lock(&userland_threads_lock);
+        total = vector_size(userland_threads);
+        spin_unlock(&userland_threads_lock);
+        if (parked >= total) {
+            return true;
+        }
+        sleep_ms(1);
+    }
+    return false;
+}
+
+/*
+ * Resume a guest suspended with rvvm_user_suspend(). Wakes every parked vCPU;
+ * no-op when the guest is not suspended.
+ */
+PUBLIC void rvvm_user_resume(void)
+{
+    if (atomic_swap_uint32(&userland_suspend, 0) == 0) {
+        return; // Was not suspended
+    }
+    rvvm_futex_wake(&userland_suspend, UINT32_MAX);
+}
+
+// True while the guest is suspended (requested; see rvvm_user_suspend())
+PUBLIC bool rvvm_user_is_suspended(void)
+{
+    return atomic_load_uint32(&userland_suspend) != 0;
+}
+
 static void userland_thread_register(rvvm_user_thread_t* thread)
 {
     spin_lock(&userland_threads_lock);
@@ -794,6 +902,28 @@ static void userland_process_exit(int code, rvvm_user_thread_t* self)
         }
     }
     spin_unlock(&userland_threads_lock);
+
+    // Release vCPUs parked by rvvm_user_suspend(): they were told to finish
+    // above but cannot see it while suspended, and must unwind like the rest.
+    if (atomic_swap_uint32(&userland_suspend, 0)) {
+        rvvm_futex_wake(&userland_suspend, UINT32_MAX);
+    }
+}
+
+/*
+ * Host-initiated stop: the win32 launcher's Stop falls back to this when a
+ * guest ignores the Android lifecycle teardown (a guest that never polls
+ * APP_CMD_DESTROY, or one wedged in its own loop).
+ *
+ * It goes through the guest-exit path with self == NULL. The caller is not a
+ * guest thread, so no thread is exempt: every guest thread - the guest main
+ * thread included - is paused and marked finished, then breaks out of its wrap
+ * loop and unwinds through the normal cleanup. That makes this a clean stop
+ * rather than a TerminateThread() on live interpreter state.
+ */
+PUBLIC void rvvm_user_stop(int exit_code)
+{
+    userland_process_exit(exit_code, NULL);
 }
 
 /*
@@ -1277,7 +1407,23 @@ static void* rvvm_user_thread_wrap(void* arg)
             // Userland is shutting down - leave the run loop cleanly
             break;
         }
+        // Suspended by the host (rvvm_user_suspend): park here until resume
+        userland_park_if_suspended(thread);
+        if (atomic_load_uint32(&thread->finished)) {
+            // Shutdown raced the suspend - do not re-enter the guest to unwind
+            break;
+        }
         rvvm_addr_t cause = rvvm_run_user_thread(cpu);
+        if (atomic_load_uint32(&userland_suspend)) {
+            /*
+             * A suspend request kicked this vCPU out of the interpreter. The
+             * value we got back describes whatever trapped last, not a fresh
+             * trap, so it must not be interpreted as a syscall. Dropping it
+             * loses nothing: the vCPU was not advanced, so on resume it
+             * re-enters at the same PC and the trap (if any) reoccurs.
+             */
+            continue;
+        }
         if (cause == 8) {
             // Handle syscall trap
             rvvm_addr_t a0 = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 10);
@@ -2192,6 +2338,10 @@ static void jump_start(size_t entry, size_t stack_top)
     );
 #else
     atomic_store_uint32(&userland_exit_reported, 0);
+    // A new guest starts running: the launcher boots several in one process,
+    // so a suspend left over from the previous one must not carry over.
+    atomic_store_uint32(&userland_suspend, 0);
+    atomic_store_uint32(&userland_parked, 0);
 
     rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
     thread->cpu = rvvm_create_user_thread(userland);

@@ -41,17 +41,30 @@
 #define WM_APP_RESIZE_TO_SURFACE (WM_APP + 2)
 #define SENSOR_TIMER_ID   1
 #define SENSOR_TIMER_MS   100
+/* Stop watchdog: armed together with the cooperative teardown, fires when the
+ * guest is still alive at the end of the grace period. */
+#define STOP_TIMER_ID     2
 
 /* Launcher (Android-style picker) child control IDs. */
-#define IDC_COMBO 101
-#define IDC_RUN   102
-#define IDC_STOP  103
-#define IDC_EXIT  104
+#define IDC_COMBO   101
+#define IDC_RUN     102
+#define IDC_STOP    103
+#define IDC_EXIT    104
+#define IDC_SUSPEND 105
 
 /* How long win32_host_shutdown() waits for the guest thread to unwind. Kept
  * below the ~5s budget Windows grants a CTRL_CLOSE_EVENT handler so a
  * console-close shutdown still completes before the OS hard-kills us. */
 #define GUEST_EXIT_TIMEOUT_MS 4000
+
+/* Grace period the cooperative Android teardown gets before the host stops the
+ * guest itself. A guest that polls its lifecycle commands exits in a frame or
+ * two; anything still alive after this is not going to exit on its own. */
+#define STOP_GRACE_MS 1500
+
+/* Exit code reported for a host-forced stop (128 + SIGKILL). It is not a guest
+ * exit code: the guest was taken down by the host, not by its own sys_exit. */
+#define STOP_FORCED_EXIT_CODE 137
 
 /* ------------------------------------------------------------------ */
 /* Host state                                                          */
@@ -169,11 +182,16 @@ static HWND g_combo     = NULL;      /* guest dropdown        */
 static HWND g_btn_run   = NULL;      /* Run  button           */
 static HWND g_btn_stop  = NULL;      /* Stop button           */
 static HWND g_btn_exit  = NULL;      /* Exit button           */
+static HWND g_btn_susp  = NULL;      /* Suspend/Resume toggle */
 
 /* Guest switch requested while another guest is still running: the old one is
  * torn down cooperatively and this pick is booted from WM_APP_GUEST_EXIT. */
 static bool g_switch_pending = false;
 static int  g_switch_sel     = -1;
+
+/* True while the Stop watchdog (STOP_TIMER_ID) is armed, i.e. a cooperative
+ * teardown is outstanding. Cleared when the guest exits or the watchdog fires. */
+static bool g_stop_watchdog  = false;
 
 /* Off-screen composition surface for WM_PAINT. The whole client area is
  * composed here (black letterbox + uniformly scaled panel + boundary frame)
@@ -943,6 +961,7 @@ static void launcher_ui_idle(void);
 static void launcher_launch(void);
 static void launcher_launch_sel(int sel);
 static void launcher_stop(void);
+static void launcher_toggle_suspend(void);
 
 static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -977,6 +996,7 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         switch (LOWORD(wParam)) {
         case IDC_RUN:  launcher_launch();       return 0;
         case IDC_STOP: launcher_stop();         return 0;
+        case IDC_SUSPEND: launcher_toggle_suspend(); return 0;
         case IDC_EXIT: PostMessageA(hwnd, WM_CLOSE, 0, 0); return 0;
         default: break;
         }
@@ -1099,10 +1119,12 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             /* Foreground again: re-arm the vsync source before resuming so the
              * clock is running when the guest comes back. The guest re-probes
              * the fd-wakeup path on its next frame (cmdpost_set_choreographer_
-             * callback clears the source-lost flag the stop above raised). */
+             * callback clears the source-lost flag the stop above raised).
+             * A host-suspended guest is parked and polls nothing, so the clock
+             * stays off; launcher_toggle_suspend() re-arms it on resume. */
             g_minimized = false;
             cmdpost_set_choreographer_callback(on_choreographer_wait);
-            vsync_clock_start();
+            if (!rvvm_user_is_suspended()) vsync_clock_start();
             queue_lifecycle(APP_CMD_START);
             queue_lifecycle(APP_CMD_RESUME);
         } else {
@@ -1143,10 +1165,35 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
 
     case WM_TIMER:
-        if (wParam == SENSOR_TIMER_ID) feed_stub_sensors();
+        if (wParam == SENSOR_TIMER_ID) {
+            feed_stub_sensors();
+        } else if (wParam == STOP_TIMER_ID) {
+            /* The guest sat through the whole cooperative teardown without
+             * exiting: it never polls its lifecycle commands (e.g.
+             * guest-samples/test_render.c renders in a loop and ignores
+             * APP_CMD_DESTROY) or it is wedged in its own loop. Stop it from
+             * the host side instead of leaving the Stop button dead.
+             *
+             * rvvm_user_stop() is not TerminateThread(): it pauses every guest
+             * vCPU and marks every guest thread finished, so the guest unwinds
+             * through its normal exit path (cmdpost_cleanup, machine free) and
+             * WM_APP_GUEST_EXIT follows exactly as on a real guest exit. */
+            KillTimer(hwnd, STOP_TIMER_ID);
+            g_stop_watchdog = false;
+            if (g_guest_thread) {
+                winhost_log("Stop: guest ignored the teardown, forcing rvvm_user_stop()");
+                rvvm_user_stop(STOP_FORCED_EXIT_CODE);
+            }
+        }
         return 0;
 
     case WM_APP_GUEST_EXIT:
+        /* The guest exited on its own (or was forced down above): the pending
+         * watchdog has nothing left to do. */
+        if (g_stop_watchdog) {
+            KillTimer(hwnd, STOP_TIMER_ID);
+            g_stop_watchdog = false;
+        }
         /* Release the finished guest thread handle: launcher_launch() guards
          * on g_guest_thread, so keeping it would silently block the next Run
          * in the picker. The thread has posted its final message and only
@@ -1340,7 +1387,18 @@ static void launcher_scan_guests(void)
     winhost_log("launcher: %d guest(s) in %s", g_guest_count, g_assets_dir);
 }
 
-/* Create the dropdown + Run/Stop/Exit buttons as children of the host window. */
+/* Put the Suspend control back into its idle state: label "Suspend", enabled
+ * only while a guest is actually running. Called on boot and on guest exit so a
+ * suspend left over from the previous guest can never leak into the next one. */
+static void launcher_suspend_ui_reset(void)
+{
+    if (!g_btn_susp) return;
+    SetWindowTextA(g_btn_susp, "Suspend");
+    EnableWindow(g_btn_susp, g_guest_thread != NULL);
+}
+
+/* Create the dropdown + Run/Stop/Suspend/Exit buttons as children of the host
+ * window. */
 static void launcher_ui_create(void)
 {
     int i;
@@ -1374,6 +1432,13 @@ static void launcher_ui_create(void)
                                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                LAUNCH_MARGIN + 176,  LAUNCH_BTN_Y, 80, LAUNCH_CTRL_H,
                                g_hwnd, (HMENU)(INT_PTR)IDC_EXIT, hinst, NULL);
+    /* Suspend/Resume toggle. Disabled while no guest is running: there is
+     * nothing to suspend, and it is re-enabled by launcher_ui_running(). */
+    g_btn_susp = CreateWindowA("BUTTON", "Suspend",
+                               WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                               LAUNCH_MARGIN + 264,  LAUNCH_BTN_Y, 88, LAUNCH_CTRL_H,
+                               g_hwnd, (HMENU)(INT_PTR)IDC_SUSPEND, hinst, NULL);
+    if (g_btn_susp) EnableWindow(g_btn_susp, FALSE);
 }
 
 /* Enter the guest-running view. The picker controls stay visible: the parent
@@ -1383,6 +1448,7 @@ static void launcher_ui_create(void)
 static void launcher_ui_running(void)
 {
     g_launcher_idle = false;
+    launcher_suspend_ui_reset();
     vsync_clock_start();
 }
 
@@ -1406,6 +1472,8 @@ static void launcher_ui_idle(void)
     LeaveCriticalSection(&g_surf_cs);
 
     vsync_clock_stop();
+
+    launcher_suspend_ui_reset();
 
     g_launcher_idle = true;
     if (g_hwnd) { InvalidateRect(g_hwnd, NULL, TRUE); set_title("launcher"); }
@@ -1460,9 +1528,10 @@ static void launcher_launch_sel(int sel)
 }
 
 /* Run button. Now that the picker stays on screen it is reachable while a
- * guest is running, so it switches guests instead of doing nothing: the guest
- * thread cannot be killed, so the current one is asked to tear down and the
- * new pick is booted from WM_APP_GUEST_EXIT once it is gone. */
+ * guest is running, so it switches guests instead of doing nothing: the current
+ * one is asked to tear down (see launcher_stop(), which escalates for guests
+ * that ignore the lifecycle commands) and the new pick is booted from
+ * WM_APP_GUEST_EXIT once it is gone. */
 static void launcher_launch(void)
 {
     int sel;
@@ -1482,16 +1551,52 @@ static void launcher_launch(void)
     launcher_launch_sel(sel);
 }
 
-/* Stop the running guest. The guest thread cannot be force-killed safely, so
- * this is a cooperative stop: queue the Android teardown and let the guest
- * exit on its own (WM_APP_GUEST_EXIT then returns us to the picker). */
+/* Stop the running guest. Cooperative first: queue the Android teardown and
+ * let the guest exit on its own (WM_APP_GUEST_EXIT then returns us to the
+ * picker). A guest must poll its lifecycle commands for that to work, so a
+ * watchdog is armed as well - see the WM_TIMER handler for what happens when
+ * the grace period expires with the guest still alive. */
 static void launcher_stop(void)
 {
     if (!g_guest_thread) return;
+    /* A suspended guest cannot poll the teardown, so the cooperative stop would
+     * just sit out the grace period and end in a forced rvvm_user_stop(). Wake
+     * it first: it then exits the normal way. */
+    if (rvvm_user_is_suspended()) {
+        rvvm_user_resume();
+        launcher_suspend_ui_reset();
+        if (!g_minimized) vsync_clock_start();
+        winhost_log("Stop: resuming the suspended guest first");
+    }
     queue_lifecycle(APP_CMD_PAUSE);
     queue_lifecycle(APP_CMD_STOP);
     queue_lifecycle(APP_CMD_DESTROY);
-    winhost_log("Stop requested: teardown lifecycle queued");
+    if (!g_stop_watchdog) {
+        SetTimer(g_hwnd, STOP_TIMER_ID, STOP_GRACE_MS, NULL);
+        g_stop_watchdog = true;
+    }
+    winhost_log("Stop requested: teardown lifecycle queued (%d ms grace)", STOP_GRACE_MS);
+}
+
+/* Suspend/Resume toggle. Suspending the vCPUs also parks the frame clock: a
+ * parked guest polls neither frames nor lifecycle commands, so a running clock
+ * would only pile up vsync ticks for it to burn through on resume. */
+static void launcher_toggle_suspend(void)
+{
+    if (!g_guest_thread) return;
+
+    if (rvvm_user_is_suspended()) {
+        rvvm_user_resume();
+        SetWindowTextA(g_btn_susp, "Suspend");
+        if (!g_minimized) vsync_clock_start();
+        winhost_log("Suspend: guest resumed");
+    } else {
+        bool parked = rvvm_user_suspend();
+        SetWindowTextA(g_btn_susp, "Resume");
+        vsync_clock_stop();
+        winhost_log("Suspend: vCPUs %s",
+                    parked ? "parked" : "parking (one is in a blocking syscall)");
+    }
 }
 
 /* (Re)register every host-side cmdpost callback. Done once at init and again
@@ -1673,15 +1778,35 @@ void win32_host_shutdown(void)
      * source is gone, so the guest degrades instead of waiting forever. */
     vsync_clock_stop();
 
+    /* A suspended guest is parked in its wrap loop and cannot poll the teardown
+     * WM_CLOSE queued, so wake it: it then takes the cooperative path below
+     * instead of being forced down. No-op when it was not suspended. */
+    rvvm_user_resume();
+
     /* Stop the audio backend before the guest thread: the WASAPI pump threads
      * must be joined before cmdpost_cleanup() tears down the stream table. */
     win32_aaudio_shutdown();
 
     bool guest_stopped = true;
     if (g_guest_thread) {
-        /* Bounded wait: a wedged guest must not make a graceful exit hang
-         * forever (CTRL_CLOSE_EVENT only grants ~5s before the OS kills us). */
-        if (WaitForSingleObject(g_guest_thread, GUEST_EXIT_TIMEOUT_MS) == WAIT_TIMEOUT) {
+        if (g_stop_watchdog) {
+            KillTimer(g_hwnd, STOP_TIMER_ID);
+            g_stop_watchdog = false;
+        }
+        /* Give a well-behaved guest the same grace period the Stop button
+         * does before taking it down from the host side. WM_CLOSE already
+         * queued the teardown, so whoever is left after this ignored it (or
+         * wedged) and would otherwise burn the whole budget below and force
+         * us to skip post-guest cleanup. */
+        if (WaitForSingleObject(g_guest_thread, STOP_GRACE_MS) == WAIT_TIMEOUT) {
+            winhost_log("guest did not exit within %d ms; forcing rvvm_user_stop()",
+                        STOP_GRACE_MS);
+            rvvm_user_stop(STOP_FORCED_EXIT_CODE);
+        }
+        /* Bounded wait: a guest also stuck in a blocking host syscall must not
+         * make a graceful exit hang forever (CTRL_CLOSE_EVENT only grants ~5s
+         * before the OS kills us). */
+        if (WaitForSingleObject(g_guest_thread, GUEST_EXIT_TIMEOUT_MS - STOP_GRACE_MS) == WAIT_TIMEOUT) {
             guest_stopped = false;
             winhost_log("guest thread did not exit within %d ms; skipping post-guest cleanup",
                         GUEST_EXIT_TIMEOUT_MS);
