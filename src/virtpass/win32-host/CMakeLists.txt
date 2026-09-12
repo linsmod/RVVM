@@ -84,4 +84,18 @@ target_include_directories(rvvm_winhost PRIVATE
 # MinGW: make %lld/%llu in printf reliable across CRT flavors
 target_compile_definitions(rvvm_winhost PRIVATE __USE_MINGW_ANSI_STDIO=1)
 
-target_link_libraries(rvvm_winhost PRIVATE user32 gdi32)
+# ---- libvterm (headless terminal parser, built from source) ----
+# Compiled directly by CMake (no external make invocation, works under both
+# MinGW make and Ninja generators). The *.inc files are pre-generated, so no
+# perl/codegen step is needed. rvvm_user.c is compiled into rvvm_winhost and
+# consumes the libvterm API, hence the PUBLIC link below.
+set(LIBVTERM_DIR "${RVVM_ROOT}/libvterm-0.3.3")
+file(GLOB LIBVTERM_SRCS "${LIBVTERM_DIR}/src/*.c")
+add_library(vterm STATIC ${LIBVTERM_SRCS})
+set_target_properties(vterm PROPERTIES C_STANDARD 99)
+target_include_directories(vterm PUBLIC "${LIBVTERM_DIR}/include" "${LIBVTERM_DIR}/src")
+# Third-party C99 code: relax the host warning flags so it compiles cleanly.
+target_compile_options(vterm PRIVATE
+    -Wno-error -Wno-unused -Wno-uninitialized -Wno-unused-parameter)
+
+target_link_libraries(rvvm_winhost PRIVATE user32 gdi32 vterm)

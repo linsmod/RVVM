@@ -112,9 +112,10 @@ target_compile_options(rvvm_core PRIVATE
     -Wno-incompatible-pointer-types
 )
 
-target_link_libraries(rvvm_core
+target_link_libraries(rvvm_core PUBLIC
     android
     log
+    vterm
 )
 
 # 16KB page size alignment for Android 15+ compatibility
@@ -133,12 +134,28 @@ target_include_directories(rvvm_jni PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+# ---- libvterm (headless terminal parser, built from source) ----
+# Compiled directly by CMake (no external make/ninja invocation) so it works
+# under the NDK toolchain regardless of whether `make` is on PATH. The *.inc
+# files are pre-generated, so no perl/codegen step is needed. rvvm_user.c lives
+# in rvvm_core and consumes the libvterm API, so core is linked PUBLIC to expose
+# both the headers and the symbols.
+set(LIBVTERM_DIR "${RVVM_ROOT}/libvterm-0.3.3")
+file(GLOB LIBVTERM_SRCS "${LIBVTERM_DIR}/src/*.c")
+add_library(vterm STATIC ${LIBVTERM_SRCS})
+set_target_properties(vterm PROPERTIES C_STANDARD 99)
+target_include_directories(vterm PUBLIC "${LIBVTERM_DIR}/include" "${LIBVTERM_DIR}/src")
+# Third-party C99 code: relax the host warning flags so it compiles cleanly.
+target_compile_options(vterm PRIVATE
+    -Wno-error -Wno-unused -Wno-uninitialized -Wno-unused-parameter)
+
 target_link_libraries(rvvm_jni
     rvvm_core
     android
     log
     m
     aaudio
+    vterm
 )
 
 # 16KB page size alignment for Android 15+ compatibility

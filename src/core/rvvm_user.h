@@ -41,6 +41,23 @@ typedef void (*rvvm_user_exit_callback)(int exit_code);
 // Called from the guest thread after the guest unwinds
 void rvvm_user_set_exit_callback(rvvm_machine_t* machine, rvvm_user_exit_callback callback);
 
+// --- Guest virtual TTY (libvterm-backed) ---
+//
+// When a host registers a TTY callback, guest writes to fd 1/2 are fed through
+// a libvterm instance instead of being written straight to the host terminal.
+// libvterm parses the raw byte stream (CR, ANSI escapes, scrolling, ...) and
+// the host renders the resulting screen state itself. This is what makes
+// in-place updates (e.g. progress counters using '\r') work consistently across
+// hosts, instead of depending on a real tty being attached (which only happens
+// on the win32 host today).
+//
+// The opaque `tty` pointer passed to the callback is a libvterm `VTerm*`; cast
+// it back after including <vterm.h>. Registering NULL disables TTY parsing and
+// restores the default behaviour (raw write to the host fd).
+typedef void (*rvvm_user_tty_callback)(void* userdata, int fd, void* tty);
+
+void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback callback, void* userdata);
+
 // Create a userland machine instance without starting it.
 //
 // This is the multi-instance entry point: everything the guest needs (memory,

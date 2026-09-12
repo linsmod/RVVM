@@ -521,12 +521,77 @@ typedef struct rvvm_userland {
     uint32_t                      userland_exit_reported;
     uint32_t                      userland_suspend;
     uint32_t                      userland_parked;
+
+    // --- Guest virtual TTY (libvterm, optional) ---
+    // When tty_cb is set, guest writes to fd 1/2 are parsed by libvterm and the
+    // host renders the screen itself instead of writing raw bytes to a tty.
+    void*                    tty_vt;        // VTerm* (opaque here)
+    void*                    tty_screen;    // VTermScreen* (opaque here)
+    rvvm_user_tty_callback   tty_cb;
+    void*                    tty_userdata;
 } rvvm_userland_t;
 
 // Context attached to a userland machine, NULL for a non-userland machine
 static inline rvvm_userland_t* rvvm_userland_ctx(rvvm_machine_t* machine)
 {
     return machine ? (rvvm_userland_t*)machine->userdata : NULL;
+}
+
+/*
+ * Guest virtual TTY backed by libvterm.
+ *
+ * Guest writes to fd 1/2 are fed to a VTerm instance which maintains the screen
+ * matrix (handling '\r', ANSI escapes, scrolling, ...). The host renders the
+ * screen via the tty callback it registered. The rendering host is responsible
+ * for calling vterm_screen_flush_damage() and reading cells; here we just push
+ * bytes in and notify the host that new output arrived.
+ */
+#include <vterm.h>
+
+#define VTERM_ROWS 24
+#define VTERM_COLS 80
+
+static void user_tty_init(rvvm_userland_t* ctx)
+{
+    if (ctx->tty_vt) {
+        return;
+    }
+    VTerm* vt = vterm_new(VTERM_ROWS, VTERM_COLS);
+    if (!vt) {
+        return;
+    }
+    VTermScreen* screen = vterm_obtain_screen(vt);
+    // No screen callbacks needed: the host renders by calling
+    // vterm_screen_flush_damage() + vterm_screen_get_chars() on demand.
+    vterm_screen_reset(screen, true);
+    ctx->tty_vt     = vt;
+    ctx->tty_screen = screen;
+}
+
+// Feed guest output on fd 1/2 through libvterm. No-op unless a host registered
+// a tty callback (so platforms that simply write to a real tty are unaffected).
+static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t count)
+{
+    if (!ctx->tty_cb || !buf || !count) {
+        return;
+    }
+    user_tty_init(ctx);
+    if (!ctx->tty_vt) {
+        return;
+    }
+    vterm_input_write((VTerm*)ctx->tty_vt, buf, count);
+    // Notify the host; it decides when to flush/render (throttling is its job).
+    ctx->tty_cb(ctx->tty_userdata, fd, ctx->tty_vt);
+}
+
+void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback callback, void* userdata)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (!ctx) {
+        return;
+    }
+    ctx->tty_cb       = callback;
+    ctx->tty_userdata = userdata;
 }
 
 /*
@@ -1755,11 +1820,23 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(read(a0, to_ptr(a1), a2));
                     break;
                 case 64: { // write
+                    void* wbuf = to_ptr(a1);
+                    if (a0 == 1 || a0 == 2) {
+                        // fd 1/2: feed the virtual TTY parser (no-op unless a host
+                        // registered a tty callback). When it did, the host renders
+                        // the screen itself, so don't also write raw bytes to the
+                        // host fd (that would double the output).
+                        user_tty_write(uctx(), a0, wbuf, a2);
+                        if (uctx()->tty_cb) {
+                            a0 = (ssize_t)a2;
+                            break;
+                        }
+                    }
                     if (uctx()->io_callback) {
-                        ssize_t ret = uctx()->io_callback(a0, to_ptr(a1), a2);
+                        ssize_t ret = uctx()->io_callback(a0, wbuf, a2);
                         a0 = errno_ret(ret);
                     } else {
-                        a0 = errno_ret(write(a0, to_ptr(a1), a2));
+                        a0 = errno_ret(write(a0, wbuf, a2));
                     }
                     break;
                 }
@@ -1774,13 +1851,20 @@ static void* rvvm_user_thread_wrap(void* arg)
                     struct iovec* hiov = rvvm_iovec_from_guest(to_ptr(a1), a2, stack_iov);
                     if (a7 == 65) {
                         a0 = errno_ret(readv(a0, hiov, a2));
-                    } else if (uctx()->io_callback && (a0 == 1 || a0 == 2)) {
-                        /* stdout/stderr: musl's stdio flushes through writev,
-                         * so the logcat callback must cover it too - printf
-                         * output would be silently lost otherwise. */
+                    } else if (a0 == 1 || a0 == 2) {
+                        /* stdout/stderr */
                         ssize_t total = 0;
                         for (int i = 0; i < (int)a2; i++) {
-                            ssize_t r = uctx()->io_callback(a0, hiov[i].iov_base, hiov[i].iov_len);
+                            // Feed each segment to the virtual TTY parser.
+                            user_tty_write(uctx(), a0, hiov[i].iov_base, hiov[i].iov_len);
+                            if (uctx()->tty_cb) {
+                                total += (ssize_t)hiov[i].iov_len;
+                                continue;
+                            }
+                            // No tty host: fall back to the raw write path.
+                            ssize_t r = uctx()->io_callback
+                                        ? uctx()->io_callback(a0, hiov[i].iov_base, hiov[i].iov_len)
+                                        : writev(a0, &hiov[i], 1);
                             if (r < 0) { total = r; break; }
                             total += r;
                         }
@@ -2708,6 +2792,9 @@ static void userland_destroy(rvvm_machine_t* machine)
     }
     machine->userdata = NULL;
     vector_free(ctx->userland_threads);
+    if (ctx->tty_vt) {
+        vterm_free((VTerm*)ctx->tty_vt);
+    }
     rvvm_free_machine(machine);
     safe_free(ctx);
 }

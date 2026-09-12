@@ -224,6 +224,25 @@ ifeq (,$(filter i386,$(ARCH)))
 override BIN_TARGETS        := $(BIN_TARGETS) rvvm_user
 override CPPFLAGS           := $(CPPFLAGS) -DRVVM_USER_TEST
 override bin_libs_rvvm_user := rvvm
+# libvterm: a headless terminal state machine used to parse guest tty output
+# (fd 1/2) so that CR / ANSI escape sequences are handled correctly. It is
+# built on the fly from source into a static archive and linked here. The
+# pre-generated *.inc files are already present, so no perl step is needed.
+#
+# NOTE: BUILDDIR is not yet defined when project.mk is parsed (it is set later in
+# Makefile), so we place the archive at a fixed path inside the source tree and
+# reference it by a path that is known at parse time (relative to $(CURDIR)).
+LIBVTERM_DIR  := libvterm-0.3.3
+LIBVTERM_A    := $(LIBVTERM_DIR)/libvterm.a
+$(LIBVTERM_A):
+	$(MAKE) -f $(LIBVTERM_DIR)/Makefile.cmake \
+		CC="$(CC)" AR="$(AR)" LIBVTERM_A="$@"
+# rvvm_user.c is compiled into the shared librvvm, so every binary that links it
+# needs the libvterm archive. Make all binaries depend on it, and wire it into
+# the link via a path relative to the repo root (where linking runs).
+$(BIN_TARGETS): $(LIBVTERM_A)
+override LDFLAGS            := $(LDFLAGS) -L$(LIBVTERM_DIR) -lvterm
+override CPPFLAGS           := $(CPPFLAGS) -I$(CURDIR)/$(LIBVTERM_DIR)/include
 endif
 endif
 

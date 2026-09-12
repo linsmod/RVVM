@@ -36,6 +36,7 @@
 #include "win32_gl_dispatch.h" /* on_egl_dispatch, on_gl_dispatch, g_gl_active */
 #include "win32_gl_backend.h"  /* win32_gl_backend_load/ready/name/unload, w32gl_arg_f */
 #include "win32_aaudio_wasapi.h" /* win32_aaudio_ops, win32_aaudio_shutdown */
+#include <vterm.h>               /* guest virtual TTY parser (libvterm) */
 
 #define WM_APP_GUEST_EXIT (WM_APP + 1)
 #define WM_APP_RESIZE_TO_SURFACE (WM_APP + 2)
@@ -73,6 +74,14 @@
 /* ------------------------------------------------------------------ */
 
 static HWND            g_hwnd       = NULL;
+
+/* Guest virtual TTY (libvterm) rendering state. g_tty_vt is set by the tty
+ * callback that rvvm_user fires on guest fd 1/2 output; g_tty_dirty gates the
+ * (already throttled to paint-time) screen repaint. */
+#define TTY_ROWS 24
+#define TTY_COLS 80
+static VTerm*   g_tty_vt    = NULL;
+static bool     g_tty_dirty = false;
 static bool            g_cs_ready   = false;
 static CRITICAL_SECTION g_surf_cs;
 
@@ -1230,6 +1239,59 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     DeleteObject(pen);
                 }
             }
+            /* Guest virtual TTY overlay: draw the libvterm screen matrix on top
+             * of the panel. Throttled to paint time (g_tty_dirty) so guest output
+             * bursts don't trigger one redraw per write. Drawn in the top-left so
+             * it is visible over the letterboxed panel; swap to the panel rect if
+             * you want it composited inside the virtual display. */
+            if (g_tty_vt && g_tty_dirty) {
+                VTermScreen* scr = vterm_obtain_screen(g_tty_vt);
+                uint32_t cells[TTY_ROWS * TTY_COLS];
+                VTermRect rect = { 0, 0, TTY_ROWS, TTY_COLS };
+                vterm_screen_flush_damage(scr);
+                vterm_screen_get_chars(scr, cells, TTY_ROWS * TTY_COLS, rect);
+
+                LOGFONT lf = { 0 };
+                lf.lfHeight = 16; lf.lfWidth = 0; lf.lfWeight = FW_NORMAL;
+                lf.lfCharSet = ANSI_CHARSET;
+                lf.lfFaceName[0] = 'L'; lf.lfFaceName[1] = 'u';
+                lf.lfFaceName[2] = 'c'; lf.lfFaceName[3] = 'i';
+                lf.lfFaceName[4] = 'd'; lf.lfFaceName[5] = 'a';
+                lf.lfFaceName[6] = ' '; lf.lfFaceName[7] = 'C';
+                lf.lfFaceName[8] = 'o'; lf.lfFaceName[9] = 'n';
+                lf.lfFaceName[10] = 's'; lf.lfFaceName[11] = 'o';
+                lf.lfFaceName[12] = 'l'; lf.lfFaceName[13] = 'e';
+                HFONT font = CreateFontIndirectA(&lf);
+                HGDIOBJ old_font = SelectObject(cdc, font);
+                SIZE ch;
+                GetTextExtentPoint32A(cdc, "M", 1, &ch);
+                int cw = ch.cx, chh = ch.cy;
+
+                /* Opaque backdrop so text is readable over the panel. */
+                RECT tty_bg = { 0, 0, cw * TTY_COLS, chh * TTY_ROWS };
+                FillRect(cdc, &tty_bg, (HBRUSH)GetStockObject(BLACK_BRUSH));
+                SetBkMode(cdc, TRANSPARENT);
+                SetTextColor(cdc, RGB(220, 220, 220));
+
+                char line[TTY_COLS + 1];
+                for (int r = 0; r < TTY_ROWS; r++) {
+                    int len = 0;
+                    for (int c = 0; c < TTY_COLS; c++) {
+                        uint32_t cp = cells[r * TTY_COLS + c];
+                        if (cp == 0 || cp == ' ') { line[len++] = ' '; }
+                        else if (cp < 0x20 || cp > 0x7E) { line[len++] = '.'; }
+                        else { line[len++] = (char)cp; }
+                    }
+                    while (len > 0 && line[len - 1] == ' ') len--; /* trim trailing */
+                    if (len > 0) {
+                        TextOutA(cdc, 0, r * chh, line, len);
+                    }
+                }
+                SelectObject(cdc, old_font);
+                DeleteObject(font);
+                g_tty_dirty = false;
+            }
+
             BitBlt(wdc, 0, 0, rc.right, rc.bottom, cdc, 0, 0, SRCCOPY);
         }
         LeaveCriticalSection(&g_surf_cs);
@@ -1352,9 +1414,12 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             CloseHandle(g_guest_thread);
             g_guest_thread = NULL;
         }
-        /* rvvm_user_linux_ex() frees the machine before the guest thread posts
-         * this message; drop the handle so no stale pointer survives. */
+        /* rvvm_user_linux_ex() frees the machine (and its libvterm VTerm) before
+         * the guest thread posts this message; drop the handle so no stale pointer
+         * survives, and clear the TTY render state for the same reason. */
         g_guest_machine = NULL;
+        g_tty_vt       = NULL;
+        g_tty_dirty    = false;
         {
             char title[48];
             snprintf(title, sizeof(title), "guest exited (%d)", g_guest_rc);
@@ -1468,6 +1533,20 @@ static void host_guest_exit_cb(int exit_code)
      * this callback is the only source of the real exit code. */
     g_guest_rc = exit_code;
     winhost_log("guest exit callback: code %d", exit_code);
+}
+
+/* TTY callback: rvvm_user fires this on every guest fd 1/2 write after feeding
+ * the bytes to libvterm. We only stash the VTerm pointer and flag a repaint; the
+ * actual screen flush + draw happens in WM_PAINT (throttled to vsync), so a burst
+ * of guest output collapses into one frame instead of one redraw per write. */
+static void host_tty_cb(void* userdata, int fd, void* tty)
+{
+    (void)userdata; (void)fd;
+    g_tty_vt    = (VTerm*)tty;
+    g_tty_dirty = true;
+    if (g_hwnd) {
+        InvalidateRect(g_hwnd, NULL, FALSE);
+    }
 }
 
 /* Guest environment.
@@ -2021,6 +2100,14 @@ bool win32_host_start_guest(int argc, char** argv)
      * graceful unwind instead of rvvm_user.c's _Exit() fallback (see
      * host_guest_exit_cb). Same role as jni_bridge.c's on_guest_exit. */
     rvvm_user_set_exit_callback(g_guest_machine, host_guest_exit_cb);
+
+    /* Route guest fd 1/2 through libvterm so CR / ANSI escapes render correctly
+     * (the win32 host's stdout is a real tty today, but the renderer below draws
+     * the parsed screen matrix, which is what makes in-place updates consistent
+     * across hosts). rvvm_user owns the VTerm; we just keep a pointer to it. */
+    g_tty_vt    = NULL;
+    g_tty_dirty = false;
+    rvvm_user_set_tty_callback(g_guest_machine, host_tty_cb, NULL);
 
     g_guest_argv = (char**)calloc((size_t)argc + 1, sizeof(char*));
     if (!g_guest_argv) {
