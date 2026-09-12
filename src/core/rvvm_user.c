@@ -1769,6 +1769,17 @@ static void* rvvm_user_thread_wrap(void* arg)
                     struct iovec* hiov = rvvm_iovec_from_guest(to_ptr(a1), a2, stack_iov);
                     if (a7 == 65) {
                         a0 = errno_ret(readv(a0, hiov, a2));
+                    } else if (uctx()->io_callback && (a0 == 1 || a0 == 2)) {
+                        /* stdout/stderr: musl's stdio flushes through writev,
+                         * so the logcat callback must cover it too - printf
+                         * output would be silently lost otherwise. */
+                        ssize_t total = 0;
+                        for (int i = 0; i < (int)a2; i++) {
+                            ssize_t r = uctx()->io_callback(a0, hiov[i].iov_base, hiov[i].iov_len);
+                            if (r < 0) { total = r; break; }
+                            total += r;
+                        }
+                        a0 = errno_ret(total);
                     } else {
                         a0 = errno_ret(writev(a0, hiov, a2));
                     }

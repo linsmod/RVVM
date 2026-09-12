@@ -621,6 +621,14 @@ void present_gl_set_surface_size(int32_t cw, int32_t ch)
     LeaveCriticalSection(&g_surf_cs);
 }
 
+void present_gl_panel_size(int32_t* w, int32_t* h)
+{
+    EnterCriticalSection(&g_surf_cs);
+    if (w) *w = (g_virt_w > 0) ? g_virt_w : g_init_w;
+    if (h) *h = (g_virt_h > 0) ? g_virt_h : g_init_h;
+    LeaveCriticalSection(&g_surf_cs);
+}
+
 void present_gl_frame(void)
 {
     if (!g_gl_active) return;

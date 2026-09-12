@@ -42,19 +42,29 @@
 #include "virtpass/vp_gl.h"
 #include "virtpass/vp_android.h"
 
-/* Content size (layer 1). The default is deliberately much smaller than the
- * virtual panel: the surface must land at the panel origin at 1:1 rather than
- * being stretched across it, and a small surface makes that placement obvious
- * on screen. The host logs the resulting geometry as
- * "panel WxH <- content wxh".
+/* Two run modes, selected at startup:
  *
- * RVVM_GL_TEST_SIZE overrides it, which is how the oversized case is reached:
- *   RVVM_GL_TEST_SIZE=WxH   exact content size (may exceed the panel)
- *   RVVM_GL_TEST_SIZE=full  match the panel
- * An oversized surface exercises the crop in present_frame_impl(), which must
- * clamp the copy to the panel instead of running past the DIB. */
+ *  - default: WINDOW SURFACE, the path a real app takes. The guest binds
+ *    eglCreateWindowSurface with a placeholder (NULL) native window - the
+ *    host owns the real one - and eglSwapBuffers presents: through the DIB
+ *    blit on win32 (which backs the window surface with a pbuffer) and
+ *    through SurfaceFlinger on Android (which binds the real SurfaceView).
+ *    The window dictates the surface size, so the content size is re-latched
+ *    from eglQuerySurface after bring-up.
+ *
+ *  - RVVM_GL_TEST_OFFSCREEN=1: PBUFFER mode, the pixel-exact regression
+ *    gate. The content size comes from RVVM_GL_TEST_SIZE (default 64x64),
+ *    which is also how the oversized case is reached:
+ *      RVVM_GL_TEST_SIZE=WxH   exact content size (may exceed the panel)
+ *      RVVM_GL_TEST_SIZE=full  match the panel
+ *    An oversized surface exercises the crop in the win32 presenter, which
+ *    must clamp the copy to the panel instead of running past the DIB. */
 static int32_t g_fb_w = 64;
 static int32_t g_fb_h = 64;
+
+/* Non-zero: pbuffer regression mode (RVVM_GL_TEST_OFFSCREEN=1). Zero: the
+ * default window-surface mode. See the file header. */
+static int g_offscreen;
 
 #define FB_MAX 2048
 
@@ -82,6 +92,13 @@ static void content_size_from_env(int32_t* w, int32_t* h)
         *w = vw;
         *h = vh;
     }
+}
+
+/* Offscreen regression mode? Anything other than unset/empty/"0" enables it. */
+static int offscreen_from_env(void)
+{
+    const char* s = getenv("RVVM_GL_TEST_OFFSCREEN");
+    return s && *s && strcmp(s, "0") != 0;
 }
 
 static void stage(const char* name)
@@ -272,11 +289,16 @@ int main(void)
     EGLint major = 0, minor = 0, num_config = 0;
     EGLConfig config = NULL;
 
+    g_offscreen = offscreen_from_env();
     /* Must run before the attribute arrays below: they are const-initialised
      * from g_fb_w/g_fb_h, so a late parse would send the default 64x64 to the
-     * host while the pixel probes assume the requested size. */
-    content_size_from_env(&g_fb_w, &g_fb_h);
+     * host while the pixel probes assume the requested size. Only the
+     * offscreen mode honours RVVM_GL_TEST_SIZE: a window dictates its own
+     * size, and the probes re-latch it after bring-up. */
+    if (g_offscreen) content_size_from_env(&g_fb_w, &g_fb_h);
     printf("=== GL ES 2.0 Pipeline Test ===\n");
+    printf("mode: %s\n", g_offscreen ? "offscreen pbuffer (regression)"
+                                     : "window surface (native present)");
     printf("content size: %dx%d\n", (int)g_fb_w, (int)g_fb_h);
 
     const EGLint pbuffer_attribs[] = {
@@ -308,8 +330,28 @@ int main(void)
     check(eglChooseConfig(dpy, choose_attribs, &config, 1, &num_config)
           && num_config == 1, "eglChooseConfig");
 
-    surf = eglCreatePbufferSurface(dpy, config, pbuffer_attribs);
-    check(surf != EGL_NO_SURFACE, "eglCreatePbufferSurface");
+    if (g_offscreen) {
+        surf = eglCreatePbufferSurface(dpy, config, pbuffer_attribs);
+        check(surf != EGL_NO_SURFACE, "eglCreatePbufferSurface");
+    } else {
+        /* Real-app path: bind the window surface. The stub window handle is
+         * a placeholder - the host owns the native window - so pass NULL.
+         * What backs it is host policy: a panel-sized pbuffer + DIB blit on
+         * win32, the real SurfaceView on Android. */
+        surf = eglCreateWindowSurface(dpy, config, NULL, NULL);
+        check(surf != EGL_NO_SURFACE, "eglCreateWindowSurface");
+
+        /* The window dictates the surface size; re-latch the content size so
+         * every pixel probe below lands inside the real surface. */
+        EGLint wsw = 0, wsh = 0;
+        if (eglQuerySurface(dpy, surf, EGL_WIDTH, &wsw) &&
+            eglQuerySurface(dpy, surf, EGL_HEIGHT, &wsh) &&
+            wsw > 0 && wsh > 0) {
+            g_fb_w = (int32_t)wsw;
+            g_fb_h = (int32_t)wsh;
+        }
+        printf("    window surface: %dx%d\n", (int)g_fb_w, (int)g_fb_h);
+    }
 
     ctx = eglCreateContext(dpy, config, EGL_NO_CONTEXT, context_attribs);
     check(ctx != EGL_NO_CONTEXT, "eglCreateContext");
@@ -684,10 +726,16 @@ int main(void)
             glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT);
             glDrawArrays(GL_TRIANGLES, 0, 3);
-            eglSwapBuffers(dpy, surf);
 
+            /* Read back BEFORE the swap. On a real window surface the back
+             * buffer after eglSwapBuffers is implementation-defined - the
+             * compositor's buffer queue decides which buffer comes back next
+             * (a triple-buffered phone reads a two-frames-old frame), while a
+             * pbuffer just keeps its content. A pre-swap readback always sees
+             * the frame just drawn, on both surfaces and both hosts. */
             expect_pixel(g_fb_w - 1, g_fb_h - 1, 255, 0, 0, 255,
                          "content intact at its far corner");
+            eglSwapBuffers(dpy, surf);
             check(glGetError() == GL_NO_ERROR, "no GL error after present");
 
             glDisableVertexAttribArray((GLuint)l);

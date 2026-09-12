@@ -77,4 +77,10 @@ void present_gl_frame(void);
  * renders at (layer 1). cw/ch <= 0 leaves the current value alone. */
 void present_gl_set_surface_size(int32_t cw, int32_t ch);
 
+/* Current virtual panel size. For callers that must size an offscreen backing
+ * surface themselves (the GL dispatch backs a guest window surface with a
+ * panel-sized pbuffer). Both values stay positive: the panel defaults to
+ * 1024x768 until the first real window size is known. */
+void present_gl_panel_size(int32_t* w, int32_t* h);
+
 #endif /* WIN32_CMDPOST_BRIDGE_H */

@@ -162,23 +162,35 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
          * args[3] and is a guest pointer like every other data argument. */
         const vpgl_EGLint* attribs = (const vpgl_EGLint*)vpgl_gptr(args[3]);
 
-        /* Layer-1 size for the presenter. A guest may carry it in the surface
-         * attributes; otherwise it sets it later via SET_BUF or the panel
-         * default applies. */
-        if (attribs) {
-            int32_t sw = 0, sh = 0;
-            for (const vpgl_EGLint* a = attribs;
-                 a[0] != vpgl_EGL_NONE; a += 2) {
-                if (a[0] == vpgl_EGL_WIDTH)  sw = a[1];
-                if (a[0] == vpgl_EGL_HEIGHT) sh = a[1];
-            }
-            present_gl_set_surface_size(sw, sh);
+        /* A pbuffer requires EGL_WIDTH/EGL_HEIGHT, but a real window-surface
+         * attribute list never carries them (the window dictates the size).
+         * Copy the guest list and, when the pair is missing, append the panel
+         * size so the offscreen backing and the presenter readback both have
+         * a defined size. */
+        vpgl_EGLint fb[20];
+        int32_t sw = 0, sh = 0;
+        int n = 0;
+        while (attribs && attribs[n] != vpgl_EGL_NONE && n < 12) {
+            vpgl_EGLint key = attribs[n], val = attribs[n + 1];
+            if (key == vpgl_EGL_WIDTH)  sw = val;
+            if (key == vpgl_EGL_HEIGHT) sh = val;
+            fb[n++] = key;
+            fb[n++] = val;
         }
+        if (sw <= 0 || sh <= 0) {
+            present_gl_panel_size(&sw, &sh);
+            fb[n++] = vpgl_EGL_WIDTH;
+            fb[n++] = (vpgl_EGLint)sw;
+            fb[n++] = vpgl_EGL_HEIGHT;
+            fb[n++] = (vpgl_EGLint)sh;
+        }
+        fb[n] = vpgl_EGL_NONE;
+        present_gl_set_surface_size(sw, sh);
 
         *ret = (int64_t)(intptr_t)p_eglCreatePbufferSurface(
             (vpgl_EGLDisplay)(uintptr_t)args[0],
             (vpgl_EGLConfig)(uintptr_t)args[1],
-            attribs);
+            fb);
         break;
     }
     case EGL_FN_SWAPBUFFERS:
