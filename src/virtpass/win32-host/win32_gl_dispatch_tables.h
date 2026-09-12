@@ -26,11 +26,184 @@
  * defined in win32_gl_dispatch.c above this include.
  */
 
+/* fn_id -> name, for the RVVM_GL_TRACE call log */
+static const char* w32gl_egl_name(uint32_t fn_id)
+{
+    switch (fn_id) {
+    case EGL_FN_CHOOSECONFIG: return "eglChooseConfig";
+    case EGL_FN_CREATECONTEXT: return "eglCreateContext";
+    case EGL_FN_CREATEPBUFFERSURFACE: return "eglCreatePbufferSurface";
+    case EGL_FN_CREATEWINDOWSURFACE: return "eglCreateWindowSurface";
+    case EGL_FN_DESTROYCONTEXT: return "eglDestroyContext";
+    case EGL_FN_DESTROYSURFACE: return "eglDestroySurface";
+    case EGL_FN_GETCONFIGATTRIB: return "eglGetConfigAttrib";
+    case EGL_FN_GETDISPLAY: return "eglGetDisplay";
+    case EGL_FN_GETERROR: return "eglGetError";
+    case EGL_FN_GETPROCADDRESS: return "eglGetProcAddress";
+    case EGL_FN_INITIALIZE: return "eglInitialize";
+    case EGL_FN_MAKECURRENT: return "eglMakeCurrent";
+    case EGL_FN_QUERYSTRING: return "eglQueryString";
+    case EGL_FN_QUERYSURFACE: return "eglQuerySurface";
+    case EGL_FN_SWAPBUFFERS: return "eglSwapBuffers";
+    case EGL_FN_TERMINATE: return "eglTerminate";
+    default: return NULL;
+    }
+}
+
+static const char* w32gl_gl_name(uint32_t fn_id)
+{
+    switch (fn_id) {
+    case GL_FN_ACTIVETEXTURE: return "glActiveTexture";
+    case GL_FN_ATTACHSHADER: return "glAttachShader";
+    case GL_FN_BINDATTRIBLOCATION: return "glBindAttribLocation";
+    case GL_FN_BINDBUFFER: return "glBindBuffer";
+    case GL_FN_BINDFRAMEBUFFER: return "glBindFramebuffer";
+    case GL_FN_BINDRENDERBUFFER: return "glBindRenderbuffer";
+    case GL_FN_BINDTEXTURE: return "glBindTexture";
+    case GL_FN_BLENDCOLOR: return "glBlendColor";
+    case GL_FN_BLENDEQUATION: return "glBlendEquation";
+    case GL_FN_BLENDEQUATIONSEPARATE: return "glBlendEquationSeparate";
+    case GL_FN_BLENDFUNC: return "glBlendFunc";
+    case GL_FN_BLENDFUNCSEPARATE: return "glBlendFuncSeparate";
+    case GL_FN_BUFFERDATA: return "glBufferData";
+    case GL_FN_BUFFERSUBDATA: return "glBufferSubData";
+    case GL_FN_CHECKFRAMEBUFFERSTATUS: return "glCheckFramebufferStatus";
+    case GL_FN_CLEAR: return "glClear";
+    case GL_FN_CLEARCOLOR: return "glClearColor";
+    case GL_FN_CLEARDEPTHF: return "glClearDepthf";
+    case GL_FN_CLEARSTENCIL: return "glClearStencil";
+    case GL_FN_COLORMASK: return "glColorMask";
+    case GL_FN_COMPILESHADER: return "glCompileShader";
+    case GL_FN_COMPRESSEDTEXIMAGE2D: return "glCompressedTexImage2D";
+    case GL_FN_COMPRESSEDTEXSUBIMAGE2D: return "glCompressedTexSubImage2D";
+    case GL_FN_COPYTEXIMAGE2D: return "glCopyTexImage2D";
+    case GL_FN_COPYTEXSUBIMAGE2D: return "glCopyTexSubImage2D";
+    case GL_FN_CREATEPROGRAM: return "glCreateProgram";
+    case GL_FN_CREATESHADER: return "glCreateShader";
+    case GL_FN_CULLFACE: return "glCullFace";
+    case GL_FN_DELETEBUFFERS: return "glDeleteBuffers";
+    case GL_FN_DELETEFRAMEBUFFERS: return "glDeleteFramebuffers";
+    case GL_FN_DELETEPROGRAM: return "glDeleteProgram";
+    case GL_FN_DELETERENDERBUFFERS: return "glDeleteRenderbuffers";
+    case GL_FN_DELETESHADER: return "glDeleteShader";
+    case GL_FN_DELETETEXTURES: return "glDeleteTextures";
+    case GL_FN_DEPTHFUNC: return "glDepthFunc";
+    case GL_FN_DEPTHMASK: return "glDepthMask";
+    case GL_FN_DEPTHRANGEF: return "glDepthRangef";
+    case GL_FN_DETACHSHADER: return "glDetachShader";
+    case GL_FN_DISABLE: return "glDisable";
+    case GL_FN_DISABLEVERTEXATTRIBARRAY: return "glDisableVertexAttribArray";
+    case GL_FN_DRAWARRAYS: return "glDrawArrays";
+    case GL_FN_DRAWELEMENTS: return "glDrawElements";
+    case GL_FN_ENABLE: return "glEnable";
+    case GL_FN_ENABLEVERTEXATTRIBARRAY: return "glEnableVertexAttribArray";
+    case GL_FN_FINISH: return "glFinish";
+    case GL_FN_FLUSH: return "glFlush";
+    case GL_FN_FRAMEBUFFERRENDERBUFFER: return "glFramebufferRenderbuffer";
+    case GL_FN_FRAMEBUFFERTEXTURE2D: return "glFramebufferTexture2D";
+    case GL_FN_FRONTFACE: return "glFrontFace";
+    case GL_FN_GENBUFFERS: return "glGenBuffers";
+    case GL_FN_GENERATEMIPMAP: return "glGenerateMipmap";
+    case GL_FN_GENFRAMEBUFFERS: return "glGenFramebuffers";
+    case GL_FN_GENRENDERBUFFERS: return "glGenRenderbuffers";
+    case GL_FN_GENTEXTURES: return "glGenTextures";
+    case GL_FN_GETACTIVEATTRIB: return "glGetActiveAttrib";
+    case GL_FN_GETACTIVEUNIFORM: return "glGetActiveUniform";
+    case GL_FN_GETATTACHEDSHADERS: return "glGetAttachedShaders";
+    case GL_FN_GETATTRIBLOCATION: return "glGetAttribLocation";
+    case GL_FN_GETBOOLEANV: return "glGetBooleanv";
+    case GL_FN_GETBUFFERPARAMETERIV: return "glGetBufferParameteriv";
+    case GL_FN_GETERROR: return "glGetError";
+    case GL_FN_GETFLOATV: return "glGetFloatv";
+    case GL_FN_GETFRAMEBUFFERATTACHMENTPARAMETERIV: return "glGetFramebufferAttachmentParameteriv";
+    case GL_FN_GETINTEGERV: return "glGetIntegerv";
+    case GL_FN_GETPROGRAMIV: return "glGetProgramiv";
+    case GL_FN_GETPROGRAMINFOLOG: return "glGetProgramInfoLog";
+    case GL_FN_GETRENDERBUFFERPARAMETERIV: return "glGetRenderbufferParameteriv";
+    case GL_FN_GETSHADERIV: return "glGetShaderiv";
+    case GL_FN_GETSHADERINFOLOG: return "glGetShaderInfoLog";
+    case GL_FN_GETSHADERPRECISIONFORMAT: return "glGetShaderPrecisionFormat";
+    case GL_FN_GETSHADERSOURCE: return "glGetShaderSource";
+    case GL_FN_GETSTRING: return "glGetString";
+    case GL_FN_GETTEXPARAMETERFV: return "glGetTexParameterfv";
+    case GL_FN_GETTEXPARAMETERIV: return "glGetTexParameteriv";
+    case GL_FN_GETUNIFORMFV: return "glGetUniformfv";
+    case GL_FN_GETUNIFORMIV: return "glGetUniformiv";
+    case GL_FN_GETUNIFORMLOCATION: return "glGetUniformLocation";
+    case GL_FN_GETVERTEXATTRIBFV: return "glGetVertexAttribfv";
+    case GL_FN_GETVERTEXATTRIBIV: return "glGetVertexAttribiv";
+    case GL_FN_GETVERTEXATTRIBPOINTERV: return "glGetVertexAttribPointerv";
+    case GL_FN_HINT: return "glHint";
+    case GL_FN_ISBUFFER: return "glIsBuffer";
+    case GL_FN_ISENABLED: return "glIsEnabled";
+    case GL_FN_ISFRAMEBUFFER: return "glIsFramebuffer";
+    case GL_FN_ISPROGRAM: return "glIsProgram";
+    case GL_FN_ISRENDERBUFFER: return "glIsRenderbuffer";
+    case GL_FN_ISSHADER: return "glIsShader";
+    case GL_FN_ISTEXTURE: return "glIsTexture";
+    case GL_FN_LINEWIDTH: return "glLineWidth";
+    case GL_FN_LINKPROGRAM: return "glLinkProgram";
+    case GL_FN_PIXELSTOREI: return "glPixelStorei";
+    case GL_FN_POLYGONOFFSET: return "glPolygonOffset";
+    case GL_FN_READPIXELS: return "glReadPixels";
+    case GL_FN_RELEASESHADERCOMPILER: return "glReleaseShaderCompiler";
+    case GL_FN_RENDERBUFFERSTORAGE: return "glRenderbufferStorage";
+    case GL_FN_SAMPLECOVERAGE: return "glSampleCoverage";
+    case GL_FN_SCISSOR: return "glScissor";
+    case GL_FN_SHADERBINARY: return "glShaderBinary";
+    case GL_FN_SHADERSOURCE: return "glShaderSource";
+    case GL_FN_STENCILFUNC: return "glStencilFunc";
+    case GL_FN_STENCILFUNCSEPARATE: return "glStencilFuncSeparate";
+    case GL_FN_STENCILMASK: return "glStencilMask";
+    case GL_FN_STENCILMASKSEPARATE: return "glStencilMaskSeparate";
+    case GL_FN_STENCILOP: return "glStencilOp";
+    case GL_FN_STENCILOPSEPARATE: return "glStencilOpSeparate";
+    case GL_FN_TEXIMAGE2D: return "glTexImage2D";
+    case GL_FN_TEXPARAMETERF: return "glTexParameterf";
+    case GL_FN_TEXPARAMETERFV: return "glTexParameterfv";
+    case GL_FN_TEXPARAMETERI: return "glTexParameteri";
+    case GL_FN_TEXPARAMETERIV: return "glTexParameteriv";
+    case GL_FN_TEXSUBIMAGE2D: return "glTexSubImage2D";
+    case GL_FN_UNIFORM1F: return "glUniform1f";
+    case GL_FN_UNIFORM1FV: return "glUniform1fv";
+    case GL_FN_UNIFORM1I: return "glUniform1i";
+    case GL_FN_UNIFORM1IV: return "glUniform1iv";
+    case GL_FN_UNIFORM2F: return "glUniform2f";
+    case GL_FN_UNIFORM2FV: return "glUniform2fv";
+    case GL_FN_UNIFORM2I: return "glUniform2i";
+    case GL_FN_UNIFORM2IV: return "glUniform2iv";
+    case GL_FN_UNIFORM3F: return "glUniform3f";
+    case GL_FN_UNIFORM3FV: return "glUniform3fv";
+    case GL_FN_UNIFORM3I: return "glUniform3i";
+    case GL_FN_UNIFORM3IV: return "glUniform3iv";
+    case GL_FN_UNIFORM4F: return "glUniform4f";
+    case GL_FN_UNIFORM4FV: return "glUniform4fv";
+    case GL_FN_UNIFORM4I: return "glUniform4i";
+    case GL_FN_UNIFORM4IV: return "glUniform4iv";
+    case GL_FN_UNIFORMMATRIX2FV: return "glUniformMatrix2fv";
+    case GL_FN_UNIFORMMATRIX3FV: return "glUniformMatrix3fv";
+    case GL_FN_UNIFORMMATRIX4FV: return "glUniformMatrix4fv";
+    case GL_FN_USEPROGRAM: return "glUseProgram";
+    case GL_FN_VALIDATEPROGRAM: return "glValidateProgram";
+    case GL_FN_VERTEXATTRIB1F: return "glVertexAttrib1f";
+    case GL_FN_VERTEXATTRIB1FV: return "glVertexAttrib1fv";
+    case GL_FN_VERTEXATTRIB2F: return "glVertexAttrib2f";
+    case GL_FN_VERTEXATTRIB2FV: return "glVertexAttrib2fv";
+    case GL_FN_VERTEXATTRIB3F: return "glVertexAttrib3f";
+    case GL_FN_VERTEXATTRIB3FV: return "glVertexAttrib3fv";
+    case GL_FN_VERTEXATTRIB4F: return "glVertexAttrib4f";
+    case GL_FN_VERTEXATTRIB4FV: return "glVertexAttrib4fv";
+    case GL_FN_VERTEXATTRIBPOINTER: return "glVertexAttribPointer";
+    case GL_FN_VIEWPORT: return "glViewport";
+    default: return NULL;
+    }
+}
+
 static void w32gl_dispatch_egl_generic(uint32_t fn_id, const int64_t* a, int64_t* ret)
 {
     switch (fn_id) {
     case EGL_FN_CHOOSECONFIG:
-        if (p_eglChooseConfig) { *ret = (int64_t)(uint32_t)((w32gl_PFN_eglChooseConfig)p_eglChooseConfig)((w32gl_void*)(uintptr_t)a[0], (const w32gl_EGLint*)w32gl_gptr(a[1]), (w32gl_void*)(uintptr_t)a[2], (w32gl_EGLint)a[3], (w32gl_EGLint*)w32gl_gptr(a[4])); }
+        if (p_eglChooseConfig) { *ret = (int64_t)(uint32_t)((w32gl_PFN_eglChooseConfig)p_eglChooseConfig)((w32gl_void*)(uintptr_t)a[0], (const w32gl_EGLint*)w32gl_gptr(a[1]), (w32gl_EGLConfig*)w32gl_gptr(a[2]), (w32gl_EGLint)a[3], (w32gl_EGLint*)w32gl_gptr(a[4])); }
         break;
     case EGL_FN_CREATECONTEXT:
         if (p_eglCreateContext) { *ret = (int64_t)(intptr_t)((w32gl_PFN_eglCreateContext)p_eglCreateContext)((w32gl_void*)(uintptr_t)a[0], (w32gl_void*)(uintptr_t)a[1], (w32gl_void*)(uintptr_t)a[2], (const w32gl_EGLint*)w32gl_gptr(a[3])); }

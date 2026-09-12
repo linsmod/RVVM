@@ -1,6 +1,8 @@
 #include "win32_gl_backend.h"
+#include "win32_gl_dispatch.h" /* on_*_dispatch, g_gl_inflight */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "core/rvvm_user.h" /* rvvm_user_guest_ptr */
@@ -61,18 +63,26 @@ static const w32gl_GLchar** w32gl_translate_shader_srcs(const int64_t* a, int co
 
 /* Pointer-returning calls (glGetString/eglQueryString) hand out a string
  * owned by the GL DLL, which the guest cannot read. Copy it into the guest
- * scratch buffer offered in args[GL_CALL_RETBUF_SLOT] and answer with that
- * guest address instead. */
+ * scratch buffer the stub offered in args[GL_CALL_RETBUF_SLOT] and answer
+ * with that guest address instead. */
 static int64_t w32gl_string_out(const int64_t* a, const char* str)
 {
     if (!str) return 0;
-    char* dst = (char*)rvvm_user_guest_ptr((uint64_t)a[GL_CALL_RETBUF_SLOT]);
-    if (!dst) return 0;
+    uint64_t ga = (uint64_t)a[GL_CALL_RETBUF_SLOT];
+    /* Refuse to write unless the whole landing zone is mapped, so a bogus
+     * slot value cannot run off the end of guest RAM. */
+    if (!ga || !rvvm_user_guest_ptr(ga) ||
+        !rvvm_user_guest_ptr(ga + GL_CALL_RETBUF_CAP - 1)) {
+        fprintf(stderr, "[gl] retbuf slot %llx unmapped; dropping string\n",
+                (unsigned long long)ga);
+        return 0;
+    }
+    char* dst = (char*)rvvm_user_guest_ptr(ga);
     size_t len = strlen(str);
     if (len > GL_CALL_RETBUF_CAP - 1) len = GL_CALL_RETBUF_CAP - 1;
     memcpy(dst, str, len);
     dst[len] = '\0';
-    return a[GL_CALL_RETBUF_SLOT];
+    return (int64_t)ga;
 }
 
 #include "win32_gl_dispatch_tables.h"
@@ -80,12 +90,57 @@ static int64_t w32gl_string_out(const int64_t* a, const char* str)
 
 bool g_gl_active = false;
 
+/* Trace every marshalled call. The guest smashes its stack as soon as ANGLE
+ * touches it, so the last line printed before the fault is the call that
+ * introduced the bad pointer. */
+static bool gl_trace_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* v = getenv("RVVM_GL_TRACE");
+        enabled = (v && strcmp(v, "off") != 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+/* Print the argument list before dispatching. A call that faults inside the
+ * GL implementation never reaches the post-call trace, so this is the only
+ * record of what it was handed. */
+static void gl_trace_args(const char* kind, uint32_t fn_id, const int64_t* a)
+{
+    if (!gl_trace_enabled() || !a) return;
+    const char* name = (kind[0] == 'g') ? w32gl_gl_name(fn_id) : w32gl_egl_name(fn_id);
+    printf("[gl] %s %-28s args=[", kind, name ? name : "?");
+    for (int i = 0; i < GL_CALL_MAX_ARGS; i++) printf(" %llx", (unsigned long long)a[i]);
+    printf(" ]\n");
+    fflush(stdout);
+}
+
+static void gl_trace(const char* kind, uint32_t fn_id, const int64_t* a, int64_t ret)
+{
+    g_gl_inflight = NULL;
+    if (!gl_trace_enabled()) return;
+    const char* name = (kind[0] == 'g') ? w32gl_gl_name(fn_id) : w32gl_egl_name(fn_id);
+    printf("[gl] %s %-28s ret=%lld", kind, name ? name : "?", (long long)ret);
+    if (a) {
+        printf(" [");
+        for (int i = 0; i < GL_CALL_MAX_ARGS; i++) printf(" %llx", (unsigned long long)a[i]);
+        printf(" ]");
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
 /* ============================================================
  * EGL dispatch: 3 special cases before the generic table
  * ============================================================ */
 
 void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
 {
+    *ret = 0;
+    g_gl_inflight = w32gl_egl_name(fn_id);
+    gl_trace_args("egl", fn_id, args);
+    if (gl_trace_enabled()) fflush(stdout);
     switch (fn_id) {
     case EGL_FN_GETDISPLAY:
         *ret = (int64_t)(intptr_t)p_eglGetDisplay((w32gl_void*)0);
@@ -110,6 +165,7 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
         w32gl_dispatch_egl_generic(fn_id, args, ret);
         break;
     }
+    gl_trace("egl", fn_id, args, *ret);
 }
 
 /* ============================================================
@@ -119,9 +175,13 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
 
 void on_gl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
 {
+    *ret = 0;
+    g_gl_inflight = w32gl_gl_name(fn_id);
+    gl_trace_args("gl", fn_id, args);
     switch (fn_id) {
     default:
         w32gl_dispatch_gl_generic(fn_id, args, ret);
         break;
     }
+    gl_trace("gl", fn_id, args, *ret);
 }

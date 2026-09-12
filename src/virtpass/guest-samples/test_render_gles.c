@@ -40,6 +40,13 @@ int main(void)
         EGL_NONE
     };
     int has_gl = 1;
+    /* Initialize everything up front: every later step is conditional, so a
+     * half-filled set only shows up as a bogus-argument crash much further
+     * down. This ordering makes the first failing step obvious in the log. */
+    dpy = EGL_NO_DISPLAY;
+    surf = EGL_NO_SURFACE;
+    ctx = EGL_NO_CONTEXT;
+    major = minor = num_config = 0;
 
     printf("=== GL ES Red Frame Smoke Test ===\n");
 
@@ -64,10 +71,12 @@ int main(void)
         has_gl = 0;
     }
 
-    surf = eglCreatePbufferSurface(dpy, config, attrib_list);
-    if (surf == EGL_NO_SURFACE) {
-        printf("eglCreatePbufferSurface failed: %d\n", eglGetError());
-        has_gl = 0;
+    if (has_gl) {
+        surf = eglCreatePbufferSurface(dpy, config, attrib_list);
+        if (surf == EGL_NO_SURFACE) {
+            printf("eglCreatePbufferSurface failed: %d\n", eglGetError());
+            has_gl = 0;
+        }
     }
 
     if (has_gl) {
@@ -84,6 +93,8 @@ int main(void)
     }
 
     if (has_gl) {
+        printf("GL_VERSION : %s\n", (const char*)glGetString(GL_VERSION));
+        printf("GL_VENDOR  : %s\n", (const char*)glGetString(GL_VENDOR));
         glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         eglSwapBuffers(dpy, surf);

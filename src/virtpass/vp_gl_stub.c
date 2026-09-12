@@ -72,8 +72,10 @@ static inline int64_t glstub_packf(float v)
 #define GLSTUB_DO(nr)                             \
     virtpass_syscall((nr), (long)(uintptr_t)&_c, 0, 0, 0, 0, 0)
 
-/* Scratch buffer handed to the host by calls that return a host-owned string
- * (glGetString, eglQueryString) - see args[GL_CALL_RETBUF_SLOT]. */
+/* Scratch buffer handed to the host by calls returning a host-owned string
+ * (glGetString/eglQueryString). File scope, not a gl_call member: the host
+ * answers with this guest address and the caller reads it after the call, so
+ * it must outlive the stub's own stack frame. */
 static char glstub_retbuf[GL_CALL_RETBUF_CAP];
 
 uint32_t eglChooseConfig(void* dpy, const int32_t* attrib_list, void* configs, int32_t config_size, int32_t* num_config)
@@ -200,7 +202,7 @@ const char* eglQueryString(void* dpy, int32_t name)
     _c.args[1] = (int64_t)(int32_t)name;
     _c.args[GL_CALL_RETBUF_SLOT] = (int64_t)(uintptr_t)glstub_retbuf;
     GLSTUB_DO(SYS_EGL_CALL);
-    return (const char*)(uintptr_t)_c.ret;
+    return (const char*)(uintptr_t)glstub_retbuf;
 }
 
 uint32_t eglQuerySurface(void* dpy, void* surface, int32_t attribute, int32_t* value)
@@ -855,7 +857,7 @@ const uint8_t* glGetString(uint32_t name)
     _c.args[0] = (int64_t)(uint32_t)name;
     _c.args[GL_CALL_RETBUF_SLOT] = (int64_t)(uintptr_t)glstub_retbuf;
     GLSTUB_DO(SYS_GL_CALL);
-    return (const uint8_t*)(uintptr_t)_c.ret;
+    return (const uint8_t*)(uintptr_t)glstub_retbuf;
 }
 
 void glGetTexParameterfv(uint32_t target, uint32_t pname, float* params)

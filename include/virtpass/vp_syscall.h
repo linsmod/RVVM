@@ -64,4 +64,17 @@
 #define SYS_ANDROID_CHOREOGRAPHER_SET_FD        (SYS_ANDROID_BASE + 27)
 #define SYS_ANDROID_CHOREOGRAPHER_REQUEST_VSYNC (SYS_ANDROID_BASE + 28)
 
+/* Marshalled GL/EGL calls (Phase 3 hardware GL proxy).
+ *
+ * The guest passes a `gl_call*` in a0 (see virtpass/vp_gl.h for the struct
+ * and the fn_id space) and nothing else; the host dispatches on the syscall
+ * number and forwards a0 to cmdpost_dispatch().
+ *
+ * These are part of the shared ABI rather than living in the generated
+ * vp_gl.h: rvvm_user.c has to name them in its syscall switch, and the
+ * header generator must not be the only place they exist. */
+#define SYS_GL_CALL_BASE  0x10020
+#define SYS_GL_CALL       (SYS_GL_CALL_BASE + 0)
+#define SYS_EGL_CALL      (SYS_GL_CALL_BASE + 1)
+
 #endif /* VIRTPASS_SYSCALL_H */

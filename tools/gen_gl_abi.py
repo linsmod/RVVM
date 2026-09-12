@@ -45,8 +45,10 @@ EGL_H = os.path.join(NDK_SYSROOT, "EGL", "egl.h")
 GL_FN_BASE = 1
 EGL_FN_BASE = 0x100
 
-# Syscall numbers for the two new marshalled hypercalls
-SYS_GL_CALL_BASE = 0x10020
+# Syscall numbers for the two new marshalled hypercalls live in the shared
+# ABI header virtpass/vp_syscall.h (SYS_GL_CALL / SYS_EGL_CALL); the generated
+# guest header includes it rather than redefining them, so rvvm_user.c and the
+# guest stub can never disagree about the numbers.
 
 # EGL core subset exposed to the guest (Phase 3 scope; add names here to
 # widen the surface - everything else is generated automatically).
@@ -74,9 +76,10 @@ EGL_WHITELIST = [
 # Number of argument slots in gl_call (glCompressedTexSubImage2D needs 9)
 GL_CALL_MAX_ARGS = 9
 
-# gl_call.args[GL_CALL_RETBUF_SLOT] is a scratch buffer the guest stub offers
-# for functions that hand back a host-owned string (glGetString /
-# eglQueryString). Sized for glGetString(GL_EXTENSIONS).
+# Scratch buffer the guest offers via args[GL_CALL_RETBUF_SLOT] for functions
+# that hand back a host-owned string (glGetString / eglQueryString). It must
+# outlive the call, so the guest stub owns it as a file-scope buffer - it
+# cannot live inside gl_call, whose `&_c.retbuf` would be a stack address.
 GL_CALL_RETBUF_CAP = 8192
 
 # ---------------------------------------------------------------------------
@@ -84,12 +87,15 @@ GL_CALL_RETBUF_CAP = 8192
 # ---------------------------------------------------------------------------
 
 # Argument overrides: (function name, param index) -> C expression consuming
-# `a` and producing the host argument. Used where a single translation is not
-# enough (arrays of pointers).
+# `a` and producing the host argument. Needed where a parameter typed `void*`
+# is a guest data pointer rather than an opaque handle.
 ARG_OVERRIDES = {
     # glShaderSource passes an array of `count` guest string pointers; the
     # host needs an array of translated host pointers instead.
     ("glShaderSource", 2): "w32gl_translate_shader_srcs(a, (int)a[1])",
+    # eglChooseConfig's `configs` is declared void* but points at an array of
+    # EGLConfig the implementation writes into - a guest buffer, not a handle.
+    ("eglChooseConfig", 2): "(w32gl_EGLConfig*)w32gl_gptr(a[2])",
 }
 
 # Pointer arguments that are *either* a guest address (client-side array) or
@@ -101,8 +107,9 @@ OFFSET_PTR_ARGS = {
     ("glDrawElements", 3),
 }
 
-# Functions returning a host-owned string: the guest stub offers a scratch
-# buffer in args[GL_CALL_RETBUF_SLOT] and the host copies the string there.
+# Functions returning a host-owned string: the guest stub offers its static
+# glstub_retbuf via args[GL_CALL_RETBUF_SLOT], the host copies the string
+# there and answers with that guest address.
 STRING_RET_FNS = {"glGetString", "eglQueryString"}
 
 # ---------------------------------------------------------------------------
@@ -552,14 +559,15 @@ def fn_id_defs(gl_fns, egl_fns):
         out.append("#define EGL_FN_%s 0x%03X" % (fn["name"][3:].upper(), EGL_FN_BASE + i))
     out.append("")
     out.append("#define GL_CALL_MAX_ARGS %d" % GL_CALL_MAX_ARGS)
-    out.append("/* Guest scratch buffer slot for calls returning a host-owned string */")
+    out.append("/* gl_call.args[] slot carrying the guest scratch buffer for the")
+    out.append(" * calls returning a host-owned string (glGetString / eglQueryString).")
+    out.append(" * The buffer must outlive the call: the stub owns it statically. */")
     out.append("#define GL_CALL_RETBUF_SLOT (GL_CALL_MAX_ARGS - 1)")
     out.append("#define GL_CALL_RETBUF_CAP  %d" % GL_CALL_RETBUF_CAP)
     out.append("")
-    out.append("/* Syscall numbers for marshalled GL/EGL calls (Phase 3) */")
-    out.append("#define SYS_GL_CALL_BASE   0x%05X" % SYS_GL_CALL_BASE)
-    out.append("#define SYS_GL_CALL   (SYS_GL_CALL_BASE + 0)")
-    out.append("#define SYS_EGL_CALL  (SYS_GL_CALL_BASE + 1)")
+    out.append("/* The marshalled-call syscall numbers (SYS_GL_CALL / SYS_EGL_CALL) come")
+    out.append(" * from the shared ABI header, together with every other hypercall. */")
+    out.append('#include "virtpass/vp_syscall.h"')
     return "\n".join(out)
 
 
@@ -574,10 +582,11 @@ def gl_call_struct():
  * (EGLDisplay/EGLConfig/EGLSurface/EGLContext and the EGLNative* types) are
  * only passed back by the guest, never dereferenced, so they pass through.
  *
- * args[GL_CALL_RETBUF_SLOT] carries the address of a guest scratch buffer
- * (GL_CALL_RETBUF_CAP bytes) for calls that hand back a host-owned string:
- * glGetString and eglQueryString answer with that guest address instead of a
- * pointer the guest cannot read. Only those single-argument calls use the
+ * args[GL_CALL_RETBUF_SLOT] holds the address of a guest scratch buffer
+ * (GL_CALL_RETBUF_CAP bytes) for calls that hand back a host-owned string
+ * (glGetString/eglQueryString): the host copies the string there and answers
+ * with that guest address. The stub keeps it in a static, not on its stack -
+ * the pointer outlives the call. Only those two single-argument calls use the
  * slot; everywhere else it is just the last parameter (or unused).
  * ============================================================ */
 typedef struct {
@@ -588,7 +597,7 @@ typedef struct {
                                         * extended; floats bit-packed;
                                         * data pointers as guest VA;
                                         * handles as opaque host values;
-                                        * last slot = scratch buffer     */
+                                        * last slot = string scratch     */
 } gl_call;
 """
 
@@ -686,8 +695,10 @@ static inline int64_t glstub_packf(float v)
 #define GLSTUB_DO(nr)                             \\
     virtpass_syscall((nr), (long)(uintptr_t)&_c, 0, 0, 0, 0, 0)
 
-/* Scratch buffer handed to the host by calls that return a host-owned string
- * (glGetString, eglQueryString) - see args[GL_CALL_RETBUF_SLOT]. */
+/* Scratch buffer handed to the host by calls returning a host-owned string
+ * (glGetString/eglQueryString). File scope, not a gl_call member: the host
+ * answers with this guest address and the caller reads it after the call, so
+ * it must outlive the stub's own stack frame. */
 static char glstub_retbuf[GL_CALL_RETBUF_CAP];
 """)
 
@@ -706,9 +717,17 @@ static char glstub_retbuf[GL_CALL_RETBUF_CAP];
             out.append("    _c.args[GL_CALL_RETBUF_SLOT] = "
                        "(int64_t)(uintptr_t)glstub_retbuf;")
         out.append("    GLSTUB_DO(%s);" % syscall_nr)
-        r = guest_return_expr(fn)
-        if r:
-            out.append("    %s" % r)
+        if fn["name"] in STRING_RET_FNS:
+            # The host landed the string in glstub_retbuf and answered with its
+            # guest address, which is what _c.ret already holds - the raw host
+            # pointer never crosses back. Return the stub's own buffer so the
+            # value stays valid for the caller.
+            out.append("    return (%s)(uintptr_t)glstub_retbuf;"
+                       % guest_decl_type(fn["ret"]))
+        else:
+            r = guest_return_expr(fn)
+            if r:
+                out.append("    %s" % r)
         out.append("}")
         out.append("")
 
@@ -840,6 +859,28 @@ def gen_host_dispatch_tables(gl_fns, egl_fns):
     out.append(" * Guest data pointers are translated by the w32gl_gptr*() helpers")
     out.append(" * defined in win32_gl_dispatch.c above this include.")
     out.append(" */")
+    out.append("")
+
+    out.append("/* fn_id -> name, for the RVVM_GL_TRACE call log */")
+    out.append("static const char* w32gl_egl_name(uint32_t fn_id)")
+    out.append("{")
+    out.append("    switch (fn_id) {")
+    for fn in egl_fns:
+        fid = "EGL_FN_" + fn["name"][3:].upper()
+        out.append('    case %s: return "%s";' % (fid, fn["name"]))
+    out.append("    default: return NULL;")
+    out.append("    }")
+    out.append("}")
+    out.append("")
+    out.append("static const char* w32gl_gl_name(uint32_t fn_id)")
+    out.append("{")
+    out.append("    switch (fn_id) {")
+    for fn in gl_fns:
+        fid = "GL_FN_" + fn["name"][2:].upper()
+        out.append('    case %s: return "%s";' % (fid, fn["name"]))
+    out.append("    default: return NULL;")
+    out.append("    }")
+    out.append("}")
     out.append("")
 
     out.append("static void w32gl_dispatch_egl_generic(uint32_t fn_id, const int64_t* a, int64_t* ret)")

@@ -739,6 +739,14 @@ void sig_handler(int signal)
 #endif
 static THREAD_LOCAL rvvm_hart_t* current_user_hart = NULL;
 
+/* Name of the marshalled GL/EGL call currently being serviced, or NULL when
+ * the guest is running its own code. The win32 GL dispatch writes it (see
+ * win32_gl_dispatch.c) and the fault dump below reads it, so that a host
+ * fault can be attributed to the guest call that triggered it. Storage lives
+ * here rather than in the dispatch so host binaries that do not link the GL
+ * dispatch still resolve this symbol. */
+const char* g_gl_inflight = NULL;
+
 static void user_fault_hex(char** p, uint64_t val)
 {
     char tmp[17];
@@ -765,6 +773,21 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
     const char* addr = "fault addr(si_addr): ";
     while (*addr) *p++ = *addr++;
     user_fault_hex(&p, (uint64_t)(size_t)info->si_addr);
+    /* Which marshalled GL/EGL call (if any) was being serviced. Without this
+     * the register dump alone cannot say whether the fault came from the
+     * guest's own code or from a host GL call on its behalf. */
+    {
+        const char* inf = "in-flight host call: ";
+        while (*inf) *p++ = *inf++;
+        const char* name = g_gl_inflight;
+        if (name) {
+            while (*name) *p++ = *name++;
+        } else {
+            const char* none = "(none - guest code)";
+            while (*none) *p++ = *none++;
+        }
+        *p++ = '\n';
+    }
     rvvm_hart_t* cpu = current_user_hart;
     if (cpu) {
         const char* pch = "guest PC: ";
@@ -1698,10 +1721,18 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = errno_ret(fchown(a0, a1, a2));
                     }
                     break;
-                case 56: // openat
-                    rvvm_info("sys_openat(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
-                    a0 = errno_ret(openat(a0, wrap_path(path_buf, to_str(a1)), a2, a3));
+                case 56: { // openat
+                    const char* path = to_str(a1);
+                    rvvm_info("sys_openat(%ld, %s, %lx, %lx)", a0, path, a2, a3);
+                    if (!path && !(a2 & AT_EMPTY_PATH)) {
+                        /* openat would dereference the NULL path */
+                        a0 = -EFAULT;
+                    } else {
+                        /* NULL path with AT_EMPTY_PATH refers to the dirfd */
+                        a0 = errno_ret(openat(a0, path ? wrap_path(path_buf, path) : path, a2, a3));
+                    }
                     break;
+                }
                 case 57: // close
                     a0 = errno_ret(close(a0));
                     break;
@@ -1762,8 +1793,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 79: { // newfstatat
                     struct stat st = {0};
-                    rvvm_info("sys_newfstatat(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
-                    a0 = errno_ret(fstatat(a0, wrap_path(path_buf, to_str(a1)), &st, a3));
+                    const char* path = to_str(a1);
+                    int ret;
+                    rvvm_info("sys_newfstatat(%ld, %s, %lx, %lx)", a0, path, a2, a3);
+                    if (!path && !(a3 & AT_EMPTY_PATH)) {
+                        /* fstatat would dereference the NULL path */
+                        ret = -1;
+                        errno = EFAULT;
+                    } else {
+                        /* NULL path with AT_EMPTY_PATH means "fstat the fd";
+                         * fstatat() accepts it but wrap_path() would not. */
+                        ret = fstatat(a0, path ? wrap_path(path_buf, path) : path, &st, a3);
+                    }
+                    a0 = errno_ret(ret);
                     uapi_stat_convert(to_ptr(a2), &st);
                     break;
                 }
@@ -2325,8 +2367,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = cmdpost_dispatch(SYS_ANDROID_CALL, a0, a1, a2, a3, a4, a5, NULL);
                     break;
                 }
-                case 0x10020: // SYS_GL_CALL
-                case 0x10021: // SYS_EGL_CALL
+                case SYS_GL_CALL:
+                case SYS_EGL_CALL:
                     rvvm_info("cmdpost_dispatch nr=%lx a0=%lx a1=%lx", a7, a0, a1);
                     a0 = cmdpost_dispatch(a7, a0, a1, a2, a3, a4, a5, NULL);
                     break;

@@ -11,6 +11,12 @@
 /* GL active state shared between dispatch and bridge. */
 extern bool g_gl_active;
 
+/* Name of the marshalled GL/EGL call currently being serviced. Storage lives
+ * in the core (rvvm_user.c), which also prints it from the host fault dump so
+ * a crash can be tied back to the guest call that caused it. NULL when no
+ * marshalled call is in flight. */
+extern const char* g_gl_inflight;
+
 /* Dispatch callbacks — registered with vp_cmdpost in win32_host_init. */
 void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret);
 void on_gl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret);

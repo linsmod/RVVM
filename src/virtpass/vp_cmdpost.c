@@ -34,40 +34,21 @@
 #include "utils.h"
 #include "rvvm_types.h"
 #include "core/rvvm_user.h"
+#include "virtpass/vp_gl.h" /* gl_call + fn_id macros (generated) */
 
 /* ============================================================
  * Custom syscall numbers (must match the guest stub)
  *
  * Both sides now compile the same header, virtpass/vp_syscall.h, so there is
- * nothing left to keep in sync by hand.
+ * nothing left to keep in sync by hand. SYS_GL_CALL / SYS_EGL_CALL are the
+ * marshalled GL/EGL entries (Phase 3 hardware GL proxy).
+ *
+ * gl_call itself comes from the generated virtpass/vp_gl.h. This file used to
+ * carry a hand-copied struct mirroring only its first four fields - adding
+ * gl_call.retbuf on the guest side then desynced the layouts and every
+ * dispatch read the guest stack at the wrong offsets. Never duplicate it.
  * ============================================================ */
 #include "virtpass/vp_syscall.h"
-
-/* Marshalled GL/EGL calls (Phase 3: hardware GL proxy) */
-#define SYS_GL_CALL_BASE   0x10020
-#define SYS_GL_CALL   (SYS_GL_CALL_BASE + 0)
-#define SYS_EGL_CALL  (SYS_GL_CALL_BASE + 1)
-
-/*
- * Phase 3: marshalled GL/EGL call struct - minimal controlled copy of the
- * guest ABI layout in vp_gles_stub.h (kept in sync by hand; see handover
- * 0.3-1). The guest allocates gl_call on its stack and passes its address
- * in a0. Pointers inside args[] are GUEST addresses: guest memory is no
- * longer mapped into the host, so a backend must run each pointer argument
- * through rvvm_user_guest_ptr() before dereferencing it. (Handles such as
- * EGLDisplay/EGLSurface are host values the guest passes back unchanged and
- * must NOT be translated - hence per-function handling, not a blanket map.)
- * args[GL_CALL_RETBUF_SLOT] holds a guest scratch buffer for calls that
- * return a host string (glGetString/eglQueryString).
- * Floats travel bit-packed through the int64_t slots.
- */
-#define GL_CALL_MAX_ARGS 9
-typedef struct {
-    uint32_t fn_id;                  /* GL_FN_* / EGL_FN_*           */
-    uint32_t nargs;                  /* number of valid args[] slots */
-    int64_t  ret;                    /* host writes the return value */
-    int64_t  args[GL_CALL_MAX_ARGS];
-} gl_call;
 
 /* ============================================================
  * Sensor types (must match vp_ndk_stub)

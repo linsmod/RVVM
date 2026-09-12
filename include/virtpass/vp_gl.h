@@ -346,14 +346,15 @@ typedef uint32_t EGLenum;
 #define EGL_FN_TERMINATE 0x10F
 
 #define GL_CALL_MAX_ARGS 9
-/* Guest scratch buffer slot for calls returning a host-owned string */
+/* gl_call.args[] slot carrying the guest scratch buffer for the
+ * calls returning a host-owned string (glGetString / eglQueryString).
+ * The buffer must outlive the call: the stub owns it statically. */
 #define GL_CALL_RETBUF_SLOT (GL_CALL_MAX_ARGS - 1)
 #define GL_CALL_RETBUF_CAP  8192
 
-/* Syscall numbers for marshalled GL/EGL calls (Phase 3) */
-#define SYS_GL_CALL_BASE   0x10020
-#define SYS_GL_CALL   (SYS_GL_CALL_BASE + 0)
-#define SYS_EGL_CALL  (SYS_GL_CALL_BASE + 1)
+/* The marshalled-call syscall numbers (SYS_GL_CALL / SYS_EGL_CALL) come
+ * from the shared ABI header, together with every other hypercall. */
+#include "virtpass/vp_syscall.h"
 /* ============================================================
  * Marshalling struct (guest fills, host consumes)
  *
@@ -364,10 +365,11 @@ typedef uint32_t EGLenum;
  * (EGLDisplay/EGLConfig/EGLSurface/EGLContext and the EGLNative* types) are
  * only passed back by the guest, never dereferenced, so they pass through.
  *
- * args[GL_CALL_RETBUF_SLOT] carries the address of a guest scratch buffer
- * (GL_CALL_RETBUF_CAP bytes) for calls that hand back a host-owned string:
- * glGetString and eglQueryString answer with that guest address instead of a
- * pointer the guest cannot read. Only those single-argument calls use the
+ * args[GL_CALL_RETBUF_SLOT] holds the address of a guest scratch buffer
+ * (GL_CALL_RETBUF_CAP bytes) for calls that hand back a host-owned string
+ * (glGetString/eglQueryString): the host copies the string there and answers
+ * with that guest address. The stub keeps it in a static, not on its stack -
+ * the pointer outlives the call. Only those two single-argument calls use the
  * slot; everywhere else it is just the last parameter (or unused).
  * ============================================================ */
 typedef struct {
@@ -378,7 +380,7 @@ typedef struct {
                                         * extended; floats bit-packed;
                                         * data pointers as guest VA;
                                         * handles as opaque host values;
-                                        * last slot = scratch buffer     */
+                                        * last slot = string scratch     */
 } gl_call;
 
 /* ============================================================
