@@ -11,7 +11,11 @@
  *    original Phase 3 plan said 6 - widened before first deployment, so this
  *    is an internal ABI change with zero consumers).
  *  - Floats travel bit-packed through the int64_t slots; pointers travel as
- *    raw uintptr values (identity-mapped guest memory).
+ *    guest virtual addresses. Guest memory is NOT mapped into the host, so
+ *    the host dispatch translates every data pointer argument with
+ *    rvvm_user_guest_ptr() and, for calls that hand back a host-owned string
+ *    (glGetString/eglQueryString), copies it through the guest scratch
+ *    buffer offered in args[GL_CALL_RETBUF_SLOT].
  */
 
 /*
@@ -67,6 +71,10 @@ static inline int64_t glstub_packf(float v)
 
 #define GLSTUB_DO(nr)                             \
     virtpass_syscall((nr), (long)(uintptr_t)&_c, 0, 0, 0, 0, 0)
+
+/* Scratch buffer handed to the host by calls that return a host-owned string
+ * (glGetString, eglQueryString) - see args[GL_CALL_RETBUF_SLOT]. */
+static char glstub_retbuf[GL_CALL_RETBUF_CAP];
 
 uint32_t eglChooseConfig(void* dpy, const int32_t* attrib_list, void* configs, int32_t config_size, int32_t* num_config)
 {
@@ -190,6 +198,7 @@ const char* eglQueryString(void* dpy, int32_t name)
     GLSTUB_CALL(EGL_FN_QUERYSTRING, 2);
     _c.args[0] = (int64_t)(uintptr_t)dpy;
     _c.args[1] = (int64_t)(int32_t)name;
+    _c.args[GL_CALL_RETBUF_SLOT] = (int64_t)(uintptr_t)glstub_retbuf;
     GLSTUB_DO(SYS_EGL_CALL);
     return (const char*)(uintptr_t)_c.ret;
 }
@@ -844,6 +853,7 @@ const uint8_t* glGetString(uint32_t name)
 {
     GLSTUB_CALL(GL_FN_GETSTRING, 1);
     _c.args[0] = (int64_t)(uint32_t)name;
+    _c.args[GL_CALL_RETBUF_SLOT] = (int64_t)(uintptr_t)glstub_retbuf;
     GLSTUB_DO(SYS_GL_CALL);
     return (const uint8_t*)(uintptr_t)_c.ret;
 }

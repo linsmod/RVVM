@@ -171,13 +171,6 @@ w32gl_PFN_glVertexAttrib4fv p_glVertexAttrib4fv;
 w32gl_PFN_glVertexAttribPointer p_glVertexAttribPointer;
 w32gl_PFN_glViewport p_glViewport;
 
-static const char* gl_backend_dir(void)
-{
-    const char* dir = getenv("RVVM_GL_DLL_DIR");
-    if (dir && *dir) return dir;
-    return NULL;
-}
-
 static void gl_log(const char* fmt, ...)
 {
     va_list ap;
@@ -196,54 +189,159 @@ static inline float w32gl_arg_f(int64_t v)
     return f;
 }
 
+/* ---------------------------------------------------------------------------
+ * Backend DLL discovery
+ *
+ * libEGL.dll / libGLESv2.dll ship with the Android SDK emulator, one
+ * directory per backend:
+ *   <sdk>\emulator\lib64\gles_angle\{libEGL,libGLESv2,d3dcompiler_47}.dll
+ *   <sdk>\emulator\lib64\gles_swiftshader\...
+ * <sdk> comes from RVVM_GL_DLL_DIR (explicit, wins), then ANDROID_SDK_ROOT /
+ * ANDROID_HOME, then the usual per-user install location.
+ * --------------------------------------------------------------------------- */
+
+static char g_dll_dir[MAX_PATH];
+static char g_backend[32];
+
+/* Load the pair from `dir`. Full paths keep a stray libEGL.dll next to the
+ * executable from shadowing the backend, and SetDllDirectoryA keeps the
+ * directory on the search path while ANGLE pulls in d3dcompiler_47.dll. */
+static bool gl_load_pair(const char* dir)
+{
+    char egl_path[MAX_PATH], gles_path[MAX_PATH];
+    const char* egl_name  = "libEGL.dll";
+    const char* gles_name = "libGLESv2.dll";
+
+    if (dir && *dir) {
+        snprintf(egl_path, sizeof(egl_path), "%s\\%s", dir, egl_name);
+        snprintf(gles_path, sizeof(gles_path), "%s\\%s", dir, gles_name);
+        egl_name = egl_path;
+        gles_name = gles_path;
+        SetDllDirectoryA(dir);
+    }
+
+    g_h_egl  = LoadLibraryA(egl_name);
+    g_h_gles = LoadLibraryA(gles_name);
+    SetDllDirectoryA(NULL);
+
+    if (g_h_egl && g_h_gles) return true;
+    if (g_h_egl)  { FreeLibrary(g_h_egl);  g_h_egl = NULL; }
+    if (g_h_gles) { FreeLibrary(g_h_gles); g_h_gles = NULL; }
+    return false;
+}
+
+/* Try <root>\emulator\lib64\gles_<name>; skip roots that do not exist. */
+static bool gl_try_backend_dir(const char* root, const char* name)
+{
+    char dir[MAX_PATH];
+    snprintf(dir, sizeof(dir), "%s\\emulator\\lib64\\gles_%s", root, name);
+    if (GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES) return false;
+    if (!gl_load_pair(dir)) {
+        gl_log("GL backend probe failed: %s", dir);
+        return false;
+    }
+    snprintf(g_dll_dir, sizeof(g_dll_dir), "%s", dir);
+    snprintf(g_backend, sizeof(g_backend), "%s", name);
+    gl_log("GL backend dir: %s", dir);
+    return true;
+}
+
+/* Last resort: any gles_* sibling that actually loads (covers emulator
+ * releases that add gles_angle9 / gles_angle11 / ...). */
+static bool gl_scan_backend_dirs(const char* root)
+{
+    char pattern[MAX_PATH];
+    snprintf(pattern, sizeof(pattern), "%s\\emulator\\lib64\\gles_*", root);
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    char dir[MAX_PATH];
+    bool hit = false;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        snprintf(dir, sizeof(dir), "%s\\emulator\\lib64\\%s", root, fd.cFileName);
+        if (!gl_load_pair(dir)) continue;
+        snprintf(g_dll_dir, sizeof(g_dll_dir), "%s", dir);
+        snprintf(g_backend, sizeof(g_backend), "%s", fd.cFileName + 5);
+        gl_log("GL backend dir: %s", dir);
+        hit = true;
+        break;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return hit;
+}
+
+static bool gl_try_sdk_root(const char* root, const char* prefer, const char* other)
+{
+    if (!root || !*root) return false;
+    return gl_try_backend_dir(root, prefer) ||
+           gl_try_backend_dir(root, other) ||
+           gl_scan_backend_dirs(root);
+}
+
 bool win32_gl_backend_load(void)
 {
     if (g_loaded) { g_refcnt++; return true; }
 
-    const char* dir = gl_backend_dir();
-    gl_log("GL backend dir: %s", dir ? dir : "(guess)");
-
     const char* backend = getenv("RVVM_GL_BACKEND");
-    const char* gl_type = backend && strcmp(backend, "off") == 0 ? "off" :
-                          backend && strcmp(backend, "swiftshader") == 0 ? "swiftshader" : "angle";
-
-    if (strcmp(gl_type, "off") == 0) {
+    if (backend && strcmp(backend, "off") == 0) {
         gl_log("GL backend disabled (RVVM_GL_BACKEND=off)");
         return false;
     }
 
-    if (dir) {
-        SetDllDirectoryA(dir);
+    /* RVVM_GL_BACKEND names the preferred DLL set; the other one is the
+     * fallback (ANGLE needs D3D, SwiftShader is pure CPU). */
+    const char* prefer = (backend && strcmp(backend, "swiftshader") == 0)
+                             ? "swiftshader" : "angle";
+    const char* other  = strcmp(prefer, "angle") == 0 ? "swiftshader" : "angle";
+
+    /* 1. Explicit directory wins. */
+    const char* dir = getenv("RVVM_GL_DLL_DIR");
+    if (dir && *dir) {
+        gl_log("GL backend dir: %s", dir);
+        if (gl_load_pair(dir)) {
+            snprintf(g_dll_dir, sizeof(g_dll_dir), "%s", dir);
+            snprintf(g_backend, sizeof(g_backend), "%s", prefer);
+        } else {
+            gl_log("GL backend load failed (%s): egl=%p gles=%p",
+                   prefer, (void*)g_h_egl, (void*)g_h_gles);
+        }
     }
 
-    g_h_egl  = LoadLibraryA("libEGL.dll");
-    g_h_gles = LoadLibraryA("libGLESv2.dll");
-    SetDllDirectoryA(NULL);
+    /* 2. Android SDK emulator tree (libEGL.dll + libGLESv2.dll per backend). */
+    if (!g_h_egl || !g_h_gles) {
+        char local_sdk[MAX_PATH], profile_sdk[MAX_PATH];
+        const char* roots[4];
+        int nroots = 0;
+        const char* env;
+
+        if ((env = getenv("ANDROID_SDK_ROOT")) && *env) roots[nroots++] = env;
+        if ((env = getenv("ANDROID_HOME")) && *env) roots[nroots++] = env;
+        if ((env = getenv("LOCALAPPDATA")) && *env) {
+            snprintf(local_sdk, sizeof(local_sdk), "%s\\Android\\Sdk", env);
+            roots[nroots++] = local_sdk;
+        }
+        if ((env = getenv("USERPROFILE")) && *env) {
+            snprintf(profile_sdk, sizeof(profile_sdk),
+                     "%s\\AppData\\Local\\Android\\Sdk", env);
+            roots[nroots++] = profile_sdk;
+        }
+
+        for (int i = 0; i < nroots; i++) {
+            if (gl_try_sdk_root(roots[i], prefer, other)) break;
+        }
+    }
 
     if (!g_h_egl || !g_h_gles) {
         gl_log("GL backend load failed (%s): egl=%p gles=%p",
-               gl_type, (void*)g_h_egl, (void*)g_h_gles);
-        if (g_h_egl) { FreeLibrary(g_h_egl); g_h_egl = NULL; }
+               prefer, (void*)g_h_egl, (void*)g_h_gles);
+        if (g_h_egl)  { FreeLibrary(g_h_egl);  g_h_egl = NULL; }
         if (g_h_gles) { FreeLibrary(g_h_gles); g_h_gles = NULL; }
-        const char* sdk = getenv("ANDROID_SDK_ROOT");
-        if (!sdk) sdk = getenv("ANDROID_HOME");
-        if (sdk) {
-            const char* fallback = strcmp(gl_type, "angle") == 0 ? "swiftshader" : "angle";
-            char fpath[512];
-            snprintf(fpath, sizeof(fpath), "%s\\emulator\\lib64\\gles_%s", sdk, fallback);
-            gl_log("Trying fallback backend: %s", fpath);
-            SetDllDirectoryA(fpath);
-            g_h_egl  = LoadLibraryA("libEGL.dll");
-            g_h_gles = LoadLibraryA("libGLESv2.dll");
-            SetDllDirectoryA(NULL);
-            if (g_h_egl && g_h_gles) goto loaded;
-            if (g_h_egl) { FreeLibrary(g_h_egl); g_h_egl = NULL; }
-            if (g_h_gles) { FreeLibrary(g_h_gles); g_h_gles = NULL; }
-        }
         return false;
     }
 
-loaded:
     #define LOAD(name) p_egl##name = (w32gl_PFN_egl##name)GetProcAddress(g_h_egl, "egl" #name)
     LOAD(ChooseConfig);
     LOAD(CreateContext);
@@ -416,9 +514,8 @@ loaded:
 
     g_loaded = true;
     g_refcnt = 1;
-    gl_log("GL backend loaded: %s (%s)",
-           backend && strcmp(backend, "swiftshader") == 0 ? "swiftshader" : "angle",
-           dir ? dir : "(default)");
+    gl_log("GL backend loaded: %s (%s)", g_backend,
+           g_dll_dir[0] ? g_dll_dir : "(default)");
     return true;
 }
 
@@ -430,9 +527,8 @@ bool win32_gl_backend_ready(void)
 const char* win32_gl_backend_name(void)
 {
     const char* backend = getenv("RVVM_GL_BACKEND");
-    if (backend && strcmp(backend, "swiftshader") == 0) return "swiftshader";
     if (backend && strcmp(backend, "off") == 0) return "off";
-    return g_loaded ? "angle" : "";
+    return g_loaded ? g_backend : "";
 }
 
 void win32_gl_backend_unload(void)

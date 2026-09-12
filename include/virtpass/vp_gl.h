@@ -11,7 +11,11 @@
  *    original Phase 3 plan said 6 - widened before first deployment, so this
  *    is an internal ABI change with zero consumers).
  *  - Floats travel bit-packed through the int64_t slots; pointers travel as
- *    raw uintptr values (identity-mapped guest memory).
+ *    guest virtual addresses. Guest memory is NOT mapped into the host, so
+ *    the host dispatch translates every data pointer argument with
+ *    rvvm_user_guest_ptr() and, for calls that hand back a host-owned string
+ *    (glGetString/eglQueryString), copies it through the guest scratch
+ *    buffer offered in args[GL_CALL_RETBUF_SLOT].
  */
 
 #ifndef VIRTPASS_GL
@@ -342,6 +346,9 @@ typedef uint32_t EGLenum;
 #define EGL_FN_TERMINATE 0x10F
 
 #define GL_CALL_MAX_ARGS 9
+/* Guest scratch buffer slot for calls returning a host-owned string */
+#define GL_CALL_RETBUF_SLOT (GL_CALL_MAX_ARGS - 1)
+#define GL_CALL_RETBUF_CAP  8192
 
 /* Syscall numbers for marshalled GL/EGL calls (Phase 3) */
 #define SYS_GL_CALL_BASE   0x10020
@@ -351,16 +358,27 @@ typedef uint32_t EGLenum;
  * Marshalling struct (guest fills, host consumes)
  *
  * Guest allocates gl_call on its stack and passes its address in a0.
- * Pointers inside args[] are guest addresses - identity-mapped into
- * host memory by the emulator, so the host uses them directly.
+ * Pointers inside args[] are GUEST addresses: guest memory is no longer
+ * mapped into the host, so the backend must run each data pointer through
+ * rvvm_user_guest_ptr() before dereferencing it. Opaque host values
+ * (EGLDisplay/EGLConfig/EGLSurface/EGLContext and the EGLNative* types) are
+ * only passed back by the guest, never dereferenced, so they pass through.
+ *
+ * args[GL_CALL_RETBUF_SLOT] carries the address of a guest scratch buffer
+ * (GL_CALL_RETBUF_CAP bytes) for calls that hand back a host-owned string:
+ * glGetString and eglQueryString answer with that guest address instead of a
+ * pointer the guest cannot read. Only those single-argument calls use the
+ * slot; everywhere else it is just the last parameter (or unused).
  * ============================================================ */
 typedef struct {
     uint32_t fn_id;                    /* GL_FN_* / EGL_FN_*            */
-    uint32_t nargs;                    /* number of valid args[] slots  */
+    uint32_t nargs;                    /* number of real args[] slots   */
     int64_t  ret;                      /* host writes the return value  */
     int64_t  args[GL_CALL_MAX_ARGS];   /* 32-bit ints are zero/sign
                                         * extended; floats bit-packed;
-                                        * pointers as uintptr           */
+                                        * data pointers as guest VA;
+                                        * handles as opaque host values;
+                                        * last slot = scratch buffer     */
 } gl_call;
 
 /* ============================================================

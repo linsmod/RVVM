@@ -66,13 +66,44 @@ EGL_WHITELIST = [
     "eglSwapBuffers",
     "eglQuerySurface",
     "eglGetProcAddress",
-    # Returns a host constant string; the pointer is passed through and
-    # readable by the guest thanks to identity-mapped guest memory.
+    # Returns a host constant string; the host copies it into the guest
+    # scratch buffer offered in args[GL_CALL_RETBUF_SLOT].
     "eglQueryString",
 ]
 
 # Number of argument slots in gl_call (glCompressedTexSubImage2D needs 9)
 GL_CALL_MAX_ARGS = 9
+
+# gl_call.args[GL_CALL_RETBUF_SLOT] is a scratch buffer the guest stub offers
+# for functions that hand back a host-owned string (glGetString /
+# eglQueryString). Sized for glGetString(GL_EXTENSIONS).
+GL_CALL_RETBUF_CAP = 8192
+
+# ---------------------------------------------------------------------------
+# Pointer translation tables (see win32_gl_dispatch.c for the host helpers)
+# ---------------------------------------------------------------------------
+
+# Argument overrides: (function name, param index) -> C expression consuming
+# `a` and producing the host argument. Used where a single translation is not
+# enough (arrays of pointers).
+ARG_OVERRIDES = {
+    # glShaderSource passes an array of `count` guest string pointers; the
+    # host needs an array of translated host pointers instead.
+    ("glShaderSource", 2): "w32gl_translate_shader_srcs(a, (int)a[1])",
+}
+
+# Pointer arguments that are *either* a guest address (client-side array) or
+# a byte offset into the currently bound buffer object. Translating them
+# unconditionally breaks the offset form (VBO draws), so the host passes the
+# raw value through when it is not a mappable guest address.
+OFFSET_PTR_ARGS = {
+    ("glVertexAttribPointer", 5),
+    ("glDrawElements", 3),
+}
+
+# Functions returning a host-owned string: the guest stub offers a scratch
+# buffer in args[GL_CALL_RETBUF_SLOT] and the host copies the string there.
+STRING_RET_FNS = {"glGetString", "eglQueryString"}
 
 # ---------------------------------------------------------------------------
 # Type tables
@@ -272,23 +303,38 @@ def host_pfn(fn):
     return "w32gl_PFN_" + fn["name"]
 
 
-def host_arg_expr(idx, t):
-    if t.is_pointer():
-        return "(%s)(uintptr_t)a[%d]" % (host_type(t), idx)
-    if t.is_float():
-        return "w32gl_arg_f(a[%d])" % idx
-    if t.is_int64():
+def host_arg_expr(fn, idx, t):
+    override = ARG_OVERRIDES.get((fn["name"], idx))
+    if override is not None:
+        return override
+    if not t.is_pointer():
+        if t.is_float():
+            return "w32gl_arg_f(a[%d])" % idx
+        # 32-bit ints: cast (int64 -> uint32/int32 handled by C conversion)
         return "(%s)a[%d]" % (host_type(t), idx)
-    # 32-bit integers: cast (int64 -> uint32/int32 handled by the C conversion)
-    return "(%s)a[%d]" % (host_type(t), idx)
+    if t.base in IMPLICIT_PTR or t.base in NATIVE_TYPES:
+        # Opaque host handle: produced by the host, handed back untouched.
+        return "(%s)(uintptr_t)a[%d]" % (host_type(t), idx)
+    if (fn["name"], idx) in OFFSET_PTR_ARGS:
+        return "(%s)w32gl_gptr_or_off(a[%d])" % (host_type(t), idx)
+    # Guest data pointer: translate before the host dereferences it.
+    return "(%s)w32gl_gptr(a[%d])" % (host_type(t), idx)
 
 
 def host_call_expr(fn):
-    argexprs = [host_arg_expr(i, t) for i, (t, _) in enumerate(fn["params"])]
+    argexprs = [host_arg_expr(fn, i, t) for i, (t, _) in enumerate(fn["params"])]
     call = "((%s)p_%s)(%s)" % (host_pfn(fn), fn["name"], ", ".join(argexprs))
     r = fn["ret"]
     if r.base == "void" and r.ptr == 0:
         return "%s;" % call
+    if r.is_pointer() and r.base not in IMPLICIT_PTR and r.base not in NATIVE_TYPES:
+        # Host-owned string: land it in the guest scratch buffer instead of
+        # handing a host pointer to the guest.
+        if fn["name"] not in STRING_RET_FNS:
+            raise ValueError(
+                "%s returns a pointer; add it to STRING_RET_FNS or teach the "
+                "host dispatch how to translate the result" % fn["name"])
+        return "*ret = w32gl_string_out(a, (const char*)%s);" % call
     if r.is_pointer():
         return "*ret = (int64_t)(intptr_t)%s;" % call
     if r.is_float():
@@ -317,7 +363,11 @@ GENERATED_BANNER = """/*
  *    original Phase 3 plan said 6 - widened before first deployment, so this
  *    is an internal ABI change with zero consumers).
  *  - Floats travel bit-packed through the int64_t slots; pointers travel as
- *    raw uintptr values (identity-mapped guest memory).
+ *    guest virtual addresses. Guest memory is NOT mapped into the host, so
+ *    the host dispatch translates every data pointer argument with
+ *    rvvm_user_guest_ptr() and, for calls that hand back a host-owned string
+ *    (glGetString/eglQueryString), copies it through the guest scratch
+ *    buffer offered in args[GL_CALL_RETBUF_SLOT].
  */
 """
 
@@ -502,6 +552,9 @@ def fn_id_defs(gl_fns, egl_fns):
         out.append("#define EGL_FN_%s 0x%03X" % (fn["name"][3:].upper(), EGL_FN_BASE + i))
     out.append("")
     out.append("#define GL_CALL_MAX_ARGS %d" % GL_CALL_MAX_ARGS)
+    out.append("/* Guest scratch buffer slot for calls returning a host-owned string */")
+    out.append("#define GL_CALL_RETBUF_SLOT (GL_CALL_MAX_ARGS - 1)")
+    out.append("#define GL_CALL_RETBUF_CAP  %d" % GL_CALL_RETBUF_CAP)
     out.append("")
     out.append("/* Syscall numbers for marshalled GL/EGL calls (Phase 3) */")
     out.append("#define SYS_GL_CALL_BASE   0x%05X" % SYS_GL_CALL_BASE)
@@ -515,16 +568,27 @@ def gl_call_struct():
  * Marshalling struct (guest fills, host consumes)
  *
  * Guest allocates gl_call on its stack and passes its address in a0.
- * Pointers inside args[] are guest addresses - identity-mapped into
- * host memory by the emulator, so the host uses them directly.
+ * Pointers inside args[] are GUEST addresses: guest memory is no longer
+ * mapped into the host, so the backend must run each data pointer through
+ * rvvm_user_guest_ptr() before dereferencing it. Opaque host values
+ * (EGLDisplay/EGLConfig/EGLSurface/EGLContext and the EGLNative* types) are
+ * only passed back by the guest, never dereferenced, so they pass through.
+ *
+ * args[GL_CALL_RETBUF_SLOT] carries the address of a guest scratch buffer
+ * (GL_CALL_RETBUF_CAP bytes) for calls that hand back a host-owned string:
+ * glGetString and eglQueryString answer with that guest address instead of a
+ * pointer the guest cannot read. Only those single-argument calls use the
+ * slot; everywhere else it is just the last parameter (or unused).
  * ============================================================ */
 typedef struct {
     uint32_t fn_id;                    /* GL_FN_* / EGL_FN_*            */
-    uint32_t nargs;                    /* number of valid args[] slots  */
+    uint32_t nargs;                    /* number of real args[] slots   */
     int64_t  ret;                      /* host writes the return value  */
     int64_t  args[GL_CALL_MAX_ARGS];   /* 32-bit ints are zero/sign
                                         * extended; floats bit-packed;
-                                        * pointers as uintptr           */
+                                        * data pointers as guest VA;
+                                        * handles as opaque host values;
+                                        * last slot = scratch buffer     */
 } gl_call;
 """
 
@@ -621,6 +685,10 @@ static inline int64_t glstub_packf(float v)
 
 #define GLSTUB_DO(nr)                             \\
     virtpass_syscall((nr), (long)(uintptr_t)&_c, 0, 0, 0, 0, 0)
+
+/* Scratch buffer handed to the host by calls that return a host-owned string
+ * (glGetString, eglQueryString) - see args[GL_CALL_RETBUF_SLOT]. */
+static char glstub_retbuf[GL_CALL_RETBUF_CAP];
 """)
 
     def emit(fn, syscall_nr):
@@ -634,6 +702,9 @@ static inline int64_t glstub_packf(float v)
                       else "EGL_FN_" + fn["name"][3:].upper(), len(fn["params"])))
         for i, (t, _) in enumerate(fn["params"]):
             out.append("    _c.args[%d] = %s;" % (i, guest_marshal_expr(names[i], t)))
+        if fn["name"] in STRING_RET_FNS:
+            out.append("    _c.args[GL_CALL_RETBUF_SLOT] = "
+                       "(int64_t)(uintptr_t)glstub_retbuf;")
         out.append("    GLSTUB_DO(%s);" % syscall_nr)
         r = guest_return_expr(fn)
         if r:
@@ -735,6 +806,11 @@ def gen_host_backend_header(gl_fns, egl_fns):
  *   RVVM_GL_DLL_DIR   = explicit directory containing libEGL.dll and
  *                     libGLESv2.dll (skips backend lookup)
  *
+ * Without RVVM_GL_DLL_DIR the Android SDK emulator tree is searched:
+ *   <sdk>/emulator/lib64/gles_angle, gles_swiftshader, gles_angle9, ...
+ * with <sdk> taken from ANDROID_SDK_ROOT / ANDROID_HOME, then the per-user
+ * install under LOCALAPPDATA/Android/Sdk or USERPROFILE/AppData/Local.
+ *
  * When no backend can be loaded every GL/EGL dispatch returns 0, which
  * makes guests fall back to the CPU rendering path (WINDOW_LOCK/UNLOCK).
  */
@@ -761,6 +837,8 @@ def gen_host_dispatch_tables(gl_fns, egl_fns):
     out.append(" * Generic dispatch switches, included from win32_gl_dispatch.c.")
     out.append(" * Do not include from anywhere else (defines static functions).")
     out.append(" * `a` is the const int64_t* args array, `ret` the int64_t* out.")
+    out.append(" * Guest data pointers are translated by the w32gl_gptr*() helpers")
+    out.append(" * defined in win32_gl_dispatch.c above this include.")
     out.append(" */")
     out.append("")
 

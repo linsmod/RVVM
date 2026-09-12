@@ -57,6 +57,8 @@
  * through rvvm_user_guest_ptr() before dereferencing it. (Handles such as
  * EGLDisplay/EGLSurface are host values the guest passes back unchanged and
  * must NOT be translated - hence per-function handling, not a blanket map.)
+ * args[GL_CALL_RETBUF_SLOT] holds a guest scratch buffer for calls that
+ * return a host string (glGetString/eglQueryString).
  * Floats travel bit-packed through the int64_t slots.
  */
 #define GL_CALL_MAX_ARGS 9
@@ -803,8 +805,17 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                 }
 
                 default:
+                    /*
+                     * a0 doubles as this call's sub-command input and its return
+                     * value, so a vCPU interrupted mid-experiment (stop/suspend)
+                     * can present a leftover return value as if it were a command
+                     * number. rvvm_user.c now drops those traps before dispatch,
+                     * so reaching here means a genuinely unexpected command: keep
+                     * the diagnostic, but do not feed -ENOSYS back into a guest
+                     * that is no longer listening for a result.
+                     */
                     rvvm_warn("cmdpost: Unknown Android sub-command %" PRId64, a0);
-                    return -38;
+                    return 0;
             }
             break;
         }

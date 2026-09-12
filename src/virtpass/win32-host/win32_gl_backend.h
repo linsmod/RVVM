@@ -11,7 +11,11 @@
  *    original Phase 3 plan said 6 - widened before first deployment, so this
  *    is an internal ABI change with zero consumers).
  *  - Floats travel bit-packed through the int64_t slots; pointers travel as
- *    raw uintptr values (identity-mapped guest memory).
+ *    guest virtual addresses. Guest memory is NOT mapped into the host, so
+ *    the host dispatch translates every data pointer argument with
+ *    rvvm_user_guest_ptr() and, for calls that hand back a host-owned string
+ *    (glGetString/eglQueryString), copies it through the guest scratch
+ *    buffer offered in args[GL_CALL_RETBUF_SLOT].
  */
 
 #ifndef WIN32_GL_BACKEND_H
@@ -224,6 +228,9 @@ typedef unsigned int  w32gl_EGLenum;
 #define EGL_FN_TERMINATE 0x10F
 
 #define GL_CALL_MAX_ARGS 9
+/* Guest scratch buffer slot for calls returning a host-owned string */
+#define GL_CALL_RETBUF_SLOT (GL_CALL_MAX_ARGS - 1)
+#define GL_CALL_RETBUF_CAP  8192
 
 /* Syscall numbers for marshalled GL/EGL calls (Phase 3) */
 #define SYS_GL_CALL_BASE   0x10020
@@ -234,17 +241,27 @@ typedef unsigned int  w32gl_EGLenum;
  * Marshalling struct (guest fills, host consumes)
  *
  * Guest allocates gl_call on its stack and passes its address in a0.
- * Pointers inside args[] are guest addresses and MUST be translated with
- * rvvm_user_guest_ptr() before use - guest memory is no longer mapped into
- * the host. Host handles (EGLDisplay, EGLSurface, ...) pass through as-is.
+ * Pointers inside args[] are GUEST addresses: guest memory is no longer
+ * mapped into the host, so the backend must run each data pointer through
+ * rvvm_user_guest_ptr() before dereferencing it. Opaque host values
+ * (EGLDisplay/EGLConfig/EGLSurface/EGLContext and the EGLNative* types) are
+ * only passed back by the guest, never dereferenced, so they pass through.
+ *
+ * args[GL_CALL_RETBUF_SLOT] carries the address of a guest scratch buffer
+ * (GL_CALL_RETBUF_CAP bytes) for calls that hand back a host-owned string:
+ * glGetString and eglQueryString answer with that guest address instead of a
+ * pointer the guest cannot read. Only those single-argument calls use the
+ * slot; everywhere else it is just the last parameter (or unused).
  * ============================================================ */
 typedef struct {
     uint32_t fn_id;                    /* GL_FN_* / EGL_FN_*            */
-    uint32_t nargs;                    /* number of valid args[] slots  */
+    uint32_t nargs;                    /* number of real args[] slots   */
     int64_t  ret;                      /* host writes the return value  */
     int64_t  args[GL_CALL_MAX_ARGS];   /* 32-bit ints are zero/sign
                                         * extended; floats bit-packed;
-                                        * pointers as uintptr           */
+                                        * data pointers as guest VA;
+                                        * handles as opaque host values;
+                                        * last slot = scratch buffer     */
 } gl_call;
 
 /* ---- EGL function pointer types ---- */
@@ -581,6 +598,11 @@ extern w32gl_PFN_glViewport p_glViewport;
  *                     falling back to swiftshader if angle fails)
  *   RVVM_GL_DLL_DIR   = explicit directory containing libEGL.dll and
  *                     libGLESv2.dll (skips backend lookup)
+ *
+ * Without RVVM_GL_DLL_DIR the Android SDK emulator tree is searched:
+ *   <sdk>/emulator/lib64/gles_angle, gles_swiftshader, gles_angle9, ...
+ * with <sdk> taken from ANDROID_SDK_ROOT / ANDROID_HOME, then the per-user
+ * install under LOCALAPPDATA/Android/Sdk or USERPROFILE/AppData/Local.
  *
  * When no backend can be loaded every GL/EGL dispatch returns 0, which
  * makes guests fall back to the CPU rendering path (WINDOW_LOCK/UNLOCK).
