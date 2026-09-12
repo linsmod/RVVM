@@ -173,6 +173,22 @@ public class RvvmNative {
     public static native void nativeSetConsoleListener(ConsoleListener listener);
 
     /**
+     * Snapshot of the persistent guest TTY (libvterm screen matrix) into
+     * {@code out}, one cell = 4 ints: [0] UCS-4 codepoint (0 = erased),
+     * [1] fg ARGB, [2] bg ARGB, [3] flags: bit0 bold, bit1 underline,
+     * bit2 reverse (already swapped into fg/bg), bit3 wide glyph.
+     * @return number of cells written (24*80), or 0 when no TTY exists
+     */
+    public static native int nativeTtySnapshot(int[] out);
+
+    /**
+     * Repaint hint for the TTY console: bumped by native on every guest
+     * output burst. Poll at ~30 Hz and re-snapshot + redraw only when the
+     * value changes.
+     */
+    public static native int nativeTtySerial();
+
+    /**
       * Listener for the guest's console I/O. onOutput receives one line per
       * call (line breaks normalized); onFirstFrame fires once per guest run
       * when the first frame has actually reached the screen - either through

@@ -4,53 +4,96 @@
     android:layout_height="match_parent"
     android:orientation="vertical">
 
-    <!-- The guest's render target with the console overlay on top. Declared
-         after the SurfaceView, so it draws above it: the overlay shows the
-         guest I/O before the first presented frame, hides once rendering
-         takes over, and comes back when the guest exits. -->
-    <FrameLayout
+    <!-- Two tabs: the guest's render target (SurfaceView + console overlay)
+         and the persistent TTY console (TextureView). The flipper swaps
+         between them; both stay alive, so the TTY keeps its screen while
+         graphics run in the other tab. -->
+    <ViewFlipper
+        android:id="@+id/viewFlipper"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1">
 
-        <SurfaceView
-            android:id="@+id/surfaceView"
+        <!-- Tab 1: graphics -->
+        <FrameLayout
             android:layout_width="match_parent"
-            android:layout_height="match_parent" />
+            android:layout_height="match_parent">
 
-        <!-- Tap toggles word wrap. Two nested scrollers so the unwrapped
-             (single-line) mode can extend horizontally: the outer view
-             scrolls X, the inner one Y. -->
-        <HorizontalScrollView
-            android:id="@+id/logOverlayScroll"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:background="#C0000000"
-            android:fillViewport="true"
-            android:scrollbars="none"
-            android:visibility="gone">
+            <SurfaceView
+                android:id="@+id/surfaceView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent" />
 
-            <ScrollView
-                android:id="@+id/logOverlayVScroll"
+            <!-- Tap toggles word wrap. Two nested scrollers so the unwrapped
+                 (single-line) mode can extend horizontally: the outer view
+                 scrolls X, the inner one Y. -->
+            <HorizontalScrollView
+                android:id="@+id/logOverlayScroll"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
+                android:background="#C0000000"
                 android:fillViewport="true"
-                android:scrollbars="none">
+                android:scrollbars="none"
+                android:visibility="gone">
 
-                <TextView
-                    android:id="@+id/logOverlayText"
+                <ScrollView
+                    android:id="@+id/logOverlayVScroll"
                     android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:padding="6dp"
-                    android:textColor="#E0E0E0"
-                    android:textSize="12sp"
-                    android:typeface="monospace" />
+                    android:layout_height="match_parent"
+                    android:fillViewport="true"
+                    android:scrollbars="none">
 
-            </ScrollView>
+                    <TextView
+                        android:id="@+id/logOverlayText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:padding="6dp"
+                        android:textColor="#E0E0E0"
+                        android:textSize="12sp"
+                        android:typeface="monospace" />
 
-        </HorizontalScrollView>
+                </ScrollView>
 
-    </FrameLayout>
+            </HorizontalScrollView>
+
+        </FrameLayout>
+
+        <!-- Tab 2: TTY console, rendered by a TextureView + Canvas -->
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="#FF000000">
+
+            <TextureView
+                android:id="@+id/ttyView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent" />
+
+        </FrameLayout>
+
+    </ViewFlipper>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/tabGraphicsButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/tab_graphics"
+            android:layout_marginEnd="4dp" />
+
+        <Button
+            android:id="@+id/tabConsoleButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/tab_console" />
+
+    </LinearLayout>
 
     <LinearLayout
         android:layout_width="match_parent"

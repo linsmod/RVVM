@@ -34,6 +34,8 @@
 /* Include rvvm-user API */
 #include "rvvm_user.h"
 
+#include <vterm.h> /* guest virtual TTY (set_tty0 injection, snapshot readout) */
+
 #define LOG_TAG "RVVM-JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
@@ -306,6 +308,129 @@ static size_t          g_console_len = 0;
  * nativeRunElf(). Read from the guest thread, written from the UI thread
  * (clear) and the guest thread (set); volatile is enough for this pattern. */
 static volatile int g_first_frame_sent = 0;
+
+/* ============================================================
+ * Guest virtual TTY: host-owned libvterm + set_tty0 injection
+ * ============================================================
+ * Mirrors the win32 host: the process owns one persistent VTerm (24x80,
+ * UTF-8), injected into every guest via rvvm_user_set_tty0(). Guest fd 1/2
+ * output is parsed into the screen matrix there, so the terminal survives
+ * guest exit (the TextureView keeps showing the frozen last screen until
+ * the next run resets it) and guest libc's isatty() probes are answered
+ * (line-buffered stdio).
+ *
+ * The tty callback registered alongside tty0 does nothing but bump
+ * g_tty_serial - the repaint hint for the Java-side poller
+ * (nativeTtySerial() / nativeTtySnapshot()), which renders the cells onto
+ * the TextureView canvas. With tty0 active rvvm_user routes fd 1/2 into the
+ * VTerm, so the old io_callback console bridge no longer sees stdout: the
+ * TextureView console replaces the text overlay.
+ * ============================================================ */
+#define TTY_ROWS 24
+#define TTY_COLS 80
+
+static VTerm*         g_tty_vt     = NULL;
+static volatile int   g_tty_serial = 0; /* bumped on every output burst */
+
+/* Repaint hint: guest thread, on every fd 1/2 write. */
+static void jni_tty_cb(void* userdata, int fd, void* tty)
+{
+    (void)userdata; (void)fd; (void)tty;
+    g_tty_serial++;
+}
+
+/* Persistent VTerm for the process lifetime. */
+static void jni_tty_init(void)
+{
+    if (g_tty_vt) {
+        return;
+    }
+    g_tty_vt = vterm_new(TTY_ROWS, TTY_COLS);
+    if (!g_tty_vt) {
+        LOGE("vterm_new failed");
+        return;
+    }
+    vterm_set_utf8(g_tty_vt, 1); /* UTF-8 is off by default in libvterm */
+    vterm_screen_reset(vterm_obtain_screen(g_tty_vt), true);
+    LOGI("Guest TTY initialized (%dx%d)", TTY_ROWS, TTY_COLS);
+}
+
+/* Cell snapshot for the Java renderer: rows*cols cells, each 4 uint32:
+ * [0] codepoint (UCS-4), [1] fg ARGB, [2] bg ARGB, [3] flags (bit0 bold,
+ * bit1 underline, bit2 reverse already swapped into fg/bg, bit3 CJK-wide).
+ * Returns 0 if there is no TTY yet. */
+JNIEXPORT jint JNICALL
+Java_com_rvvm_android_RvvmNative_nativeTtySnapshot(JNIEnv* env, jobject thiz, jintArray out)
+{
+    (void)thiz;
+    if (!g_tty_vt || !out) {
+        return 0;
+    }
+    jsize len = (*env)->GetArrayLength(env, out);
+    if (len < TTY_ROWS * TTY_COLS * 4) {
+        return 0;
+    }
+    jint* buf = (*env)->GetIntArrayElements(env, out, NULL);
+    if (!buf) {
+        return 0;
+    }
+
+    VTermScreen* scr = vterm_obtain_screen(g_tty_vt);
+    for (int r = 0; r < TTY_ROWS; r++) {
+        for (int c = 0; c < TTY_COLS; c++) {
+            VTermPos pos = { r, c };
+            VTermScreenCell cell;
+            jint* cellout = buf + (r * TTY_COLS + c) * 4;
+            uint32_t cp = 0;
+            if (vterm_screen_get_cell(scr, pos, &cell) && cell.chars[0]) {
+                cp = cell.chars[0];
+            }
+            jint flags = 0;
+            if (cp == (uint32_t)-1) {
+                cp = 0; /* double-width gap: lead char already drawn */
+            } else if (cp) {
+                if (cell.attrs.bold)      flags |= 1 << 0;
+                if (cell.attrs.underline) flags |= 1 << 1;
+                /* libvterm's own wcwidth covers CJK *and* emoji (U+1F300+);
+                 * a hand-rolled codepoint range list misses the latter and
+                 * renders them overlapping the next cell. */
+                if (cell.width == 2) flags |= 1 << 3;
+            }
+            /* Colors: resolve defaults and indexed palette to ARGB. */
+            VTermColor fg = cell.fg, bg = cell.bg;
+            if (VTERM_COLOR_IS_DEFAULT_FG(&fg)) {
+                cellout[1] = 0xFFDCDCDC; /* light gray on black */
+            } else {
+                vterm_screen_convert_color_to_rgb(scr, &fg);
+                cellout[1] = 0xFF000000u | ((jint)fg.rgb.red << 16) |
+                             ((jint)fg.rgb.green << 8) | (jint)fg.rgb.blue;
+            }
+            if (VTERM_COLOR_IS_DEFAULT_BG(&bg)) {
+                cellout[2] = 0xFF000000; /* black */
+            } else {
+                vterm_screen_convert_color_to_rgb(scr, &bg);
+                cellout[2] = 0xFF000000u | ((jint)bg.rgb.red << 16) |
+                             ((jint)bg.rgb.green << 8) | (jint)bg.rgb.blue;
+            }
+            if (cell.attrs.reverse) {
+                jint t = cellout[1]; cellout[1] = cellout[2]; cellout[2] = t;
+                flags |= 1 << 2;
+            }
+            cellout[0] = (jint)cp;
+            cellout[3] = flags;
+        }
+    }
+    (*env)->ReleaseIntArrayElements(env, out, buf, 0);
+    return TTY_ROWS * TTY_COLS;
+}
+
+/* Repaint hint for the Java poller: bumped on every guest output burst. */
+JNIEXPORT jint JNICALL
+Java_com_rvvm_android_RvvmNative_nativeTtySerial(JNIEnv* env, jobject thiz)
+{
+    (void)env; (void)thiz;
+    return g_tty_serial;
+}
 
 /* JNIEnv for the calling thread, attaching it first when needed. The caller
  * must detach when *attached comes back non-zero. */
@@ -1527,6 +1652,16 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
     /* on_guest_exit re-reads g_exit_listener when it fires, so registering it
      * once per run covers a listener set before or after this point. */
     rvvm_user_set_exit_callback(g_guest_machine, on_guest_exit);
+
+    /* Host-owned persistent VTerm: reset the screen for this run, inject it
+     * into the machine (survives guest exit - the console tab keeps showing
+     * the last screen) and register the repaint-hint callback. */
+    jni_tty_init();
+    if (g_tty_vt) {
+        vterm_screen_reset(vterm_obtain_screen(g_tty_vt), true);
+        rvvm_user_set_tty0(g_guest_machine, g_tty_vt);
+        rvvm_user_set_tty_callback(g_guest_machine, jni_tty_cb, NULL);
+    }
     
     /* Start guest thread */
     g_guest_running = 1;

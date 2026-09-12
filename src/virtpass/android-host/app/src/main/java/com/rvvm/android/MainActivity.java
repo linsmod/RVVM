@@ -4,6 +4,10 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.res.AssetManager;
 import android.content.res.Configuration;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.Typeface;
+import android.graphics.SurfaceTexture;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -15,6 +19,7 @@ import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AdapterView;
@@ -25,6 +30,7 @@ import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.ViewFlipper;
 
 import java.io.BufferedWriter;
 import java.io.File;
@@ -76,6 +82,8 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private TextView sensorDataText;
     private SurfaceView surfaceView;
     private SurfaceHolder surfaceHolder;
+    private TextureView ttyView;          // Console tab render target
+    private ViewFlipper viewFlipper;
     private Button runButton;
     private Button suspendButton;
     private Button stopButton;
@@ -129,6 +137,159 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private boolean isInitialized = false;
     private boolean isSurfaceReady = false;
     private boolean hasAutoStarted = false;
+
+    // ---- TTY console (TextureView tab) ----
+    // One cell = 4 ints from nativeTtySnapshot: [0] UCS-4 cp, [1] fg ARGB,
+    // [2] bg ARGB, [3] flags (bit0 bold, bit1 underline, bit2 reverse,
+    // bit3 wide). Drawn with a monospace Paint; nativeTtySerial() gates
+    // re-snapshotting, so idle output costs nothing but a compare.
+    private static final int TTY_ROWS = 24;
+    private static final int TTY_COLS = 80;
+    private static final int TTY_CELL = 4;
+    private static final float TTY_PAD = 8f;
+    private final int[] ttyCells = new int[TTY_ROWS * TTY_COLS * TTY_CELL];
+    private int ttySerial = -1;
+    private volatile boolean ttyRunning = false;
+    private final Paint ttyTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint ttyBgPaint = new Paint();
+    private final Paint ttyUnderlinePaint = new Paint();
+
+    // 30 Hz poll: snapshot + redraw only when the native serial changed.
+    private final Runnable ttyTick = new Runnable() {
+        @Override public void run() {
+            if (!ttyRunning) return;
+            if (ttyView != null && ttyView.isAvailable()) {
+                int serial = RvvmNative.nativeTtySerial();
+                if (serial != ttySerial) {
+                    ttySerial = serial;
+                    drawTty();
+                }
+            }
+            ttyView.postDelayed(this, 33);
+        }
+    };
+
+    private final TextureView.SurfaceTextureListener ttyTextureListener =
+            new TextureView.SurfaceTextureListener() {
+        @Override public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) {
+            startTtyLoop();
+        }
+        @Override public void onSurfaceTextureSizeChanged(SurfaceTexture st, int w, int h) {
+            if (ttyRunning) drawTty();
+        }
+        @Override public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
+            stopTtyLoop();
+            return true;
+        }
+        @Override public void onSurfaceTextureUpdated(SurfaceTexture st) {}
+    };
+
+    private void startTtyLoop() {
+        if (ttyRunning) return;
+        ttyRunning = true;
+        ttyTextPaint.setTypeface(Typeface.MONOSPACE);
+        ttyUnderlinePaint.setStyle(Paint.Style.STROKE);
+        ttySerial = -1;
+        ttyView.post(ttyTick);
+    }
+
+    private void stopTtyLoop() {
+        ttyRunning = false;
+        if (ttyView != null) ttyView.removeCallbacks(ttyTick);
+    }
+
+    /** Snapshot the native TTY and render the grid onto the TextureView. */
+    private void drawTty() {
+        if (ttyView.getSurfaceTexture() == null) return;
+        if (RvvmNative.nativeTtySnapshot(ttyCells) <= 0) return;
+
+        Canvas canvas = ttyView.lockCanvas(null);
+        if (canvas == null) return;
+        try {
+            int w = canvas.getWidth(), h = canvas.getHeight();
+            canvas.drawColor(0xFF000000);
+
+            /* Fit the 80x24 grid by measuring the real monospace advance.
+             * At the 100px probe size the advance is adv100, so the size
+             * that fits TTY_COLS cells is 100 * availW / (cols * adv100);
+             * the height cap works directly on lineH = 1.2 * size. */
+            ttyTextPaint.setTextSize(100f);
+            float adv100 = ttyTextPaint.measureText("M");
+            float maxByWidth = 100f * (w - 2 * TTY_PAD) / (TTY_COLS * adv100);
+            float maxByHeight = (h - 2 * TTY_PAD) / (TTY_ROWS * 1.2f);
+            float size = Math.min(100f, Math.min(maxByWidth, maxByHeight));
+            size = Math.max(size, 9f);
+            ttyTextPaint.setTextSize(size);
+
+            float adv = ttyTextPaint.measureText("M");
+            float lineH = size * 1.2f;
+            float gridW = adv * TTY_COLS, gridH = lineH * TTY_ROWS;
+            float ox = (w - gridW) / 2f, oy = (h - gridH) / 2f;
+            float ascent = ttyTextPaint.ascent();
+
+            ttyUnderlinePaint.setStyle(Paint.Style.STROKE);
+            ttyUnderlinePaint.setStrokeWidth(Math.max(1f, size / 14f));
+
+            int lastFg = 0, lastBg = 0, lastFlags = -1;
+            float runX = 0;
+            StringBuilder run = null;
+
+            for (int r = 0; r < TTY_ROWS; r++) {
+                float y0 = oy + r * lineH;
+                float baseline = y0 - ascent;
+
+                for (int c = 0; c <= TTY_COLS; c++) {
+                    int fg = 0, bg = 0, flags = 0;
+                    String ch = null;
+                    if (c < TTY_COLS) {
+                        int i = (r * TTY_COLS + c) * TTY_CELL;
+                        int cp = ttyCells[i];
+                        fg = ttyCells[i + 1];
+                        bg = ttyCells[i + 2];
+                        flags = ttyCells[i + 3];
+                        if (cp > 0 && cp != (int) ' ') {
+                            ch = new String(Character.toChars(cp));
+                        }
+                    }
+
+                    boolean sameRun = ch != null && run != null
+                            && fg == lastFg && bg == lastBg && flags == lastFlags;
+                    if (run != null && !sameRun) {
+                        // Draw the finished run: background then text.
+                        float endX = c * adv;
+                        if (lastBg != 0xFF000000) {
+                            ttyBgPaint.setColor(lastBg);
+                            canvas.drawRect(runX, y0, endX, y0 + lineH, ttyBgPaint);
+                        }
+                        ttyTextPaint.setColor(lastFg);
+                        ttyTextPaint.setFakeBoldText((lastFlags & 1) != 0);
+                        canvas.drawText(run.toString(), runX, baseline, ttyTextPaint);
+                        if ((lastFlags & 2) != 0) {
+                            ttyUnderlinePaint.setColor(lastFg);
+                            canvas.drawLine(runX, y0 + lineH * 0.95f,
+                                    endX, y0 + lineH * 0.95f, ttyUnderlinePaint);
+                        }
+                        run = null;
+                    }
+                    if (ch != null) {
+                        if (run == null) {
+                            run = new StringBuilder();
+                            runX = c * adv;
+                        }
+                        run.append(ch);
+                        if ((flags & 8) != 0 && c + 1 < TTY_COLS) {
+                            // Wide glyph: reserve the next (gap) cell too.
+                            run.append(' ');
+                            c++;
+                        }
+                        lastFg = fg; lastBg = bg; lastFlags = flags;
+                    }
+                }
+            }
+        } finally {
+            ttyView.unlockCanvasAndPost(canvas);
+        }
+    }
 
     // Exit code of the most recent guest, delivered by the native exit
     // callback. The callback fires on the guest thread while the guest is
@@ -204,6 +365,15 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         // Setup surface holder
         surfaceHolder = surfaceView.getHolder();
         surfaceHolder.addCallback(this);
+
+        // Tab switcher: graphics (SurfaceView) vs TTY console (TextureView)
+        ViewFlipper flipper = findViewById(R.id.viewFlipper);
+        Button tabGraphics = findViewById(R.id.tabGraphicsButton);
+        Button tabConsole = findViewById(R.id.tabConsoleButton);
+        tabGraphics.setOnClickListener(v -> flipper.setDisplayedChild(0));
+        tabConsole.setOnClickListener(v -> flipper.setDisplayedChild(1));
+        ttyView = findViewById(R.id.ttyView);
+        ttyView.setSurfaceTextureListener(ttyTextureListener);
 
         // Initialize sensor manager
         sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
