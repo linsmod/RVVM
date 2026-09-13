@@ -13,7 +13,7 @@
       apk    -> android        (guest assets + librvvm_jni.so + APK)
       assets -> android-assets (zig/musl riscv64 guest ELFs into APK assets)
       jni    -> android-jni    (librvvm_jni.so only)
-      sdk    -> vp-sdk         (guest VirtPass SDK: vpsdk.a + vpsdk.so)
+      sdk    -> vp-sdk         (guest VirtPass SDK: libvpsdk.a + libvpsdk.so)
       clean  -> android-clean  (Gradle clean)
 
 .PARAMETER Target

@@ -31,7 +31,7 @@ porting a guest to a new host, or when trimming a host backend.
 Together they cover the whole guest API surface, so a guest can be linked
 against `vpsdk` **instead of** `libandroid_stubs.a` + `libgles_stubs.a`.
 
-Any further `*.c` dropped into this directory is compiled into `vpsdk`
+Any further `*.c` dropped into this directory is compiled into both artifacts
 automatically (the Makefile matches the directory, not a file list). The directory
 is also part of `lib_src_virtpass_nonhost`, so these sources can never be picked
 up by the host build - RISC-V guest code must not end up inside `librvvm`.
@@ -81,15 +81,18 @@ produces, from one `-fPIC` object set:
 
 | Artifact | Description |
 |----------|-------------|
-| `$(BUILDDIR)/vp-sdk/vpsdk.a`  | static archive (use this for guests) |
-| `$(BUILDDIR)/vp-sdk/vpsdk.so` | shared object, riscv64-linux-musl |
+| `lib/libvpsdk.a`  | static archive (use this for guests) |
+| `lib/libvpsdk.so` | shared object, riscv64-linux-musl |
 
-with `$(BUILDDIR)` defaulting to `release.<os>.<arch>` (e.g.
-`release.windows.x86_64`). Like every other `src/virtpass` stub these are
-riscv64 **guest** objects: they are cross-compiled with `zig cc`, never with the
-host compiler, and the build directory is gitignored - `make clean` removes
-them. Override the flags with `VP_SDK_CFLAGS=...` (they are tracked in
-`vp-sdk/sdk_flags.stamp`, so changing them rebuilds).
+Both land in the repository root's `lib/` (`VP_SDK_OUT`, relative to the repo
+root) instead of the build directory: that is the single directory a guest build
+has to point `-L` at. Only the object files stay in `$(BUILDDIR)/vp-sdk/`, which
+defaults to `release.<os>.<arch>` (e.g. `release.windows.x86_64`). Like every
+other `src/virtpass` stub these are riscv64 **guest** objects: they are
+cross-compiled with `zig cc`, never with the host compiler, and `lib/` is
+gitignored - `make clean` (or `make vp-sdk-clean`) removes them. Override the
+flags with `VP_SDK_CFLAGS=...` (they are tracked in the build directory's
+`sdk_flags.stamp`, so changing them rebuilds).
 
 From the wrapper scripts:
 
@@ -109,12 +112,14 @@ Link a guest against the archive instead of the real stubs:
 ```sh
 zig cc -target riscv64-linux-musl -O0 -g -I include -static \
     src/virtpass/guest-samples/test_render.c \
-    release.windows.x86_64/vp-sdk/vpsdk.a -o test_render.exe
+    -L lib -lvpsdk -o test_render.exe
 ```
 
-The artifacts are named `vpsdk.a` / `vpsdk.so` **without** the `lib` prefix, so
-`-lvpsdk` will not find them - pass the path, or copy the archive to
-`libvpsdk.a` in your own link directory.
+Both artifacts carry the `lib` prefix (`libvpsdk.a` / `libvpsdk.so`), so the usual
+`-L <dir> -lvpsdk` lookup works; passing the archive path directly
+(`lib/libvpsdk.a`) works just as well. `lib/` is a plain path with no dots, so
+`-Llib` is safe on PowerShell too - unlike the old
+`release.windows.x86_64/vp-sdk`, which PowerShell splits at the first dot.
 
 The guest runs against any host, including one with no virtpass backend: it just
 does nothing and prints what it wanted. Each distinct API is reported once (a
@@ -142,7 +147,7 @@ the log); regenerate with `--no-dedupe` for one line per call.
   ```
 
   The banner records `--keep`, so a regenerated file says how it was made.
-- **`vpsdk.so` exports every non-static symbol** (no version script); the static
+- **`libvpsdk.so` exports every non-static symbol** (no version script); the static
   archive is the artifact guest builds should use. The `.so` is only usable with
   a dynamic loader inside the guest.
 - **Do not link `vpsdk` together with the real stubs** - the API symbols would

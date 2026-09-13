@@ -230,13 +230,20 @@ endif
 # Like every other src/virtpass stub these are riscv64 guest objects, so they
 # are cross-compiled with zig (the same toolchain which builds the Android guest
 # assets below) and never with the host compiler. Both the static and the shared
-# library are produced from one -fPIC object set, into $(BUILDDIR)/vp-sdk/.
+# library are produced from one -fPIC object set: the objects stay inside
+# $(VP_SDK_DIR) under $(BUILDDIR), while the finished artifacts are written
+# straight out to $(VP_SDK_OUT) - the repo root's lib/ - so a guest build only
+# ever points -L at that one directory.
 #
-#   make vp-sdk       -> $(BUILDDIR)/vp-sdk/vpsdk.a + $(BUILDDIR)/vp-sdk/vpsdk.so
+#   make vp-sdk       -> lib/libvpsdk.a + lib/libvpsdk.so
 #   make vp-sdk-gen   -> regenerate those .c files from the real guest stubs
 #
 
 override VP_SDK_DIR   := $(BUILDDIR)/vp-sdk
+# Where the linkable artifacts land, relative to the repository root (the CWD of
+# the build): lib/, i.e. TOP/lib. Object files stay in the build tree, and
+# `make clean` (see vp-sdk-clean below) removes these along with everything else.
+VP_SDK_OUT            ?= lib
 override VP_SDK_SRC   := $(filter %.c,$(call ls_dir,$(SRCDIR)/virtpass/vp-sdk))
 override VP_SDK_OBJ   := $(addprefix $(VP_SDK_DIR)/,$(addsuffix .o,$(notdir $(basename $(VP_SDK_SRC)))))
 override VP_SDK_ZIG   := zig cc
@@ -246,8 +253,9 @@ override VP_SDK_AR    := zig ar
 VP_SDK_CFLAGS ?= -target riscv64-linux-musl -O2 -g -fPIC -I$(INCDIR) -fno-sanitize=undefined
 # Whole guest ABI header directory, so an edit to any vp_*.h rebuilds the SDK
 override VP_SDK_HEADS := $(filter %.h,$(call ls_dir,$(INCDIR)/virtpass))
-override VP_SDK_A     := $(VP_SDK_DIR)/vpsdk.a
-override VP_SDK_SO    := $(VP_SDK_DIR)/vpsdk.so
+# Both artifacts carry the lib prefix, so `-L$(VP_SDK_OUT) -lvpsdk` resolves them
+override VP_SDK_A     := $(VP_SDK_OUT)/libvpsdk.a
+override VP_SDK_SO    := $(VP_SDK_OUT)/libvpsdk.so
 
 # Cross-compile flags are data, not a file, so they are not prerequisites of the
 # objects they affect. Keep them in a stamp and depend on it: it is rewritten
@@ -265,10 +273,12 @@ $(VP_SDK_DIR)/%.o: $(SRCDIR)/virtpass/vp-sdk/%.c $(VP_SDK_HEADS) $(VP_SDK_STAMP)
 	@$(call shell_esc,$(VP_SDK_ZIG) $(VP_SDK_CFLAGS) -c -o $@ $<)
 
 $(VP_SDK_A): $(VP_SDK_OBJ)
+	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)AR$(TEXT)] $@ $(RESET))
 	@$(call shell_esc,$(VP_SDK_AR) rcs $@ $(VP_SDK_OBJ))
 
 $(VP_SDK_SO): $(VP_SDK_OBJ)
+	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)LD$(TEXT)] $@ $(RESET))
 	@$(call shell_esc,$(VP_SDK_ZIG) $(VP_SDK_CFLAGS) -shared -o $@ $(VP_SDK_OBJ))
 
@@ -280,13 +290,24 @@ VP_SDK_GEN_SRC ?= $(SRCDIR)/virtpass/vp_ndk_stub.c $(SRCDIR)/virtpass/vp_aaudio_
 VP_SDK_GEN     ?= python tools/gen_stub_notimpl.py
 VP_SDK_GEN_OPTS ?= --outdir $(SRCDIR)/virtpass/vp-sdk
 
-.PHONY: vp-sdk       # Build the VirtPass "not implemented" guest SDK (vpsdk.a / vpsdk.so)
+.PHONY: vp-sdk       # Build the VirtPass "not implemented" guest SDK into $(VP_SDK_OUT)/ (TOP/lib)
 vp-sdk: $(VP_SDK_A) $(VP_SDK_SO)
 
 .PHONY: vp-sdk-gen   # Regenerate src/virtpass/vp-sdk/*.c from the real guest stubs
 vp-sdk-gen:
 	$(call log_info,Regenerating the VirtPass SDK stubs)
 	@$(call shell_esc,$(VP_SDK_GEN) $(VP_SDK_GEN_SRC) $(VP_SDK_GEN_OPTS))
+
+# The artifacts live outside $(BUILDDIR), so `make clean` would leave them behind
+# and a later `make vp-sdk` would then consider them up to date. Hook them into
+# clean; the trailing rmdir only ever succeeds while $(VP_SDK_OUT) is empty.
+.PHONY: vp-sdk-clean # Remove the $(VP_SDK_OUT)/ artifacts built by vp-sdk
+vp-sdk-clean:
+	$(call log_info,Removing the VirtPass SDK artifacts)
+	$(call shell_ex,$(if $(HOST_POSIX),rm -f $(call path_shell,$(VP_SDK_A) $(VP_SDK_SO)),del $(call path_shell,$(subst /,\,$(VP_SDK_A) $(VP_SDK_SO))) 2>&1))
+	$(call shell_ex,$(if $(HOST_POSIX),rmdir $(call path_shell,$(VP_SDK_OUT)),rd $(call path_shell,$(VP_SDK_OUT))) 2>&1)
+
+clean: vp-sdk-clean
 
 # The userland emulator assumes a 64-bit host address space,
 # build it solely on non-i386 targets
