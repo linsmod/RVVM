@@ -1185,6 +1185,88 @@ static bool proc_mem_readable(const void* addr, size_t size)
     return write(fd, addr, size) == (ssize_t)size;
 }
 
+/*
+ * Guest symbolization for crash backtraces. Setting RVVM_ADDR2LINE to an
+ * addr2line (or llvm-addr2line, the CLIs are compatible) makes the crash
+ * report batch-hand the guest addresses of every frame to that tool together
+ * with the ELF image they belong to, which is still on the host disk:
+ *
+ *   RVVM_ADDR2LINE=C:/msys64/mingw64/bin/addr2line.exe
+ *
+ * turns a frame into "CL_Init (client/cl_main.c:812)" instead of a bare
+ * relocation offset. Off by default (no environment variable, no subprocess).
+ */
+static char proc_main_elf_path[UAPI_PATH_MAX];   // Host path of the guest ELF
+static char proc_interp_elf_path[UAPI_PATH_MAX]; // Host path of its interpreter
+
+#if defined(_WIN32)
+#define proc_popen  _popen
+#define proc_pclose _pclose
+#else
+#define proc_popen  popen
+#define proc_pclose pclose
+#endif
+
+static void proc_symbolize(const char* label, const char* elf, const rvvm_addr_t* addrs, size_t count)
+{
+    const char* tool = getenv("RVVM_ADDR2LINE");
+    if (!tool || !tool[0] || !elf || !elf[0] || !count) {
+        return;
+    }
+    // One tool invocation per image: addresses as arguments, two output lines
+    // (function, location) per address
+    char cmd[4096];
+#if defined(_WIN32)
+    /* The Win32 CRT spawns the tool itself instead of going through a shell,
+     * and hands the first word to CreateProcess() verbatim: quoting the
+     * program name makes it fail with "The filename, directory name, or volume
+     * label syntax is incorrect.", while quoted *arguments* are fine. */
+    if (rvvm_strfind(tool, " ")) {
+        rvvm_warn("RVVM_ADDR2LINE path must not contain spaces");
+        return;
+    }
+    size_t len = rvvm_snprintf(cmd, sizeof(cmd), "%s -f -C -e \"%s\"", tool, elf);
+#else
+    // popen() goes through a shell, so quote the commands and paths
+    size_t len = rvvm_snprintf(cmd, sizeof(cmd), "\"%s\" -f -C -e \"%s\"", tool, elf);
+#endif
+    size_t used = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (len >= sizeof(cmd) - 32) {
+            break; // Command line limit, symbolize what fits
+        }
+        len += rvvm_snprintf(cmd + len, sizeof(cmd) - len, " 0x%llx", (unsigned long long)addrs[i]);
+        used++;
+    }
+    if (!used) {
+        return;
+    }
+
+    FILE* pipe = proc_popen(cmd, "r");
+    if (!pipe) {
+        rvvm_warn("Failed to run %s", tool);
+        return;
+    }
+    rvvm_warn("Symbols (%s):", label);
+    for (size_t i = 0; i < used; ++i) {
+        char func[256] = {0};
+        char loc[512]  = {0};
+        if (!fgets(func, sizeof(func), pipe) || !fgets(loc, sizeof(loc), pipe)) {
+            rvvm_warn(" * * * Symbolizer output ended early!");
+            break;
+        }
+        // Trim trailing line endings
+        for (size_t j = 0; func[j]; ++j) {
+            if (func[j] == '\n' || func[j] == '\r') func[j] = 0;
+        }
+        for (size_t j = 0; loc[j]; ++j) {
+            if (loc[j] == '\n' || loc[j] == '\r') loc[j] = 0;
+        }
+        rvvm_warn("  %llx: %s (%s)", (unsigned long long)addrs[i], func, loc);
+    }
+    proc_pclose(pipe);
+}
+
 #ifndef __riscv
 #define USERLAND_DEFAULT_PREFIX "/home/lekkit/stuff/userland/debian"
 #else
@@ -3328,13 +3410,24 @@ static void* rvvm_user_thread_wrap(void* arg)
             // Guest load addresses: elf->base is a host pointer
             rvvm_addr_t elf_base = uctx()->elf.base ? to_addr(uctx()->elf.base) : 0;
             rvvm_addr_t interp_base = uctx()->interp.base ? to_addr(uctx()->interp.base) : 0;
+            // Frames falling into a known image, symbolized below
+            rvvm_addr_t elf_frames[64];
+            rvvm_addr_t interp_frames[32];
+            size_t elf_frames_count = 0;
+            size_t interp_frames_count = 0;
             do {
                 rvvm_warn(" PC %lx", pc);
                 if (pc >= elf_base && pc < elf_base + uctx()->elf.buf_size) {
                     rvvm_warn("  @ Main binary, reloc: %lx", pc - elf_base);
+                    if (elf_frames_count < STATIC_ARRAY_SIZE(elf_frames)) {
+                        elf_frames[elf_frames_count++] = pc;
+                    }
                 }
                 if (pc >= interp_base && pc < interp_base + uctx()->interp.buf_size) {
                     rvvm_warn("  @ Interpreter, reloc: %lx", pc - interp_base);
+                    if (interp_frames_count < STATIC_ARRAY_SIZE(interp_frames)) {
+                        interp_frames[interp_frames_count++] = pc;
+                    }
                 }
                 if (next_fp <= (rvvm_addr_t)(size_t)fp) break;
                 void** frame = to_ptr_sz(next_fp, sizeof(void*));
@@ -3362,6 +3455,10 @@ static void* rvvm_user_thread_wrap(void* arg)
             } else {
                 rvvm_warn(" * * * PC points to inaccessible memory!");
             }
+
+            // Resolve the frames through the ELF images on the host disk
+            proc_symbolize("Main binary", proc_main_elf_path, elf_frames, elf_frames_count);
+            proc_symbolize("Interpreter", proc_interp_elf_path, interp_frames, interp_frames_count);
 
             break;
         }
@@ -3698,13 +3795,18 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
     
     /* Initialize Android NDK API proxy */
     cmdpost_init();
-    rvfile_t* file = rvopen(wrap_path(path_buf, argv[0]), 0);
+    // Remember the ELF images for crash symbolization (see proc_symbolize())
+    proc_main_elf_path[0] = 0;
+    proc_interp_elf_path[0] = 0;
+    const char* host_elf = wrap_path(path_buf, argv[0]);
+    rvvm_strlcpy(proc_main_elf_path, host_elf, sizeof(proc_main_elf_path));
+    rvfile_t* file = rvopen(host_elf, 0);
     if (!file) {
         // drvfs (WSL) sometimes fails opening big files right after host-side
         // writes, retry a couple of times before giving up
         for (int retry = 0; !file && retry < 10; retry++) {
             sleep_ms(100);
-            file = rvopen(wrap_path(path_buf, argv[0]), 0);
+            file = rvopen(host_elf, 0);
         }
     }
     if (!file) {
@@ -3748,7 +3850,10 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
 
     if (uctx()->elf.interp_path) {
         rvvm_info("ELF interpreter at %s", uctx()->elf.interp_path);
-        file = rvopen(wrap_path(path_buf, uctx()->elf.interp_path), 0);
+        // wrap_path() may pass the path through untouched - keep its result
+        const char* host_interp = wrap_path(path_buf, uctx()->elf.interp_path);
+        rvvm_strlcpy(proc_interp_elf_path, host_interp, sizeof(proc_interp_elf_path));
+        file = rvopen(host_interp, 0);
         if (file) {
             /* A relocatable interpreter needs a guest address picked upfront.
              * Reserve its full memory extent, not the file size: .bss counts
