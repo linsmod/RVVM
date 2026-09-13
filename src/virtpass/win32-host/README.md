@@ -93,7 +93,7 @@ mingw32-make bin                      # everything, incl. rvvm_winhost.exe
 mingw32-make release.windows.x86_64\rvvm_winhost_x86_64.exe   # just the host
 
 # Thin wrapper that locates the toolchain, runs make and prints the exe path:
-pwsh ./build_virtpass-win32.ps1       # -Clean / -Jobs N / -RegenGlAbi available
+pwsh ./build_virtpass.ps1 -Target win32   # -Clean / -Jobs N / -RegenGlAbi available
 ```
 
 The build compiles the real RVVM core (same macro set as the Android app) and

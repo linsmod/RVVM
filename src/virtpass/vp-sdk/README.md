@@ -94,11 +94,10 @@ gitignored - `make clean` (or `make vp-sdk-clean`) removes them. Override the
 flags with `VP_SDK_CFLAGS=...` (they are tracked in the build directory's
 `sdk_flags.stamp`, so changing them rebuilds).
 
-From the wrapper scripts:
+From the wrapper script:
 
 ```sh
-pwsh ./build_virtpass-android.ps1 -Target sdk     # == make vp-sdk
-pwsh ./build_virtpass-win32.ps1 -Target vp-sdk
+pwsh ./build_virtpass.ps1 -Target sdk     # == make vp-sdk
 ```
 
 `make vp-sdk` compiles the checked-in sources as-is; it never rewrites this

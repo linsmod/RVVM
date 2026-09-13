@@ -88,11 +88,12 @@ backend behind each callback differs.
 
 ## Build
 
-- Windows: `pwsh ./build_virtpass-win32.ps1` (target `bin`; `-RegenGlAbi`
-  regenerates the GL dispatch from `tools/gen_gl_abi.py`).
-- Android: `pwsh ./build_virtpass-android.ps1` (make target `android`, which
+- Windows: `pwsh ./build_virtpass.ps1 -Target win32` (make target `bin`;
+  `-RegenGlAbi` regenerates the GL dispatch from `tools/gen_gl_abi.py`).
+- Android: `pwsh ./build_virtpass.ps1 -Target apk` (make target `android`, which
   first cross-compiles every guest in `guest-samples/` for
   riscv64-linux-musl via zig cc into the APK assets).
+- `pwsh ./build_virtpass.ps1` with no `-Target` builds both, plus the guest SDK.
 
 ## Sensor conformance test
 

@@ -30,8 +30,7 @@
 !/Doxyfile
 
 # Explicitly track build scripts
-!/build_virtpass-win32.ps1
-!/build_virtpass-android.ps1
+!/build_virtpass.ps1
 !/building_userland-host.md
 
 # Explicitly track CI infrastructure

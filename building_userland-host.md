@@ -46,21 +46,38 @@ ls H:\AndroidSdk\Sdk\ndk\27.0.12077973\toolchains\llvm\prebuilt\windows-x86_64\b
 Guest programs are riscv64 static ELFs. They call Android NDK APIs through
 `vp_ndk_stub` and optionally `vp_gles_stub` for EGL/GLES.
 
-### 1A. Using the PowerShell build scripts (recommended)
+### 1A. Using the PowerShell build script (recommended)
 
-Both scripts are thin wrappers around the repository `Makefile` — they only
-locate the toolchain, run `mingw32-make` and report the artifacts.
+`build_virtpass.ps1` is a thin wrapper around the repository `Makefile` — it
+only locates the toolchain, runs `mingw32-make` and reports the artifacts.
+`-Target` selects the side to build; without it everything is built.
 
 ```powershell
 # From repo root
-pwsh ./build_virtpass-android.ps1 -Target assets  # zig/musl riscv64 guest ELFs -> APK assets
-pwsh ./build_virtpass-android.ps1                 # guest assets + librvvm_jni.so + APK
-pwsh ./build_virtpass-win32.ps1 -RegenGlAbi       # regenerate GL ABI headers, then build
+pwsh ./build_virtpass.ps1 -Target assets  # zig/musl riscv64 guest ELFs -> APK assets
+pwsh ./build_virtpass.ps1 -Target apk     # guest assets + librvvm_jni.so + APK
+pwsh ./build_virtpass.ps1 -Target win32   # Win32 host binaries
+pwsh ./build_virtpass.ps1                 # every target below + the VirtPass SDK
+pwsh ./build_virtpass.ps1 -Target win32 -RegenGlAbi   # regenerate GL ABI headers, then build
 
 # Equivalent raw make invocations
 mingw32-make android-assets        # guest ELFs only
 mingw32-make android               # guest ELFs + librvvm_jni.so + APK
 ```
+
+| `-Target` | make goals | Produces |
+|-----------|------------|----------|
+| `all` (default) | `bin android vp-sdk` | every artifact listed below |
+| `win32` | `bin` | `rvvm_winhost_<arch>.exe`, `rvvm.exe`, `rvvm_user.exe` |
+| `apk` / `android` | `android` | guest assets + `librvvm_jni.so` + APK |
+| `assets` | `android-assets` | guest ELFs into the APK assets tree |
+| `jni` | `android-jni` | `librvvm_jni.so` only |
+| `sdk` | `vp-sdk` | `lib/libvpsdk.{a,so}` |
+| `clean` | `clean android-clean` | removes the make build tree + Gradle outputs |
+
+`-Variant debug|release` (Gradle variant, default `debug`), `-Clean`, `-Jobs N`,
+`-RegenGlAbi` and passthrough make arguments (e.g. `USE_RVJIT=0`) apply to every
+target; all goals of a run go to a single `make` invocation, so `-jN` is shared.
 
 ### 1B. Manual: NDK riscv64 clang
 
@@ -181,16 +198,16 @@ the same callbacks that `jni_bridge.c` provides on Android.
 
 ```powershell
 # From repo root - produces release.windows.x86_64\rvvm_winhost_x86_64.exe
-pwsh ./build_virtpass-win32.ps1
-pwsh ./build_virtpass-win32.ps1 -Clean -Jobs 8
-pwsh ./build_virtpass-win32.ps1 -RegenGlAbi
+pwsh ./build_virtpass.ps1 -Target win32
+pwsh ./build_virtpass.ps1 -Target win32 -Clean -Jobs 8
+pwsh ./build_virtpass.ps1 -Target win32 -RegenGlAbi
 
 # With GL backend selection:
 $env:RVVM_GL_BACKEND = "swiftshader"
-pwsh ./build_virtpass-win32.ps1
+pwsh ./build_virtpass.ps1 -Target win32
 
 $env:RVVM_GL_DLL_DIR = "H:\AndroidSdk\Sdk\emulator\lib64\gles_swiftshader"
-pwsh ./build_virtpass-win32.ps1
+pwsh ./build_virtpass.ps1 -Target win32
 ```
 
 ### Direct Makefile build
@@ -248,7 +265,7 @@ bridges to Android NDK APIs.
 ```powershell
 # From repo root - guest assets + librvvm_jni.so + APK
 mingw32-make android ANDROID_VARIANT=debug
-pwsh ./build_virtpass-android.ps1 -Target apk
+pwsh ./build_virtpass.ps1 -Target apk -Variant debug
 ```
 
 ### CMakeLists.txt notes
@@ -299,7 +316,7 @@ python tools\gen_gl_abi.py
 
 ### Recompile after regenerating
 
-After `gen_gl_abi.py`, run either build script with `-RegenGlAbi` (it
+After `gen_gl_abi.py`, run `build_virtpass.ps1` with `-RegenGlAbi` (it
 regenerates, then rebuilds), or recompile manually:
 1. `mingw32-make android-assets` — rebuilds the zig guest stubs + samples
 2. `mingw32-make bin` — rebuilds the Win32 host against the new headers
@@ -354,8 +371,7 @@ repo root (H:\github_repos\RVVM)
 │   └── win32_main.c                   # Win32 UI entry point
 │
 ├── Makefile / project.mk               # Build system (bin, android*, test, clean)
-├── build_virtpass-win32.ps1            # Win32 host wrapper (make bin)
-├── build_virtpass-android.ps1          # Guest assets / JNI / APK wrapper
+├── build_virtpass.ps1                  # Wrapper: -Target all|win32|apk|assets|jni|sdk|clean
 └── tools/
     └── gen_gl_abi.py                  # GL ABI header generator from NDK headers
 ```
@@ -382,7 +398,7 @@ Use `mingw32-make` from MSYS2 MinGW64 (the build scripts locate it for you):
 mingw32-make android-assets
 ```
 
-Or use a PowerShell build script: `pwsh ./build_virtpass-android.ps1 -Target assets`
+Or use a PowerShell build script: `pwsh ./build_virtpass.ps1 -Target assets`
 
 ### `riscv64-linux-android35-clang: not found`
 
@@ -409,7 +425,7 @@ zig cc -target riscv64-linux-musl -c -fno-sanitize=undefined ...
 
 You're using NDK-built guests on the Win32 host. Switch to zig/musl:
 ```powershell
-pwsh ./build_virtpass-android.ps1 -Target assets
+pwsh ./build_virtpass.ps1 -Target assets
 ```
 
 ### `mingw32-make: command not found`
