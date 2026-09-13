@@ -25,10 +25,13 @@ backend behind each callback differs.
 - Guest stubs: `vp_ndk_stub.c` (NDK APIs), `vp_gl_stub.c` (EGL/GLES), and
   `vp_aaudio_stub.c` (AAudio). GL calls are marshalled through
   `SYS_GL_CALL`/`SYS_EGL_CALL` with guest addresses in `args[]`.
-- Every GL/EGL symbolic constant in `virtpass/vp_gl.h` is parsed out of the NDK
-  headers instead of being typed in by hand: core `gl2.h`/`gl3.h` and the
-  extension `gl2ext.h`/`gl3ext.h` give the guest 2566 tokens (constants only -
-  the extensions contribute no prototypes, so nobody claims a fn_id).
+- GL/EGL symbolic constants are parsed out of the NDK headers instead of being
+  typed in by hand. Core `gl2.h`/`gl3.h` tokens go into `virtpass/vp_gl.h`; the
+  roughly 1500 registry tokens `gl2ext.h`/`gl3ext.h` add (S3TC/DXT formats,
+  `GL_BGRA_EXT`, anisotropy, ...) live in **`virtpass/vp_glext.h`**, which a
+  guest includes only when it actually needs them - same split the real NDK
+  makes, and it keeps `vp_gl.h` from dwarfing every other header. Constants
+  only: the extensions contribute no prototypes, so nothing claims a fn_id.
 - Generated GL dispatch (from `tools/gen_gl_abi.py`): `vp_gl_host_types.h`
   (neutral `vpgl_` types + PFN typedefs), `vp_gl_host_entries.h` (the `p_*`
   storage, included by exactly one host TU per host) and

@@ -61,7 +61,6 @@ GL_HEADERS = [GL2_H, GL3_H]
 # reaches for GL_COMPRESSED_RGBA_S3TC_DXT5_EXT or GL_TEXTURE_MAX_ANISOTROPY_EXT.
 GL_EXT_HEADERS = [os.path.join(NDK_SYSROOT, p) for p in
                   ("GLES2/gl2ext.h", "GLES3/gl3ext.h")]
-GL_CONST_HEADERS = GL_HEADERS + [p for p in GL_EXT_HEADERS if os.path.isfile(p)]
 
 # fn_id bases (single source of truth, consumed by the guest stub, vp_cmdpost
 # and both host dispatches). The whole GL set must fit in [GL_FN_BASE,
@@ -706,6 +705,39 @@ typedef struct {
 """
 
 
+def gen_ext_header(gl_ext_consts):
+    """The extension-half of the constant set, opt-in.
+
+    Mirrors how the real NDK lays it out (gl2.h for core, gl2ext.h for the
+    extensions): every guest pays for the ~630 core tokens it may plausibly
+    use, and the ~1500 registry tokens nobody asked for stay out of the
+    preprocessed output until something actually includes this header.
+    """
+    parts = [GENERATED_BANNER.format(nargs=GL_CALL_MAX_ARGS)]
+    parts.append("#ifndef VIRTPASS_GLEXT")
+    parts.append("#define VIRTPASS_GLEXT")
+    parts.append("")
+    parts.append("/* The extension tokens without the core ones are meaningless, so this")
+    parts.append(" * header is self-sufficient rather than a fragment. */")
+    parts.append('#include "virtpass/vp_gl.h"')
+    parts.append("")
+    parts.append(const_block(
+        "GLES extension symbolic constants",
+        "Everything gl2ext.h / gl3ext.h adds on top of the core tokens already\n"
+        "generated into virtpass/vp_gl.h: the S3TC/DXT compressed formats a DDS\n"
+        "loader asks for, GL_BGRA_EXT, anisotropy, ETC/RGTC/... texture formats.\n"
+        "\n"
+        "CONSTANTS ONLY - deliberately no prototypes. No extension entry point\n"
+        "is part of the marshalled ABI (they have no fn_id there), so a guest\n"
+        "gets the token to compile against while the call itself still has to\n"
+        "go through core GLES2/GLES3. The values are verified not to collide\n"
+        "with anything in the core set.", gl_ext_consts))
+    parts.append("")
+    parts.append("#endif /* VIRTPASS_GLEXT */")
+    parts.append("")
+    return "\n".join(parts)
+
+
 def guest_prototypes(gl_fns, egl_fns):
     out = ["/* ============================================================",
            " * Guest-facing API (same signatures as the NDK headers)",
@@ -735,8 +767,8 @@ def gen_guest_header(gl_fns, egl_fns, egl_host_fns, gl_consts, egl_consts):
         "GLES2 + GLES3 symbolic constants",
         "gl2.h is merged before gl3.h, exactly like the prototypes: a shared\n"
         "token keeps its GLES2 spelling rather than being re-pinned by the ES3\n"
-        "copy. gl2ext.h/gl3ext.h contribute their tokens too - constants only,\n"
-        "never prototypes, since extensions have no fn_id here.", gl_consts))
+        "copy. The extension tokens gl2ext.h/gl3ext.h add live one header over,\n"
+        "in virtpass/vp_glext.h - include that one when you need them.", gl_consts))
     parts.append(egl_type_defs())
     parts.append(const_block(
         "EGL symbolic constants",
@@ -1484,12 +1516,19 @@ def main():
     os.makedirs(GUEST_SRC_DIR, exist_ok=True)
     os.makedirs(HOST_DIR, exist_ok=True)
 
-    gl_consts = load_constants(GL_CONST_HEADERS, "GL_")
+    # Core and extension tokens are computed from disjoint header sets and then
+    # differenced, so vp_glext.h carries only what vp_gl.h does not already
+    # define - including the same macro twice is legal but pointless.
+    gl_consts = load_constants(GL_HEADERS, "GL_")
+    gl_ext = load_constants(GL_EXT_HEADERS, "GL_")
+    gl_ext_consts = {n: v for n, v in gl_ext.items() if n not in gl_consts}
     egl_consts = load_constants([EGL_H], "EGL_")
 
     outs = [
         (os.path.join(GUEST_INC_DIR, "vp_gl.h"),
          gen_guest_header(gl_fns, egl_fns, egl_host_fns, gl_consts, egl_consts)),
+        # Extension-only constant header: opt-in, includes vp_gl.h itself.
+        (os.path.join(GUEST_INC_DIR, "vp_glext.h"), gen_ext_header(gl_ext_consts)),
         (os.path.join(GUEST_SRC_DIR, "vp_gl_stub.c"), gen_guest_source(gl_fns, egl_fns)),
         # Host-side shared headers (both the win32 and the android host
         # include these; the argument-translation tables exist once).
@@ -1510,6 +1549,8 @@ def main():
 
     print("\nGL core functions: %d (GLES2+GLES3, %d excluded)   EGL functions: %d"
           % (len(gl_fns), len(EXCLUDED_FNS), len(egl_fns)))
+    print("constants: %d core GL + %d EGL in vp_gl.h, %d extension-only in vp_glext.h"
+          % (len(gl_consts), len(egl_consts), len(gl_ext_consts)))
     print("GL fn_id range:  [%d, %d)   EGL fn_id range: [0x%03X, 0x%03X)"
           % (GL_FN_BASE, GL_FN_BASE + len(gl_fns), EGL_FN_BASE, EGL_FN_BASE + len(egl_fns)))
 
