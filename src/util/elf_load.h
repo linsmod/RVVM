@@ -44,6 +44,10 @@ typedef struct {
     // is set; ignored otherwise. Zero means "pick one", which only works
     // without a window.
     size_t load_addr;
+
+    // Entry symbol to jump to when the image carries no entry point of its own
+    // (e_entry == 0, as in a shared object). NULL keeps the ELF entry.
+    const char* entry_symbol;
 } elf_desc_t;
 
 bool elf_load_file(rvfile_t* file, elf_desc_t* elf);

@@ -582,6 +582,13 @@ PUBLIC uint64_t rvvm_user_host_ptr(const void* ptr)
 #define GUEST_STACK_SIZE 0x4000000UL // 64 MiB
 #define GUEST_PAGE_SIZE  0x1000UL
 
+// Guest address a relocatable (ET_DYN) main image is placed at: above the NULL
+// page and far below the mmap area, so the brk heap still fits in between (see
+// rvvm_user_linux_ex()). A PIE executable or a bare .so launched as the guest
+// program lands here; ET_EXEC images carry their own link-time address and
+// ignore this.
+#define GUEST_DYN_BASE   0x400000UL
+
 typedef struct {
     rvvm_addr_t addr;
     size_t      size;
@@ -3661,6 +3668,15 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
         rvvm_user_free(machine);
         return -1;
     }
+    /* A relocatable (ET_DYN) main image - a PIE executable, or a .so launched
+     * as the guest program - has no link-time address, so hand the loader one:
+     * elf_load_file() places the image there and ignores this for ET_EXEC.
+     * Must be set on every launch: elf_unload_file() zeroes the descriptor. */
+    uctx()->elf.load_addr = GUEST_DYN_BASE;
+    /* Shared objects carry no entry point, so name the symbol to start from.
+     * RVVM_USER_ENTRY overrides it (android_main, ANativeActivity_onCreate...). */
+    const char* entry_sym = getenv("RVVM_USER_ENTRY");
+    uctx()->elf.entry_symbol = (entry_sym && entry_sym[0]) ? entry_sym : "main";
     bool success = elf_load_file(file, &uctx()->elf);
     rvclose(file);
     if (!success) {

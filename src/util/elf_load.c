@@ -34,6 +34,10 @@ PUSH_OPTIMIZATION_SIZE
 #define ELF_PT_PHDR    0x06
 #define ELF_PT_TLS     0x07
 
+#define ELF_SHT_SYMTAB 0x02
+#define ELF_SHT_DYNSYM 0x0b
+#define ELF_SHN_UNDEF  0x00
+
 #define ELF_PF_X       0x01
 #define ELF_PF_W       0x02
 #define ELF_PF_R       0x04
@@ -50,6 +54,86 @@ PUSH_OPTIMIZATION_SIZE
         return false;                                                                                                  \
     }
 
+static bool elf_str_eq(const char* a, const char* b)
+{
+    while (*a && (*a == *b)) {
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+/*
+ * Look @name up in the ELF symbol table and return its link-time address.
+ *
+ * This exists for images that carry no entry point of their own: a shared
+ * object has e_entry == 0, so launching one as a guest program needs the entry
+ * picked out of its exported symbols instead. .dynsym is searched first (that
+ * is what a stripped .so still has), .symtab second.
+ */
+static bool elf_lookup_symbol(rvfile_t* file, const char* name, uint64_t shoff,
+                              size_t shnum, size_t shentsize, size_t* out, bool class64)
+{
+    uint8_t shdr[64] = {0};
+    if (shentsize > sizeof(shdr)) {
+        return false;
+    }
+    for (size_t pass = 0; pass < 2; ++pass) {
+        uint32_t wanted_type = pass ? ELF_SHT_SYMTAB : ELF_SHT_DYNSYM;
+        for (size_t i = 0; i < shnum; ++i) {
+            if (rvread(file, shdr, shentsize, shoff + (i * shentsize)) != shentsize) {
+                return false;
+            }
+            if (read_uint32_le_m(shdr + 4) != wanted_type) {
+                continue;
+            }
+            uint64_t sym_off   = class64 ? read_uint64_le_m(shdr + 24) : read_uint32_le_m(shdr + 16);
+            uint64_t sym_size  = class64 ? read_uint64_le_m(shdr + 32) : read_uint32_le_m(shdr + 20);
+            uint32_t str_idx   = read_uint32_le_m(shdr + (class64 ? 40 : 24));
+            uint64_t sym_entsz = class64 ? read_uint64_le_m(shdr + 56) : read_uint32_le_m(shdr + 36);
+            size_t   sym_sizeof = class64 ? 24 : 16;
+            if (sym_entsz < sym_sizeof) {
+                return false;
+            }
+            if (rvread(file, shdr, shentsize, shoff + ((size_t)str_idx * shentsize)) != shentsize) {
+                return false;
+            }
+            uint64_t str_off  = class64 ? read_uint64_le_m(shdr + 24) : read_uint32_le_m(shdr + 16);
+            uint64_t str_size = class64 ? read_uint64_le_m(shdr + 32) : read_uint32_le_m(shdr + 20);
+            if (!str_size || str_size > (1u << 20)) {
+                return false;
+            }
+            char* strtab = safe_new_arr(char, str_size + 1);
+            if (rvread(file, strtab, str_size, str_off) != str_size) {
+                free(strtab);
+                return false;
+            }
+            bool    found = false;
+            size_t  ent   = (size_t)sym_entsz;
+            size_t  total = (size_t)sym_size;
+            for (size_t s = 0; s + ent <= total && !found; s += ent) {
+                uint8_t sym[24] = {0};
+                if (rvread(file, sym, sym_sizeof, sym_off + s) != sym_sizeof) {
+                    break;
+                }
+                uint32_t st_name  = read_uint32_le_m(sym);
+                uint64_t st_value = class64 ? read_uint64_le_m(sym + 8) : read_uint32_le_m(sym + 4);
+                uint16_t st_shndx = read_uint16_le_m(sym + (class64 ? 6 : 14));
+                if (st_value && st_shndx != ELF_SHN_UNDEF && st_name < str_size
+                    && elf_str_eq(strtab + st_name, name)) {
+                    *out   = (size_t)st_value;
+                    found  = true;
+                }
+            }
+            free(strtab);
+            if (found) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
 {
     uint8_t tmp[64] = {0};
@@ -64,8 +148,10 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
     bool     class64   = (tmp[4] == 2);
     uint16_t elf_type  = read_uint16_le_m(tmp + 16);
     uint64_t elf_entry = class64 ? read_uint64_le_m(tmp + 24) : read_uint32_le_m(tmp + 24);
-    uint64_t elf_phoff = class64 ? read_uint64_le_m(tmp + 32) : read_uint32_le_m(tmp + 28);
-    // uint64_t elf_shoff = class64 ? read_uint64_le_m(tmp + 40) : read_uint32_le_m(tmp + 32);
+    uint64_t elf_phoff     = class64 ? read_uint64_le_m(tmp + 32) : read_uint32_le_m(tmp + 28);
+    uint64_t elf_shoff     = class64 ? read_uint64_le_m(tmp + 40) : read_uint32_le_m(tmp + 32);
+    uint16_t elf_shentsize = read_uint16_le_m(tmp + (class64 ? 58 : 46));
+    uint16_t elf_shnum     = read_uint16_le_m(tmp + (class64 ? 60 : 48));
     size_t elf_phnsz = class64 ? 56 : 32;
     size_t elf_phnum = read_uint16_le_m(tmp + (class64 ? 56 : 44));
 
@@ -99,6 +185,11 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
         elf_loaddr = 0; // No ELF segments
     }
 
+    // Guest address the image ends up at: its link-time address for a fixed
+    // image, load_addr for a relocatable one. Also translates a symbol value
+    // into a guest address when the entry comes from the symbol table.
+    uint64_t guest_base = elf_loaddr;
+
     // Relocate pointers
     if (objcopy) {
         if (elf->entry) {
@@ -115,9 +206,7 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
         // can only MEM_RELEASE the exact allocation extent, so ask for the
         // rounded size upfront and remember it for elf_unload_file().
         elf->buf_size = align_size_up(elf->buf_size, vma_alloc_granularity());
-        // Guest address the image ends up at: elf->base is the host pointer,
-        // entry/phdr below are guest addresses and follow this instead.
-        uint64_t guest_base = elf_loaddr;
+        // elf->base is the host pointer, entry/phdr below are guest addresses
         if (elf->guest_window && elf_type == ELF_ET_DYN) {
             // Dynamic (PIC) ELF inside a guest memory window: place it at the
             // address the caller picked, no host mapping involved
@@ -178,6 +267,18 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
             elf->interp_path = safe_new_arr(char, p_fsize + 1);
             WRAP_ERR(rvread(file, elf->interp_path, p_fsize, p_offset) == p_fsize, "Failed to read ELF interp_path");
         }
+    }
+
+    /* An image with no entry point of its own (a shared object, where e_entry
+     * is 0) starts at the requested symbol instead, so a .so can be launched
+     * as a guest program without an interpreter running ahead of it. */
+    if (!objcopy && elf->entry_symbol && !elf->entry) {
+        size_t sym_value = 0;
+        if (!elf_lookup_symbol(file, elf->entry_symbol, elf_shoff, elf_shnum, elf_shentsize, &sym_value, class64)) {
+            rvvm_error("Entry symbol %s not found in the ELF image", elf->entry_symbol);
+            return false;
+        }
+        elf->entry = sym_value + (guest_base - elf_loaddr);
     }
 
     return true;
