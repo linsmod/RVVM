@@ -113,6 +113,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // Put syscall headers here
 #include <linux/futex.h> // FUTEX_*
+#include <linux/stat.h>  // struct statx
 #include <sys/syscall.h> // SYS_*
 #include <unistd.h>
 #endif
@@ -175,20 +176,106 @@ typedef int32_t  uapi_long_t;
 
 #define UAPI_PATH_MAX 4096
 
-#define UAPI_EPERM   1
-#define UAPI_ENOENT  2
-#define UAPI_EINTR   4
-#define UAPI_EIO     5
-#define UAPI_EBADF   9
-#define UAPI_EAGAIN  11
-#define UAPI_ENOMEM  12
-#define UAPI_EACCESS 13
-#define UAPI_EFAULT  14
-#define UAPI_EBUSY   16
-#define UAPI_EEXIST  17
-#define UAPI_EINVAL  22
-#define UAPI_ENOTTY  25
-#define UAPI_ENOSYS  38
+/*
+ * Guest-visible errno values (riscv64 Linux UAPI).
+ *
+ * These are deliberately spelled out instead of being taken from <errno.h>:
+ * the emulator host may number its errors differently (BSD/macOS puts EAGAIN at
+ * 35, win32 puts the whole socket family at 100+), so the two sets must never be
+ * mixed. Anything that leaves a host call has to be translated first - see
+ * host_to_uapi_errno().
+ */
+#define UAPI_EPERM           1
+#define UAPI_ENOENT          2
+#define UAPI_ESRCH           3
+#define UAPI_EINTR           4
+#define UAPI_EIO             5
+#define UAPI_ENXIO           6
+#define UAPI_E2BIG           7
+#define UAPI_ENOEXEC         8
+#define UAPI_EBADF           9
+#define UAPI_ECHILD          10
+#define UAPI_EAGAIN          11
+#define UAPI_EWOULDBLOCK     11 // Alias of EAGAIN
+#define UAPI_ENOMEM          12
+#define UAPI_EACCESS         13
+#define UAPI_EFAULT          14
+#define UAPI_ENOTBLK         15
+#define UAPI_EBUSY           16
+#define UAPI_EEXIST          17
+#define UAPI_EXDEV           18
+#define UAPI_ENODEV          19
+#define UAPI_ENOTDIR         20
+#define UAPI_EISDIR          21
+#define UAPI_EINVAL          22
+#define UAPI_ENFILE          23
+#define UAPI_EMFILE          24
+#define UAPI_ENOTTY          25
+#define UAPI_ETXTBSY         26
+#define UAPI_EFBIG           27
+#define UAPI_ENOSPC          28
+#define UAPI_ESPIPE          29
+#define UAPI_EROFS           30
+#define UAPI_EMLINK          31
+#define UAPI_EPIPE           32
+#define UAPI_EDOM            33
+#define UAPI_ERANGE          34
+#define UAPI_EDEADLK         35
+#define UAPI_ENAMETOOLONG    36
+#define UAPI_ENOLCK          37
+#define UAPI_ENOSYS          38
+#define UAPI_ENOTEMPTY       39
+#define UAPI_ELOOP           40
+#define UAPI_ENOMSG          42
+#define UAPI_EIDRM           43
+#define UAPI_ENOSTR          60
+#define UAPI_ENODATA         61
+#define UAPI_ETIME           62
+#define UAPI_ENOSR           63
+#define UAPI_ENOLINK         67
+#define UAPI_EPROTO          71
+#define UAPI_EBADMSG         74
+#define UAPI_EOVERFLOW       75
+#define UAPI_EILSEQ          84
+#define UAPI_ERESTART        85
+#define UAPI_ESTRPIPE        86
+#define UAPI_EUSERS          87
+#define UAPI_ENOTSOCK        88
+#define UAPI_EDESTADDRREQ    89
+#define UAPI_EMSGSIZE        90
+#define UAPI_EPROTOTYPE      91
+#define UAPI_ENOPROTOOPT     92
+#define UAPI_EPROTONOSUPPORT 93
+#define UAPI_ESOCKTNOSUPPORT 94
+#define UAPI_EOPNOTSUPP      95
+#define UAPI_ENOTSUP         95 // Alias of EOPNOTSUPP
+#define UAPI_EPFNOSUPPORT    96
+#define UAPI_EAFNOSUPPORT    97
+#define UAPI_EADDRINUSE      98
+#define UAPI_EADDRNOTAVAIL   99
+#define UAPI_ENETDOWN        100
+#define UAPI_ENETUNREACH     101
+#define UAPI_ENETRESET       102
+#define UAPI_ECONNABORTED    103
+#define UAPI_ECONNRESET      104
+#define UAPI_ENOBUFS         105
+#define UAPI_EISCONN         106
+#define UAPI_ENOTCONN        107
+#define UAPI_ESHUTDOWN       108
+#define UAPI_ETOOMANYREFS    109
+#define UAPI_ETIMEDOUT       110
+#define UAPI_ECONNREFUSED    111
+#define UAPI_EHOSTDOWN       112
+#define UAPI_EHOSTUNREACH    113
+#define UAPI_EALREADY        114
+#define UAPI_EINPROGRESS     115
+#define UAPI_ESTALE          116
+#define UAPI_EDQUOT          122
+#define UAPI_ENOMEDIUM       123
+#define UAPI_EMEDIUMTYPE     124
+#define UAPI_ECANCELED       125
+#define UAPI_EOWNERDEAD      130
+#define UAPI_ENOTRECOVERABLE 131
 
 // RISC-V UAPI struct definitions & conversions
 struct uapi_new_utsname {
@@ -309,6 +396,20 @@ struct uapi_timespec {
     uint64_t tv_nsec;
 };
 
+struct uapi_timeval {
+    uint64_t tv_sec;
+    uint64_t tv_usec;
+};
+
+struct uapi_itimerval {
+    struct uapi_timeval it_interval;
+    struct uapi_timeval it_value;
+};
+
+BUILD_ASSERT(sizeof(struct uapi_timespec) == 16);
+BUILD_ASSERT(sizeof(struct uapi_timeval) == 16);
+BUILD_ASSERT(sizeof(struct uapi_itimerval) == 32);
+
 struct uapi_pollfd {
     int32_t  fd;
     uint16_t events;
@@ -328,6 +429,14 @@ struct uapi_linux_dirent64 {
 BUILD_ASSERT(sizeof(struct uapi_stat) == sizeof(struct stat));
 BUILD_ASSERT(sizeof(struct uapi_statfs64) == sizeof(struct statfs));
 
+#endif
+
+#ifdef __linux__
+// struct statx is a fixed-width kernel UAPI layout (every field is __u32/__u64),
+// so the guest's view of the buffer is byte-identical to the host's and statx()
+// needs no field conversion - unlike struct stat, which is architecture-specific.
+BUILD_ASSERT(sizeof(struct statx) == 256);
+BUILD_ASSERT(sizeof(struct statx_timestamp) == 16);
 #endif
 
 static void uapi_stat_convert(struct uapi_stat* dst, const struct stat* src)
@@ -386,12 +495,34 @@ static void* to_ptr(rvvm_addr_t addr)
         // RVVM_USER_TEST* modes run the guest natively, guest == host
         return (void*)(size_t)addr;
     }
-    // Preserve NULL: the guest's NULL page is unmapped, and callers test the
-    // result for NULL (a bare offset would make addr 0 look like valid memory)
-    if (addr < userland->mem.addr) {
+    // Guest RAM is exactly [mem.addr, mem.addr + mem.size). Below it sits the
+    // guest's unmapped NULL page (callers test the result for NULL, so a bare
+    // offset must not make addr 0 look valid), above it there is nothing at all:
+    // rejecting the upper end keeps a bogus guest address from turning into a
+    // wild pointer into the host's own address space.
+    if (addr < userland->mem.addr || (addr - userland->mem.addr) >= userland->mem.size) {
         return NULL;
     }
     return ((uint8_t*)userland->mem.data) + (addr - userland->mem.addr);
+}
+
+// Range-checked variant: the whole [addr, addr + size) window must lie inside
+// guest RAM. Use it wherever the host itself touches guest memory (copy, zero,
+// struct write) or hands a buffer to host code, so a bogus guest pointer fails
+// with -EFAULT instead of corrupting the host address space.
+static void* to_ptr_sz(rvvm_addr_t addr, size_t size)
+{
+    if (!userland) {
+        return (void*)(size_t)addr;
+    }
+    if (addr < userland->mem.addr) {
+        return NULL;
+    }
+    rvvm_addr_t off = addr - userland->mem.addr;
+    if (size > userland->mem.size || off > userland->mem.size - size) {
+        return NULL;
+    }
+    return ((uint8_t*)userland->mem.data) + off;
 }
 
 // Short cast rvvm_addr_t -> const char*
@@ -413,14 +544,7 @@ static rvvm_addr_t to_addr(const void* ptr)
 
 PUBLIC void* rvvm_user_guest_ptr(uint64_t addr)
 {
-    if (!userland) {
-        // RVVM_USER_TEST* modes run the guest natively, guest == host
-        return addr ? (void*)(size_t)addr : NULL;
-    }
-    if (addr < userland->mem.addr || (addr - userland->mem.addr) >= userland->mem.size) {
-        return NULL;
-    }
-    return ((uint8_t*)userland->mem.data) + (addr - userland->mem.addr);
+    return to_ptr((rvvm_addr_t)addr);
 }
 
 PUBLIC uint64_t rvvm_user_host_ptr(const void* ptr)
@@ -792,11 +916,187 @@ static void guest_range_free(rvvm_addr_t addr, size_t size)
     }
 }
 
+/*
+ * A host libc that does not define one of these names cannot return it either,
+ * so the entry is neutralised with a value errno can never take (errno is
+ * always positive) instead of breaking the build. win32 lacks all of them.
+ */
+#ifndef ENOTBLK
+#define ENOTBLK (-1)
+#endif
+#ifndef ERESTART
+#define ERESTART (-1)
+#endif
+#ifndef ESTRPIPE
+#define ESTRPIPE (-1)
+#endif
+#ifndef EUSERS
+#define EUSERS (-1)
+#endif
+#ifndef ESOCKTNOSUPPORT
+#define ESOCKTNOSUPPORT (-1)
+#endif
+#ifndef EPFNOSUPPORT
+#define EPFNOSUPPORT (-1)
+#endif
+#ifndef ESHUTDOWN
+#define ESHUTDOWN (-1)
+#endif
+#ifndef ETOOMANYREFS
+#define ETOOMANYREFS (-1)
+#endif
+#ifndef EHOSTDOWN
+#define EHOSTDOWN (-1)
+#endif
+#ifndef ESTALE
+#define ESTALE (-1)
+#endif
+#ifndef EDQUOT
+#define EDQUOT (-1)
+#endif
+#ifndef ENOMEDIUM
+#define ENOMEDIUM (-1)
+#endif
+#ifndef EMEDIUMTYPE
+#define EMEDIUMTYPE (-1)
+#endif
+
+/*
+ * Host -> guest errno translation.
+ *
+ * The guest was built against the riscv64 Linux UAPI numbers; the host has its
+ * own set (BSD/macOS moves EAGAIN to 35, win32 moves the whole socket family to
+ * 100+) and the two only happen to agree for the low codes. Letting a host errno
+ * through untouched therefore hands the guest a *different* error than the one
+ * that happened: host ENOSYS(40) reads as guest ELOOP, host ENAMETOOLONG(38) as
+ * guest ENOSYS, host EWOULDBLOCK(140) as nothing at all.
+ *
+ * Lookups are keyed by the host value, which makes an alias pair such as
+ * EOPNOTSUPP/ENOTSUP or EWOULDBLOCK/EAGAIN harmless: both spellings are present
+ * and resolve to the same guest code, the first match wins. On a Linux or
+ * Android host every entry is an identity mapping, so the table is a no-op there
+ * and the platform default is unchanged.
+ */
+static const struct host_guest_errno {
+    int host, guest;
+} host_guest_errno_map[] = {
+    // Base set
+    { EPERM, UAPI_EPERM },
+    { ENOENT, UAPI_ENOENT },
+    { ESRCH, UAPI_ESRCH },
+    { EINTR, UAPI_EINTR },
+    { EIO, UAPI_EIO },
+    { ENXIO, UAPI_ENXIO },
+    { E2BIG, UAPI_E2BIG },
+    { ENOEXEC, UAPI_ENOEXEC },
+    { EBADF, UAPI_EBADF },
+    { ECHILD, UAPI_ECHILD },
+    { EAGAIN, UAPI_EAGAIN },
+    { EWOULDBLOCK, UAPI_EWOULDBLOCK },
+    { ENOMEM, UAPI_ENOMEM },
+    { EACCES, UAPI_EACCESS },
+    { EFAULT, UAPI_EFAULT },
+    { ENOTBLK, UAPI_ENOTBLK },
+    { EBUSY, UAPI_EBUSY },
+    { EEXIST, UAPI_EEXIST },
+    { EXDEV, UAPI_EXDEV },
+    { ENODEV, UAPI_ENODEV },
+    { ENOTDIR, UAPI_ENOTDIR },
+    { EISDIR, UAPI_EISDIR },
+    { EINVAL, UAPI_EINVAL },
+    { ENFILE, UAPI_ENFILE },
+    { EMFILE, UAPI_EMFILE },
+    { ENOTTY, UAPI_ENOTTY },
+    { ETXTBSY, UAPI_ETXTBSY },
+    { EFBIG, UAPI_EFBIG },
+    { ENOSPC, UAPI_ENOSPC },
+    { ESPIPE, UAPI_ESPIPE },
+    { EROFS, UAPI_EROFS },
+    { EMLINK, UAPI_EMLINK },
+    { EPIPE, UAPI_EPIPE },
+    { EDOM, UAPI_EDOM },
+    { ERANGE, UAPI_ERANGE },
+
+    // File, process and IPC (the point where Linux and the hosts diverge)
+    { EDEADLK, UAPI_EDEADLK },
+    { ENAMETOOLONG, UAPI_ENAMETOOLONG },
+    { ENOLCK, UAPI_ENOLCK },
+    { ENOSYS, UAPI_ENOSYS },
+    { ENOTEMPTY, UAPI_ENOTEMPTY },
+    { ELOOP, UAPI_ELOOP },
+    { ENOMSG, UAPI_ENOMSG },
+    { EIDRM, UAPI_EIDRM },
+    { ENOSTR, UAPI_ENOSTR },
+    { ENODATA, UAPI_ENODATA },
+    { ETIME, UAPI_ETIME },
+    { ENOSR, UAPI_ENOSR },
+    { ENOLINK, UAPI_ENOLINK },
+    { EPROTO, UAPI_EPROTO },
+    { EBADMSG, UAPI_EBADMSG },
+    { EOVERFLOW, UAPI_EOVERFLOW },
+    { EILSEQ, UAPI_EILSEQ },
+    { ERESTART, UAPI_ERESTART },
+    { ESTRPIPE, UAPI_ESTRPIPE },
+    { EUSERS, UAPI_EUSERS },
+    { EDQUOT, UAPI_EDQUOT },
+    { ENOMEDIUM, UAPI_ENOMEDIUM },
+    { EMEDIUMTYPE, UAPI_EMEDIUMTYPE },
+    { ECANCELED, UAPI_ECANCELED },
+    { EOWNERDEAD, UAPI_EOWNERDEAD },
+    { ENOTRECOVERABLE, UAPI_ENOTRECOVERABLE },
+
+    // Sockets and network: a whole 40-entry block apart on win32
+    { ENOTSOCK, UAPI_ENOTSOCK },
+    { EDESTADDRREQ, UAPI_EDESTADDRREQ },
+    { EMSGSIZE, UAPI_EMSGSIZE },
+    { EPROTOTYPE, UAPI_EPROTOTYPE },
+    { ENOPROTOOPT, UAPI_ENOPROTOOPT },
+    { EPROTONOSUPPORT, UAPI_EPROTONOSUPPORT },
+    { ESOCKTNOSUPPORT, UAPI_ESOCKTNOSUPPORT },
+    { EOPNOTSUPP, UAPI_EOPNOTSUPP },
+    { ENOTSUP, UAPI_ENOTSUP },
+    { EPFNOSUPPORT, UAPI_EPFNOSUPPORT },
+    { EAFNOSUPPORT, UAPI_EAFNOSUPPORT },
+    { EADDRINUSE, UAPI_EADDRINUSE },
+    { EADDRNOTAVAIL, UAPI_EADDRNOTAVAIL },
+    { ENETDOWN, UAPI_ENETDOWN },
+    { ENETUNREACH, UAPI_ENETUNREACH },
+    { ENETRESET, UAPI_ENETRESET },
+    { ECONNABORTED, UAPI_ECONNABORTED },
+    { ECONNRESET, UAPI_ECONNRESET },
+    { ENOBUFS, UAPI_ENOBUFS },
+    { EISCONN, UAPI_EISCONN },
+    { ENOTCONN, UAPI_ENOTCONN },
+    { ESHUTDOWN, UAPI_ESHUTDOWN },
+    { ETOOMANYREFS, UAPI_ETOOMANYREFS },
+    { ETIMEDOUT, UAPI_ETIMEDOUT },
+    { ECONNREFUSED, UAPI_ECONNREFUSED },
+    { EHOSTDOWN, UAPI_EHOSTDOWN },
+    { EHOSTUNREACH, UAPI_EHOSTUNREACH },
+    { EALREADY, UAPI_EALREADY },
+    { EINPROGRESS, UAPI_EINPROGRESS },
+    { ESTALE, UAPI_ESTALE },
+};
+
 // Return last errno like a syscall interface
 static int last_errno(void)
 {
-    // TODO: Host->Guest errno conversion
-    return -errno;
+    int host_err = errno;
+    for (size_t i = 0; i < STATIC_ARRAY_SIZE(host_guest_errno_map); ++i) {
+        if (host_guest_errno_map[i].host == host_err) {
+            return -host_guest_errno_map[i].guest;
+        }
+    }
+    /*
+     * Not in the table: either a host call that failed without setting errno
+     * (0, which is not a real error code) or a host error we have never seen.
+     * Hand it through rather than inventing a code, but make a genuinely new one
+     * visible once so the table can be extended.
+     */
+    if (host_err > 0) {
+        DO_ONCE({ rvvm_warn("Unmapped host errno %d leaked to the guest", host_err); });
+    }
+    return -host_err;
 }
 
 // Return negative values on -1 error like a syscall interface does
@@ -1227,7 +1527,11 @@ static bool userland_threads_gone(rvvm_userland_t* ctx, uint32_t timeout_ms)
 static int guest_read_mem(rvvm_hart_t* cpu, uint64_t guest_addr, void* host_buf, size_t size)
 {
     (void)cpu;
-    memcpy(host_buf, to_ptr(guest_addr), size);
+    const void* src = to_ptr_sz(guest_addr, size);
+    if (!src) {
+        return -1;
+    }
+    memcpy(host_buf, src, size);
     return 0;
 }
 
@@ -1242,7 +1546,11 @@ static int guest_read_mem(rvvm_hart_t* cpu, uint64_t guest_addr, void* host_buf,
 static int guest_write_mem(rvvm_hart_t* cpu, uint64_t guest_addr, const void* host_buf, size_t size)
 {
     (void)cpu;
-    memcpy(to_ptr(guest_addr), host_buf, size);
+    void* dst = to_ptr_sz(guest_addr, size);
+    if (!dst) {
+        return -1;
+    }
+    memcpy(dst, host_buf, size);
     return 0;
 }
 
@@ -1257,7 +1565,13 @@ static int guest_write_mem(rvvm_hart_t* cpu, uint64_t guest_addr, const void* ho
 static int guest_read_str(rvvm_hart_t* cpu, uint64_t guest_addr, char* host_buf, size_t max_len)
 {
     (void)cpu;
-    const char* src = (const char*)to_ptr(guest_addr);
+    if (max_len == 0) {
+        return -1;
+    }
+    const char* src = (const char*)to_ptr_sz(guest_addr, max_len);
+    if (!src) {
+        return -1;
+    }
     size_t i;
     for (i = 0; i < max_len - 1; i++) {
         host_buf[i] = src[i];
@@ -1367,19 +1681,65 @@ static int rvvm_sys_clone(rvvm_hart_t* cpu, uint32_t flags, size_t stack, uint32
 #define UAPI_FUTEX_WAIT_BITSET 0x9
 #define UAPI_FUTEX_WAKE_BITSET 0xA
 
-static int rvvm_sys_futex(uint32_t* addr, int futex_op, uint32_t val, size_t val2, uint32_t* uaddr2, uint32_t val3)
+static int uapi_ts_to_host(struct timespec* dst, const struct uapi_timespec* src);
+
+// futex(uaddr, op, val, timeout, uaddr2, val3): the timeout is a guest struct
+// timespec sitting in guest memory, so it must be converted into a host-side
+// temporary before the host kernel dereferences it (FUTEX_WAIT treats it as a
+// relative duration, FUTEX_WAIT_BITSET / the PI ops as an absolute instant -
+// both are the same two 64-bit fields, only the interpretation differs).
+static int rvvm_sys_futex(uint32_t* addr, int futex_op, uint32_t val,
+                          const struct uapi_timespec* timeout, uint32_t* uaddr2, uint32_t val3)
 {
+    if (!addr) {
+        return -UAPI_EFAULT;
+    }
 #if defined(__linux__)
-    return errno_ret(syscall(SYS_futex, addr, futex_op, val, val2, uaddr2, val3));
+    struct timespec ts;
+    const struct timespec* hts = uapi_ts_to_host(&ts, timeout) ? &ts : NULL;
+    return errno_ret(syscall(SYS_futex, addr, futex_op, val, hts, uaddr2, val3));
 #else
-    UNUSED(val2); UNUSED(uaddr2); UNUSED(val3);
+    UNUSED(uaddr2); UNUSED(val3);
+    // No host futex: poll the guest word and honour the timeout ourselves.
+    bool absolute = (futex_op & UAPI_FUTEX_CMD_MASK) == UAPI_FUTEX_WAIT_BITSET;
+    uint64_t wait_ms = (uint64_t)-1; // No timeout: wait forever
+    if (timeout) {
+        uint64_t deadline_ms = timeout->tv_sec * 1000 + (timeout->tv_nsec + 999999) / 1000000;
+        if (absolute) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+                return -UAPI_EINVAL;
+            }
+            uint64_t now_ms = (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+            wait_ms = deadline_ms > now_ms ? deadline_ms - now_ms : 0;
+        } else {
+            wait_ms = deadline_ms;
+        }
+    }
     switch (futex_op & UAPI_FUTEX_CMD_MASK) {
         case UAPI_FUTEX_WAIT:
-        case UAPI_FUTEX_WAIT_BITSET:
-            if (atomic_load_uint32(addr) == val) {
+        case UAPI_FUTEX_WAIT_BITSET: {
+            /*
+             * Linux fails a mismatching wait on the spot instead of sleeping:
+             * the caller relies on that answer to tell "the word is still what
+             * I expect, I really have to be woken" from "somebody changed it
+             * under me, retry". The polling loop below can only ever produce
+             * the first outcome, so a wait that never matched would be reported
+             * as a success.
+             */
+            if (atomic_load_uint32(addr) != val) {
+                return -UAPI_EAGAIN;
+            }
+            uint64_t waited = 0;
+            while (atomic_load_uint32(addr) == val) {
+                if (waited >= wait_ms) {
+                    return -UAPI_ETIMEDOUT;
+                }
                 sleep_ms(1);
+                waited++;
             }
             return 0;
+        }
         case UAPI_FUTEX_WAKE:
         case UAPI_FUTEX_WAKE_BITSET:
             return 0;
@@ -1397,6 +1757,71 @@ static struct timeval* uapi_ts32_to_timeval(struct timeval* tv, const struct uap
         return tv;
     }
     return NULL;
+}
+
+// Guest <-> host time structure conversion. Guest memory is only ever
+// interpreted as a struct uapi_*, the host libc only ever writes into a
+// host-side temporary: the two layouts are not the same type (the guest's
+// fields are 8 bytes wide whatever the host's long is), so passing to_ptr()
+// straight to the host would leave half of the guest's tv_nsec untouched.
+static int uapi_ts_to_host(struct timespec* dst, const struct uapi_timespec* src)
+{
+    if (!src) {
+        return 0; // Absent structure: the syscall decides what that means
+    }
+    dst->tv_sec = (long long)src->tv_sec;
+    dst->tv_nsec = (long)src->tv_nsec; // 0 <= tv_nsec < 1e9, fits any long
+    return 1;
+}
+
+static void uapi_ts_from_host(struct uapi_timespec* dst, const struct timespec* src)
+{
+    dst->tv_sec = (uint64_t)src->tv_sec;
+    dst->tv_nsec = (uint64_t)src->tv_nsec;
+}
+
+static int uapi_timeval_to_host(struct timeval* dst, const struct uapi_timeval* src)
+{
+    if (!src) {
+        return 0;
+    }
+    dst->tv_sec = (long long)src->tv_sec;
+    dst->tv_usec = (long)src->tv_usec;
+    return 1;
+}
+
+static void uapi_timeval_from_host(struct uapi_timeval* dst, const struct timeval* src)
+{
+    dst->tv_sec = (uint64_t)src->tv_sec;
+    dst->tv_usec = (uint64_t)src->tv_usec;
+}
+
+// The host gettimeofday() is not usable as-is here: MinGW's struct timeval has
+// a 32-bit tv_sec (LLP64), so routing the guest clock through it would truncate
+// the wall clock. clock_gettime() keeps full 64-bit seconds on every host we
+// build for, and the vDSO makes it just as cheap on Linux.
+static rvvm_addr_t rvvm_sys_gettimeofday(struct uapi_timeval* tv)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts)) {
+        return last_errno();
+    }
+    tv->tv_sec  = (uint64_t)ts.tv_sec;
+    tv->tv_usec = (uint64_t)(ts.tv_nsec / 1000);
+    return 0;
+}
+
+static void uapi_itimerval_to_host(struct itimerval* dst, const struct uapi_itimerval* src)
+{
+    memset(dst, 0, sizeof(*dst));
+    uapi_timeval_to_host(&dst->it_interval, src ? &src->it_interval : NULL);
+    uapi_timeval_to_host(&dst->it_value, src ? &src->it_value : NULL);
+}
+
+static void uapi_itimerval_from_host(struct uapi_itimerval* dst, const struct itimerval* src)
+{
+    uapi_timeval_from_host(&dst->it_interval, &src->it_interval);
+    uapi_timeval_from_host(&dst->it_value, &src->it_value);
 }
 
 static int rvvm_sys_select_time32(int nfds, void* rfds, void* wfds, void* efds, const struct uapi_timespec32* ts32)
@@ -1485,8 +1910,16 @@ static struct iovec* rvvm_iovec_from_guest(const struct uapi_iovec* giov, size_t
         hiov = safe_new_arr(struct iovec, count);
     }
     for (size_t i = 0; i < count; ++i) {
-        hiov[i].iov_base = to_ptr(giov[i].base);
+        hiov[i].iov_base = to_ptr_sz(giov[i].base, giov[i].len);
         hiov[i].iov_len  = giov[i].len;
+        if (giov[i].len && !hiov[i].iov_base) {
+            // A segment outside guest RAM: fail the whole call instead of
+            // letting the host (or the host kernel) touch a wild pointer.
+            if (hiov != stack_buf) {
+                free(hiov);
+            }
+            return NULL;
+        }
     }
     return hiov;
 }
@@ -1503,11 +1936,11 @@ static void rvvm_msghdr_from_guest(struct msghdr* host, const struct uapi_msghdr
                                    struct iovec* iov_buf, size_t iov_count)
 {
     memset(host, 0, sizeof(*host));
-    host->msg_name       = guest->name ? to_ptr(guest->name) : NULL;
+    host->msg_name       = guest->name ? to_ptr_sz(guest->name, guest->namelen) : NULL;
     host->msg_namelen    = guest->namelen;
     host->msg_iov        = iov_buf;
     host->msg_iovlen     = EVAL_MIN(guest->iovlen, iov_count);
-    host->msg_control    = guest->control ? to_ptr(guest->control) : NULL;
+    host->msg_control    = guest->control ? to_ptr_sz(guest->control, guest->controllen) : NULL;
     host->msg_controllen = guest->controllen;
     host->msg_flags      = guest->flags;
 }
@@ -1723,7 +2156,8 @@ static void* rvvm_user_thread_wrap(void* arg)
             switch (a7) {
                 case 17: { // getcwd
                     rvvm_info("sys_getcwd(%lx, %lx)", a0, a1);
-                    a0 = rvvm_sys_getcwd(to_ptr(a0), a1);
+                    char* buf = to_ptr_sz(a0, a1);
+                    a0 = buf ? rvvm_sys_getcwd(buf, a1) : (rvvm_addr_t)-UAPI_EFAULT;
                     break;
                 }
 #ifdef __linux__
@@ -1742,10 +2176,13 @@ static void* rvvm_user_thread_wrap(void* arg)
                     struct epoll_event host_ev;
                     struct epoll_event* host_ev_ptr = NULL;
                     if (a3) {
-                        struct uapi_epoll_event guest_ev;
-                        memcpy(&guest_ev, to_ptr(a3), sizeof(guest_ev));
-                        host_ev.events = guest_ev.event;
-                        host_ev.data.u64 = guest_ev.data.u64;
+                        const struct uapi_epoll_event* guest_ev = to_ptr_sz(a3, sizeof(*guest_ev));
+                        if (!guest_ev) {
+                            a0 = -UAPI_EFAULT;
+                            break;
+                        }
+                        host_ev.events = guest_ev->event;
+                        host_ev.data.u64 = guest_ev->data.u64;
                         host_ev_ptr = &host_ev;
                     }
                     a0 = errno_ret(epoll_ctl(a0, a1, a2, host_ev_ptr));
@@ -1766,10 +2203,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     a0 = errno_ret(epoll_wait(a0, host_evs, maxev, a3));
                     if ((ssize_t)a0 > 0 && a1) {
-                        struct uapi_epoll_event* guest_evs = to_ptr(a1);
-                        for (size_t i = 0; i < (size_t)a0; i++) {
-                            guest_evs[i].event = host_evs[i].events;
-                            guest_evs[i].data.u64 = host_evs[i].data.u64;
+                        struct uapi_epoll_event* guest_evs =
+                            to_ptr_sz(a1, (size_t)a0 * sizeof(struct uapi_epoll_event));
+                        if (guest_evs) {
+                            for (size_t i = 0; i < (size_t)a0; i++) {
+                                guest_evs[i].event = host_evs[i].events;
+                                guest_evs[i].data.u64 = host_evs[i].data.u64;
+                            }
+                        } else {
+                            a0 = -UAPI_EFAULT;
                         }
                     }
                     if (host_evs != stack_evs) free(host_evs);
@@ -1828,16 +2270,26 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 43: { // statfs64
                     struct statfs stfs = {0};
+                    struct uapi_statfs64* out = to_ptr_sz(a1, sizeof(*out));
                     rvvm_info("sys_statfs64(%s, %lx, %lx)", to_str(a0), a1, a2);
+                    if (!out) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
                     a0 = errno_ret(statfs(wrap_path(path_buf, to_str(a0)), &stfs));
-                    uapi_statfs64_convert(to_ptr(a1), &stfs);
+                    uapi_statfs64_convert(out, &stfs);
                     break;
                 }
                 case 44: { // fstatfs64
                     struct statfs stfs = {0};
+                    struct uapi_statfs64* out = to_ptr_sz(a1, sizeof(*out));
                     rvvm_info("sys_fstatfs64(%ld, %lx, %lx)", a0, a1, a2);
+                    if (!out) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
                     a0 = errno_ret(fstatfs(a0, &stfs));
-                    uapi_statfs64_convert(to_ptr(a1), &stfs);
+                    uapi_statfs64_convert(out, &stfs);
                     break;
                 }
                 case 45: // truncate64
@@ -1905,21 +2357,31 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 57: // close
                     a0 = errno_ret(close(a0));
                     break;
-                case 59: // pipe2
+                case 59: { // pipe2
                     rvvm_info("sys_pipe2(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(pipe(to_ptr(a0)));
+                    int* fds = to_ptr_sz(a0, sizeof(int) * 2);
+                    a0 = fds ? errno_ret(pipe(fds)) : (rvvm_addr_t)-UAPI_EFAULT;
                     break;
-                case 61: // getdents64
-                    a0 = rvvm_sys_getdents64(a0, to_ptr(a1), a2);
+                }
+                case 61: { // getdents64
+                    void* dirp = a2 ? to_ptr_sz(a1, a2) : NULL;
+                    a0 = (a2 && !dirp) ? (rvvm_addr_t)-UAPI_EFAULT : (rvvm_addr_t)rvvm_sys_getdents64(a0, dirp, a2);
                     break;
+                }
                 case 62: // lseek
                     a0 = errno_ret(lseek(a0, a1, a2));
                     break;
-                case 63: // read
-                    a0 = errno_ret(read(a0, to_ptr(a1), a2));
+                case 63: { // read
+                    void* buf = a2 ? to_ptr_sz(a1, a2) : NULL;
+                    a0 = (a2 && !buf) ? (rvvm_addr_t)-UAPI_EFAULT : errno_ret(read(a0, buf, a2));
                     break;
+                }
                 case 64: { // write
-                    void* wbuf = to_ptr(a1);
+                    void* wbuf = a2 ? to_ptr_sz(a1, a2) : NULL;
+                    if (a2 && !wbuf) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
                     if (a0 == 1 || a0 == 2) {
                         // fd 1/2: feed the virtual TTY parser first (no-op unless a
                         // host injected a VTerm or registered a tty callback). The
@@ -1947,7 +2409,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                         break;
                     }
                     struct iovec  stack_iov[IOV_STACK_MAX] = {0};
-                    struct iovec* hiov = rvvm_iovec_from_guest(to_ptr(a1), a2, stack_iov);
+                    const struct uapi_iovec* giov = to_ptr_sz(a1, a2 * sizeof(*giov));
+                    struct iovec* hiov = giov ? rvvm_iovec_from_guest(giov, a2, stack_iov) : NULL;
+                    if (!hiov) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
                     if (a7 == 65) {
                         a0 = errno_ret(readv(a0, hiov, a2));
                     } else if (a0 == 1 || a0 == 2) {
@@ -1972,12 +2439,16 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_iovec_release(hiov, stack_iov);
                     break;
                 }
-                case 67: // pread64
-                    a0 = errno_ret(pread(a0, to_ptr(a1), a2, a3));
+                case 67: { // pread64
+                    void* buf = a2 ? to_ptr_sz(a1, a2) : NULL;
+                    a0 = (a2 && !buf) ? (rvvm_addr_t)-UAPI_EFAULT : errno_ret(pread(a0, buf, a2, a3));
                     break;
-                case 68: // pwrite64
-                    a0 = errno_ret(pwrite(a0, to_ptr(a1), a2, a3));
+                }
+                case 68: { // pwrite64
+                    const void* buf = a2 ? to_ptr_sz(a1, a2) : NULL;
+                    a0 = (a2 && !buf) ? (rvvm_addr_t)-UAPI_EFAULT : errno_ret(pwrite(a0, buf, a2, a3));
                     break;
+                }
                 case 72: // pselect6_time32
                     a0 = rvvm_sys_select_time32(a0, to_ptr(a1), to_ptr(a2), to_ptr(a3), to_ptr(a4));
                     break;
@@ -1991,8 +2462,13 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 79: { // newfstatat
                     struct stat st = {0};
                     const char* path = to_str(a1);
+                    struct uapi_stat* out = to_ptr_sz(a2, sizeof(*out));
                     int ret;
                     rvvm_info("sys_newfstatat(%ld, %s, %lx, %lx)", a0, path, a2, a3);
+                    if (!out) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
                     if (!path && !(a3 & AT_EMPTY_PATH)) {
                         /* fstatat would dereference the NULL path */
                         ret = -1;
@@ -2003,14 +2479,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                         ret = fstatat(a0, path ? wrap_path(path_buf, path) : path, &st, a3);
                     }
                     a0 = errno_ret(ret);
-                    uapi_stat_convert(to_ptr(a2), &st);
+                    uapi_stat_convert(out, &st);
                     break;
                 }
                 case 80: { // newfstat
                     struct stat st = {0};
+                    struct uapi_stat* out = to_ptr_sz(a1, sizeof(*out));
                     rvvm_info("sys_newfstat(%ld, %lx)", a0, a1);
+                    if (!out) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
                     a0 = errno_ret(fstat(a0, &st));
-                    uapi_stat_convert(to_ptr(a1), &st);
+                    uapi_stat_convert(out, &st);
                     break;
                 }
                 case 82: // fsync
@@ -2059,7 +2540,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = atomic_load_uint32(&thread->tid);
                     break;
                 case 98: // futex
-                    a0 = rvvm_sys_futex(to_ptr(a0), a1, a2, a3, to_ptr(a4), a5);
+                    a0 = rvvm_sys_futex(to_ptr(a0), a1, a2, (const struct uapi_timespec*)to_ptr(a3), to_ptr(a4), a5);
                     break;
                 case 99: // set_robust_list
                     // TODO: Implement this
@@ -2067,59 +2548,128 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = 0;
                     break;
                 case 101: // nanosleep
-                    // TODO: Struct conversion
-                    a0 = errno_ret(nanosleep(to_ptr(a0), to_ptr(a1)));
+                {
+                    struct timespec req, rem = { 0, 0 };
+                    struct uapi_timespec* grem = to_ptr(a1);
+                    if (!uapi_ts_to_host(&req, to_ptr(a0))) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    a0 = errno_ret(nanosleep(&req, grem ? &rem : NULL));
+                    // rem is only filled in when the sleep is interrupted, but
+                    // the guest gets it either way
+                    if (grem) {
+                        uapi_ts_from_host(grem, &rem);
+                    }
                     break;
+                }
                 case 103: // setitimer
+                {
+                    struct itimerval newval = { 0 }, oldval = { 0 };
+                    struct uapi_itimerval* gnew = to_ptr(a1);
+                    struct uapi_itimerval* gold = to_ptr(a2);
                     rvvm_info("sys_setitimer(%lx, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(setitimer(a0, to_ptr(a1), to_ptr(a2)));
+                    uapi_itimerval_to_host(&newval, gnew);
+                    a0 = errno_ret(setitimer(a0, gnew ? &newval : NULL, gold ? &oldval : NULL));
+                    if (gold) {
+                        uapi_itimerval_from_host(gold, &oldval);
+                    }
                     break;
+                }
                 case 113: // clock_gettime
-                    // TODO: Struct conversion!
+                {
+                    struct timespec ts;
                     rvvm_info("sys_clock_gettime(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(clock_gettime(a0, to_ptr(a1)));
+                    int ret = clock_gettime(a0, &ts);
+                    if (ret == 0) {
+                        // A NULL target has nothing to write back to; that is
+                        // not worth faulting on, POSIX allows it for getres/clock_gettime alike
+                        struct uapi_timespec* out = to_ptr(a1);
+                        if (out) {
+                            uapi_ts_from_host(out, &ts);
+                        }
+                    }
+                    a0 = errno_ret(ret);
                     break;
+                }
                 case 114: // clock_getres
+                {
+                    struct timespec ts;
+                    int ret;
                     rvvm_info("sys_clock_getres(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(clock_getres(a0, to_ptr(a1)));
+                    ret = clock_getres(a0, &ts);
+                    if (ret == 0) {
+                        struct uapi_timespec* out = to_ptr(a1);
+                        if (out) {
+                            uapi_ts_from_host(out, &ts);
+                        }
+                    }
+                    a0 = errno_ret(ret);
                     break;
+                }
 #ifdef __linux__
                 case 115: // clock_nanosleep
-                    // TODO: struct conversion?
+                {
+                    struct timespec req, rem = { 0, 0 };
+                    struct uapi_timespec* grem = to_ptr(a3);
                     rvvm_info("sys_clock_nanosleep(%lx, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    a0 = errno_ret(clock_nanosleep(a0, a1, to_ptr(a2), to_ptr(a3)));
+                    if (!uapi_ts_to_host(&req, to_ptr(a2))) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    a0 = errno_ret(clock_nanosleep(a0, a1, &req, grem ? &rem : NULL));
+                    if (grem) {
+                        uapi_ts_from_host(grem, &rem);
+                    }
                     break;
+                }
 #endif
                 case 118: // sched_setparam - ignore
                 case 119: // sched_setscheduler - ignore
                 case 120: // sched_getscheduler - ignore
                     a0 = 0;
                     break;
-                case 121: // sched_getparam - stub
+                case 121: { // sched_getparam - stub
                     if (a1) {
-                        struct uapi_sched_param* param = to_ptr(a1);
+                        struct uapi_sched_param* param = to_ptr_sz(a1, sizeof(*param));
+                        if (!param) {
+                            a0 = -UAPI_EFAULT;
+                            break;
+                        }
                         memset(param, 0, sizeof(*param));
                     }
                     a0 = 0;
                     break;
+                }
                 case 122: // sched_setaffinity - ignore
                     a0 = 0;
                     break;
                 case 123: { // sched_getaffinity - pass through the host affinity mask,
                     // guest allocators (f.e. Zig SmpAllocator) size per-CPU arenas by it
-                    if (a2 && a1) {
-                        memset(to_ptr(a2), 0, a1);
-                        cpu_set_t host_mask;
-                        CPU_ZERO(&host_mask);
-                        if (!sched_getaffinity(0, sizeof(host_mask), &host_mask)) {
-                            size_t copy_len = sizeof(host_mask) < a1 ? sizeof(host_mask) : a1;
-                            memcpy(to_ptr(a2), &host_mask, copy_len);
-                        } else {
-                            *(uint8_t*)to_ptr(a2) = 1;
-                        }
+                    // A mask shorter than one word cannot hold a single CPU; the
+                    // kernel rejects the size before it ever looks at the pointer
+                    if (a1 < sizeof(unsigned long)) {
+                        a0 = -UAPI_EINVAL;
+                        break;
+                    }
+                    // The mask is not optional (there is nothing to report into
+                    // and no way to answer the question without writing it)
+                    void* mask = to_ptr_sz(a2, a1);
+                    if (!mask) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    memset(mask, 0, a1);
+                    cpu_set_t host_mask;
+                    CPU_ZERO(&host_mask);
+                    if (!sched_getaffinity(0, sizeof(host_mask), &host_mask)) {
+                        size_t copy_len = sizeof(host_mask) < a1 ? sizeof(host_mask) : a1;
+                        memcpy(mask, &host_mask, copy_len);
+                    } else {
+                        *(uint8_t*)mask = 1;
                     }
                     // Syscall ABI: return the amount of bytes written into the mask
-                    a0 = (a1 >= sizeof(unsigned long)) ? sizeof(unsigned long) : a1;
+                    a0 = sizeof(unsigned long);
                     break;
                 }
                 case 124: // sched_yield
@@ -2149,9 +2699,18 @@ static void* rvvm_user_thread_wrap(void* arg)
                     struct sigaction sa = {0};
                     rvvm_info("sys_rt_sigaction(%ld, %lx, %lx, %lx)", a0, a1, a2, a3);
                     if (a0 < STATIC_ARRAY_SIZE(ctx->siga)) {
-                        if (a2) memcpy(to_ptr(a2), &ctx->siga[a0], a3);
-                        if (a1) {
-                            memcpy(&ctx->siga[a0], to_ptr(a1), a3);
+                        // a3 is the guest sigsetsize; the whole struct sigaction
+                        // must never spill past one siga[] slot
+                        size_t copy_len = a3 < sizeof(ctx->siga[0]) ? a3 : sizeof(ctx->siga[0]);
+                        void* old = a2 ? to_ptr_sz(a2, copy_len) : NULL;
+                        const void* act = a1 ? to_ptr_sz(a1, copy_len) : NULL;
+                        if ((a2 && !old) || (a1 && !act)) {
+                            a0 = -UAPI_EFAULT;
+                            break;
+                        }
+                        if (old) memcpy(old, &ctx->siga[a0], copy_len);
+                        if (act) {
+                            memcpy(&ctx->siga[a0], act, copy_len);
 
                             // Register a shim signal handler
                             if (a0 != 11) {
@@ -2191,15 +2750,34 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 147: // setresuid - semi stub
                     a0 = rvvm_sys_setuid(a0);
                     break;
-                case 148: // getresuid - semi stub
-                    a0 = rvvm_sys_getresuid(to_ptr(a0), to_ptr(a1), to_ptr(a2));
+                case 148: { // getresuid - semi stub
+                    // Linux has no optional out-parameters here - all three must
+                    // be writable, a NULL is EFAULT rather than "don't report it"
+                    int* ruid = to_ptr_sz(a0, sizeof(int));
+                    int* euid = to_ptr_sz(a1, sizeof(int));
+                    int* suid = to_ptr_sz(a2, sizeof(int));
+                    if (!ruid || !euid || !suid) {
+                        a0 = -UAPI_EFAULT;
+                    } else {
+                        a0 = rvvm_sys_getresuid(ruid, euid, suid);
+                    }
                     break;
+                }
                 case 149: // setresgid - semi stub
                     a0 = rvvm_sys_setgid(a0);
                     break;
-                case 150: // getresgid - semi stub
-                    a0 = rvvm_sys_getresgid(to_ptr(a0), to_ptr(a1), to_ptr(a2));
+                case 150: { // getresgid - semi stub
+                    // Same as getresuid: every pointer is required
+                    int* rgid = to_ptr_sz(a0, sizeof(int));
+                    int* egid = to_ptr_sz(a1, sizeof(int));
+                    int* sgid = to_ptr_sz(a2, sizeof(int));
+                    if (!rgid || !egid || !sgid) {
+                        a0 = -UAPI_EFAULT;
+                    } else {
+                        a0 = rvvm_sys_getresgid(rgid, egid, sgid);
+                    }
                     break;
+                }
                 case 151: // setfsuid - ignore
                     a0 = rvvm_sys_getuid();
                     break;
@@ -2236,7 +2814,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = errno_ret(setgroups(a0, to_ptr(a1)));
                     }
                     break;
-                case 160: // newuname
+                case 160: { // newuname
                     rvvm_info("sys_newuname(%lx)", a0);
                     if (a0) {
                         // Just lie about the host details
@@ -2247,10 +2825,16 @@ static void* rvvm_user_thread_wrap(void* arg)
                             .version = "RVVM " RVVM_VERSION,
                             .machine = "riscv64",
                         };
-                        memcpy(to_ptr(a0), &name, sizeof(name));
+                        struct uapi_new_utsname* out = to_ptr_sz(a0, sizeof(*out));
+                        if (!out) {
+                            a0 = -UAPI_EFAULT;
+                            break;
+                        }
+                        memcpy(out, &name, sizeof(name));
                         a0 = 0;
                     }
                     break;
+                }
                 case 165: // getrusage
                     rvvm_info("sys_getrusage(%lx, %lx)", a0, a1);
                     a0 = errno_ret(getrusage(a0, to_ptr(a1)));
@@ -2264,6 +2848,17 @@ static void* rvvm_user_thread_wrap(void* arg)
                     //a0 = errno_ret(prctl(a0, a1, a2, a3, a4));
                     a0 = 0;
                     break;
+                case 169: { // gettimeofday
+                    // a1 is struct timezone* - obsolete: the kernel ignores it
+                    // and every libc passes NULL, so accept it and drop it.
+                    struct uapi_timeval* tv = a0 ? to_ptr_sz(a0, sizeof(*tv)) : NULL;
+                    if (a0 && !tv) {
+                        a0 = -UAPI_EFAULT;
+                    } else {
+                        a0 = tv ? rvvm_sys_gettimeofday(tv) : 0;
+                    }
+                    break;
+                }
                 case 172: // getpid
                     a0 = errno_ret(getpid());
                     break;
@@ -2372,13 +2967,22 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 212: { // recvmsg
                     // struct msghdr embeds three guest pointers plus an iovec array
                     rvvm_info("sys_%smsg(%ld, %lx, %lx)", a7 == 211 ? "send" : "recv", a0, a1, a2);
-                    const struct uapi_msghdr* gmsg = to_ptr(a1);
+                    const struct uapi_msghdr* gmsg = to_ptr_sz(a1, sizeof(*gmsg));
+                    if (!gmsg) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
                     if (gmsg->iovlen > IOV_HARD_MAX) {
                         a0 = -UAPI_EINVAL;
                         break;
                     }
                     struct iovec  stack_iov[IOV_STACK_MAX] = {0};
-                    struct iovec* hiov = rvvm_iovec_from_guest(to_ptr(gmsg->iov), gmsg->iovlen, stack_iov);
+                    const struct uapi_iovec* giov = to_ptr_sz(gmsg->iov, gmsg->iovlen * sizeof(*giov));
+                    struct iovec* hiov = giov ? rvvm_iovec_from_guest(giov, gmsg->iovlen, stack_iov) : NULL;
+                    if (!hiov && gmsg->iovlen) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
                     struct msghdr hmsg = {0};
                     rvvm_msghdr_from_guest(&hmsg, gmsg, hiov, gmsg->iovlen);
                     if (a7 == 211) {
@@ -2407,6 +3011,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -UAPI_ENOMEM;
                         break;
                     }
+                    size_t copy_len = EVAL_MIN(a1, a2);
+                    const void* old = to_ptr_sz(a0, copy_len);
+                    if (!old) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
                     rvvm_addr_t new_addr = 0;
                     spin_lock(&uctx()->guest_lock);
                     bool ok = guest_range_alloc(&new_addr, 0, a2, false);
@@ -2415,7 +3025,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -UAPI_ENOMEM;
                         break;
                     }
-                    memcpy(to_ptr(new_addr), to_ptr(a0), EVAL_MIN(a1, a2));
+                    memcpy(to_ptr(new_addr), old, copy_len);
                     if (a2 > a1) {
                         memset(to_ptr(new_addr + a1), 0, a2 - a1);
                     }
@@ -2497,11 +3107,18 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     a0 = 0;
                     break;
-                case 260: // wait4
-                    // TODO: Struct conversion
+                case 260: { // wait4
+                    // TODO: Struct conversion (the rusage argument follows the
+                    // guest's 64-bit timeval layout, not the host's)
                     rvvm_info("sys_wait4(%lx, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    a0 = errno_ret(wait4(a0, to_ptr(a1), a2, to_ptr(a3)));
+                    int* status = a1 ? to_ptr_sz(a1, sizeof(int)) : NULL;
+                    if (a1 && !status) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    a0 = errno_ret(wait4(a0, status, a2, to_ptr(a3)));
                     break;
+                }
                 case 261: // prlimit64 - stub
                     rvvm_info("sys_prlimit64(%lx, %lx, %lx, %lx)", a0, a1, a2, a3);
                     //a0 = errno_ret(prlimit(a0, a1, to_ptr(a2), to_ptr(a3)));
@@ -2523,20 +3140,36 @@ static void* rvvm_user_thread_wrap(void* arg)
                     // Hitler SHOT HIMSELF after seeing this...
                     a0 = 0;
                     break;
-                case 278: // getrandom
-                    rvvm_randombytes(to_ptr(a0), a1);
+                case 278: { // getrandom
+                    void* buf = a1 ? to_ptr_sz(a0, a1) : NULL;
+                    if (a1 && !buf) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    if (buf) {
+                        rvvm_randombytes(buf, a1);
+                    }
                     a0 = a1;
                     break;
+                }
 #ifdef __linux__
                 case 279: // memfd_create
                     rvvm_info("sys_memfd_create(%s, %lx)", to_str(a0), a1);
                     a0 = errno_ret(memfd_create(to_str(a0), a1));
                     break;
-                case 291: // statx
-                    // TODO: Struct conversion!
+                case 291: { // statx
+                    // No field conversion needed: struct statx is a fixed-width
+                    // kernel UAPI type, guest and host layouts are identical
+                    // (asserted above), unlike struct stat.
                     rvvm_info("sys_statx(%ld, %s, %lx, %lx, %lx)", a0, to_str(a1), a2, a3, a4);
-                    a0 = errno_ret(statx(a0, wrap_path(path_buf, to_str(a1)), a2, a3, to_ptr(a4)));
+                    struct statx* stx = to_ptr_sz(a4, sizeof(*stx));
+                    if (!stx) {
+                        a0 = -UAPI_EFAULT;
+                    } else {
+                        a0 = errno_ret(statx(a0, wrap_path(path_buf, to_str(a1)), a2, a3, stx));
+                    }
                     break;
+                }
 #endif
                 case 425: // io_uring_setup - guest event loop falls back to poll on ENOSYS
                     a0 = -UAPI_ENOSYS;
