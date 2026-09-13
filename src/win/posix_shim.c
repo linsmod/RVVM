@@ -31,6 +31,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -604,6 +606,7 @@ ssize_t pwrite(int fd, const void* buf, size_t count, long long offset)
  * this is exactly the symbol those callers resolve against. */
 
 static int shim_epoll_anchor_release(int fd);
+static int shim_dir_forget(int fd);
 
 int read(int fd, void* buf, unsigned int count)
 {
@@ -629,6 +632,7 @@ int close(int fd)
     if (shim_epoll_anchor_release(fd)) {
         return 0;
     }
+    shim_dir_forget(fd);
     return _close(fd);
 }
 
@@ -767,11 +771,228 @@ int umask(int mask)
     return _umask(mask);
 }
 
+/* ------------------------------------------------------------------ */
+/* Directory enumeration                                               */
+/*                                                                     */
+/* A guest lists a directory through getdents64: opendir() opens it    */
+/* (see openat(), which wraps the directory handle the CRT refuses) and */
+/* every readdir() is a getdents64 syscall. The guest layout is        */
+/* mirrored here because the Win32 walk is the only producer of it.    */
+/* ------------------------------------------------------------------ */
+
+/* Mirror of rvvm_user.c's struct uapi_linux_dirent64 */
+struct shim_linux_dirent64 {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    char     d_name[1];
+};
+
+#define SHIM_DIR_MAX 64
+#define SHIM_DIR_BUF 8192
+
+#define SHIM_DT_DIR 4
+#define SHIM_DT_REG 8
+
+typedef struct {
+    int     used;
+    int     fd;
+    HANDLE  handle;
+    bool    eof;
+    bool    drained;                 /* no unparsed record left in buf */
+    int64_t cookie;                  /* handed out as d_off */
+    DWORD   off;                     /* consumed bytes in buf */
+    uint64_t buf[SHIM_DIR_BUF / 8];  /* FILE_ID_BOTH_DIR_INFO records */
+} shim_dir_t;
+
+static SRWLOCK    shim_dir_lock = SRWLOCK_INIT;
+static shim_dir_t shim_dirs[SHIM_DIR_MAX];
+
+static int shim_dir_forget(int fd)
+{
+    int i, found = 0;
+    AcquireSRWLockExclusive(&shim_dir_lock);
+    for (i = 0; i < SHIM_DIR_MAX; i++) {
+        if (shim_dirs[i].used && shim_dirs[i].fd == fd) {
+            shim_dirs[i].used = 0;
+            found = 1;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&shim_dir_lock);
+    return found;
+}
+
+/* Look up (or start) the walk for @fd; the caller holds shim_dir_lock */
+static shim_dir_t* shim_dir_acquire(int fd)
+{
+    HANDLE h;
+    int i;
+    for (i = 0; i < SHIM_DIR_MAX; i++) {
+        if (shim_dirs[i].used && shim_dirs[i].fd == fd) {
+            return &shim_dirs[i];
+        }
+    }
+    h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE || h == NULL) {
+        errno = EBADF;
+        return NULL;
+    }
+    for (i = 0; i < SHIM_DIR_MAX; i++) {
+        if (!shim_dirs[i].used) {
+            memset(&shim_dirs[i], 0, sizeof(shim_dirs[i]));
+            shim_dirs[i].used = 1;
+            shim_dirs[i].fd = fd;
+            shim_dirs[i].handle = h;
+            shim_dirs[i].drained = true;    /* nothing buffered yet */
+            return &shim_dirs[i];
+        }
+    }
+    errno = EMFILE;
+    return NULL;
+}
+
+/* Pull the next batch of entries; the caller holds shim_dir_lock */
+static int shim_dir_refill(shim_dir_t* d)
+{
+    /* MinGW's GetFileInformationByHandleEx() has no out-length parameter, so
+     * the batch is walked through NextEntryOffset instead (a zero offset marks
+     * its last record). */
+    if (!GetFileInformationByHandleEx(d->handle, FileIdBothDirectoryInfo,
+                                      (void*)d->buf, (DWORD)sizeof(d->buf))) {
+        DWORD err = GetLastError();
+        if (err == ERROR_NO_MORE_FILES) {
+            d->eof = true;
+            return 0;
+        }
+        if (err == ERROR_INVALID_PARAMETER || err == ERROR_DIRECTORY) {
+            /* A plain file descriptor, not a directory */
+            errno = ENOTDIR;
+            return -1;
+        }
+        win_set_errno();
+        return -1;
+    }
+    d->off = 0;
+    d->drained = false;
+    return 0;
+}
+
+/*
+ * getdents64 over a directory handle. The walk state lives per fd, so a
+ * multi-call listing (a guest buffer smaller than the directory) resumes where
+ * it stopped instead of restarting.
+ */
+static ssize_t shim_getdents64(int fd, void* out, size_t size)
+{
+    shim_dir_t* d;
+    size_t written = 0;
+
+    if (!out && size) {
+        errno = EFAULT;
+        return -1;
+    }
+
+    AcquireSRWLockExclusive(&shim_dir_lock);
+    d = shim_dir_acquire(fd);
+    if (!d) {
+        goto fail;
+    }
+
+    for (;;) {
+        while (!d->drained) {
+            const FILE_ID_BOTH_DIR_INFO* ent =
+                (const FILE_ID_BOTH_DIR_INFO*)((const BYTE*)d->buf + d->off);
+            DWORD next = ent->NextEntryOffset;
+            char name[1024];
+            int name_len;
+            size_t reclen;
+            struct shim_linux_dirent64* de;
+
+            name_len = WideCharToMultiByte(CP_UTF8, 0, ent->FileName,
+                                           (int)(ent->FileNameLength / sizeof(WCHAR)),
+                                           name, sizeof(name) - 1, NULL, NULL);
+            if (name_len < 0) {
+                name_len = 0;
+            }
+            name[name_len] = 0;
+
+            /* linux_dirent64: 8+8+2+1+name+NUL, 8-byte aligned */
+            reclen = (sizeof(uint64_t) + sizeof(int64_t) + sizeof(uint16_t) + 1 +
+                      (size_t)name_len + 1 + 7) & ~(size_t)7;
+            if (reclen > size - written) {
+                /* Does not fit: leave the entry for the next call */
+                ReleaseSRWLockExclusive(&shim_dir_lock);
+                return (ssize_t)written;
+            }
+
+            de = (struct shim_linux_dirent64*)((BYTE*)out + written);
+            memset(de, 0, reclen);
+            de->d_ino = (uint64_t)ent->FileId.QuadPart;
+            if (!de->d_ino) {
+                de->d_ino = 1;
+            }
+            de->d_off = ++d->cookie;
+            de->d_reclen = (uint16_t)reclen;
+            /* TODO: reparse points / other types could be mapped too */
+            de->d_type = (ent->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                         ? SHIM_DT_DIR : SHIM_DT_REG;
+            memcpy(de->d_name, name, (size_t)name_len);
+
+            written += reclen;
+            if (next) {
+                d->off += next;
+            } else {
+                d->drained = true;
+            }
+        }
+
+        if (d->eof) {
+            break;
+        }
+        if (shim_dir_refill(d) < 0) {
+            goto fail;
+        }
+        if (d->eof) {
+            break;
+        }
+    }
+
+    ReleaseSRWLockExclusive(&shim_dir_lock);
+    return (ssize_t)written;
+
+fail:
+    ReleaseSRWLockExclusive(&shim_dir_lock);
+    return -1;
+}
+
+/*
+ * The CRT cannot open a directory, so fdopendir() has no fd to work from:
+ * resolve the handle back to a path and let opendir() (FindFirstFile-backed)
+ * do the walk. The DIR* therefore starts from the beginning whatever the fd's
+ * own position is - good enough here, and far better than ENOSYS.
+ */
 DIR* fdopendir(int fd)
 {
-    (void)fd;
-    errno = ENOSYS;
-    return NULL;
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    char path[MAX_PATH + 16];
+    DWORD n;
+    const char* p;
+    if (h == INVALID_HANDLE_VALUE || h == NULL) {
+        errno = EBADF;
+        return NULL;
+    }
+    n = GetFinalPathNameByHandleA(h, path, MAX_PATH, 0);
+    if (!n || n >= MAX_PATH) {
+        errno = ENOSYS;
+        return NULL;
+    }
+    path[n] = 0;
+    p = path;
+    if (strncmp(p, "\\\\?\\UNC\\", 8) == 0)      p += 6;
+    else if (strncmp(p, "\\\\?\\", 4) == 0)      p += 4;
+    return opendir(p);
 }
 
 /* ------------------------------------------------------------------ */
@@ -782,6 +1003,9 @@ int openat(int dirfd, const char* path, int flags, ...)
 {
     char full[MAX_PATH + 16];
     mode_t mode = 0;
+    DWORD attrs;
+    int fd;
+
     if (flags & O_CREAT) {
         va_list ap;
         va_start(ap, flags);
@@ -791,7 +1015,30 @@ int openat(int dirfd, const char* path, int flags, ...)
     if (at_path(dirfd, path, full, sizeof(full))) {
         return -1;
     }
-    return _open(full, flags | _O_BINARY, mode);
+    fd = _open(full, flags | _O_BINARY, mode);
+    if (fd >= 0) {
+        return fd;
+    }
+
+    /* UCRT refuses to open directories, but guests do open them (opendir(),
+     * O_DIRECTORY) and then enumerate with getdents64, so hand out a descriptor
+     * wrapping the directory handle. FILE_FLAG_BACKUP_SEMANTICS is what allows
+     * CreateFile to touch a directory at all. */
+    attrs = GetFileAttributesA(full);
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        HANDLE h = CreateFileA(full, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            int dfd = _open_osfhandle((intptr_t)h, _O_RDONLY | _O_BINARY);
+            if (dfd >= 0) {
+                return dfd;
+            }
+            CloseHandle(h);
+        }
+        win_set_errno();
+    }
+    return -1;
 }
 
 int mkdirat(int dirfd, const char* path, mode_t mode)
@@ -958,6 +1205,55 @@ static void stat_fill(struct rvvm_stat* out, const struct _stat64* in)
     out->st_ctime  = (long long)in->st_ctime;
 }
 
+static long long filetime_to_unix(const FILETIME* ft)
+{
+    unsigned long long t = ((unsigned long long)ft->dwHighDateTime << 32) | ft->dwLowDateTime;
+    if (!t) {
+        return 0;
+    }
+    return (long long)((t / 10000000ULL) - 11644473600ULL);
+}
+
+/*
+ * Refine a stat result from the file's handle.
+ *
+ * The CRT path helpers are not a reliable source here: _stat64() reads the
+ * directory metadata, which on some volumes (network/virtual drives) still
+ * reports the *old* size right after a write, and _fstat64() never sets
+ * S_IFDIR for a directory. Querying BY_HANDLE_FILE_INFORMATION gives the live
+ * size, the real file index and the directory attribute - and, because both
+ * stat() and fstat() go through it, they agree with each other.
+ */
+static void stat_refine(struct rvvm_stat* out, HANDLE h)
+{
+    BY_HANDLE_FILE_INFORMATION info;
+    if (h == INVALID_HANDLE_VALUE || h == NULL || !GetFileInformationByHandle(h, &info)) {
+        return;
+    }
+    out->st_dev    = info.dwVolumeSerialNumber;
+    out->st_ino    = ((unsigned long long)info.nFileIndexHigh << 32) | info.nFileIndexLow;
+    out->st_nlink  = info.nNumberOfLinks ? info.nNumberOfLinks : 1;
+    out->st_size   = ((long long)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+    out->st_blocks = (out->st_size + 511) / 512;
+    out->st_mode   = (out->st_mode & ~(unsigned)_S_IFMT) |
+                     ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? _S_IFDIR : _S_IFREG);
+    out->st_atime  = filetime_to_unix(&info.ftLastAccessTime);
+    out->st_mtime  = filetime_to_unix(&info.ftLastWriteTime);
+    out->st_ctime  = filetime_to_unix(&info.ftCreationTime);
+}
+
+/* FILE_READ_ATTRIBUTES + FILE_FLAG_BACKUP_SEMANTICS also opens directories */
+static void stat_refine_path(struct rvvm_stat* out, const char* path)
+{
+    HANDLE h = CreateFileA(path, FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        stat_refine(out, h);
+        CloseHandle(h);
+    }
+}
+
 int rvvm_stat(const char* path, struct rvvm_stat* buf)
 {
     struct _stat64 st;
@@ -965,6 +1261,7 @@ int rvvm_stat(const char* path, struct rvvm_stat* buf)
         return -1;
     }
     stat_fill(buf, &st);
+    stat_refine_path(buf, path);
     return 0;
 }
 
@@ -981,6 +1278,7 @@ int rvvm_fstat(int fd, struct rvvm_stat* buf)
         return -1;
     }
     stat_fill(buf, &st);
+    stat_refine(buf, (HANDLE)_get_osfhandle(fd));
     return 0;
 }
 
@@ -1923,8 +2221,7 @@ long syscall(long number, ...)
 
     switch (number) {
     case SYS_getdents64:    /* 217 */
-        errno = ENOSYS;
-        return -1;
+        return (long)shim_getdents64((int)a1, (void*)(uintptr_t)a2, (size_t)a3);
     case 276:               /* SYS_renameat2 */
         {
             char from[MAX_PATH + 16], to[MAX_PATH + 16];

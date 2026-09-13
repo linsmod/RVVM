@@ -184,7 +184,15 @@ Debug switches:
    (`rvvm_win_*`) because `src/util/networking.c` links the native WinSock
    names directly. `SCM_RIGHTS` fd passing is the one socket feature still
    refused (`EINVAL`).
-   A guest exercising those paths will fail; CPU-bound or file/graphics
+   The filesystem layer is usable for real guests: guest `open(2)` flags are
+   translated to the CRT ones (`O_CREAT` / `O_APPEND` / `O_EXCL` / `O_TRUNC`),
+   directories can be opened and are enumerated through a `getdents64` built on
+   `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)` (with `.`/`..` and
+   `d_type`), and `stat`/`fstat` take the live size, file index and the
+   directory bit from the file handle - the CRT path helpers lag behind a just
+   written file on some volumes and never report `S_IFDIR` for a directory fd.
+   Symbolic links stay `ENOSYS` and `mmap` of a file is a read-only snapshot.
+   A guest exercising the remaining gaps will fail; CPU-bound or file/graphics
    based guests are the reachable target.
    The Makefile build reuses the regular `USE_WIN32_GUI`/`USE_WIN32_COMPAT`
    host macro set plus `RVVM_USER_TEST` (set globally on Windows for
@@ -207,8 +215,12 @@ Debug switches:
    `Windows.Devices.Sensors` (WinRT) for real data.
 
 5. **Assets.** `ASSET_OPEN` is unimplemented in vp_cmdpost; guest asset reads
-   resolve relative to the current working directory
-   (`RVVM_USER_PREFIX` is set to empty, same as jni_bridge.c).
+   resolve relative to the current working directory. Guest absolute paths pass
+   through to the host unchanged unless `RVVM_USER_PREFIX` names a real rootfs
+   directory when the WinHost is launched. The value is applied through
+   `rvvm_user_set_prefix()`; an empty environment value cannot express
+   "no prefix" on Win32, because there `putenv("NAME=")` removes the variable
+   and a removed variable means "keep the build-time default".
 
 ## Suggested next steps
 

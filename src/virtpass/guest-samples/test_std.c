@@ -495,14 +495,22 @@ static void stage_data(void)
         check(rc == 0 && st.st_size == fst.st_size && st.st_ino == fst.st_ino,
               "stat(2) and fstat(2) agree on size/ino");
 
-        lseek(g_file_fd, 0, SEEK_SET);
-        char head[8] = {0};
-        ssize_t n = read(g_file_fd, head, 4);
-        check(n == 4, msgf("read(file, 4) -> %ld", (long)n));
+        /* A file this sample just created and truncated is empty, so there is
+         * nothing to read back yet; the write path below covers it. Only the
+         * fallback (a pre-existing file in the guest cwd) has contents. */
+        if (st.st_size >= 4) {
+            lseek(g_file_fd, 0, SEEK_SET);
+            char head[8] = {0};
+            ssize_t n = read(g_file_fd, head, 4);
+            check(n == 4, msgf("read(file, 4) -> %ld", (long)n));
 
-        char ph[8] = {0};
-        n = pread(g_file_fd, ph, 4, 0);
-        check(n == 4 && !memcmp(ph, head, 4), msgf("pread(file, 4, 0) matches read() (\"%s\")", ph));
+            char ph[8] = {0};
+            n = pread(g_file_fd, ph, 4, 0);
+            check(n == 4 && !memcmp(ph, head, 4), msgf("pread(file, 4, 0) matches read() (\"%s\")", ph));
+        } else {
+            skip("read/pread on the file head",
+                 "the file was just created empty (covered by the write/pwrite block)");
+        }
     }
 
     if (g_file_created) {

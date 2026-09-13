@@ -622,6 +622,10 @@ typedef struct rvvm_userland {
     rvvm_user_io_callback    io_callback;
     rvvm_user_exit_callback  exit_callback;
     const char*              prefix_path;
+    // Prefix set through rvvm_user_set_prefix(): the string is owned here and
+    // the RVVM_USER_PREFIX environment must not override it
+    char*                    prefix_owned;
+    bool                     prefix_forced;
     bool                     fake_root;
     int                      fake_uid;
     int                      fake_gid;
@@ -1126,6 +1130,32 @@ PUBLIC void rvvm_user_set_exit_callback(rvvm_machine_t* machine, rvvm_user_exit_
     if (ctx) ctx->exit_callback = callback;
 }
 
+PUBLIC void rvvm_user_set_prefix(rvvm_machine_t* machine, const char* prefix)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (!ctx) {
+        return;
+    }
+    safe_free(ctx->prefix_owned);
+    ctx->prefix_owned = NULL;
+    if (prefix && prefix[0]) {
+        size_t len = strlen(prefix) + 1;
+        char* copy = safe_malloc(len);
+        memcpy(copy, prefix, len);
+        ctx->prefix_owned = copy;
+        ctx->prefix_path = copy;
+    } else {
+        ctx->prefix_path = NULL;
+    }
+    ctx->prefix_forced = true;
+}
+
+PUBLIC const char* rvvm_user_get_prefix(rvvm_machine_t* machine)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    return ctx ? ctx->prefix_path : NULL;
+}
+
 static bool proc_mem_readable(const void* addr, size_t size)
 {
     static int fd = 0;
@@ -1191,6 +1221,29 @@ static size_t unwrap_path(char* buffer, const char* path, size_t size)
     }
 
     return rvvm_strlcpy(buffer, path, UAPI_PATH_MAX);
+}
+
+/* Guest open(2) flags -> host open() flags.
+ *
+ * On a Linux host the two sets are identical, so this passes through. The
+ * win32 CRT numbers them differently (O_CREAT 0x40 vs 0x100, O_APPEND 0x400 vs
+ * 0x8, O_EXCL 0x80 vs 0x400) and has no equivalent for O_DIRECTORY / O_CLOEXEC
+ * / O_NONBLOCK / O_NOFOLLOW / O_PATH, while some guest bits would even alias a
+ * *different* CRT flag (the guest's O_NOCTTY 0x100 would be read as _O_CREAT,
+ * silently creating files). Everything without an equivalent is dropped; the
+ * CRT layer adds _O_BINARY itself. */
+static int uapi_open_flags(int flags)
+{
+#if defined(_WIN32)
+    int host = flags & 3;                   /* O_RDONLY / O_WRONLY / O_RDWR agree */
+    if (flags & 0x40)   host |= _O_CREAT;   /* guest O_CREAT */
+    if (flags & 0x80)   host |= _O_EXCL;    /* guest O_EXCL */
+    if (flags & 0x200)  host |= _O_TRUNC;   /* guest O_TRUNC */
+    if (flags & 0x400)  host |= _O_APPEND;  /* guest O_APPEND */
+    return host;
+#else
+    return flags;
+#endif
 }
 
 void sig_handler(int signal)
@@ -1848,40 +1901,12 @@ static int rvvm_sys_poll_time32(void* pfds, size_t npfds, const struct uapi_time
 
 static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
 {
-    int64_t ret = 0;
-    ret = errno_ret(syscall(SYS_getdents64, fd, dirp, size));
+    /* SYS_getdents64 is served by the host layer: the native syscall on Linux,
+     * the Win32 directory walk in posix_shim.c elsewhere. The guest structure
+     * (struct uapi_linux_dirent64 above) is filled by that layer. */
+    int64_t ret = errno_ret(syscall(SYS_getdents64, fd, dirp, size));
     //rvvm_warn("getdents64(%d, %p, %ld) -> %ld (%s)", fd, dirp, size, ret, (ret < 0) ? strerror(errno) : "Success");
     return ret;
-    DIR* dir = fdopendir(dup(fd));
-    if (dir) {
-        struct dirent* dent = NULL;
-        while ((dent = readdir(dir))) {
-            size_t name_len = rvvm_strlen(dent->d_name);
-            size_t dirent_size = sizeof(struct uapi_linux_dirent64) + name_len + 1;
-            if (dirent_size <= size) {
-                struct uapi_linux_dirent64* dirent = dirp;
-                dirent->d_ino = dent->d_ino;
-                dirent->d_off = dirent_size;
-                dirent->d_reclen = dirent_size;
-                // TODO: Figure d_type somehow?
-                dirent->d_type = 0;
-                memcpy(dirent->d_name, dent->d_name, name_len);
-                dirent->d_name[name_len] = 0;
-
-                ret += dirent_size;
-                size -= dirent_size;
-                dirp = ((uint8_t*)dirp) + dirent_size;
-            } else {
-                closedir(dir);
-
-                return ret;
-            }
-        }
-        closedir(dir);
-        return ret;
-    } else {
-        return -UAPI_ENOENT;
-    }
 }
 
 #define UAPI_PROT_READ  0x1
@@ -2075,7 +2100,11 @@ static rvvm_addr_t rvvm_sys_getcwd(char* buffer, size_t size)
     if (!getcwd(tmp, size)) {
         return last_errno();
     }
-    return unwrap_path(buffer, tmp, size);
+    /* The kernel returns the string length (NUL excluded) and libc getcwd()
+     * treats a 0 as ENOENT, so report it explicitly instead of forwarding
+     * whatever the copy helper happens to return. */
+    unwrap_path(buffer, tmp, size);
+    return rvvm_strlen(buffer);
 }
 
 static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* buffer, size_t size)
@@ -2362,7 +2391,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -EFAULT;
                     } else {
                         /* NULL path with AT_EMPTY_PATH refers to the dirfd */
-                        a0 = errno_ret(openat(a0, path ? wrap_path(path_buf, path) : path, a2, a3));
+                        a0 = errno_ret(openat(a0, path ? wrap_path(path_buf, path) : path,
+                                              uapi_open_flags(a2), a3));
                     }
                     break;
                 }
@@ -3533,6 +3563,7 @@ static void userland_destroy(rvvm_machine_t* machine)
         return;
     }
     machine->userdata = NULL;
+    safe_free(ctx->prefix_owned);
     vector_free(ctx->userland_threads);
     if (ctx->tty_vt && ctx->tty_owned) {
         vterm_free((VTerm*)ctx->tty_vt);

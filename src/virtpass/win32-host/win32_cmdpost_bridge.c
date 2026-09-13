@@ -1830,11 +1830,20 @@ static bool guest_env_build(void)
     char** env = (char**)calloc(cap, sizeof(char*));
     if (!env) return false;
 
-    /* Assets resolve relative to CWD; keep the prefix visible to the host too
-     * so anything reading it locally sees the same value. */
-    static char env_prefix[] = GUEST_ENV_PREFIX;
-    putenv(env_prefix);
-    env[n++] = _strdup(env_prefix);
+    /* Hand the guest the same prefix the host resolved (empty = host paths pass
+     * through). The host side reads it through rvvm_user_set_prefix() rather
+     * than putenv(): MinGW's putenv("NAME=") removes the variable instead of
+     * setting it empty, which rvvm_user.c reads as "use the build-time
+     * default". */
+    {
+        static char env_prefix[1024];
+        const char* host_prefix = getenv("RVVM_USER_PREFIX");
+        snprintf(env_prefix, sizeof(env_prefix), GUEST_ENV_PREFIX "%s",
+                 (host_prefix && host_prefix[0]) ? host_prefix : "");
+        env[n] = _strdup(env_prefix);
+        if (!env[n]) { free(env); return false; }
+        n++;
+    }
 
     {
         /* environ is the live host block; _wenviron is the wide variant, so
@@ -2336,6 +2345,19 @@ bool win32_host_start_guest(int argc, char** argv)
      * graceful unwind instead of rvvm_user.c's _Exit() fallback (see
      * host_guest_exit_cb). Same role as jni_bridge.c's on_guest_exit. */
     rvvm_user_set_exit_callback(g_guest_machine, host_guest_exit_cb);
+
+    /* Guest filesystem view: host paths pass through unchanged unless the
+     * launching shell asked for a prefix directory (RVVM_USER_PREFIX pointing
+     * at a real rootfs). This must not rely on the environment alone - MinGW's
+     * putenv("NAME=") *removes* the variable instead of setting it empty, and
+     * rvvm_user.c reads a removed variable as "keep the build-time default",
+     * which prefixes every guest absolute path with a directory that does not
+     * exist on this host. */
+    {
+        const char* host_prefix = getenv("RVVM_USER_PREFIX");
+        rvvm_user_set_prefix(g_guest_machine,
+                             (host_prefix && host_prefix[0]) ? host_prefix : NULL);
+    }
 
     /* Route guest fd 1/2 through libvterm so CR / ANSI escapes render correctly
      * (the win32 host's stdout is a real tty today, but the renderer below draws

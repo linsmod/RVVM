@@ -72,6 +72,27 @@ void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback 
 // rvvm_user_linux_ex().
 void rvvm_user_set_tty0(rvvm_machine_t* machine, void* tty);
 
+// Override the guest's filesystem prefix - the directory guest absolute paths
+// are resolved against.
+//
+//   prefix = NULL  -> host paths pass through unchanged (no sandbox)
+//   prefix = "/x"  -> guest "/foo" becomes "/x/foo"; "/dev", "/sys", "/proc",
+//                     "/tmp", "/var/tmp" and relative paths still pass through
+//
+// Passing NULL is how a host asks for passthrough. Setting the environment
+// variable RVVM_USER_PREFIX to an empty string means the same, but Win32
+// cannot express "set it to empty": MinGW's putenv("NAME=") *removes* the
+// variable, and a removed variable means "keep the build-time default". A host
+// in that situation must call this instead.
+//
+// The string is copied and may be freed by the caller. Must be called before
+// rvvm_user_linux_ex().
+void rvvm_user_set_prefix(rvvm_machine_t* machine, const char* prefix);
+
+// Read back the prefix in effect (NULL when host paths pass through). The
+// pointer is owned by the machine.
+const char* rvvm_user_get_prefix(rvvm_machine_t* machine);
+
 // Create a userland machine instance without starting it.
 //
 // This is the multi-instance entry point: everything the guest needs (memory,
