@@ -537,7 +537,9 @@ static int32_t wasapi_set_buffer_size(void* user, int32_t frames, int32_t* appli
     wasapi_stream_t* s = (wasapi_stream_t*)user;
     if (!s) return VP_AUDIO_ERROR_INVALID_ARG;
 
-    /* Shared mode: the engine owns the period, report it back. */
+    /* Shared mode: the engine owns the period, so the requested frame count is
+     * only advisory - the current engine period is reported back instead. */
+    (void)frames;
     if (applied_out) {
         *applied_out = s->buffer_frames;
     }

@@ -183,7 +183,10 @@ bool win32_gl_backend_load(void)
         return false;
     }
 
-    #define LOAD(name) p_egl##name = (vpgl_PFN_egl##name)GetProcAddress(g_h_egl, "egl" #name)
+    /* GetProcAddress returns a generic FARPROC: cast through void* so the
+     * function-pointer-to-function-pointer conversion is out of -Wcast-function-type
+     * (same idiom as posix_shim.c / win32_cmdpost_bridge.c). */
+    #define LOAD(name) p_egl##name = (vpgl_PFN_egl##name)(void*)GetProcAddress(g_h_egl, "egl" #name)
     LOAD(ChooseConfig);
     LOAD(CreateContext);
     LOAD(CreatePbufferSurface);
@@ -203,7 +206,7 @@ bool win32_gl_backend_load(void)
     LOAD(Terminate);
     #undef LOAD
 
-    #define LOAD(name) p_gl##name = (vpgl_PFN_gl##name)GetProcAddress(g_h_gles, "gl" #name)
+    #define LOAD(name) p_gl##name = (vpgl_PFN_gl##name)(void*)GetProcAddress(g_h_gles, "gl" #name)
     LOAD(ActiveTexture);
     LOAD(AttachShader);
     LOAD(BindAttribLocation);

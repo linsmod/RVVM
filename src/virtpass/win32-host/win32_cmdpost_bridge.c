@@ -1689,7 +1689,8 @@ static void tty_layer_render(void)
             }
             /* Erased cell: no glyph, but a non-default pen bg (SGR set before
              * erase) still needs painting. */
-            COLORREF bg;
+            COLORREF bg     = 0; /* read only while has_bg is true, but keep the
+                                  * compiler's dataflow happy */
             bool has_bg = tty_cell_bg(scr, &cell, &bg);
             if (!cell.chars[0]) {
                 if (has_bg) {
@@ -1724,7 +1725,7 @@ static void tty_layer_render(void)
                         break;
                     }
                     bool nx_cjk = tty_is_cjk(nx.chars[0]);
-                    COLORREF nbg;
+                    COLORREF nbg      = 0;
                     bool nx_has_bg = tty_cell_bg(scr, &nx, &nbg);
                     if (nx_cjk != cjk || nx.attrs.bold != cell.attrs.bold ||
                         tty_cell_fg(scr, &nx) != fg ||
