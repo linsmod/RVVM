@@ -53,6 +53,16 @@ EGL_H = os.path.join(NDK_SYSROOT, "EGL", "egl.h")
 # superset), but merging keeps the generated diff confined to the new calls.
 GL_HEADERS = [GL2_H, GL3_H]
 
+# gl2ext.h / gl3ext.h are read for CONSTANTS ONLY, never for prototypes: pulling
+# the extensions into the function ABI would need its own fn_id block (see the
+# GL_FN_BASE / EGL_FN_BASE headroom note). None of their integer tokens
+# collides with a core one, so merging them turns the exported set into the
+# whole Khronos registry - which is what a ported renderer asks for when it
+# reaches for GL_COMPRESSED_RGBA_S3TC_DXT5_EXT or GL_TEXTURE_MAX_ANISOTROPY_EXT.
+GL_EXT_HEADERS = [os.path.join(NDK_SYSROOT, p) for p in
+                  ("GLES2/gl2ext.h", "GLES3/gl3ext.h")]
+GL_CONST_HEADERS = GL_HEADERS + [p for p in GL_EXT_HEADERS if os.path.isfile(p)]
+
 # fn_id bases (single source of truth, consumed by the guest stub, vp_cmdpost
 # and both host dispatches). The whole GL set must fit in [GL_FN_BASE,
 # EGL_FN_BASE): GLES2+GLES3 core is 246 functions, so 0x100 still has room -
@@ -310,6 +320,76 @@ def parse_type(decl):
     return Type(base, ptr, const), name
 
 
+# ---------------------------------------------------------------------------
+# Constant extraction
+#
+# The guest-used GL/EGL tokens used to be a hand-written subset, and every
+# guest that reached for anything outside it failed to compile with a bare
+# "use of undeclared identifier 'GL_REPEAT'". They are no less canonical than
+# the prototypes, so they are parsed out of the very same headers: ~625 GL
+# tokens and ~163 EGL tokens, every one of them usable by a guest.
+# ---------------------------------------------------------------------------
+
+# Every macro whose value is a bare integer literal. Anything else is not a
+# constant: GL_APIENTRYP is a declarator, and the EGL_NO_*/EGL_CAST(...)
+# forms carry a type the plain integer would lose.
+CONST_RE = re.compile(
+    r"^#define\s+((?:GL|EGL)_\w+)\s+(0[xX][0-9a-fA-F]+|\d+)[uUlL]*\s*$", re.M)
+
+
+# Tokens the parsed core headers do NOT define, but that this header has always
+# exported (the *_KHR spelling of an EGL bit, and two GL entries the NDK only
+# ships inside its extension headers). Listing them keeps switching to the
+# generated set a pure superset: nothing a guest compiles against today can
+# disappear. Verified against every previously exported token: 0 changed values.
+EXTRA_CONSTANTS = {
+    "EGL_OPENGL_ES3_BIT_KHR": 0x0040,
+    "GL_FRAMEBUFFER_SRGB":    0x8DB9,
+    "GL_SAMPLES_PASSED":      0x8914,
+}
+
+
+def load_constants(headers, prefix):
+    """Every plain-integer GL_/EGL_ macro in `headers`, first definition wins.
+
+    gl2.h is read before gl3.h so the GLES2 spelling of a shared token wins:
+    the two copies agree on every value, this only keeps the generated list
+    stable if the headers are ever reordered.
+
+    The EXTRA_CONSTANTS entries matching `prefix` are laid down as a floor
+    first; `prefix` keeps the GL and the EGL block from claiming each other's
+    tokens (which would emit the same macro twice).
+    """
+    consts = {n: v for n, v in EXTRA_CONSTANTS.items() if n.startswith(prefix)}
+    for header in headers:
+        with open(header, "r", encoding="utf-8", errors="replace") as f:
+            for name, value in CONST_RE.findall(f.read()):
+                consts.setdefault(name, int(value, 0))
+    return consts
+
+
+def const_line(name, value):
+    # Small values read better decimal (GL_FALSE 0), everything else is a
+    # Khronos token traditionally written in hex.
+    return "#define %s %s" % (name.ljust(36), str(value) if value < 0x10 else ("0x%X" % value))
+
+
+def const_block(header, note, consts):
+    out = ["/* ============================================================",
+           " * %s" % header,
+           " *",
+           " * %d tokens, parsed out of the NDK headers - nothing in here is"
+           "\n * hand-maintained, so a guest can reach for every symbolic constant"
+           "\n * the real headers offer instead of only the ones somebody typed in."
+           % len(consts),
+           " *"]
+    out.extend(" * " + line for line in note.split("\n"))
+    out.append(" * ============================================================ */")
+    for name in sorted(consts):
+        out.append(const_line(name, consts[name]))
+    return "\n".join(out)
+
+
 def parse_prototypes(text, api_prefix):
     """Extract (ret: Type, name, [param: (Type, name)]) from declarations of
     the form  <PREFIX> ret <PREFIX2> name (params);"""
@@ -544,241 +624,15 @@ typedef int32_t  EGLint;
 typedef uint32_t EGLBoolean;
 typedef uint32_t EGLenum;
 
-#define EGL_FALSE 0
-#define EGL_TRUE  1
+/* Every plain-integer EGL token is generated below straight from egl.h (see
+ * load_constants()). Only the typed ones stay hand-written: their value IS the
+ * cast, and a generated `#define EGL_NO_CONTEXT 0` would silently lose it. */
 #define EGL_DONT_CARE        ((EGLint)-1)
 
 #define EGL_DEFAULT_DISPLAY  ((EGLDisplay)0)
 #define EGL_NO_DISPLAY       ((EGLDisplay)0)
 #define EGL_NO_SURFACE       ((EGLSurface)0)
 #define EGL_NO_CONTEXT       ((EGLContext)0)
-
-#define EGL_SUCCESS            0x3000
-#define EGL_NOT_INITIALIZED    0x3001
-#define EGL_BAD_ACCESS         0x3002
-#define EGL_BAD_ALLOC          0x3003
-#define EGL_BAD_ATTRIBUTE      0x3004
-#define EGL_BAD_CONFIG         0x3005
-#define EGL_BAD_CONTEXT        0x3006
-#define EGL_BAD_CURRENT_SURFACE 0x3007
-#define EGL_BAD_DISPLAY        0x3008
-#define EGL_BAD_MATCH          0x3009
-#define EGL_BAD_NATIVE_PIXMAP  0x300A
-#define EGL_BAD_NATIVE_WINDOW  0x300B
-#define EGL_BAD_PARAMETER      0x300C
-#define EGL_BAD_SURFACE        0x300D
-#define EGL_CONTEXT_LOST       0x300E
-
-#define EGL_BUFFER_SIZE      0x3020
-#define EGL_ALPHA_SIZE       0x3021
-#define EGL_BLUE_SIZE        0x3022
-#define EGL_GREEN_SIZE       0x3023
-#define EGL_RED_SIZE         0x3024
-#define EGL_DEPTH_SIZE       0x3025
-#define EGL_STENCIL_SIZE     0x3026
-#define EGL_SAMPLES          0x3031
-#define EGL_SAMPLE_BUFFERS   0x3032
-#define EGL_SURFACE_TYPE     0x3033
-#define EGL_RENDERABLE_TYPE  0x3040
-#define EGL_NONE             0x3038
-
-#define EGL_PBUFFER_BIT      0x0001
-#define EGL_PIXMAP_BIT       0x0002
-#define EGL_WINDOW_BIT       0x0004
-#define EGL_OPENGL_ES_BIT    0x0001
-#define EGL_OPENGL_ES2_BIT   0x0004
-#define EGL_OPENGL_ES3_BIT   0x0040
-#define EGL_OPENGL_ES3_BIT_KHR 0x0040
-
-#define EGL_WIDTH            0x3057
-#define EGL_HEIGHT           0x3056
-#define EGL_LARGEST_PBUFFER  0x3058
-
-#define EGL_VENDOR           0x3053
-#define EGL_VERSION          0x3054
-#define EGL_EXTENSIONS       0x3055
-#define EGL_CLIENT_APIS      0x308D
-
-#define EGL_OPENGL_ES_API    0x30A0
-#define EGL_OPENGL_API       0x30A2
-#define EGL_OPENVG_API       0x30A1
-
-#define EGL_DRAW             0x3059
-#define EGL_READ             0x305A
-
-#define EGL_CONTEXT_CLIENT_VERSION 0x3098
-/* ES 3.x contexts. EGL_CONTEXT_MAJOR_VERSION is the very same token as
- * EGL_CONTEXT_CLIENT_VERSION (both 0x3098) - it is what additionally selects
- * the API version together with the minor version below (3.1/3.2 contexts). */
-#define EGL_CONTEXT_MAJOR_VERSION  0x3098
-#define EGL_CONTEXT_MINOR_VERSION  0x30FB
-#define EGL_CONTEXT_OPENGL_DEBUG   0x31B0
-"""
-
-
-def gl2_const_defs():
-    return """/* ============================================================
- * GLES2 constants (subset used by guests + host smoke tests)
- * ============================================================ */
-#define GL_FALSE 0
-#define GL_TRUE  1
-
-#define GL_BYTE                0x1400
-#define GL_UNSIGNED_BYTE       0x1401
-#define GL_SHORT               0x1402
-#define GL_UNSIGNED_SHORT      0x1403
-#define GL_INT                 0x1404
-#define GL_UNSIGNED_INT        0x1405
-#define GL_FLOAT               0x1406
-
-#define GL_NEVER               0x0200
-#define GL_LESS                0x0201
-#define GL_EQUAL               0x0202
-#define GL_LEQUAL              0x0203
-#define GL_GREATER             0x0204
-#define GL_NOTEQUAL            0x0205
-#define GL_GEQUAL              0x0206
-#define GL_ALWAYS              0x0207
-
-#define GL_POINTS              0x0000
-#define GL_LINES               0x0001
-#define GL_LINE_LOOP           0x0002
-#define GL_LINE_STRIP          0x0003
-#define GL_TRIANGLES           0x0004
-#define GL_TRIANGLE_STRIP      0x0005
-#define GL_TRIANGLE_FAN        0x0006
-
-#define GL_ZERO                0
-#define GL_ONE                 1
-
-#define GL_NO_ERROR            0
-#define GL_INVALID_ENUM        0x0500
-#define GL_INVALID_VALUE       0x0501
-#define GL_INVALID_OPERATION   0x0502
-#define GL_OUT_OF_MEMORY       0x0505
-
-#define GL_VENDOR              0x1F00
-#define GL_RENDERER            0x1F01
-#define GL_VERSION             0x1F02
-#define GL_EXTENSIONS          0x1F03
-
-#define GL_DEPTH_BUFFER_BIT    0x00000100
-#define GL_STENCIL_BUFFER_BIT  0x00000400
-#define GL_COLOR_BUFFER_BIT    0x00004000
-
-#define GL_RGBA                0x1908
-#define GL_RGB                 0x1907
-
-#define GL_FRAGMENT_SHADER     0x8B30
-#define GL_VERTEX_SHADER       0x8B31
-#define GL_COMPILE_STATUS      0x8B81
-#define GL_LINK_STATUS         0x8B82
-#define GL_ARRAY_BUFFER        0x8892
-#define GL_ELEMENT_ARRAY_BUFFER 0x8893
-#define GL_ARRAY_BUFFER_BINDING 0x8894
-#define GL_ELEMENT_ARRAY_BUFFER_BINDING 0x8895
-#define GL_STATIC_DRAW         0x88E4
-#define GL_STREAM_DRAW         0x88E0
-#define GL_DYNAMIC_DRAW        0x88E8
-#define GL_FRAMEBUFFER         0x8D40
-#define GL_RENDERBUFFER        0x8D41
-#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
-#define GL_COLOR_ATTACHMENT0   0x8CE0
-#define GL_DEPTH_ATTACHMENT    0x8D00
-#define GL_DEPTH_COMPONENT16   0x81A5
-
-#define GL_DEPTH_TEST          0x0B71
-#define GL_BLEND               0x0BE2
-#define GL_CULL_FACE           0x0B44
-#define GL_SCISSOR_TEST        0x0C11
-#define GL_TEXTURE_2D          0x0DE1
-#define GL_TEXTURE0            0x84C0
-
-#define GL_TEXTURE_MIN_FILTER  0x2801
-#define GL_TEXTURE_MAG_FILTER  0x2800
-#define GL_TEXTURE_WRAP_S      0x2802
-#define GL_TEXTURE_WRAP_T      0x2803
-#define GL_NEAREST             0x2600
-#define GL_LINEAR              0x2601
-#define GL_CLAMP_TO_EDGE       0x812F
-
-#define GL_RGBA8               0x8058
-#define GL_FRAMEBUFFER_BINDING 0x8CA6
-#define GL_VIEWPORT            0x0BA2
-#define GL_MAX_TEXTURE_SIZE    0x0D33
-#define GL_NUM_COMPRESSED_TEXTURE_FORMATS 0x86A2
-
-#define GL_COLOR_CLEAR_VALUE   0x0C22
-#define GL_ACTIVE_UNIFORMS     0x8B86
-#define GL_ACTIVE_ATTRIBUTES   0x8B89
-#define GL_ATTACHED_SHADERS    0x8B85
-#define GL_INFO_LOG_LENGTH     0x8B84
-"""
-
-
-def gl3_const_defs():
-    return """/* ============================================================
- * GLES3 constants (subset used by guests + host smoke tests)
- * ============================================================ */
-#define GL_MAJOR_VERSION       0x821B
-#define GL_MINOR_VERSION       0x821C
-#define GL_NUM_EXTENSIONS      0x821D
-
-#define GL_MAX_3D_TEXTURE_SIZE 0x8073
-#define GL_MAX_ARRAY_TEXTURE_LAYERS 0x88FF
-#define GL_MAX_ELEMENT_INDEX   0x8D6B
-#define GL_MAX_COLOR_ATTACHMENTS 0x8CDF
-
-#define GL_R8                  0x8229
-#define GL_RGB8                0x8051
-#define GL_RGBA32F             0x8814
-#define GL_RGB32F              0x8815
-#define GL_DEPTH_COMPONENT24   0x81A6
-#define GL_DEPTH24_STENCIL8    0x88F0
-
-#define GL_TEXTURE_3D          0x806F
-#define GL_TEXTURE_WRAP_R      0x8072
-#define GL_TEXTURE_COMPARE_MODE 0x884C
-#define GL_TEXTURE_COMPARE_FUNC 0x884D
-
-#define GL_UNIFORM_BUFFER      0x8A11
-#define GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT 0x8A34
-#define GL_MAX_UNIFORM_BLOCK_SIZE 0x8A30
-#define GL_UNIFORM_BLOCK_DATA_SIZE 0x8A40
-#define GL_ACTIVE_UNIFORM_BLOCKS 0x8A36
-#define GL_INVALID_INDEX       0xFFFFFFFF
-#define GL_BUFFER_SIZE         0x8764
-#define GL_SHADING_LANGUAGE_VERSION 0x8B8C
-
-#define GL_VERTEX_ARRAY_BINDING 0x85B5
-#define GL_READ_BUFFER         0x0C02
-#define GL_READ_FRAMEBUFFER    0x8CA8
-#define GL_DRAW_FRAMEBUFFER    0x8CA9
-#define GL_COLOR_ATTACHMENT1   0x8CE1
-#define GL_FRAMEBUFFER_SRGB    0x8DB9
-
-#define GL_ANY_SAMPLES_PASSED  0x8C2F
-#define GL_SAMPLES_PASSED      0x8914
-#define GL_QUERY_RESULT        0x8866
-#define GL_QUERY_RESULT_AVAILABLE 0x8867
-
-/* glMapBufferRange() access bits. The guest needs them to ask for a mapping,
- * and the host staging code inspects the same bits to decide whether to seed
- * the staging buffer and whether to write it back. */
-#define GL_MAP_READ_BIT             0x0001
-#define GL_MAP_WRITE_BIT            0x0002
-#define GL_MAP_INVALIDATE_RANGE_BIT  0x0004
-#define GL_MAP_INVALIDATE_BUFFER_BIT 0x0008
-#define GL_MAP_FLUSH_EXPLICIT_BIT   0x0010
-#define GL_MAP_UNSYNCHRONIZED_BIT   0x0020
-
-#define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
-#define GL_SYNC_FLUSH_COMMANDS_BIT    0x00000001
-#define GL_ALREADY_SIGNALED    0x911A
-#define GL_TIMEOUT_EXPIRED     0x911B
-#define GL_CONDITION_SATISFIED 0x911C
-#define GL_WAIT_FAILED         0x911D
-#define GL_TIMEOUT_IGNORED     0xFFFFFFFFFFFFFFFFull
 """
 
 
@@ -869,7 +723,7 @@ def guest_prototypes(gl_fns, egl_fns):
     return "\n".join(out)
 
 
-def gen_guest_header(gl_fns, egl_fns, egl_host_fns):
+def gen_guest_header(gl_fns, egl_fns, egl_host_fns, gl_consts, egl_consts):
     parts = [GENERATED_BANNER.format(nargs=GL_CALL_MAX_ARGS)]
     parts.append("#ifndef VIRTPASS_GL")
     parts.append("#define VIRTPASS_GL")
@@ -877,9 +731,19 @@ def gen_guest_header(gl_fns, egl_fns, egl_host_fns):
     parts.append("#include <stdint.h>")
     parts.append("")
     parts.append(gl_type_defs())
-    parts.append(gl2_const_defs())
-    parts.append(gl3_const_defs())
+    parts.append(const_block(
+        "GLES2 + GLES3 symbolic constants",
+        "gl2.h is merged before gl3.h, exactly like the prototypes: a shared\n"
+        "token keeps its GLES2 spelling rather than being re-pinned by the ES3\n"
+        "copy. gl2ext.h/gl3ext.h contribute their tokens too - constants only,\n"
+        "never prototypes, since extensions have no fn_id here.", gl_consts))
     parts.append(egl_type_defs())
+    parts.append(const_block(
+        "EGL symbolic constants",
+        "Only the integer tokens: the typed ones (EGL_NO_CONTEXT and friends)\n"
+        "stay in the type block above, where their cast is part of the value.\n"
+        "Both EGL_CONTEXT_CLIENT_VERSION and EGL_CONTEXT_MAJOR_VERSION are\n"
+        "0x3098 - one token under two names, exactly as in egl.h.", egl_consts))
     parts.append(fn_id_defs(gl_fns, egl_host_fns))
     parts.append(gl_call_struct())
     parts.append(guest_prototypes(gl_fns, egl_fns))
@@ -1620,9 +1484,12 @@ def main():
     os.makedirs(GUEST_SRC_DIR, exist_ok=True)
     os.makedirs(HOST_DIR, exist_ok=True)
 
+    gl_consts = load_constants(GL_CONST_HEADERS, "GL_")
+    egl_consts = load_constants([EGL_H], "EGL_")
+
     outs = [
         (os.path.join(GUEST_INC_DIR, "vp_gl.h"),
-         gen_guest_header(gl_fns, egl_fns, egl_host_fns)),
+         gen_guest_header(gl_fns, egl_fns, egl_host_fns, gl_consts, egl_consts)),
         (os.path.join(GUEST_SRC_DIR, "vp_gl_stub.c"), gen_guest_source(gl_fns, egl_fns)),
         # Host-side shared headers (both the win32 and the android host
         # include these; the argument-translation tables exist once).
