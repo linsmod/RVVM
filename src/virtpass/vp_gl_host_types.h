@@ -81,6 +81,15 @@ typedef void*         vpgl_EGLNativeWindowType;
 #define vpgl_EGL_WIDTH  0x3057
 #define vpgl_EGL_HEIGHT 0x3056
 
+/* glMapBufferRange() access bits the host staging code inspects:
+ * whether to seed the guest staging buffer from the buffer object,
+ * and whether to write it back on unmap/flush. */
+#define vpgl_GL_MAP_READ_BIT              0x0001u
+#define vpgl_GL_MAP_WRITE_BIT             0x0002u
+#define vpgl_GL_MAP_INVALIDATE_RANGE_BIT  0x0004u
+#define vpgl_GL_MAP_INVALIDATE_BUFFER_BIT 0x0008u
+#define vpgl_GL_MAP_FLUSH_EXPLICIT_BIT    0x0010u
+
 /* ---- EGL function pointer types ---- */
 typedef vpgl_EGLBoolean (vpgl_APIENTRY *vpgl_PFN_eglChooseConfig)(vpgl_void* dpy, const vpgl_EGLint* attrib_list, vpgl_void* configs, vpgl_EGLint config_size, vpgl_EGLint* num_config);
 typedef vpgl_void* (vpgl_APIENTRY *vpgl_PFN_eglCreateContext)(vpgl_void* dpy, vpgl_void* config, vpgl_void* share_context, const vpgl_EGLint* attrib_list);
@@ -273,6 +282,7 @@ typedef void (vpgl_APIENTRY *vpgl_PFN_glUniformMatrix4x3fv)(vpgl_GLint location,
 typedef void (vpgl_APIENTRY *vpgl_PFN_glBlitFramebuffer)(vpgl_GLint srcX0, vpgl_GLint srcY0, vpgl_GLint srcX1, vpgl_GLint srcY1, vpgl_GLint dstX0, vpgl_GLint dstY0, vpgl_GLint dstX1, vpgl_GLint dstY1, vpgl_GLbitfield mask, vpgl_GLenum filter);
 typedef void (vpgl_APIENTRY *vpgl_PFN_glRenderbufferStorageMultisample)(vpgl_GLenum target, vpgl_GLsizei samples, vpgl_GLenum internalformat, vpgl_GLsizei width, vpgl_GLsizei height);
 typedef void (vpgl_APIENTRY *vpgl_PFN_glFramebufferTextureLayer)(vpgl_GLenum target, vpgl_GLenum attachment, vpgl_GLuint texture, vpgl_GLint level, vpgl_GLint layer);
+typedef vpgl_void* (vpgl_APIENTRY *vpgl_PFN_glMapBufferRange)(vpgl_GLenum target, vpgl_GLintptr offset, vpgl_GLsizeiptr length, vpgl_GLbitfield access);
 typedef void (vpgl_APIENTRY *vpgl_PFN_glFlushMappedBufferRange)(vpgl_GLenum target, vpgl_GLintptr offset, vpgl_GLsizeiptr length);
 typedef void (vpgl_APIENTRY *vpgl_PFN_glBindVertexArray)(vpgl_GLuint array);
 typedef void (vpgl_APIENTRY *vpgl_PFN_glDeleteVertexArrays)(vpgl_GLsizei n, const vpgl_GLuint* arrays);
@@ -542,6 +552,7 @@ extern vpgl_PFN_glUniformMatrix4x3fv p_glUniformMatrix4x3fv;
 extern vpgl_PFN_glBlitFramebuffer p_glBlitFramebuffer;
 extern vpgl_PFN_glRenderbufferStorageMultisample p_glRenderbufferStorageMultisample;
 extern vpgl_PFN_glFramebufferTextureLayer p_glFramebufferTextureLayer;
+extern vpgl_PFN_glMapBufferRange p_glMapBufferRange;
 extern vpgl_PFN_glFlushMappedBufferRange p_glFlushMappedBufferRange;
 extern vpgl_PFN_glBindVertexArray p_glBindVertexArray;
 extern vpgl_PFN_glDeleteVertexArrays p_glDeleteVertexArrays;

@@ -38,7 +38,9 @@
 
 .PARAMETER RegenGlAbi
     Regenerate include/virtpass/vp_gl.h, src/virtpass/vp_gl_stub.c and the
-    Win32 dispatch tables with tools/gen_gl_abi.py before building.
+    Win32 dispatch tables with tools/gen_gl_abi.py before building, then audit
+    the pointer classification and regenerate the "not implemented" SDK sources
+    (`make vp-sdk-gen`) so they cannot drift behind the new ABI.
 
 .PARAMETER MakeArgs
     Any extra arguments are passed verbatim to make (e.g. USE_RVJIT=0).
@@ -238,6 +240,13 @@ try {
         Write-Host "`n==> python tools/audit_gl_ptr.py --check" -ForegroundColor Cyan
         & python (Join-Path $RVVM_ROOT 'tools\audit_gl_ptr.py') --check
         if ($LASTEXITCODE -ne 0) { throw "audit_gl_ptr.py found unclassified pointer params" }
+
+        # gen_gl_abi.py rewrote the real guest stubs, so src/virtpass/vp-sdk's
+        # checked-in "not implemented" sources are stale. `make vp-sdk` compiles
+        # them as-is and would happily ship an SDK without the new entry points,
+        # so regenerate them here - this is the only step that writes that
+        # directory, and it stays out of the build rules on purpose.
+        Invoke-Make @('vp-sdk-gen')
     }
 
     if ($Clean -and $Target -ne 'clean') {

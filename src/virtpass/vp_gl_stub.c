@@ -37,6 +37,7 @@
  * the real EGL/GLES call and writes the return value back into _c.ret.
  */
 #include <string.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include "virtpass/vp_gl.h"
 
@@ -85,6 +86,60 @@ static inline int64_t glstub_packf(float v)
  * answers with this guest address and the caller reads it after the call, so
  * it must outlive the stub's own stack frame. */
 static char glstub_retbuf[GL_CALL_RETBUF_CAP];
+
+/* Staging buffers behind glMapBufferRange(). The host cannot hand the guest the
+ * address the real call returns (it points into host memory), so every mapped
+ * range is mirrored by guest memory the guest can really write, and the host
+ * copies it back into the buffer object on glUnmapBuffer() - see MAP_RANGE_FN
+ * in tools/gen_gl_abi.py. One slot per buffer target, so two ranges mapped at
+ * the same time never share a buffer; a slot keeps its allocation after
+ * unmapping and is reused by the next map of that target. */
+#define GLSTUB_MAP_SLOTS 16
+static void*    glstub_map_ptr[GLSTUB_MAP_SLOTS];
+static size_t   glstub_map_cap[GLSTUB_MAP_SLOTS];
+static uint32_t glstub_map_target[GLSTUB_MAP_SLOTS]; /* 0 = free slot */
+
+static void** glstub_map_slot(uint32_t target, size_t need)
+{
+    int i;
+    int slot = -1;
+    for (i = 0; i < GLSTUB_MAP_SLOTS; i++) {
+        if (glstub_map_target[i] == target) {
+            slot = i;
+            break;
+        }
+        if (slot < 0 && glstub_map_target[i] == 0) {
+            slot = i;
+        }
+    }
+    if (slot < 0) {
+        return NULL;
+    }
+    if (glstub_map_target[slot] == 0) {
+        glstub_map_target[slot] = target;
+    }
+    if (need > glstub_map_cap[slot]) {
+        void* buf = realloc(glstub_map_ptr[slot], need);
+        if (!buf) {
+            return NULL;
+        }
+        glstub_map_ptr[slot] = buf;
+        glstub_map_cap[slot] = need;
+    }
+    return &glstub_map_ptr[slot];
+}
+
+/* Give the slot back after a failed map. The memory itself is kept: the next
+ * map of the same target reuses it. */
+static void glstub_map_release(uint32_t target)
+{
+    int i;
+    for (i = 0; i < GLSTUB_MAP_SLOTS; i++) {
+        if (glstub_map_target[i] == target) {
+            glstub_map_target[i] = 0;
+        }
+    }
+}
 
 typedef void (*glstub_proc_t)(void);
 
@@ -259,6 +314,7 @@ static const glstub_proc_entry glstub_procs[] = {
     { "glBlitFramebuffer", (glstub_proc_t)&glBlitFramebuffer },
     { "glRenderbufferStorageMultisample", (glstub_proc_t)&glRenderbufferStorageMultisample },
     { "glFramebufferTextureLayer", (glstub_proc_t)&glFramebufferTextureLayer },
+    { "glMapBufferRange", (glstub_proc_t)&glMapBufferRange },
     { "glFlushMappedBufferRange", (glstub_proc_t)&glFlushMappedBufferRange },
     { "glBindVertexArray", (glstub_proc_t)&glBindVertexArray },
     { "glDeleteVertexArrays", (glstub_proc_t)&glDeleteVertexArrays },
@@ -2110,6 +2166,24 @@ void glFramebufferTextureLayer(uint32_t target, uint32_t attachment, uint32_t te
     _c.args[3] = (int64_t)(int32_t)level;
     _c.args[4] = (int64_t)(int32_t)layer;
     GLSTUB_DO(SYS_GL_CALL);
+}
+
+void* glMapBufferRange(uint32_t target, long offset, long length, uint32_t access)
+{
+    void** slot = (length > 0) ? glstub_map_slot(target, (size_t)length) : NULL;
+    if (!slot) return (void*)0;
+    GLSTUB_CALL(GL_FN_MAPBUFFERRANGE, 4);
+    _c.args[0] = (int64_t)(uint32_t)target;
+    _c.args[1] = (int64_t)offset;
+    _c.args[2] = (int64_t)length;
+    _c.args[3] = (int64_t)(uint32_t)access;
+    _c.args[4] = (int64_t)(uintptr_t)*slot;
+    GLSTUB_DO(SYS_GL_CALL);
+    if (!_c.ret) {
+        glstub_map_release(target);
+        return (void*)0;
+    }
+    return *slot;
 }
 
 void glFlushMappedBufferRange(uint32_t target, long offset, long length)

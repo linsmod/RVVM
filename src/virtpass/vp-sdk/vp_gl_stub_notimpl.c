@@ -49,6 +49,7 @@
  * the real EGL/GLES call and writes the return value back into _c.ret.
  */
 #include <string.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include "virtpass/vp_gl.h"
 #include <stdio.h>       /* generator: stubs report via stderr */
@@ -126,6 +127,34 @@ static inline int64_t glstub_packf(float v)
  * answers with this guest address and the caller reads it after the call, so
  * it must outlive the stub's own stack frame. */
 static char glstub_retbuf[GL_CALL_RETBUF_CAP];
+
+/* Staging buffers behind glMapBufferRange(). The host cannot hand the guest the
+ * address the real call returns (it points into host memory), so every mapped
+ * range is mirrored by guest memory the guest can really write, and the host
+ * copies it back into the buffer object on glUnmapBuffer() - see MAP_RANGE_FN
+ * in tools/gen_gl_abi.py. One slot per buffer target, so two ranges mapped at
+ * the same time never share a buffer; a slot keeps its allocation after
+ * unmapping and is reused by the next map of that target. */
+#define GLSTUB_MAP_SLOTS 16
+static void*    glstub_map_ptr[GLSTUB_MAP_SLOTS];
+static size_t   glstub_map_cap[GLSTUB_MAP_SLOTS];
+static uint32_t glstub_map_target[GLSTUB_MAP_SLOTS]; /* 0 = free slot */
+
+static void** glstub_map_slot(uint32_t target, size_t need)
+{
+    vp_stub_not_implemented(__func__);
+    (void)target;
+    (void)need;
+    return NULL;
+}
+
+/* Give the slot back after a failed map. The memory itself is kept: the next
+ * map of the same target reuses it. */
+static void glstub_map_release(uint32_t target)
+{
+    vp_stub_not_implemented(__func__);
+    (void)target;
+}
 
 typedef void (*glstub_proc_t)(void);
 
@@ -300,6 +329,7 @@ static const glstub_proc_entry glstub_procs[] = {
     { "glBlitFramebuffer", (glstub_proc_t)&glBlitFramebuffer },
     { "glRenderbufferStorageMultisample", (glstub_proc_t)&glRenderbufferStorageMultisample },
     { "glFramebufferTextureLayer", (glstub_proc_t)&glFramebufferTextureLayer },
+    { "glMapBufferRange", (glstub_proc_t)&glMapBufferRange },
     { "glFlushMappedBufferRange", (glstub_proc_t)&glFlushMappedBufferRange },
     { "glBindVertexArray", (glstub_proc_t)&glBindVertexArray },
     { "glDeleteVertexArrays", (glstub_proc_t)&glDeleteVertexArrays },
@@ -1954,6 +1984,16 @@ void glFramebufferTextureLayer(uint32_t target, uint32_t attachment, uint32_t te
     (void)texture;
     (void)level;
     (void)layer;
+}
+
+void* glMapBufferRange(uint32_t target, long offset, long length, uint32_t access)
+{
+    vp_stub_not_implemented(__func__);
+    (void)target;
+    (void)offset;
+    (void)length;
+    (void)access;
+    return NULL;
 }
 
 void glFlushMappedBufferRange(uint32_t target, long offset, long length)

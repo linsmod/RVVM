@@ -22,6 +22,9 @@ applies and, for the ambiguous ones, why:
             GL_ELEMENT_ARRAY_BUFFER) means the value is an offset.
   out-str - glGetString/glGetStringi/eglQueryString: host-owned string, copied
             into the guest scratch buffer.
+  map-stage - glMapBufferRange: the mapped range is mirrored into a guest
+            staging buffer, so the guest is answered with a guest address
+            instead of the host one the driver returned.
 
 Sections at the end list the parameter shapes the type system cannot vouch
 for, because those are where a wrong classification hides:
@@ -76,6 +79,8 @@ def ret_kind(f):
         return "opaque", "host handle"
     if f["name"] in g.STRING_RET_FNS:
         return "out-str", "host string -> guest retbuf"
+    if f["name"] == g.MAP_RANGE_FN:
+        return "map-stage", "host range mirrored into a guest staging buffer"
     return "data?", "NEEDS REVIEW: raw host pointer to guest"
 
 

@@ -37,6 +37,10 @@
  * same TU: without it a NULL p_* silently swallowed the call.
  */
 
+/* memcpy: the glMapBufferRange() staging below copies whole ranges
+ * between the host mapping and the guest staging buffer. */
+#include <string.h>
+
 /* fn_id -> name, for the RVVM_GL_TRACE call log */
 static const char* vpgl_egl_name(uint32_t fn_id)
 {
@@ -237,6 +241,7 @@ static const char* vpgl_gl_name(uint32_t fn_id)
     case GL_FN_BLITFRAMEBUFFER: return "glBlitFramebuffer";
     case GL_FN_RENDERBUFFERSTORAGEMULTISAMPLE: return "glRenderbufferStorageMultisample";
     case GL_FN_FRAMEBUFFERTEXTURELAYER: return "glFramebufferTextureLayer";
+    case GL_FN_MAPBUFFERRANGE: return "glMapBufferRange";
     case GL_FN_FLUSHMAPPEDBUFFERRANGE: return "glFlushMappedBufferRange";
     case GL_FN_BINDVERTEXARRAY: return "glBindVertexArray";
     case GL_FN_DELETEVERTEXARRAYS: return "glDeleteVertexArrays";
@@ -410,9 +415,178 @@ static void vpgl_dispatch_egl_generic(uint32_t fn_id, const int64_t* a, int64_t*
     }
 }
 
+
+/* ============================================================
+ * glMapBufferRange() staging (see tools/gen_gl_abi.py MAP_RANGE_FN)
+ *
+ * The address glMapBufferRange() returns points into host memory, which the
+ * guest cannot dereference, so it is never handed over. Instead the range is
+ * mirrored into the guest staging buffer the stub passed in args[MAP_PTR_SLOT]:
+ * reads are served through a host-only GL_MAP_READ_BIT mapping, writes are
+ * pushed back with glBufferSubData(). Nothing is ever really mapped, so
+ * glGetBufferPointerv() answers NULL - which is what a driver answers for a
+ * buffer it does not have mapped.
+ * ============================================================ */
+typedef struct {
+    uint32_t target;   /* buffer target; 0 marks a free slot */
+    int64_t  offset;
+    int64_t  length;
+    uint32_t access;
+    uint64_t guest;    /* guest address of the staging buffer */
+} vpgl_map_slot;
+
+#define VPGL_MAP_SLOTS 16
+static vpgl_map_slot vpgl_maps[VPGL_MAP_SLOTS];
+
+static vpgl_map_slot* vpgl_map_find(uint32_t target)
+{
+    int i;
+    for (i = 0; i < VPGL_MAP_SLOTS; i++) {
+        if (vpgl_maps[i].target == target) {
+            return &vpgl_maps[i];
+        }
+    }
+    return NULL;
+}
+
+static vpgl_map_slot* vpgl_map_add(uint32_t target)
+{
+    int i;
+    vpgl_map_slot* s = vpgl_map_find(target);
+    if (s) {
+        return s;
+    }
+    for (i = 0; i < VPGL_MAP_SLOTS; i++) {
+        if (!vpgl_maps[i].target) {
+            return &vpgl_maps[i];
+        }
+    }
+    return NULL;
+}
+
+/* Copy [off, off+len) of the staging buffer back into the buffer object. */
+static void vpgl_map_flush(vpgl_map_slot* s, int64_t off, int64_t len)
+{
+    void* guest;
+    if (!s || !p_glBufferSubData) {
+        return;
+    }
+    if (off < 0) {
+        off = 0;
+    }
+    if (off > s->length) {
+        off = s->length;
+    }
+    if (len < 0 || len > s->length - off) {
+        len = s->length - off;
+    }
+    if (len <= 0) {
+        return;
+    }
+    guest = vpgl_gptr((int64_t)s->guest);
+    if (!guest) {
+        return;
+    }
+    p_glBufferSubData((vpgl_GLenum)s->target, (vpgl_GLintptr)(s->offset + off),
+                      (vpgl_GLsizeiptr)len,
+                      (const void*)((char*)guest + off));
+}
+
+static void vpgl_dispatch_map_buffer_range(const int64_t* a, int64_t* ret)
+{
+    vpgl_GLenum     target = (vpgl_GLenum)a[0];
+    vpgl_GLintptr   offset = (vpgl_GLintptr)a[1];
+    vpgl_GLsizeiptr length = (vpgl_GLsizeiptr)a[2];
+    vpgl_GLbitfield access = (vpgl_GLbitfield)a[3];
+    void*           guest  = vpgl_gptr(a[4]);
+    vpgl_map_slot*  s;
+
+    *ret = 0;
+    if (!p_glMapBufferRange) {
+        vpgl_missing("glMapBufferRange");
+        return;
+    }
+    if (!guest || length <= 0) {
+        return;
+    }
+    /* Seed the staging buffer with the current contents when the guest asked
+     * to read them. An INVALIDATE_* mapping declares them undefined, so the
+     * copy is skipped there. The mapping used for it is host-only and closed
+     * again right away. */
+    if ((access & vpgl_GL_MAP_READ_BIT) &&
+        !(access & (vpgl_GL_MAP_INVALIDATE_RANGE_BIT |
+                    vpgl_GL_MAP_INVALIDATE_BUFFER_BIT))) {
+        const void* src = p_glMapBufferRange(target, offset, length,
+                                             vpgl_GL_MAP_READ_BIT);
+        if (src) {
+            memcpy(guest, src, (size_t)length);
+            if (p_glUnmapBuffer) {
+                p_glUnmapBuffer(target);
+            }
+        }
+    }
+    s = vpgl_map_add((uint32_t)target);
+    if (!s) {
+        return;
+    }
+    s->target = (uint32_t)target;
+    s->offset = (int64_t)offset;
+    s->length = (int64_t)length;
+    s->access = (uint32_t)access;
+    s->guest  = (uint64_t)a[4];
+    /* Answer with the guest address: the only pointer the caller can use. */
+    *ret = a[4];
+}
+
+static void vpgl_dispatch_unmap_buffer(const int64_t* a, int64_t* ret)
+{
+    vpgl_map_slot* s = vpgl_map_find((uint32_t)a[0]);
+
+    *ret = 0;
+    if (s) {
+        if (s->access & vpgl_GL_MAP_WRITE_BIT) {
+            vpgl_map_flush(s, 0, s->length);
+        }
+        s->target = 0;
+        *ret = 1; /* GL_TRUE: the range was mapped, through the staging buffer */
+        return;
+    }
+    /* Nothing of ours is mapped on this target: let the driver answer, which
+     * is GL_FALSE for a buffer it never mapped. */
+    if (p_glUnmapBuffer) {
+        *ret = (int64_t)(uint32_t)((vpgl_GLboolean)p_glUnmapBuffer((vpgl_GLenum)a[0]));
+    } else {
+        vpgl_missing("glUnmapBuffer");
+    }
+}
+
+static void vpgl_dispatch_flush_mapped_range(const int64_t* a, int64_t* ret)
+{
+    vpgl_map_slot* s = vpgl_map_find((uint32_t)a[0]);
+
+    if (s) {
+        if (s->access & vpgl_GL_MAP_WRITE_BIT) {
+            vpgl_map_flush(s, a[1], a[2]);
+        }
+    } else if (p_glFlushMappedBufferRange) {
+        p_glFlushMappedBufferRange((vpgl_GLenum)a[0], (vpgl_GLintptr)a[1],
+                                   (vpgl_GLsizeiptr)a[2]);
+    }
+    *ret = 0; /* void */
+}
+
 static void vpgl_dispatch_gl_generic(uint32_t fn_id, const int64_t* a, int64_t* ret)
 {
     switch (fn_id) {
+    case GL_FN_MAPBUFFERRANGE:
+        vpgl_dispatch_map_buffer_range(a, ret);
+        break;
+    case GL_FN_UNMAPBUFFER:
+        vpgl_dispatch_unmap_buffer(a, ret);
+        break;
+    case GL_FN_FLUSHMAPPEDBUFFERRANGE:
+        vpgl_dispatch_flush_mapped_range(a, ret);
+        break;
     case GL_FN_ACTIVETEXTURE:
         if (p_glActiveTexture) { ((vpgl_PFN_glActiveTexture)p_glActiveTexture)((vpgl_GLenum)a[0]); }
         else vpgl_missing("glActiveTexture");
@@ -1037,10 +1211,6 @@ static void vpgl_dispatch_gl_generic(uint32_t fn_id, const int64_t* a, int64_t* 
         if (p_glGetQueryObjectuiv) { ((vpgl_PFN_glGetQueryObjectuiv)p_glGetQueryObjectuiv)((vpgl_GLuint)a[0], (vpgl_GLenum)a[1], (vpgl_GLuint*)vpgl_gptr(a[2])); }
         else vpgl_missing("glGetQueryObjectuiv");
         break;
-    case GL_FN_UNMAPBUFFER:
-        if (p_glUnmapBuffer) { *ret = (int64_t)(uint32_t)((vpgl_PFN_glUnmapBuffer)p_glUnmapBuffer)((vpgl_GLenum)a[0]); }
-        else vpgl_missing("glUnmapBuffer");
-        break;
     case GL_FN_GETBUFFERPOINTERV:
         if (p_glGetBufferPointerv) { ((vpgl_PFN_glGetBufferPointerv)p_glGetBufferPointerv)((vpgl_GLenum)a[0], (vpgl_GLenum)a[1], (vpgl_void**)vpgl_gptr(a[2])); }
         else vpgl_missing("glGetBufferPointerv");
@@ -1084,10 +1254,6 @@ static void vpgl_dispatch_gl_generic(uint32_t fn_id, const int64_t* a, int64_t* 
     case GL_FN_FRAMEBUFFERTEXTURELAYER:
         if (p_glFramebufferTextureLayer) { ((vpgl_PFN_glFramebufferTextureLayer)p_glFramebufferTextureLayer)((vpgl_GLenum)a[0], (vpgl_GLenum)a[1], (vpgl_GLuint)a[2], (vpgl_GLint)a[3], (vpgl_GLint)a[4]); }
         else vpgl_missing("glFramebufferTextureLayer");
-        break;
-    case GL_FN_FLUSHMAPPEDBUFFERRANGE:
-        if (p_glFlushMappedBufferRange) { ((vpgl_PFN_glFlushMappedBufferRange)p_glFlushMappedBufferRange)((vpgl_GLenum)a[0], (vpgl_GLintptr)a[1], (vpgl_GLsizeiptr)a[2]); }
-        else vpgl_missing("glFlushMappedBufferRange");
         break;
     case GL_FN_BINDVERTEXARRAY:
         if (p_glBindVertexArray) { ((vpgl_PFN_glBindVertexArray)p_glBindVertexArray)((vpgl_GLuint)a[0]); }

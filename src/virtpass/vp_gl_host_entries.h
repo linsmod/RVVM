@@ -222,6 +222,7 @@ vpgl_PFN_glUniformMatrix4x3fv p_glUniformMatrix4x3fv;
 vpgl_PFN_glBlitFramebuffer p_glBlitFramebuffer;
 vpgl_PFN_glRenderbufferStorageMultisample p_glRenderbufferStorageMultisample;
 vpgl_PFN_glFramebufferTextureLayer p_glFramebufferTextureLayer;
+vpgl_PFN_glMapBufferRange p_glMapBufferRange;
 vpgl_PFN_glFlushMappedBufferRange p_glFlushMappedBufferRange;
 vpgl_PFN_glBindVertexArray p_glBindVertexArray;
 vpgl_PFN_glDeleteVertexArrays p_glDeleteVertexArrays;
@@ -480,6 +481,7 @@ vpgl_PFN_glGetInternalformativ p_glGetInternalformativ;
     X(IsVertexArray); \
     X(LineWidth); \
     X(LinkProgram); \
+    X(MapBufferRange); \
     X(PauseTransformFeedback); \
     X(PixelStorei); \
     X(PolygonOffset); \

@@ -26,7 +26,7 @@ porting a guest to a new host, or when trimming a host backend.
 |------|----------------|-------------------|
 | `vp_ndk_stub_notimpl.c`   | `src/virtpass/vp_ndk_stub.c`    | 97  |
 | `vp_aaudio_stub_notimpl.c`| `src/virtpass/vp_aaudio_stub.c` | 61  |
-| `vp_gl_stub_notimpl.c`    | `src/virtpass/vp_gl_stub.c`     | 160 |
+| `vp_gl_stub_notimpl.c`    | `src/virtpass/vp_gl_stub.c`     | 272 |
 
 Together they cover the whole guest API surface, so a guest can be linked
 against `vpsdk` **instead of** `libandroid_stubs.a` + `libgles_stubs.a`.

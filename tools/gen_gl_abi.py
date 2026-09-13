@@ -156,15 +156,11 @@ STRING_RET_FNS = {"glGetString", "eglQueryString", "glGetStringi"}
 
 # Entry points deliberately kept out of the marshalled ABI.
 #
-# glMapBufferRange hands the guest a HOST address to write through, and
-# glUnmapBuffer would have to copy it back: the reverse direction of every
-# other call here (the host owns the buffer, the guest writes into it), which
-# needs a guest-side staging buffer plus a host map table. Deferred, so the
-# guest never receives a host pointer it could not use: a caller fails to link
-# instead. glFlushMappedBufferRange and glGetBufferPointerv stay in - with
-# nothing ever mapped, glGetBufferPointerv answers NULL, exactly as a real
-# driver would.
-EXCLUDED_FNS = {"glMapBufferRange"}
+# Empty since glMapBufferRange was taught to stage through guest memory - see
+# MAP_RANGE_FN below. Kept as the extension point: an entry point that cannot
+# be proxied at all (a result the guest could never use, a callback into guest
+# code) belongs here rather than in the generic tables.
+EXCLUDED_FNS = set()
 
 # Pointer-returning functions whose result the guest must NOT receive as a raw
 # host address. eglGetProcAddress hands back an executable address in the host
@@ -176,6 +172,38 @@ EXCLUDED_FNS = {"glMapBufferRange"}
 # marshalling stub for glFoo. A name outside the generated set returns NULL,
 # exactly as a real EGL implementation would for an unsupported entry point.
 PROC_ADDRESS_FN = "eglGetProcAddress"
+
+# glMapBufferRange is the one entry point whose result cannot cross back as a
+# host address: it hands out a pointer into host memory the guest has no
+# mapping for, and glUnmapBuffer would then have to copy whatever the guest
+# wrote there back into the buffer object - the reverse direction of every
+# other call here. It is staged through guest memory instead:
+#
+#   glMapBufferRange(target, offset, length, access)
+#       The guest offers a staging buffer of `length` bytes (malloc'd by the
+#       stub, one slot per buffer target) in args[MAP_PTR_SLOT]. The host
+#       seeds it from a host-only GL_MAP_READ_BIT mapping when the guest asked
+#       to read, records the range and answers with the GUEST address, which
+#       is the only pointer the caller can actually dereference.
+#   glUnmapBuffer(target)
+#       The host pushes the staging buffer back with glBufferSubData() and
+#       answers GL_TRUE. With no recorded range it falls through to the real
+#       call, which answers GL_FALSE - nothing was ever mapped, exactly as a
+#       driver answers for a buffer it does not have mapped.
+#   glFlushMappedBufferRange(target, offset, length)
+#       The same write-back for a sub-range, so a guest that flushes instead
+#       of unmapping still sees its data land.
+#
+# glGetBufferPointerv stays on the generic path: nothing is ever really
+# mapped, so it answers NULL, which is what a real driver answers for a
+# buffer that is not mapped.
+MAP_RANGE_FN   = "glMapBufferRange"
+UNMAP_FN       = "glUnmapBuffer"
+FLUSH_RANGE_FN = "glFlushMappedBufferRange"
+
+# gl_call.args slot carrying the guest staging buffer. glMapBufferRange has 4
+# parameters, so 4 sits above every real one and below GL_CALL_RETBUF_SLOT.
+MAP_PTR_SLOT = 4
 
 # ---------------------------------------------------------------------------
 # Type tables
@@ -734,6 +762,16 @@ def gl3_const_defs():
 #define GL_QUERY_RESULT        0x8866
 #define GL_QUERY_RESULT_AVAILABLE 0x8867
 
+/* glMapBufferRange() access bits. The guest needs them to ask for a mapping,
+ * and the host staging code inspects the same bits to decide whether to seed
+ * the staging buffer and whether to write it back. */
+#define GL_MAP_READ_BIT             0x0001
+#define GL_MAP_WRITE_BIT            0x0002
+#define GL_MAP_INVALIDATE_RANGE_BIT  0x0004
+#define GL_MAP_INVALIDATE_BUFFER_BIT 0x0008
+#define GL_MAP_FLUSH_EXPLICIT_BIT   0x0010
+#define GL_MAP_UNSYNCHRONIZED_BIT   0x0020
+
 #define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
 #define GL_SYNC_FLUSH_COMMANDS_BIT    0x00000001
 #define GL_ALREADY_SIGNALED    0x911A
@@ -865,6 +903,7 @@ def gen_guest_source(gl_fns, egl_fns):
  * the real EGL/GLES call and writes the return value back into _c.ret.
  */
 #include <string.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include "virtpass/vp_gl.h"
 
@@ -913,6 +952,60 @@ static inline int64_t glstub_packf(float v)
  * answers with this guest address and the caller reads it after the call, so
  * it must outlive the stub's own stack frame. */
 static char glstub_retbuf[GL_CALL_RETBUF_CAP];
+
+/* Staging buffers behind glMapBufferRange(). The host cannot hand the guest the
+ * address the real call returns (it points into host memory), so every mapped
+ * range is mirrored by guest memory the guest can really write, and the host
+ * copies it back into the buffer object on glUnmapBuffer() - see MAP_RANGE_FN
+ * in tools/gen_gl_abi.py. One slot per buffer target, so two ranges mapped at
+ * the same time never share a buffer; a slot keeps its allocation after
+ * unmapping and is reused by the next map of that target. */
+#define GLSTUB_MAP_SLOTS 16
+static void*    glstub_map_ptr[GLSTUB_MAP_SLOTS];
+static size_t   glstub_map_cap[GLSTUB_MAP_SLOTS];
+static uint32_t glstub_map_target[GLSTUB_MAP_SLOTS]; /* 0 = free slot */
+
+static void** glstub_map_slot(uint32_t target, size_t need)
+{
+    int i;
+    int slot = -1;
+    for (i = 0; i < GLSTUB_MAP_SLOTS; i++) {
+        if (glstub_map_target[i] == target) {
+            slot = i;
+            break;
+        }
+        if (slot < 0 && glstub_map_target[i] == 0) {
+            slot = i;
+        }
+    }
+    if (slot < 0) {
+        return NULL;
+    }
+    if (glstub_map_target[slot] == 0) {
+        glstub_map_target[slot] = target;
+    }
+    if (need > glstub_map_cap[slot]) {
+        void* buf = realloc(glstub_map_ptr[slot], need);
+        if (!buf) {
+            return NULL;
+        }
+        glstub_map_ptr[slot] = buf;
+        glstub_map_cap[slot] = need;
+    }
+    return &glstub_map_ptr[slot];
+}
+
+/* Give the slot back after a failed map. The memory itself is kept: the next
+ * map of the same target reuses it. */
+static void glstub_map_release(uint32_t target)
+{
+    int i;
+    for (i = 0; i < GLSTUB_MAP_SLOTS; i++) {
+        if (glstub_map_target[i] == target) {
+            glstub_map_target[i] = 0;
+        }
+    }
+}
 """)
 
     # eglGetProcAddress must not hand the guest a host function address: the
@@ -952,6 +1045,29 @@ static char glstub_retbuf[GL_CALL_RETBUF_CAP];
             out.append("        }")
             out.append("    }")
             out.append("    return (%s)0;" % guest_decl_type(fn["ret"]))
+            out.append("}")
+            out.append("")
+            return
+        if fn["name"] == MAP_RANGE_FN:
+            # The real call answers with a host address the guest could never
+            # dereference: mirror the range into a guest staging buffer and
+            # hand the caller that address instead. The host seeds it from the
+            # buffer object and pushes it back on glUnmapBuffer().
+            out.append("    void** slot = (%s > 0) ? glstub_map_slot(%s, (size_t)%s) : NULL;"
+                       % (names[2], names[0], names[2]))
+            out.append("    if (!slot) return (%s)0;" % guest_decl_type(fn["ret"]))
+            out.append("    GLSTUB_CALL(GL_FN_%s, %d);"
+                       % (fn["name"][2:].upper(), len(fn["params"])))
+            for i, (t, _) in enumerate(fn["params"]):
+                out.append("    _c.args[%d] = %s;"
+                           % (i, guest_marshal_expr(fn, i, names[i], t)))
+            out.append("    _c.args[%d] = (int64_t)(uintptr_t)*slot;" % MAP_PTR_SLOT)
+            out.append("    GLSTUB_DO(%s);" % syscall_nr)
+            out.append("    if (!_c.ret) {")
+            out.append("        glstub_map_release(%s);" % names[0])
+            out.append("        return (%s)0;" % guest_decl_type(fn["ret"]))
+            out.append("    }")
+            out.append("    return *slot;")
             out.append("}")
             out.append("")
             return
@@ -1048,6 +1164,15 @@ def gen_host_types_header(gl_fns, egl_fns):
     out.append("#define vpgl_EGL_NONE   0x3038")
     out.append("#define vpgl_EGL_WIDTH  0x3057")
     out.append("#define vpgl_EGL_HEIGHT 0x3056")
+    out.append("")
+    out.append("/* glMapBufferRange() access bits the host staging code inspects:")
+    out.append(" * whether to seed the guest staging buffer from the buffer object,")
+    out.append(" * and whether to write it back on unmap/flush. */")
+    out.append("#define vpgl_GL_MAP_READ_BIT              0x0001u")
+    out.append("#define vpgl_GL_MAP_WRITE_BIT             0x0002u")
+    out.append("#define vpgl_GL_MAP_INVALIDATE_RANGE_BIT  0x0004u")
+    out.append("#define vpgl_GL_MAP_INVALIDATE_BUFFER_BIT 0x0008u")
+    out.append("#define vpgl_GL_MAP_FLUSH_EXPLICIT_BIT    0x0010u")
     out.append("")
 
     def pfn(fn):
@@ -1172,6 +1297,180 @@ void win32_gl_backend_unload(void);
     return "\n".join(out)
 
 
+def map_staging_helpers():
+    """glMapBufferRange() / glUnmapBuffer() / glFlushMappedBufferRange().
+
+    glMapBufferRange is the only entry point whose result cannot cross back as
+    a host address, so it is staged through a guest buffer: the host mirrors the
+    range into guest memory and pushes it back into the buffer object with
+    glBufferSubData(). See MAP_RANGE_FN for the full rationale.
+
+    The helpers are emitted into the shared dispatch tables so both hosts (and
+    the fn_id they switch on) stay generated; they only need vpgl_gptr() and
+    vpgl_missing() from the including TU.
+    """
+    return [line for line in """
+/* ============================================================
+ * glMapBufferRange() staging (see tools/gen_gl_abi.py MAP_RANGE_FN)
+ *
+ * The address glMapBufferRange() returns points into host memory, which the
+ * guest cannot dereference, so it is never handed over. Instead the range is
+ * mirrored into the guest staging buffer the stub passed in args[MAP_PTR_SLOT]:
+ * reads are served through a host-only GL_MAP_READ_BIT mapping, writes are
+ * pushed back with glBufferSubData(). Nothing is ever really mapped, so
+ * glGetBufferPointerv() answers NULL - which is what a driver answers for a
+ * buffer it does not have mapped.
+ * ============================================================ */
+typedef struct {
+    uint32_t target;   /* buffer target; 0 marks a free slot */
+    int64_t  offset;
+    int64_t  length;
+    uint32_t access;
+    uint64_t guest;    /* guest address of the staging buffer */
+} vpgl_map_slot;
+
+#define VPGL_MAP_SLOTS 16
+static vpgl_map_slot vpgl_maps[VPGL_MAP_SLOTS];
+
+static vpgl_map_slot* vpgl_map_find(uint32_t target)
+{
+    int i;
+    for (i = 0; i < VPGL_MAP_SLOTS; i++) {
+        if (vpgl_maps[i].target == target) {
+            return &vpgl_maps[i];
+        }
+    }
+    return NULL;
+}
+
+static vpgl_map_slot* vpgl_map_add(uint32_t target)
+{
+    int i;
+    vpgl_map_slot* s = vpgl_map_find(target);
+    if (s) {
+        return s;
+    }
+    for (i = 0; i < VPGL_MAP_SLOTS; i++) {
+        if (!vpgl_maps[i].target) {
+            return &vpgl_maps[i];
+        }
+    }
+    return NULL;
+}
+
+/* Copy [off, off+len) of the staging buffer back into the buffer object. */
+static void vpgl_map_flush(vpgl_map_slot* s, int64_t off, int64_t len)
+{
+    void* guest;
+    if (!s || !p_glBufferSubData) {
+        return;
+    }
+    if (off < 0) {
+        off = 0;
+    }
+    if (off > s->length) {
+        off = s->length;
+    }
+    if (len < 0 || len > s->length - off) {
+        len = s->length - off;
+    }
+    if (len <= 0) {
+        return;
+    }
+    guest = vpgl_gptr((int64_t)s->guest);
+    if (!guest) {
+        return;
+    }
+    p_glBufferSubData((vpgl_GLenum)s->target, (vpgl_GLintptr)(s->offset + off),
+                      (vpgl_GLsizeiptr)len,
+                      (const void*)((char*)guest + off));
+}
+
+static void vpgl_dispatch_map_buffer_range(const int64_t* a, int64_t* ret)
+{
+    vpgl_GLenum     target = (vpgl_GLenum)a[0];
+    vpgl_GLintptr   offset = (vpgl_GLintptr)a[1];
+    vpgl_GLsizeiptr length = (vpgl_GLsizeiptr)a[2];
+    vpgl_GLbitfield access = (vpgl_GLbitfield)a[3];
+    void*           guest  = vpgl_gptr(a[%d]);
+    vpgl_map_slot*  s;
+
+    *ret = 0;
+    if (!p_glMapBufferRange) {
+        vpgl_missing("glMapBufferRange");
+        return;
+    }
+    if (!guest || length <= 0) {
+        return;
+    }
+    /* Seed the staging buffer with the current contents when the guest asked
+     * to read them. An INVALIDATE_* mapping declares them undefined, so the
+     * copy is skipped there. The mapping used for it is host-only and closed
+     * again right away. */
+    if ((access & vpgl_GL_MAP_READ_BIT) &&
+        !(access & (vpgl_GL_MAP_INVALIDATE_RANGE_BIT |
+                    vpgl_GL_MAP_INVALIDATE_BUFFER_BIT))) {
+        const void* src = p_glMapBufferRange(target, offset, length,
+                                             vpgl_GL_MAP_READ_BIT);
+        if (src) {
+            memcpy(guest, src, (size_t)length);
+            if (p_glUnmapBuffer) {
+                p_glUnmapBuffer(target);
+            }
+        }
+    }
+    s = vpgl_map_add((uint32_t)target);
+    if (!s) {
+        return;
+    }
+    s->target = (uint32_t)target;
+    s->offset = (int64_t)offset;
+    s->length = (int64_t)length;
+    s->access = (uint32_t)access;
+    s->guest  = (uint64_t)a[%d];
+    /* Answer with the guest address: the only pointer the caller can use. */
+    *ret = a[%d];
+}
+
+static void vpgl_dispatch_unmap_buffer(const int64_t* a, int64_t* ret)
+{
+    vpgl_map_slot* s = vpgl_map_find((uint32_t)a[0]);
+
+    *ret = 0;
+    if (s) {
+        if (s->access & vpgl_GL_MAP_WRITE_BIT) {
+            vpgl_map_flush(s, 0, s->length);
+        }
+        s->target = 0;
+        *ret = 1; /* GL_TRUE: the range was mapped, through the staging buffer */
+        return;
+    }
+    /* Nothing of ours is mapped on this target: let the driver answer, which
+     * is GL_FALSE for a buffer it never mapped. */
+    if (p_glUnmapBuffer) {
+        *ret = (int64_t)(uint32_t)((vpgl_GLboolean)p_glUnmapBuffer((vpgl_GLenum)a[0]));
+    } else {
+        vpgl_missing("glUnmapBuffer");
+    }
+}
+
+static void vpgl_dispatch_flush_mapped_range(const int64_t* a, int64_t* ret)
+{
+    vpgl_map_slot* s = vpgl_map_find((uint32_t)a[0]);
+
+    if (s) {
+        if (s->access & vpgl_GL_MAP_WRITE_BIT) {
+            vpgl_map_flush(s, a[1], a[2]);
+        }
+    } else if (p_glFlushMappedBufferRange) {
+        p_glFlushMappedBufferRange((vpgl_GLenum)a[0], (vpgl_GLintptr)a[1],
+                                   (vpgl_GLsizeiptr)a[2]);
+    }
+    *ret = 0; /* void */
+}
+""".replace("%d", str(MAP_PTR_SLOT)).split("\n")]
+
+
 def gen_host_dispatch_tables(gl_fns, egl_fns):
     out = []
     out.append(GENERATED_BANNER.format(nargs=GL_CALL_MAX_ARGS))
@@ -1185,6 +1484,10 @@ def gen_host_dispatch_tables(gl_fns, egl_fns):
     out.append(" * that was never resolved reports through vpgl_missing() from the")
     out.append(" * same TU: without it a NULL p_* silently swallowed the call.")
     out.append(" */")
+    out.append("")
+    out.append("/* memcpy: the glMapBufferRange() staging below copies whole ranges")
+    out.append(" * between the host mapping and the guest staging buffer. */")
+    out.append("#include <string.h>")
     out.append("")
 
     out.append("/* fn_id -> name, for the RVVM_GL_TRACE call log */")
@@ -1224,10 +1527,24 @@ def gen_host_dispatch_tables(gl_fns, egl_fns):
     out.append("}")
     out.append("")
 
+    out.extend(map_staging_helpers())
     out.append("static void vpgl_dispatch_gl_generic(uint32_t fn_id, const int64_t* a, int64_t* ret)")
     out.append("{")
     out.append("    switch (fn_id) {")
+    out.append("    case GL_FN_%s:" % MAP_RANGE_FN[2:].upper())
+    out.append("        vpgl_dispatch_map_buffer_range(a, ret);")
+    out.append("        break;")
+    out.append("    case GL_FN_%s:" % UNMAP_FN[2:].upper())
+    out.append("        vpgl_dispatch_unmap_buffer(a, ret);")
+    out.append("        break;")
+    out.append("    case GL_FN_%s:" % FLUSH_RANGE_FN[2:].upper())
+    out.append("        vpgl_dispatch_flush_mapped_range(a, ret);")
+    out.append("        break;")
     for fn in gl_fns:
+        # These three are staged through guest memory (see MAP_RANGE_FN): a
+        # generic case would hand the guest a raw host pointer.
+        if fn["name"] in (MAP_RANGE_FN, UNMAP_FN, FLUSH_RANGE_FN):
+            continue
         fid = "GL_FN_" + fn["name"][2:].upper()
         out.append("    case %s:" % fid)
         out.append("        if (p_%s) { %s }" % (fn["name"], host_call_expr(fn)))

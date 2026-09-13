@@ -30,6 +30,11 @@ backend behind each callback differs.
   storage, included by exactly one host TU per host) and
   `vp_gl_dispatch_tables.h` (name tables + generic switch). The argument
   translation rules exist exactly once; each host adds a thin backend on top.
+- `glMapBufferRange()` is the one GL entry point whose result cannot cross back
+  as a host address, so it is staged: the stub mirrors the range into a guest
+  buffer and the host seeds / writes it back with `glBufferSubData()` on
+  `glUnmapBuffer()` and `glFlushMappedBufferRange()`
+  (`MAP_RANGE_FN` in `tools/gen_gl_abi.py`).
 
 ## Windows (`win32-host/`)
 
@@ -44,8 +49,8 @@ backend behind each callback differs.
   GLES, so ANGLE is loaded from the Android SDK emulator installation. A guest
   window surface is downgraded to a panel-sized pbuffer (EGL_WIDTH/HEIGHT
   injected when the guest's attribute list has none) and every
-  `eglSwapBuffers` blits the pbuffer through the DIB. All 157 entry points go
-  through the shared generated dispatch.
+  `eglSwapBuffers` blits the pbuffer through the DIB. All 268 entry points
+  (246 GLES2/GLES3 + 22 EGL) go through the shared generated dispatch.
 - Audio: `win32_aaudio_wasapi.c` implements the AAudio ops over WASAPI.
 - Sensors: `win32_sensor_stub.c` provides three virtual sensors, driven from
   the WM_TIMER on the UI thread and fed into `vp_sensor_ingest()`.
