@@ -63,6 +63,9 @@
 #include <sys/wait.h>
 #include <sys/epoll.h>
 
+/* FSCTL_GET_REPARSE_POINT (symbolic link targets) */
+#include <winioctl.h>
+
 /* WinSock-backed sockets (and their CRT fd anchors) - see win_socket.c */
 #include "win_socket.h"
 
@@ -99,6 +102,16 @@ static void win_set_errno(void)
         break;
     case ERROR_DISK_FULL:
         errno = ENOSPC;
+        break;
+    case ERROR_PRIVILEGE_NOT_HELD:      /* e.g. CreateSymbolicLink without the
+                                         * privilege / developer mode */
+        errno = EPERM;
+        break;
+    case ERROR_NOT_A_REPARSE_POINT:
+        errno = EINVAL;
+        break;
+    case ERROR_DIRECTORY:
+        errno = ENOTDIR;
         break;
     default:
         errno = EIO;
@@ -147,6 +160,122 @@ static int at_path(int dirfd, const char* path, char* out, size_t outsz)
         snprintf(out, outsz, "%s\\%s", dir, path);
     }
     return 0;
+}
+
+/*
+ * Symbolic links and directory junctions are reparse points. The buffer
+ * FSCTL_GET_REPARSE_POINT fills in has a layout fixed by the OS; MinGW does not
+ * declare REPARSE_DATA_BUFFER, so the parts read here are spelled out locally.
+ */
+typedef struct {
+    ULONG  ReparseTag;
+    USHORT ReparseDataLength;
+    USHORT Reserved;
+    union {
+        struct {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            ULONG  Flags;
+            WCHAR  PathBuffer[1];
+        } SymbolicLinkReparseBuffer;
+        struct {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            WCHAR  PathBuffer[1];
+        } MountPointReparseBuffer;
+    } u;
+} shim_reparse_buffer;
+
+static bool shim_path_is_reparse(const char* path)
+{
+    DWORD attrs = GetFileAttributesA(path);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT);
+}
+
+/*
+ * Read a symlink / junction target as UTF-8 (host spelling, not yet mapped back
+ * to the guest's view). Returns the byte length (NUL excluded), or -1 with
+ * EINVAL when the path is not a name-surrogate reparse point.
+ */
+static ssize_t shim_read_link(const char* path, char* out, size_t outsz)
+{
+    BYTE raw[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+    shim_reparse_buffer* rdb = (shim_reparse_buffer*)raw;
+    const WCHAR* base;
+    const WCHAR* name;
+    USHORT off, len;
+    HANDLE h;
+    DWORD bytes = 0;
+    int n;
+
+    h = CreateFileA(path, FILE_READ_EA,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        win_set_errno();
+        return -1;
+    }
+    if (!DeviceIoControl(h, FSCTL_GET_REPARSE_POINT, NULL, 0,
+                         raw, (DWORD)sizeof(raw), &bytes, NULL)) {
+        DWORD err = GetLastError();
+        CloseHandle(h);
+        errno = (err == ERROR_NOT_A_REPARSE_POINT) ? EINVAL : EIO;
+        return -1;
+    }
+    CloseHandle(h);
+
+    if (!IsReparseTagNameSurrogate(rdb->ReparseTag)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (rdb->ReparseTag == (ULONG)IO_REPARSE_TAG_SYMLINK) {
+        off  = rdb->u.SymbolicLinkReparseBuffer.PrintNameOffset;
+        len  = rdb->u.SymbolicLinkReparseBuffer.PrintNameLength;
+        base = rdb->u.SymbolicLinkReparseBuffer.PathBuffer;
+    } else {
+        off  = rdb->u.MountPointReparseBuffer.PrintNameOffset;
+        len  = rdb->u.MountPointReparseBuffer.PrintNameLength;
+        base = rdb->u.MountPointReparseBuffer.PathBuffer;
+    }
+    if (!len) {
+        /* Junctions often only carry the NT form ("\??\C:\path") */
+        if (rdb->ReparseTag == (ULONG)IO_REPARSE_TAG_SYMLINK) {
+            off  = rdb->u.SymbolicLinkReparseBuffer.SubstituteNameOffset;
+            len  = rdb->u.SymbolicLinkReparseBuffer.SubstituteNameLength;
+            base = rdb->u.SymbolicLinkReparseBuffer.PathBuffer;
+        } else {
+            off  = rdb->u.MountPointReparseBuffer.SubstituteNameOffset;
+            len  = rdb->u.MountPointReparseBuffer.SubstituteNameLength;
+            base = rdb->u.MountPointReparseBuffer.PathBuffer;
+        }
+        if (len >= 8) {
+            const WCHAR* sub = (const WCHAR*)((const BYTE*)base + off);
+            if (sub[0] == L'\\' && sub[1] == L'?' && sub[2] == L'?' && sub[3] == L'\\') {
+                off = (USHORT)(off + 8);    /* drop the "\??\" prefix */
+                len = (USHORT)(len - 8);
+            }
+        }
+    }
+    if (!len) {
+        errno = EINVAL;
+        return -1;
+    }
+    name = (const WCHAR*)((const BYTE*)base + off);
+    n = WideCharToMultiByte(CP_UTF8, 0, name, (int)(len / sizeof(WCHAR)),
+                            out, outsz ? (int)outsz - 1 : 0, NULL, NULL);
+    if (n < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (outsz) {
+        out[n] = 0;
+    }
+    return (ssize_t)n;
 }
 
 /* ------------------------------------------------------------------ */
@@ -794,6 +923,7 @@ struct shim_linux_dirent64 {
 
 #define SHIM_DT_DIR 4
 #define SHIM_DT_REG 8
+#define SHIM_DT_LNK 10
 
 typedef struct {
     int     used;
@@ -935,9 +1065,13 @@ static ssize_t shim_getdents64(int fd, void* out, size_t size)
             }
             de->d_off = ++d->cookie;
             de->d_reclen = (uint16_t)reclen;
-            /* TODO: reparse points / other types could be mapped too */
-            de->d_type = (ent->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-                         ? SHIM_DT_DIR : SHIM_DT_REG;
+            if (ent->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                /* A symlink or a directory junction */
+                de->d_type = SHIM_DT_LNK;
+            } else {
+                de->d_type = (ent->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                             ? SHIM_DT_DIR : SHIM_DT_REG;
+            }
             memcpy(de->d_name, name, (size_t)name_len);
 
             written += reclen;
@@ -1070,27 +1204,122 @@ int unlinkat(int dirfd, const char* path, int flags)
     if (flags & AT_REMOVEDIR) {
         return _rmdir(full);
     }
-    return _unlink(full);
+    if (_unlink(full) == 0) {
+        return 0;
+    }
+    /* A symlink to a directory (or a junction) is a directory object: POSIX
+     * unlink(2) removes the link in either case, so retry accordingly. */
+    if (shim_path_is_reparse(full) && _rmdir(full) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+/*
+ * A failed CreateSymbolicLinkA() reports the reason through GetLastError(). An
+ * already existing name is final: retrying with another flag combination would
+ * overwrite the errno with a different failure (typically EPERM from the
+ * privileged attempt). Returns true when the caller must stop and fail.
+ */
+static bool win_symlink_errno_pending(void)
+{
+    DWORD err = GetLastError();
+    if (err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS) {
+        errno = EEXIST;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Windows stores the link *type* in the reparse point, so it must be chosen at
+ * creation time; a file link to a directory cannot be followed as a directory.
+ * Resolve a relative target against the directory holding the link (which is
+ * how both POSIX and Win32 interpret it) and ask the object that exists there.
+ */
+static bool win_symlink_target_is_dir(const char* target, const char* linkpath)
+{
+    char resolved[MAX_PATH + 16];
+    const char* base = target;
+    DWORD attrs;
+
+    if (target[0] != '\\' && target[0] != '/' &&
+        !(((target[0] >= 'A' && target[0] <= 'Z') || (target[0] >= 'a' && target[0] <= 'z')) &&
+          target[1] == ':')) {
+        const char* slash = strrchr(linkpath, '\\');
+        const char* slash2 = strrchr(linkpath, '/');
+        if (slash2 && (!slash || slash2 > slash)) {
+            slash = slash2;
+        }
+        if (slash) {
+            size_t dirlen = (size_t)(slash - linkpath) + 1;
+            if (dirlen + strlen(target) >= sizeof(resolved)) {
+                return false;
+            }
+            memcpy(resolved, linkpath, dirlen);
+            snprintf(resolved + dirlen, sizeof(resolved) - dirlen, "%s", target);
+            base = resolved;
+        }
+    }
+    attrs = GetFileAttributesA(base);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
 int symlinkat(const char* target, int dirfd, const char* linkpath)
 {
-    (void)target;
-    (void)dirfd;
-    (void)linkpath;
-    errno = ENOSYS;
+    char full[MAX_PATH + 16];
+    DWORD flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+    DWORD dirflag;
+
+    if (!target || !linkpath) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (at_path(dirfd, linkpath, full, sizeof(full))) {
+        return -1;
+    }
+    dirflag = win_symlink_target_is_dir(target, full) ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+
+    if (CreateSymbolicLinkA(full, target, flags | dirflag)) {
+        return 0;
+    }
+    if (win_symlink_errno_pending()) {
+        return -1;
+    }
+    /* The target may be a dangling name, or the guess above may be wrong */
+    if (CreateSymbolicLinkA(full, target, flags | (dirflag ^ SYMBOLIC_LINK_FLAG_DIRECTORY))) {
+        return 0;
+    }
+    if (win_symlink_errno_pending()) {
+        return -1;
+    }
+    /* Windows older than 1703 rejects the unprivileged flag outright */
+    if (CreateSymbolicLinkA(full, target, dirflag) ||
+        CreateSymbolicLinkA(full, target, dirflag ^ SYMBOLIC_LINK_FLAG_DIRECTORY)) {
+        return 0;
+    }
+    win_set_errno();
     return -1;
 }
 
 ssize_t linkat(int fd1, const char* path1, int fd2, const char* path2, int flags)
 {
-    (void)fd1;
-    (void)path1;
-    (void)fd2;
-    (void)path2;
-    (void)flags;
-    errno = ENOSYS;
-    return -1;
+    char from[MAX_PATH + 16], to[MAX_PATH + 16];
+    (void)flags;    /* no way to express AT_SYMLINK_FOLLOW differently */
+
+    if (!path1 || !path2) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (at_path(fd1, path1, from, sizeof(from)) ||
+        at_path(fd2, path2, to, sizeof(to))) {
+        return -1;
+    }
+    if (!CreateHardLinkA(to, from, NULL)) {
+        win_set_errno();
+        return -1;
+    }
+    return 0;
 }
 
 int renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath)
@@ -1127,23 +1356,42 @@ int faccessat(int dirfd, const char* path, int mode, int flags)
 
 ssize_t readlinkat(int dirfd, const char* path, char* buf, size_t bufsiz)
 {
-    char tmp[MAX_PATH + 1];
-    DWORD n = 0;
+    char full[MAX_PATH + 16];
+    char tmp[MAX_PATH + 16];
+    ssize_t n;
     size_t i;
-    if (at_path(dirfd, path, tmp, sizeof(tmp))) {
+
+    if (!buf && bufsiz) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (at_path(dirfd, path, full, sizeof(full))) {
         return -1;
     }
     if (!strcmp(path, "/proc/self/exe")) {
-        n = GetModuleFileNameA(NULL, tmp, MAX_PATH);
+        DWORD len = GetModuleFileNameA(NULL, tmp, MAX_PATH);
+        if (!len || len >= MAX_PATH) {
+            errno = EINVAL;
+            return -1;
+        }
+        n = (ssize_t)len;
     } else if (!strcmp(path, "/proc/self/cwd")) {
-        n = GetCurrentDirectoryA(MAX_PATH, tmp);
+        DWORD len = GetCurrentDirectoryA(MAX_PATH, tmp);
+        if (!len || len >= MAX_PATH) {
+            errno = EINVAL;
+            return -1;
+        }
+        n = (ssize_t)len;
+    } else {
+        /* A symbolic link (or directory junction): its target is stored as a
+         * reparse point. Anything else is EINVAL, as on POSIX. */
+        n = shim_read_link(full, tmp, sizeof(tmp));
+        if (n < 0) {
+            return -1;
+        }
     }
-    if (!n || n >= sizeof(tmp)) {
-        errno = EINVAL;
-        return -1;
-    }
-    tmp[n] = 0;
-    for (i = 0; i < n && i < bufsiz; i++) {
+    /* The guest never sees Windows separators */
+    for (i = 0; i < (size_t)n && i < bufsiz; i++) {
         buf[i] = (tmp[i] == '\\') ? '/' : tmp[i];
     }
     return (ssize_t)i;
@@ -1265,10 +1513,46 @@ int rvvm_stat(const char* path, struct rvvm_stat* buf)
     return 0;
 }
 
+#ifndef _S_IFLNK
+#define _S_IFLNK 0xA000     /* Linux S_IFLNK; some CRT headers omit it */
+#endif
+
 int rvvm_lstat(const char* path, struct rvvm_stat* buf)
 {
-    /* No symlink support: same as stat */
-    return rvvm_stat(path, buf);
+    DWORD attrs = GetFileAttributesA(path);
+    char target[MAX_PATH + 16];
+    HANDLE h;
+
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        /* Not a link: stat() is both the answer and the errno source */
+        return rvvm_stat(path, buf);
+    }
+    if (shim_read_link(path, target, sizeof(target)) < 0) {
+        /* A reparse point that is not a name surrogate (a cloud placeholder,
+         * say) stands for a real object: describe that instead */
+        return rvvm_stat(path, buf);
+    }
+
+    /* lstat(2) describes the link itself: S_IFLNK plus the target length */
+    memset(buf, 0, sizeof(*buf));
+    buf->st_mode = _S_IFLNK | 0777;
+    buf->st_nlink = 1;
+    buf->st_blksize = 4096;
+    buf->st_size = (long long)strlen(target);
+
+    h = CreateFileA(path, FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        /* dev/ino/times of the link object, then the link's own mode/size back
+         * on top (stat_refine() reports the attributes it sees) */
+        stat_refine(buf, h);
+        buf->st_mode = (buf->st_mode & ~(unsigned)_S_IFMT) | _S_IFLNK;
+        buf->st_size = (long long)strlen(target);
+        CloseHandle(h);
+    }
+    return 0;
 }
 
 int rvvm_fstat(int fd, struct rvvm_stat* buf)

@@ -191,7 +191,13 @@ Debug switches:
    `d_type`), and `stat`/`fstat` take the live size, file index and the
    directory bit from the file handle - the CRT path helpers lag behind a just
    written file on some volumes and never report `S_IFDIR` for a directory fd.
-   Symbolic links stay `ENOSYS` and `mmap` of a file is a read-only snapshot.
+   Symbolic and hard links work too: `symlink()`/`link()` go through
+  `CreateSymbolicLink`/`CreateHardLink` (the link type is chosen from the target
+  that exists at creation time, so a directory link can be followed as a
+  directory), `readlink()` and `lstat()` read the reparse point, `readdir()`
+  reports `DT_LNK`, and `open()`/`stat()` follow the link. Creating a symlink
+  needs the Windows privilege or Developer Mode - a failure surfaces as `EPERM`.
+  `mmap` of a file is still a read-only snapshot.
    A guest exercising the remaining gaps will fail; CPU-bound or file/graphics
    based guests are the reachable target.
    The Makefile build reuses the regular `USE_WIN32_GUI`/`USE_WIN32_COMPAT`
