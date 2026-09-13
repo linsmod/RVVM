@@ -12,6 +12,7 @@ custom hypercalls, with platform-specific host bridges.
 | Guest ELFs | zig cc / riscv64 NDK clang | `src/virtpass/guest-samples/*.c` | Run on host or Android |
 | Win32 host | MinGW gcc + Makefile | `release.windows.x86_64/rvvm_winhost_x86_64.exe` | Run guests on Windows |
 | Android app | Android NDK + Gradle | APK containing `librvvm_jni.so` | Install on Android device |
+| VirtPass SDK | zig cc + Makefile | `release.<os>.<arch>/vp-sdk/vpsdk.a` + `.so` | Link a guest to log which host APIs it needs |
 | GL ABI headers | Python 3 | `include/virtpass/vp_gl.h`, `src/virtpass/vp_gl_stub.c`, `win32_gl_backend.h`, `win32_gl_dispatch_tables.h` | Auto-generated from NDK headers |
 
 ## Prerequisites
@@ -128,6 +129,29 @@ mingw32-make android-assets
 Every `guest-samples/*.c` is bundled by default (`ANDROID_GUEST_SAMPLES` is
 derived from the directory listing), so adding a new sample needs no Makefile
 edit — override the variable to build a subset.
+
+### 1D. VirtPass SDK (`vpsdk.a` / `vpsdk.so`)
+
+`make vp-sdk` cross-compiles `src/virtpass/vp-sdk/*.c` — generated "not
+implemented" variants of the two stub libraries above — into a static and a
+shared library under `$(BUILDDIR)/vp-sdk/`. A guest linked against the archive
+**instead of** `vp_android_stub.a` + `vp_gles_stub.a` never reaches a host
+backend: every API it asks for is printed once on stderr, which tells you
+exactly which host APIs it depends on.
+
+```powershell
+mingw32-make vp-sdk                          # -> release.windows.x86_64\vp-sdk\vpsdk.{a,so}
+
+zig cc -target riscv64-linux-musl -static -O1 -fno-sanitize=undefined -Iinclude `
+    src\virtpass\guest-samples\test_render.c `
+    release.windows.x86_64\vp-sdk\vpsdk.a -o build\test_render
+```
+
+`mingw32-make vp-sdk-gen` regenerates those sources (via
+`tools/gen_stub_notimpl.py`) from `vp_ndk_stub.c`, `vp_aaudio_stub.c` and
+`vp_gl_stub.c`; they are checked in, so `make vp-sdk` alone is enough otherwise.
+See `src/virtpass/vp-sdk/README.md` for the report format, the `--keep` escape
+hatch and the limitations.
 
 ### Why `-fno-sanitize=undefined` for zig?
 

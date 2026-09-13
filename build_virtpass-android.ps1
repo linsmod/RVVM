@@ -13,10 +13,11 @@
       apk    -> android        (guest assets + librvvm_jni.so + APK)
       assets -> android-assets (zig/musl riscv64 guest ELFs into APK assets)
       jni    -> android-jni    (librvvm_jni.so only)
+      sdk    -> vp-sdk         (guest VirtPass SDK: vpsdk.a + vpsdk.so)
       clean  -> android-clean  (Gradle clean)
 
 .PARAMETER Target
-    What to build: apk (default), assets, jni or clean.
+    What to build: apk (default), assets, jni, sdk or clean.
 
 .PARAMETER Variant
     Gradle build variant: debug (default) or release.
@@ -45,7 +46,7 @@
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('apk', 'assets', 'jni', 'clean')]
+    [ValidateSet('apk', 'assets', 'jni', 'sdk', 'clean')]
     [string]$Target = 'apk',
     [ValidateSet('debug', 'release')]
     [string]$Variant = 'debug',
@@ -94,7 +95,7 @@ if (($env:PATH -split ';') -notcontains $mingwBin) {
     $env:PATH = "$mingwBin;$env:PATH"
 }
 
-$targetMap = @{ apk = 'android'; assets = 'android-assets'; jni = 'android-jni'; clean = 'android-clean' }
+$targetMap = @{ apk = 'android'; assets = 'android-assets'; jni = 'android-jni'; sdk = 'vp-sdk'; clean = 'android-clean' }
 $makeTarget = $targetMap[$Target]
 
 # --- Toolchain checks (zig cross-compiles the riscv64 guest ELFs) ---

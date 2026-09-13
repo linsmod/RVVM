@@ -204,8 +204,9 @@ override lib_src_virtpass_guest := $(SRCDIR)/virtpass/vp_ndk_stub.c $(SRCDIR)/vi
 
 # Other non-host subtrees under src/virtpass: the guest programs and the
 # Android JNI pass are cross-built for RISC-V / Android, win32-host provides
-# its own binary - none of them may end up in librvvm
-override lib_src_virtpass_nonhost := $(SRCDIR)/virtpass/guest-samples/% $(SRCDIR)/virtpass/android-host/% $(SRCDIR)/virtpass/win32-host/%
+# its own binary, vp-sdk is cross-built by `make vp-sdk` - none of them may end
+# up in librvvm
+override lib_src_virtpass_nonhost := $(SRCDIR)/virtpass/guest-samples/% $(SRCDIR)/virtpass/android-host/% $(SRCDIR)/virtpass/win32-host/% $(SRCDIR)/virtpass/vp-sdk/%
 
 # virtpass_stub bundles those guest-side stubs so guest programs can link them
 # against the virtpass passthrough. It is only buildable on a native riscv64
@@ -216,6 +217,76 @@ override LIB_TARGETS           := $(LIB_TARGETS) virtpass_stub
 override lib_src_virtpass_stub := $(lib_src_virtpass_guest)
 endif
 endif
+
+#
+# VirtPass SDK: guest libraries whose APIs report instead of talking to the host
+#
+# src/virtpass/vp-sdk/*.c are generated from the real guest stubs by
+# tools/gen_stub_notimpl.py and checked in (see src/virtpass/vp-sdk/README.md).
+# They keep the NDK / EGL / AAudio signatures but return early, printing the API
+# name on stderr - a guest linked against vpsdk runs on a host with no backend
+# at all, and the log lists exactly which host APIs the guest asks for.
+#
+# Like every other src/virtpass stub these are riscv64 guest objects, so they
+# are cross-compiled with zig (the same toolchain which builds the Android guest
+# assets below) and never with the host compiler. Both the static and the shared
+# library are produced from one -fPIC object set, into $(BUILDDIR)/vp-sdk/.
+#
+#   make vp-sdk       -> $(BUILDDIR)/vp-sdk/vpsdk.a + $(BUILDDIR)/vp-sdk/vpsdk.so
+#   make vp-sdk-gen   -> regenerate those .c files from the real guest stubs
+#
+
+override VP_SDK_DIR   := $(BUILDDIR)/vp-sdk
+override VP_SDK_SRC   := $(filter %.c,$(call ls_dir,$(SRCDIR)/virtpass/vp-sdk))
+override VP_SDK_OBJ   := $(addprefix $(VP_SDK_DIR)/,$(addsuffix .o,$(notdir $(basename $(VP_SDK_SRC)))))
+override VP_SDK_ZIG   := zig cc
+override VP_SDK_AR    := zig ar
+# -fPIC so the very same objects serve both the archive and the .so;
+# -fno-sanitize=undefined is a zig cc requirement
+VP_SDK_CFLAGS ?= -target riscv64-linux-musl -O2 -g -fPIC -I$(INCDIR) -fno-sanitize=undefined
+# Whole guest ABI header directory, so an edit to any vp_*.h rebuilds the SDK
+override VP_SDK_HEADS := $(filter %.h,$(call ls_dir,$(INCDIR)/virtpass))
+override VP_SDK_A     := $(VP_SDK_DIR)/vpsdk.a
+override VP_SDK_SO    := $(VP_SDK_DIR)/vpsdk.so
+
+# Cross-compile flags are data, not a file, so they are not prerequisites of the
+# objects they affect. Keep them in a stamp and depend on it: it is rewritten
+# (and thus made newer than every object) only when the flags change, so an
+# unchanged build stays up to date.
+override VP_SDK_STAMP := $(VP_SDK_DIR)/sdk_flags.stamp
+ifneq ($(if $(wildcard $(VP_SDK_STAMP)),$(file <$(VP_SDK_STAMP)),),$(VP_SDK_CFLAGS))
+$(call create_dirs,$(VP_SDK_DIR))
+$(file >$(VP_SDK_STAMP),$(VP_SDK_CFLAGS))
+endif
+
+$(VP_SDK_DIR)/%.o: $(SRCDIR)/virtpass/vp-sdk/%.c $(VP_SDK_HEADS) $(VP_SDK_STAMP)
+	$(call create_dirs,$(dir $@))
+	$(call println,$(TEXT)[$(GREEN)CC$(TEXT)] $@ $(RESET))
+	@$(call shell_esc,$(VP_SDK_ZIG) $(VP_SDK_CFLAGS) -c -o $@ $<)
+
+$(VP_SDK_A): $(VP_SDK_OBJ)
+	$(call println,$(TEXT)[$(GREEN)AR$(TEXT)] $@ $(RESET))
+	@$(call shell_esc,$(VP_SDK_AR) rcs $@ $(VP_SDK_OBJ))
+
+$(VP_SDK_SO): $(VP_SDK_OBJ)
+	$(call println,$(TEXT)[$(GREEN)LD$(TEXT)] $@ $(RESET))
+	@$(call shell_esc,$(VP_SDK_ZIG) $(VP_SDK_CFLAGS) -shared -o $@ $(VP_SDK_OBJ))
+
+# Regenerate the sources from the real guest stubs. Kept out of the artifact
+# rules on purpose: it rewrites files inside the source tree, and it would make
+# every build non-incremental. Sources are listed explicitly because the shell
+# on Windows does not expand wildcards.
+VP_SDK_GEN_SRC ?= $(SRCDIR)/virtpass/vp_ndk_stub.c $(SRCDIR)/virtpass/vp_aaudio_stub.c $(SRCDIR)/virtpass/vp_gl_stub.c
+VP_SDK_GEN     ?= python tools/gen_stub_notimpl.py
+VP_SDK_GEN_OPTS ?= --outdir $(SRCDIR)/virtpass/vp-sdk
+
+.PHONY: vp-sdk       # Build the VirtPass "not implemented" guest SDK (vpsdk.a / vpsdk.so)
+vp-sdk: $(VP_SDK_A) $(VP_SDK_SO)
+
+.PHONY: vp-sdk-gen   # Regenerate src/virtpass/vp-sdk/*.c from the real guest stubs
+vp-sdk-gen:
+	$(call log_info,Regenerating the VirtPass SDK stubs)
+	@$(call shell_esc,$(VP_SDK_GEN) $(VP_SDK_GEN_SRC) $(VP_SDK_GEN_OPTS))
 
 # The userland emulator assumes a 64-bit host address space,
 # build it solely on non-i386 targets
