@@ -257,6 +257,15 @@ override VP_SDK_HEADS := $(filter %.h,$(call ls_dir,$(INCDIR)/virtpass))
 # Both artifacts carry the lib prefix, so `-L$(VP_SDK_OUT) -lvpsdk` resolves them
 override VP_SDK_A     := $(VP_SDK_OUT)/libvpsdk.a
 override VP_SDK_SO    := $(VP_SDK_OUT)/libvpsdk.so
+# A DT_SONAME is not cosmetic here. lld (what zig cc links with) records the
+# *path it resolved* a soname-less -l input to, so a guest doing
+# `-L<sysroot>/lib -lvpsdk` ends up with
+#   DT_NEEDED /home/you/riscv64-sysroot/lib/libvpsdk.so
+# baked into its own shared objects - a path that only exists on the build
+# machine, so the library fails to load and every symbol it provides stays
+# unresolved. Naming the soname after the file keeps DT_NEEDED a bare
+# "libvpsdk.so", which any -L dir, sysroot or guest /lib can satisfy.
+override VP_SDK_SONAME := -Wl$(COMMA)-soname$(COMMA)$(notdir $(VP_SDK_SO))
 
 # Cross-compile flags are data, not a file, so they are not prerequisites of the
 # objects they affect. Keep them in a stamp and depend on it: it is rewritten
@@ -281,7 +290,7 @@ $(VP_SDK_A): $(VP_SDK_OBJ)
 $(VP_SDK_SO): $(VP_SDK_OBJ)
 	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)LD$(TEXT)] $@ $(RESET))
-	@$(call shell_esc,$(VP_SDK_ZIG) $(VP_SDK_CFLAGS) -shared -o $@ $(VP_SDK_OBJ))
+	@$(call shell_esc,$(VP_SDK_ZIG) $(VP_SDK_CFLAGS) -shared $(VP_SDK_SONAME) -o $@ $(VP_SDK_OBJ))
 
 # Regenerate the sources from the real guest stubs. Kept out of the artifact
 # rules on purpose: it rewrites files inside the source tree, and it would make

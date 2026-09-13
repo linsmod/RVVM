@@ -796,6 +796,8 @@ static void log_print(const char* prefix, const char* fmt, const void* argv)
     }
     rvvm_strlcpy(buffer + pos, log_has_colors() ? "\033[0m\n" : "\n", sizeof(buffer) - pos);
     fputs(buffer, stderr);
+    // Flush right away: a crash or a kill must not swallow the last messages
+    fflush(stderr);
 #if defined(ANDROID)
     {
         char* log_body = buffer;

@@ -866,7 +866,12 @@ static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, b
     }
 
     if (fixed) {
-        if (hint < GUEST_MMAP_BASE || hint + size > ctx->guest_mmap_end) {
+        /* A fixed mapping may legitimately land below the mmap area: a dynamic
+         * loader maps .bss / guard pages right next to the image, and mremap()
+         * moves a mapping wherever it fits. Only the NULL page and the mmap
+         * ceiling are off limits - like Linux, such a mapping replaces
+         * whatever was there. */
+        if (hint < GUEST_PAGE_SIZE || hint + size > ctx->guest_mmap_end) {
             return false;
         }
         memset(to_ptr(hint), 0, size);
@@ -900,7 +905,14 @@ static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, b
     }
     rvvm_addr_t addr = ctx->guest_bump;
     ctx->guest_bump += size;
+    if (size >= (1u << 20)) {
+        rvvm_warn("DBG alloc: zeroing %llx bytes at %llx (mmap_end %llx)", (long long)size, (long long)addr,
+                  (long long)ctx->guest_mmap_end);
+    }
     memset(to_ptr(addr), 0, size);
+    if (size >= (1u << 20)) {
+        rvvm_warn("DBG alloc: zeroed ok");
+    }
     *out = addr;
     return true;
 }
@@ -1407,9 +1419,11 @@ static void userland_park_if_suspended(rvvm_user_thread_t* thread)
     }
 
     atomic_add_uint32(&ctx->userland_parked, 1);
+    rvvm_warn("DBG park: guest thread parking (suspend=%u)", atomic_load_uint32(&ctx->userland_suspend));
     while (atomic_load_uint32(&ctx->userland_suspend) && !atomic_load_uint32(&thread->finished)) {
         rvvm_futex_wait(&ctx->userland_suspend, 1, USERLAND_SUSPEND_POLL_NS);
     }
+    rvvm_warn("DBG park: guest thread resumed");
     atomic_sub_uint32(&ctx->userland_parked, 1);
 }
 
@@ -2014,7 +2028,14 @@ static rvvm_addr_t rvvm_sys_mmap(rvvm_addr_t addr, size_t size, int prot, int fl
     if (!(flags & UAPI_MAP_ANON) && fd >= 0) {
         /* File-backed mapping: the guest can only see its own buffer, so read
          * the requested window in. Write-back to the file is not emulated. */
+        if (size >= (1u << 20)) {
+            rvvm_warn("DBG mmap: pread %llx bytes fd=%d off=%llx -> guest %llx",
+                      (long long)size, fd, (long long)offset, (long long)ret);
+        }
         ssize_t rd = pread(fd, to_ptr(ret), size, (off_t)offset);
+        if (size >= (1u << 20)) {
+            rvvm_warn("DBG mmap: pread returned %lld (short read = past EOF)", (long long)rd);
+        }
         if (rd < 0) {
             rvvm_warn("sys_mmap: pread failed (fd=%d off=%llx size=%llx)",
                       fd, (long long)offset, (long long)size);
@@ -2159,6 +2180,10 @@ static void* rvvm_user_thread_wrap(void* arg)
             break;
         }
         rvvm_addr_t cause = rvvm_run_user_thread(cpu);
+        rvvm_warn("DBG loop: interpreter returned cause=%llx pc=%llx a7=%llx finished=%u",
+                  (long long)cause, (long long)rvvm_read_cpu_reg(cpu, RVVM_REGID_PC),
+                  (long long)rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 17),
+                  atomic_load_uint32(&thread->finished));
         if (atomic_load_uint32(&thread->finished)) {
             /*
              * A stop/exit request kicked this vCPU out of the interpreter (see
@@ -2398,8 +2423,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -EFAULT;
                     } else {
                         /* NULL path with AT_EMPTY_PATH refers to the dirfd */
-                        a0 = errno_ret(openat(a0, path ? wrap_path(path_buf, path) : path,
-                                              uapi_open_flags(a2), a3));
+                        const char* host_path = path ? wrap_path(path_buf, path) : path;
+                        a0 = errno_ret(openat(a0, host_path, uapi_open_flags(a2), a3));
+                        if (host_path && a0 < 0x1000) {
+                            rvvm_warn("DBG openat %s -> fd %ld", host_path, (long)a0);
+                        }
                     }
                     break;
                 }
@@ -2534,12 +2562,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 80: { // newfstat
                     struct stat st = {0};
                     struct uapi_stat* out = to_ptr_sz(a1, sizeof(*out));
+                    const long fd = (long)a0;
                     rvvm_info("sys_newfstat(%ld, %lx)", a0, a1);
                     if (!out) {
                         a0 = -UAPI_EFAULT;
                         break;
                     }
-                    a0 = errno_ret(fstat(a0, &st));
+                    a0 = errno_ret(fstat(fd, &st));
+                    rvvm_warn("DBG newfstat fd=%ld ret=%ld host_size=%lld", fd, (long)a0, (long long)st.st_size);
                     uapi_stat_convert(out, &st);
                     break;
                 }
@@ -2589,8 +2619,16 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = atomic_load_uint32(&thread->tid);
                     break;
                 case 98: // futex
-                    a0 = rvvm_sys_futex(to_ptr(a0), a1, a2, (const struct uapi_timespec*)to_ptr(a3), to_ptr(a4), a5);
+                {
+                    uint32_t* faddr = to_ptr(a0);
+                    rvvm_warn("DBG futex: uaddr=%llx op=%llx val=%llx timeout=%llx uaddr2=%llx val3=%llx word=%x ra=%llx sp=%llx",
+                              (long long)a0, (long long)a1, (long long)a2, (long long)a3, (long long)a4, (long long)a5,
+                              faddr ? *faddr : 0xdeadbeef,
+                              (long long)rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 1),
+                              (long long)rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 2));
+                    a0 = rvvm_sys_futex(faddr, a1, a2, (const struct uapi_timespec*)to_ptr(a3), to_ptr(a4), a5);
                     break;
+                }
                 case 99: // set_robust_list
                     // TODO: Implement this
                     rvvm_info("sys_set_robust_list(%lx, %lx)", a0, a1);
@@ -3706,14 +3744,23 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
         rvvm_info("ELF interpreter at %s", uctx()->elf.interp_path);
         file = rvopen(wrap_path(path_buf, uctx()->elf.interp_path), 0);
         if (file) {
-            // A relocatable interpreter needs a guest address picked upfront
+            /* A relocatable interpreter needs a guest address picked upfront.
+             * Reserve its full memory extent, not the file size: .bss counts
+             * too, and musl's ldso keeps its internal locks there. An
+             * undersized reservation leaves that tail outside the interpreter,
+             * so the next guest mmap() (the first shared library) lands on top
+             * of it - the loader then blocks forever on a corrupted lock. */
             spin_lock(&uctx()->guest_lock);
-            bool placed = guest_range_alloc(&uctx()->interp.load_addr, 0, rvfilesize(file), false);
+            bool placed = guest_range_alloc(&uctx()->interp.load_addr, 0, elf_image_extent(file), false);
             spin_unlock(&uctx()->guest_lock);
             if (!placed) {
                 uctx()->interp.load_addr = 0;
             }
         }
+        /* The interpreter is itself a shared object (musl's ld-musl / glibc's
+         * ld.so are linked as .so), so it carries no usable e_entry: the kernel
+         * jumps to its loader entry symbol instead. */
+        uctx()->interp.entry_symbol = "_dlstart";
         success = file && elf_load_file(file, &uctx()->interp);
         rvclose(file);
         if (!success) {

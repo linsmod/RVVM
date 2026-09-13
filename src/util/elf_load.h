@@ -52,6 +52,14 @@ typedef struct {
 
 bool elf_load_file(rvfile_t* file, elf_desc_t* elf);
 
+// Guest address space an ELF image occupies: the memsz-inclusive extent of its
+// PT_LOAD/PT_PHDR segments, rounded to the VMA allocation granularity (the same
+// extent elf_load_file() reports via buf_size). The plain file size is NOT
+// enough - it omits the trailing .bss, which is where musl's ldso keeps its
+// internal locks, so an undersized reservation lets a later guest mmap() land
+// on top of them. Returns 0 if the file can't be parsed.
+size_t elf_image_extent(rvfile_t* file);
+
 // Release the mapping made by a previous elf_load_file() userland load and
 // reset the descriptor. Required before re-loading into the same descriptor:
 // a stale elf->base makes elf_load_file() take the objcopy path and produces

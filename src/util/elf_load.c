@@ -284,6 +284,48 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
     return true;
 }
 
+size_t elf_image_extent(rvfile_t* file)
+{
+    uint8_t tmp[64] = {0};
+    if (!file || rvread(file, tmp, 64, 0) != 64) {
+        return 0;
+    }
+    if (read_uint32_le_m(tmp) != 0x464c457F) {
+        return 0;
+    }
+
+    bool     class64   = (tmp[4] == 2);
+    uint64_t elf_phoff = class64 ? read_uint64_le_m(tmp + 32) : read_uint32_le_m(tmp + 28);
+    size_t   elf_phnsz = class64 ? 56 : 32;
+    size_t   elf_phnum = read_uint16_le_m(tmp + (class64 ? 56 : 44));
+
+    uint64_t loaddr = (uint64_t)-1;
+    uint64_t hiaddr = 0;
+    for (size_t i = 0; i < elf_phnum; ++i) {
+        uint64_t off = elf_phoff + (elf_phnsz * i);
+        if (rvread(file, tmp, elf_phnsz, off) != elf_phnsz) {
+            return 0;
+        }
+        uint32_t p_type  = read_uint32_le_m(tmp);
+        uint64_t p_vaddr = class64 ? read_uint64_le_m(tmp + 16) : read_uint32_le_m(tmp + 8);
+        uint64_t p_memsz = class64 ? read_uint64_le_m(tmp + 40) : read_uint32_le_m(tmp + 20);
+        if (p_type == ELF_PT_LOAD || p_type == ELF_PT_PHDR) {
+            if (p_vaddr < loaddr) {
+                loaddr = p_vaddr;
+            }
+            if (p_vaddr + p_memsz > hiaddr) {
+                hiaddr = p_vaddr + p_memsz;
+            }
+        }
+    }
+    if (loaddr == (uint64_t)-1 || hiaddr <= loaddr) {
+        return 0;
+    }
+    // Match elf_load_file()'s buf_size so the reservation covers everything the
+    // loader (and a later memset of buf_size) may touch.
+    return align_size_up(hiaddr - loaddr, vma_alloc_granularity());
+}
+
 bool bin_objcopy(rvfile_t* file, void* buffer, size_t size, bool try_elf)
 {
     uint8_t mag[4] = {0};
