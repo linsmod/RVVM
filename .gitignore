@@ -31,7 +31,6 @@
 
 # Explicitly track build scripts
 !/build_virtpass.ps1
-!/building_userland-host.md
 
 # Explicitly track CI infrastructure
 !/.github

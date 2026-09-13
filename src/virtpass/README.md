@@ -89,11 +89,37 @@ backend behind each callback differs.
 ## Build
 
 - Windows: `pwsh ./build_virtpass.ps1 -Target win32` (make target `bin`;
-  `-RegenGlAbi` regenerates the GL dispatch from `tools/gen_gl_abi.py`).
+  `-RegenGlAbi` regenerates the GL dispatch from `tools/gen_gl_abi.py` first).
 - Android: `pwsh ./build_virtpass.ps1 -Target apk` (make target `android`, which
   first cross-compiles every guest in `guest-samples/` for
   riscv64-linux-musl via zig cc into the APK assets).
 - `pwsh ./build_virtpass.ps1` with no `-Target` builds both, plus the guest SDK.
+- `pwsh ./build_virtpass.ps1 -?` lists every target; it only locates the
+  toolchain and drives `mingw32-make`, so the raw Makefile goals work as well.
+
+### Toolchain
+
+| Tool | Version | Used for |
+|---|---|---|
+| MSYS2 MinGW64 gcc | 15+ | `mingw32-make`, the host binaries |
+| zig cc | 0.14+ | every riscv64 guest artifact (guest stubs + `guest-samples/`) |
+| Android SDK + NDK | 27.x | the Gradle/NDK-CMake build of `android-host/` (found via `local.properties`, `ANDROID_HOME` or `ANDROID_SDK_ROOT`) |
+| Python 3 | 3.10+ | `tools/gen_gl_abi.py`, i.e. only with `-RegenGlAbi` |
+
+Guests are built for **riscv64-linux-musl with zig cc, never the NDK/bionic**:
+bionic links scudo, which reserves terabyte-scale address ranges at startup that
+the Win32 host mmap layer cannot satisfy (the guest then exits 127). Those zig
+flags carry `-fno-sanitize=undefined` because zig otherwise implies UBSan and
+emits `__ubsan_handle_*` references that a static musl link does not provide.
+
+`tools/gen_gl_abi.py` reads `GLES2/gl2.h` + `EGL/egl.h` from the NDK sysroot
+(`NDK_SYSROOT`, else the NDK 27.x path hardcoded in the script) and rewrites
+`include/virtpass/vp_gl.h`, `src/virtpass/vp_gl_stub.c`,
+`src/virtpass/vp_gl_host_types.h`, `src/virtpass/vp_gl_host_entries.h`,
+`src/virtpass/vp_gl_dispatch_tables.h` and
+`src/virtpass/win32-host/win32_gl_backend.h`; guest and host must then be
+rebuilt together (`-RegenGlAbi` regenerates, audits the pointer params and
+rebuilds in one go).
 
 ## Sensor conformance test
 

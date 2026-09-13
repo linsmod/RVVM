@@ -105,6 +105,10 @@ static void print_help(const char* prog)
         "  RVVM_VIRT_PPI                Virtual panel density, PPI (default 160)\n"
         "  RVVM_ASSETS                  Launcher guest directory\n"
         "  RVVM_VERBOSE=1               Verbose logging (syscall trace)\n"
+        "  RVVM_GL_BACKEND              angle (default) | swiftshader | off\n"
+        "  RVVM_GL_DLL_DIR              Directory holding libEGL.dll/libGLESv2.dll\n"
+        "                               (or <sdk>\\emulator\\lib64\\gles_<name>)\n"
+        "  RVVM_GL_TRACE=1              Trace every GL/EGL call on stderr\n"
         "\n"
         "Exit status: the guest's exit code in direct mode (1 on a host error);\n"
         "in launcher mode the window stays open across guests.\n",
