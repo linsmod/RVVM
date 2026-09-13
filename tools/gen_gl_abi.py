@@ -3,19 +3,25 @@
 gen_gl_abi.py - Generate the GL/EGL guest stubs and host-side dispatch tables
 for the RVVM Android-userland emulator (Phase 3: EGL+GLES).
 
-Source of truth: the NDK's own EGL/egl.h and GLES2/gl2.h headers (parsed),
-so signatures are canonical and zero-maintenance.
+Source of truth: the NDK's own EGL/egl.h, GLES2/gl2.h and GLES3/gl3.h headers
+(parsed), so signatures are canonical and zero-maintenance. gl3.h re-declares
+the whole GLES2 core, so it is merged *after* gl2.h with the names already seen
+dropped: the GLES2 entry points keep their order (and their fn_id) and only the
+GLES3 additions are appended.
 
 Outputs (all marked GENERATED - do not edit by hand):
   include/virtpass/vp_gl.h            shared ABI: types, constants, fn_id
                                       macros, gl_call struct, guest API
                                       prototypes
-  src/virtpass/vp_gl_stub.c           guest stubs (142 functions)
-  src/virtpass/win32-host/win32_gl_backend.h
-                                      host types (vpgl_*), PFN typedefs,
+  src/virtpass/vp_gl_stub.c           guest stubs (one per GL/EGL entry point)
+  src/virtpass/vp_gl_host_types.h     host types (vpgl_*), PFN typedefs,
                                       resolved procs
-  src/virtpass/win32-host/win32_gl_dispatch_tables.h
+  src/virtpass/vp_gl_host_entries.h   p_* storage + the entry-point name lists
+                                      the host loaders expand (X-macro)
+  src/virtpass/vp_gl_dispatch_tables.h
                                       host generic dispatch switches
+  src/virtpass/win32-host/win32_gl_backend.h
+                                      win32 backend lifecycle API
 
 Usage:  python tools/gen_gl_abi.py
 """
@@ -39,10 +45,18 @@ GUEST_SRC_DIR = SRC_DIR
 HOST_DIR = os.path.join(SRC_DIR, "win32-host")
 
 GL2_H = os.path.join(NDK_SYSROOT, "GLES2", "gl2.h")
+GL3_H = os.path.join(NDK_SYSROOT, "GLES3", "gl3.h")
 EGL_H = os.path.join(NDK_SYSROOT, "EGL", "egl.h")
 
-# fn_id bases (single source of truth, consumed by guest stub, vp_cmdpost
-# and the win32 host dispatch)
+# Parsed in this order: gl2.h establishes the GLES2 ids, gl3.h contributes the
+# GLES3 additions. Parsing gl3.h alone would produce the same set (it is a
+# superset), but merging keeps the generated diff confined to the new calls.
+GL_HEADERS = [GL2_H, GL3_H]
+
+# fn_id bases (single source of truth, consumed by the guest stub, vp_cmdpost
+# and both host dispatches). The whole GL set must fit in [GL_FN_BASE,
+# EGL_FN_BASE): GLES2+GLES3 core is 246 functions, so 0x100 still has room -
+# widen it before pulling in the GLES extension headers (gl2ext.h/gl3ext.h).
 GL_FN_BASE = 1
 EGL_FN_BASE = 0x100
 
@@ -68,6 +82,15 @@ EGL_WHITELIST = [
     "eglMakeCurrent",
     "eglSwapBuffers",
     "eglQuerySurface",
+    # GLES3 add-ons. eglBindAPI is what an ES3 application calls before
+    # creating its context, and eglQueryContext is the only way to read back
+    # which client version the context actually got.
+    "eglBindAPI",
+    "eglQueryContext",
+    "eglSwapInterval",
+    "eglGetCurrentDisplay",
+    "eglGetCurrentSurface",
+    "eglGetCurrentContext",
     # Resolved in the guest (see PROC_ADDRESS_FN): the host would hand back an
     # address in the host GL DLL that the guest cannot call. Listing it here
     # still generates the guest stub, while no EGL_FN_* / host dispatch entry
@@ -78,8 +101,10 @@ EGL_WHITELIST = [
     "eglQueryString",
 ]
 
-# Number of argument slots in gl_call (glCompressedTexSubImage2D needs 9)
-GL_CALL_MAX_ARGS = 9
+# Argument slots in gl_call. The widest core call is now glTexSubImage3D with
+# 11 arguments (GLES2's widest, glCompressedTexSubImage2D, needs 9); the extra
+# slot keeps GL_CALL_RETBUF_SLOT above every real parameter list.
+GL_CALL_MAX_ARGS = 12
 
 # Scratch buffer the guest offers via args[GL_CALL_RETBUF_SLOT] for functions
 # that hand back a host-owned string (glGetString / eglQueryString). It must
@@ -104,18 +129,42 @@ ARG_OVERRIDES = {
 }
 
 # Pointer arguments that are *either* a guest address (client-side array) or
-# a byte offset into the currently bound buffer object. Translating them
-# unconditionally breaks the offset form (VBO draws), so the host passes the
-# raw value through when it is not a mappable guest address.
-OFFSET_PTR_ARGS = {
+# a byte offset into a buffer object. GL says which one by the *bound buffer*:
+# with GL_ARRAY_BUFFER (resp. GL_ELEMENT_ARRAY_BUFFER) non-zero the value is an
+# offset, otherwise it is a client-side address. The distinction cannot be made
+# from the value alone (a small offset looks like a small guest address), and
+# the guest stub does not track VAO element bindings, so the host resolves it
+# from live GL state via vpgl_ptr() - see host_arg_expr().
+ARRAY_PTR_ARGS = {
     ("glVertexAttribPointer", 5),
-    ("glDrawElements", 3),
+    # GLES3: the integer-attribute variant of the same overload.
+    ("glVertexAttribIPointer", 4),
 }
+ELEMENT_PTR_ARGS = {
+    ("glDrawElements", 3),
+    # GLES3: the instanced and ranged index draws.
+    ("glDrawElementsInstanced", 3),
+    ("glDrawRangeElements", 5),
+}
+OVERLOADED_PTR_ARGS = ARRAY_PTR_ARGS | ELEMENT_PTR_ARGS
 
 # Functions returning a host-owned string: the guest stub offers its static
 # glstub_retbuf via args[GL_CALL_RETBUF_SLOT], the host copies the string
-# there and answers with that guest address.
-STRING_RET_FNS = {"glGetString", "eglQueryString"}
+# there and answers with that guest address. glGetStringi is the GLES3 way to
+# walk the extension list one name at a time.
+STRING_RET_FNS = {"glGetString", "eglQueryString", "glGetStringi"}
+
+# Entry points deliberately kept out of the marshalled ABI.
+#
+# glMapBufferRange hands the guest a HOST address to write through, and
+# glUnmapBuffer would have to copy it back: the reverse direction of every
+# other call here (the host owns the buffer, the guest writes into it), which
+# needs a guest-side staging buffer plus a host map table. Deferred, so the
+# guest never receives a host pointer it could not use: a caller fails to link
+# instead. glFlushMappedBufferRange and glGetBufferPointerv stay in - with
+# nothing ever mapped, glGetBufferPointerv answers NULL, exactly as a real
+# driver would.
+EXCLUDED_FNS = {"glMapBufferRange"}
 
 # Pointer-returning functions whose result the guest must NOT receive as a raw
 # host address. eglGetProcAddress hands back an executable address in the host
@@ -132,9 +181,11 @@ PROC_ADDRESS_FN = "eglGetProcAddress"
 # Type tables
 # ---------------------------------------------------------------------------
 
-# Types that are themselves pointers in the headers
+# Types that are themselves pointers in the headers. GLsync (GLES3 fence
+# objects) joins the EGL handles here: it is a host-side value the guest only
+# ever hands back to glIsSync/glDeleteSync/glClientWaitSync, never dereferences.
 IMPLICIT_PTR = {"EGLDisplay", "EGLSurface", "EGLContext", "EGLConfig",
-                "__eglMustCastToProperFunctionPointerType"}
+                "__eglMustCastToProperFunctionPointerType", "GLsync"}
 
 # Platform-native handles -> opaque pointers
 NATIVE_TYPES = {
@@ -162,6 +213,10 @@ GUEST_TYPES = {
     "GLclampf": "float",
     "GLintptr": "long",
     "GLsizeiptr": "long",
+    # GLES3 64-bit integers. riscv64 guest is LP64, so int64_t/uint64_t match
+    # the int64_t args[] slot exactly.
+    "GLint64": "int64_t",
+    "GLuint64": "uint64_t",
     "EGLint": "int32_t",
     "EGLBoolean": "uint32_t",
     "EGLenum": "uint32_t",
@@ -171,7 +226,10 @@ INT32_UNSIGNED = {"GLenum", "GLuint", "GLbitfield", "EGLBoolean", "EGLenum",
                   "GLboolean", "GLubyte", "GLushort"}
 INT32_SIGNED = {"GLint", "GLsizei", "EGLint", "GLbyte", "GLshort", "GLchar"}
 FLOAT_TYPES = {"GLfloat", "GLclampf"}
-INT64_TYPES = {"GLintptr", "GLsizeiptr"}
+INT64_TYPES = {"GLintptr", "GLsizeiptr", "GLint64", "GLuint64"}
+# Unsigned 64-bit values need the round trip through uint64_t: casting a value
+# above INT64_MAX straight to int64_t is implementation-defined.
+UINT64_TYPES = {"GLuint64"}
 
 # ---------------------------------------------------------------------------
 # Header parsing
@@ -191,6 +249,9 @@ class Type:
 
     def is_int64(self):
         return self.base in INT64_TYPES and not self.is_pointer()
+
+    def is_uint64(self):
+        return self.base in UINT64_TYPES and not self.is_pointer()
 
     def __repr__(self):
         return "Type(%s%s%s)" % ("const " if self.const else "", self.base, "*" * self.ptr)
@@ -276,17 +337,16 @@ def guest_decl_type(t):
 def guest_marshal_expr(fn, idx, name, t):
     """Expression storing parameter `name` of guest type t into args[idx].
 
-    glVertexAttribPointer/glDrawElements overload their pointer argument as
-    either a client array address or a buffer byte offset, and only the guest
-    knows which it meant. Those go through GLSTUB_OFFSET_PTR(), which tags the
-    address form so the host never has to guess (see vpgl_gptr_or_off).
+    The overloaded pointer arguments (OVERLOADED_PTR_ARGS) travel as their bare
+    value: the host decides address-vs-offset from the bound buffer object, so
+    the stub must not rewrite them.
     """
     if t.is_pointer():
-        if (fn["name"], idx) in OFFSET_PTR_ARGS:
-            return "GLSTUB_OFFSET_PTR(%s)" % name
         return "(int64_t)(uintptr_t)%s" % name
     if t.is_float():
         return "glstub_packf(%s)" % name
+    if t.is_uint64():
+        return "(int64_t)(uint64_t)%s" % name
     if t.is_int64():
         return "(int64_t)%s" % name
     if t.base in INT32_UNSIGNED:
@@ -346,8 +406,10 @@ def host_arg_expr(fn, idx, t):
     if t.base in IMPLICIT_PTR or t.base in NATIVE_TYPES:
         # Opaque host handle: produced by the host, handed back untouched.
         return "(%s)(uintptr_t)a[%d]" % (host_type(t), idx)
-    if (fn["name"], idx) in OFFSET_PTR_ARGS:
-        return "(%s)vpgl_gptr_or_off(a[%d])" % (host_type(t), idx)
+    if (fn["name"], idx) in ARRAY_PTR_ARGS:
+        return "(%s)vpgl_ptr(a[%d], VPGL_PTR_ARRAY)" % (host_type(t), idx)
+    if (fn["name"], idx) in ELEMENT_PTR_ARGS:
+        return "(%s)vpgl_ptr(a[%d], VPGL_PTR_ELEMENT)" % (host_type(t), idx)
     # Guest data pointer: translate before the host dereferences it.
     return "(%s)vpgl_gptr(a[%d])" % (host_type(t), idx)
 
@@ -370,6 +432,8 @@ def host_call_expr(fn):
         return "*ret = (int64_t)(intptr_t)%s;" % call
     if r.is_float():
         return "*ret = vpgl_pack_f(%s);" % call
+    if r.is_uint64():
+        return "*ret = (int64_t)(uint64_t)%s;" % call
     if r.is_int64():
         return "*ret = (int64_t)%s;" % call
     if r.base in INT32_UNSIGNED:
@@ -384,28 +448,37 @@ def host_call_expr(fn):
 GENERATED_BANNER = """/*
  * GENERATED FILE - produced by tools/gen_gl_abi.py - DO NOT EDIT BY HAND.
  *
- * Source of truth: NDK sysroot headers GLES2/gl2.h + EGL/egl.h (parsed).
+ * Source of truth: NDK sysroot headers GLES2/gl2.h + GLES3/gl3.h + EGL/egl.h
+ * (parsed; gl3.h is merged after gl2.h so the GLES2 ids never move).
  * Regenerate with:  python tools/gen_gl_abi.py
  *
- * Phase 3 ABI notes:
+ * ABI notes:
  *  - fn_id macros are the single source of truth shared by the guest stubs,
- *    src/virtpass/vp_cmdpost.c and the win32 host GL dispatch.
- *  - gl_call.args has {nargs} slots (glCompressedTexSubImage2D needs 9; the
- *    original Phase 3 plan said 6 - widened before first deployment, so this
- *    is an internal ABI change with zero consumers).
+ *    src/virtpass/vp_cmdpost.c and both host GL dispatches.
+ *  - gl_call.args has {nargs} slots. glTexSubImage3D (GLES3) needs 11 and
+ *    glCompressedTexSubImage2D (GLES2) 9; the extra slot keeps
+ *    GL_CALL_RETBUF_SLOT above every real parameter list. Guest and host are
+ *    rebuilt together, so widening it is an internal ABI change only.
  *  - Floats travel bit-packed through the int64_t slots; pointers travel as
  *    guest virtual addresses. Guest memory is NOT mapped into the host, so
  *    the host dispatch translates every data pointer argument with
  *    rvvm_user_guest_ptr() and, for calls that hand back a host-owned string
- *    (glGetString/eglQueryString), copies it through the guest scratch
- *    buffer offered in args[GL_CALL_RETBUF_SLOT].
+ *    (glGetString/glGetStringi/eglQueryString), copies it through the guest
+ *    scratch buffer offered in args[GL_CALL_RETBUF_SLOT].
+ *  - Opaque host values (EGLDisplay/Config/Surface/Context, GLsync) are only
+ *    passed back by the guest and never translated.
+ *  - The overloaded pointer arguments (glVertexAttribPointer/IPointer,
+ *    glDrawElements/Instanced, glDrawRangeElements) travel as their bare
+ *    value; the host reads it as a byte offset when a buffer is bound to the
+ *    matching target and as a guest address otherwise (vpgl_ptr()).
  */
 """
 
 
-def gl2_type_defs():
+def gl_type_defs():
     return """/* ============================================================
- * GLES2 core types (khronos widths, riscv64 LP64 guest)
+ * GL types (khronos widths, riscv64 LP64 guest)
+ * GLES2 core, plus the GLES3 additions (64-bit integers, GLsync)
  * ============================================================ */
 typedef void             GLvoid;
 typedef unsigned int     GLenum;
@@ -423,6 +496,11 @@ typedef float            GLclampf;
 typedef char             GLchar;
 typedef long             GLintptr;    /* khronos_intptr_t */
 typedef long             GLsizeiptr;  /* khronos_ssize_t  */
+typedef long             GLint64;     /* khronos_int64_t  */
+typedef unsigned long    GLuint64;    /* khronos_uint64_t */
+/* Fence/sync object. Never dereferenced: the guest only hands it back, so the
+ * opaque pointer form is all the guest side needs. */
+typedef void*            GLsync;
 """
 
 
@@ -451,14 +529,15 @@ typedef uint32_t EGLenum;
 #define EGL_NOT_INITIALIZED    0x3001
 #define EGL_BAD_ACCESS         0x3002
 #define EGL_BAD_ALLOC          0x3003
-#define EGL_BAD_MATCH          0x3004
-#define EGL_BAD_ATTRIBUTE      0x3005
-#define EGL_BAD_CONFIG         0x3006
-#define EGL_BAD_CONTEXT        0x3007
-#define EGL_BAD_CURRENT_SURFACE 0x3008
-#define EGL_BAD_DISPLAY        0x3009
-#define EGL_BAD_MATCH2         0x300A /* reserved */
+#define EGL_BAD_ATTRIBUTE      0x3004
+#define EGL_BAD_CONFIG         0x3005
+#define EGL_BAD_CONTEXT        0x3006
+#define EGL_BAD_CURRENT_SURFACE 0x3007
+#define EGL_BAD_DISPLAY        0x3008
+#define EGL_BAD_MATCH          0x3009
+#define EGL_BAD_NATIVE_PIXMAP  0x300A
 #define EGL_BAD_NATIVE_WINDOW  0x300B
+#define EGL_BAD_PARAMETER      0x300C
 #define EGL_BAD_SURFACE        0x300D
 #define EGL_CONTEXT_LOST       0x300E
 
@@ -481,6 +560,7 @@ typedef uint32_t EGLenum;
 #define EGL_OPENGL_ES_BIT    0x0001
 #define EGL_OPENGL_ES2_BIT   0x0004
 #define EGL_OPENGL_ES3_BIT   0x0040
+#define EGL_OPENGL_ES3_BIT_KHR 0x0040
 
 #define EGL_WIDTH            0x3057
 #define EGL_HEIGHT           0x3056
@@ -499,6 +579,12 @@ typedef uint32_t EGLenum;
 #define EGL_READ             0x305A
 
 #define EGL_CONTEXT_CLIENT_VERSION 0x3098
+/* ES 3.x contexts. EGL_CONTEXT_MAJOR_VERSION is the very same token as
+ * EGL_CONTEXT_CLIENT_VERSION (both 0x3098) - it is what additionally selects
+ * the API version together with the minor version below (3.1/3.2 contexts). */
+#define EGL_CONTEXT_MAJOR_VERSION  0x3098
+#define EGL_CONTEXT_MINOR_VERSION  0x30FB
+#define EGL_CONTEXT_OPENGL_DEBUG   0x31B0
 """
 
 
@@ -561,6 +647,8 @@ def gl2_const_defs():
 #define GL_LINK_STATUS         0x8B82
 #define GL_ARRAY_BUFFER        0x8892
 #define GL_ELEMENT_ARRAY_BUFFER 0x8893
+#define GL_ARRAY_BUFFER_BINDING 0x8894
+#define GL_ELEMENT_ARRAY_BUFFER_BINDING 0x8895
 #define GL_STATIC_DRAW         0x88E4
 #define GL_STREAM_DRAW         0x88E0
 #define GL_DYNAMIC_DRAW        0x88E8
@@ -600,6 +688,62 @@ def gl2_const_defs():
 """
 
 
+def gl3_const_defs():
+    return """/* ============================================================
+ * GLES3 constants (subset used by guests + host smoke tests)
+ * ============================================================ */
+#define GL_MAJOR_VERSION       0x821B
+#define GL_MINOR_VERSION       0x821C
+#define GL_NUM_EXTENSIONS      0x821D
+
+#define GL_MAX_3D_TEXTURE_SIZE 0x8073
+#define GL_MAX_ARRAY_TEXTURE_LAYERS 0x88FF
+#define GL_MAX_ELEMENT_INDEX   0x8D6B
+#define GL_MAX_COLOR_ATTACHMENTS 0x8CDF
+
+#define GL_R8                  0x8229
+#define GL_RGB8                0x8051
+#define GL_RGBA32F             0x8814
+#define GL_RGB32F              0x8815
+#define GL_DEPTH_COMPONENT24   0x81A6
+#define GL_DEPTH24_STENCIL8    0x88F0
+
+#define GL_TEXTURE_3D          0x806F
+#define GL_TEXTURE_WRAP_R      0x8072
+#define GL_TEXTURE_COMPARE_MODE 0x884C
+#define GL_TEXTURE_COMPARE_FUNC 0x884D
+
+#define GL_UNIFORM_BUFFER      0x8A11
+#define GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT 0x8A34
+#define GL_MAX_UNIFORM_BLOCK_SIZE 0x8A30
+#define GL_UNIFORM_BLOCK_DATA_SIZE 0x8A40
+#define GL_ACTIVE_UNIFORM_BLOCKS 0x8A36
+#define GL_INVALID_INDEX       0xFFFFFFFF
+#define GL_BUFFER_SIZE         0x8764
+#define GL_SHADING_LANGUAGE_VERSION 0x8B8C
+
+#define GL_VERTEX_ARRAY_BINDING 0x85B5
+#define GL_READ_BUFFER         0x0C02
+#define GL_READ_FRAMEBUFFER    0x8CA8
+#define GL_DRAW_FRAMEBUFFER    0x8CA9
+#define GL_COLOR_ATTACHMENT1   0x8CE1
+#define GL_FRAMEBUFFER_SRGB    0x8DB9
+
+#define GL_ANY_SAMPLES_PASSED  0x8C2F
+#define GL_SAMPLES_PASSED      0x8914
+#define GL_QUERY_RESULT        0x8866
+#define GL_QUERY_RESULT_AVAILABLE 0x8867
+
+#define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#define GL_SYNC_FLUSH_COMMANDS_BIT    0x00000001
+#define GL_ALREADY_SIGNALED    0x911A
+#define GL_TIMEOUT_EXPIRED     0x911B
+#define GL_CONDITION_SATISFIED 0x911C
+#define GL_WAIT_FAILED         0x911D
+#define GL_TIMEOUT_IGNORED     0xFFFFFFFFFFFFFFFFull
+"""
+
+
 def fn_id_defs(gl_fns, egl_host_fns):
     """fn_id constants for the calls that actually round-trip to the host.
 
@@ -623,8 +767,11 @@ def fn_id_defs(gl_fns, egl_host_fns):
     out.append("")
     out.append("#define GL_CALL_MAX_ARGS %d" % GL_CALL_MAX_ARGS)
     out.append("/* gl_call.args[] slot carrying the guest scratch buffer for the")
-    out.append(" * calls returning a host-owned string (glGetString / eglQueryString).")
-    out.append(" * The buffer must outlive the call: the stub owns it statically. */")
+    out.append(" * calls returning a host-owned string (glGetString/glGetStringi/")
+    out.append(" * eglQueryString). GL_CALL_MAX_ARGS is one wider than the widest real")
+    out.append(" * call (glTexSubImage3D, 11), so this slot can never collide with a")
+    out.append(" * parameter. The buffer must outlive the call: the stub owns it")
+    out.append(" * statically. */")
     out.append("#define GL_CALL_RETBUF_SLOT (GL_CALL_MAX_ARGS - 1)")
     out.append("#define GL_CALL_RETBUF_CAP  %d" % GL_CALL_RETBUF_CAP)
     out.append("")
@@ -647,10 +794,12 @@ def gl_call_struct():
  *
  * args[GL_CALL_RETBUF_SLOT] holds the address of a guest scratch buffer
  * (GL_CALL_RETBUF_CAP bytes) for calls that hand back a host-owned string
- * (glGetString/eglQueryString): the host copies the string there and answers
- * with that guest address. The stub keeps it in a static, not on its stack -
- * the pointer outlives the call. Only those two single-argument calls use the
- * slot; everywhere else it is just the last parameter (or unused).
+ * (glGetString/glGetStringi/eglQueryString): the host copies the string there
+ * and answers with that guest address. The stub keeps it in a static, not on
+ * its stack - the pointer outlives the call. Only the string-returning calls
+ * use the slot (glGetStringi passes its index in args[1]); everywhere else it
+ * is unused, and nothing can reach it as a parameter because it sits one slot
+ * above the widest call.
  * ============================================================ */
 typedef struct {
     uint32_t fn_id;                    /* GL_FN_* / EGL_FN_*            */
@@ -689,8 +838,9 @@ def gen_guest_header(gl_fns, egl_fns, egl_host_fns):
     parts.append("")
     parts.append("#include <stdint.h>")
     parts.append("")
-    parts.append(gl2_type_defs())
+    parts.append(gl_type_defs())
     parts.append(gl2_const_defs())
+    parts.append(gl3_const_defs())
     parts.append(egl_type_defs())
     parts.append(fn_id_defs(gl_fns, egl_host_fns))
     parts.append(gl_call_struct())
@@ -739,8 +889,8 @@ static inline long virtpass_syscall(long nr, long a0, long a1, long a2,
     return t1;
 }
 
-/* Float <-> int64 bit packing (GLES2 has no double params).
- * Only packing is needed guest-side: no GLES2 core function returns a float,
+/* Float <-> int64 bit packing (neither GLES2 nor GLES3 has double params).
+ * Only packing is needed guest-side: no GL core function returns a float,
  * unpacking happens host-side via vpgl_arg_f(). */
 static inline int64_t glstub_packf(float v)
 {
@@ -763,18 +913,6 @@ static inline int64_t glstub_packf(float v)
  * answers with this guest address and the caller reads it after the call, so
  * it must outlive the stub's own stack frame. */
 static char glstub_retbuf[GL_CALL_RETBUF_CAP];
-
-/* glVertexAttribPointer/glDrawElements accept either a guest address (client
- * array) or a byte offset into the bound buffer object, and the host cannot
- * tell the two apart from the value alone. The stub therefore marks the
- * address form by setting the top bit, which no real offset or guest address
- * uses; the host clears it after translating. An offset passes through
- * unmarked and reaches the GL implementation unchanged. */
-#define GLSTUB_OFFSET_PTR_TAG  ((int64_t)1 << 62)
-#define GLSTUB_OFFSET_PTR(p)                                    \\
-    (((p) && (uintptr_t)(p) < GLSTUB_OFFSET_PTR_TAG)            \\
-         ? ((int64_t)(uintptr_t)(p) | GLSTUB_OFFSET_PTR_TAG)    \\
-         : (int64_t)(uintptr_t)(p))
 """)
 
     # eglGetProcAddress must not hand the guest a host function address: the
@@ -866,7 +1004,7 @@ def gen_host_types_header(gl_fns, egl_fns):
     out.append("/*")
     out.append(" * Host-side GL/EGL function types matching the real EGL/GLES")
     out.append(" * implementations (win32: SwiftShader / ANGLE from the Android SDK")
-    out.append(" * emulator directory; android: the system libEGL/libGLESv2).")
+    out.append(" * emulator directory; android: the system libEGL/libGLESv3).")
     out.append(" * All types are vpgl_-prefixed so this header never collides with")
     out.append(" * real GL/EGL headers.")
     out.append(" */")
@@ -891,6 +1029,8 @@ def gen_host_types_header(gl_fns, egl_fns):
     out.append("typedef float         vpgl_GLclampf;")
     out.append("typedef ptrdiff_t     vpgl_GLintptr;")
     out.append("typedef ptrdiff_t     vpgl_GLsizeiptr;")
+    out.append("typedef int64_t       vpgl_GLint64;")
+    out.append("typedef uint64_t      vpgl_GLuint64;")
     out.append("typedef void*         vpgl_EGLDisplay;")
     out.append("typedef void*         vpgl_EGLSurface;")
     out.append("typedef void*         vpgl_EGLContext;")
@@ -920,7 +1060,7 @@ def gen_host_types_header(gl_fns, egl_fns):
     for fn in egl_fns:
         out.append(pfn(fn))
     out.append("")
-    out.append("/* ---- GLES2 function pointer types ---- */")
+    out.append("/* ---- GL/GLES function pointer types ---- */")
     for fn in gl_fns:
         out.append(pfn(fn))
     out.append("")
@@ -939,10 +1079,31 @@ def gen_host_types_header(gl_fns, egl_fns):
     return "\n".join(out)
 
 
+def entry_list_macro(macro, fns, strip):
+    """An X-macro list of entry-point names, minus their egl/gl prefix.
+
+    Each host expands it with its own loader policy, so *which* symbols to
+    resolve stays generated while the loading itself stays host-specific. This
+    replaces the two hand-maintained LOAD() tables that had to be updated in
+    lockstep with every ABI change - forgetting one left p_* NULL, and a NULL
+    p_* used to be an invisible no-op in the dispatch.
+    """
+    out = ["#define %s(X) \\" % macro]
+    names = [fn["name"][strip:] for fn in sorted(fns, key=lambda f: f["name"])]
+    for i, name in enumerate(names):
+        # The trailing ';' belongs to the invocation, so X() can be a bare
+        # assignment (win32) or a do{}while(0) block (android) without either
+        # having to supply its own terminator.
+        out.append("    X(%s);%s" % (name, " \\" if i + 1 < len(names) else ""))
+    out.append("")
+    return out
+
+
 def gen_host_entries_header(gl_fns, egl_fns):
-    """Definitions of the p_* entry-point storage. Include from exactly one TU
-    per host binary (the backend loader); every other TU sees the extern
-    declarations from vp_gl_host_types.h."""
+    """Definitions of the p_* entry-point storage plus the entry-point name
+    lists the host loaders expand. Include from exactly one TU per host binary
+    (the backend loader); every other TU sees the extern declarations from
+    vp_gl_host_types.h."""
     out = []
     out.append(GENERATED_BANNER.format(nargs=GL_CALL_MAX_ARGS))
     out.append("#ifndef VPGL_HOST_ENTRIES_H")
@@ -957,6 +1118,9 @@ def gen_host_entries_header(gl_fns, egl_fns):
     for fn in gl_fns:
         out.append("%s p_%s;" % (host_pfn(fn), fn["name"]))
     out.append("")
+    out.append("/* ---- entry-point name lists (X-macro) ---- */")
+    out.extend(entry_list_macro("VPGL_EGL_ENTRY_LIST", egl_fns, 3))
+    out.extend(entry_list_macro("VPGL_GL_ENTRY_LIST", gl_fns, 2))
     out.append("#endif /* VPGL_HOST_ENTRIES_H */")
     out.append("")
     return "\n".join(out)
@@ -1017,7 +1181,9 @@ def gen_host_dispatch_tables(gl_fns, egl_fns):
     out.append(" * Do not include from anywhere else (defines static functions).")
     out.append(" * `a` is the const int64_t* args array, `ret` the int64_t* out.")
     out.append(" * Guest data pointers are translated by the vpgl_gptr*() helpers")
-    out.append(" * defined in the including TU above this include.")
+    out.append(" * defined in the including TU above this include, and an entry point")
+    out.append(" * that was never resolved reports through vpgl_missing() from the")
+    out.append(" * same TU: without it a NULL p_* silently swallowed the call.")
     out.append(" */")
     out.append("")
 
@@ -1050,6 +1216,7 @@ def gen_host_dispatch_tables(gl_fns, egl_fns):
         fid = "EGL_FN_" + fn["name"][3:].upper()
         out.append("    case %s:" % fid)
         out.append("        if (p_%s) { %s }" % (fn["name"], host_call_expr(fn)))
+        out.append('        else vpgl_missing("%s");' % fn["name"])
         out.append("        break;")
     out.append("    default:")
     out.append("        break;")
@@ -1064,6 +1231,7 @@ def gen_host_dispatch_tables(gl_fns, egl_fns):
         fid = "GL_FN_" + fn["name"][2:].upper()
         out.append("    case %s:" % fid)
         out.append("        if (p_%s) { %s }" % (fn["name"], host_call_expr(fn)))
+        out.append('        else vpgl_missing("%s");' % fn["name"])
         out.append("        break;")
     out.append("    default:")
     out.append("        break;")
@@ -1077,12 +1245,38 @@ def gen_host_dispatch_tables(gl_fns, egl_fns):
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    if not os.path.isfile(GL2_H) or not os.path.isfile(EGL_H):
-        sys.exit("NDK headers not found (set NDK_SYSROOT env var):\n  %s\n  %s" % (GL2_H, EGL_H))
+def load_gl_functions():
+    """Every GL entry point that crosses the ABI, in fn_id order.
 
-    with open(GL2_H, "r", encoding="utf-8", errors="replace") as f:
-        gl_fns = parse_prototypes(f.read(), ("GL_APICALL", "GL_APIENTRY"))
+    GL_HEADERS are merged in order with duplicate names dropped: gl3.h
+    re-declares the whole GLES2 core, and keeping the gl2.h copy means the
+    GLES2 ids and the dispatch order stay exactly where they were.
+
+    EXCLUDED_FNS (see its definition) are dropped here. This is the same list
+    tools/audit_gl_ptr.py audits - it imports this function - because auditing
+    a different set than the one that ships would be worthless.
+    """
+    fns = []
+    seen = set()
+    for header in GL_HEADERS:
+        if not os.path.isfile(header):
+            sys.exit("NDK GL header not found (set NDK_SYSROOT env var):\n  %s"
+                     % header)
+        with open(header, "r", encoding="utf-8", errors="replace") as f:
+            for fn in parse_prototypes(f.read(), ("GL_APICALL", "GL_APIENTRY")):
+                if fn["name"] in seen:
+                    continue
+                seen.add(fn["name"])
+                if fn["name"] not in EXCLUDED_FNS:
+                    fns.append(fn)
+    return fns
+
+
+def main():
+    if not os.path.isfile(EGL_H):
+        sys.exit("NDK EGL header not found (set NDK_SYSROOT env var):\n  %s" % EGL_H)
+
+    gl_fns = load_gl_functions()
     with open(EGL_H, "r", encoding="utf-8", errors="replace") as f:
         all_egl = parse_prototypes(f.read(), ("EGLAPI", "EGLAPIENTRY"))
 
@@ -1130,7 +1324,8 @@ def main():
             f.write(content)
         print("wrote %s" % os.path.relpath(path, REPO_ROOT))
 
-    print("\nGLES2 core functions: %d   EGL functions: %d" % (len(gl_fns), len(egl_fns)))
+    print("\nGL core functions: %d (GLES2+GLES3, %d excluded)   EGL functions: %d"
+          % (len(gl_fns), len(EXCLUDED_FNS), len(egl_fns)))
     print("GL fn_id range:  [%d, %d)   EGL fn_id range: [0x%03X, 0x%03X)"
           % (GL_FN_BASE, GL_FN_BASE + len(gl_fns), EGL_FN_BASE, EGL_FN_BASE + len(egl_fns)))
 

@@ -11,16 +11,17 @@ For each pointer parameter the report says which classification the generator
 applies and, for the ambiguous ones, why:
 
   opaque  - host handle that the guest only ever passes back
-            (EGLDisplay/EGLConfig/EGLContext/EGLSurface, EGLNative*).
-            Passed through untouched, never dereferenced.
+            (EGLDisplay/EGLConfig/EGLContext/EGLSurface, EGLNative*, and the
+            GLES3 GLsync). Passed through untouched, never dereferenced.
   data    - guest buffer; translated with rvvm_user_guest_ptr() before use.
   offset  - guest address for client-side arrays, but a byte offset into the
             bound buffer object for VBO rendering (glVertexAttribPointer,
-            glDrawElements). The guest stub tags the address form with
-            GLSTUB_OFFSET_PTR_TAG so the host never has to guess from the
-            value; see w32gl_gptr_or_off.
-  out-str - glGetString/eglQueryString: host-owned string, copied into the
-            guest scratch buffer.
+            glVertexAttribIPointer, glDrawElements, glDrawElementsInstanced,
+            glDrawRangeElements). The host resolves it from live GL state with
+            vpgl_ptr(): a non-zero binding of GL_ARRAY_BUFFER (resp.
+            GL_ELEMENT_ARRAY_BUFFER) means the value is an offset.
+  out-str - glGetString/glGetStringi/eglQueryString: host-owned string, copied
+            into the guest scratch buffer.
 
 Sections at the end list the parameter shapes the type system cannot vouch
 for, because those are where a wrong classification hides:
@@ -28,6 +29,9 @@ for, because those are where a wrong classification hides:
   * `void*` / `void**` params -- the C type says nothing about intent.
   * pointer-returning functions -- a host pointer handed to the guest is only
     valid if the guest treats it as an opaque handle.
+
+Entry points that gen_gl_abi.EXCLUDED_FNS keeps out of the ABI never reach the
+host at all; they are listed at the end of the report rather than audited.
 
 Usage: python tools/audit_gl_ptr.py [--check]
 
@@ -55,8 +59,10 @@ def classify(fn, idx, t):
         return "opaque", "host handle"
     if (fn["name"], idx) in g.ARG_OVERRIDES:
         return "data", "ARG_OVERRIDES"
-    if (fn["name"], idx) in g.OFFSET_PTR_ARGS:
-        return "offset", "guest VA or VBO offset (tagged)"
+    if (fn["name"], idx) in g.ARRAY_PTR_ARGS:
+        return "offset", "guest VA, or VBO offset when GL_ARRAY_BUFFER is bound"
+    if (fn["name"], idx) in g.ELEMENT_PTR_ARGS:
+        return "offset", "guest VA, or VBO offset when GL_ELEMENT_ARRAY_BUFFER is bound"
     return "data", "rvvm_user_guest_ptr"
 
 
@@ -74,12 +80,13 @@ def ret_kind(f):
 
 
 def load():
-    gl = open(g.GL2_H, encoding="utf-8", errors="replace").read()
     egl = open(g.EGL_H, encoding="utf-8", errors="replace").read()
-    glf = g.parse_prototypes(gl, ("GL_APICALL", "GL_APIENTRY"))
     eglf = [f for f in g.parse_prototypes(egl, ("EGLAPI", "EGLAPIENTRY"))
             if f["name"] in set(g.EGL_WHITELIST)]
-    return eglf, glf
+    # Exactly the set the generator emits: GL_HEADERS merged, EXCLUDED_FNS
+    # dropped. Auditing a different list than the one that ships would be
+    # worthless.
+    return eglf, g.load_gl_functions()
 
 
 def main():
@@ -112,6 +119,11 @@ def main():
             print("  %-30s -> %-8s %s" % (f["name"], kind, why))
             if kind == "data?":
                 bad.append(f["name"])
+
+    print()
+    print("=== entry points excluded from the marshalled ABI ===")
+    for name in sorted(g.EXCLUDED_FNS):
+        print("  %-30s -> out of the ABI (see gen_gl_abi.EXCLUDED_FNS)" % name)
 
     print()
     print("%d pointer params, %d functions" % (len(rows), len(eglf) + len(glf)))

@@ -1,21 +1,29 @@
 /*
  * GENERATED FILE - produced by tools/gen_gl_abi.py - DO NOT EDIT BY HAND.
  *
- * Source of truth: NDK sysroot headers GLES2/gl2.h + EGL/egl.h (parsed).
+ * Source of truth: NDK sysroot headers GLES2/gl2.h + GLES3/gl3.h + EGL/egl.h
+ * (parsed; gl3.h is merged after gl2.h so the GLES2 ids never move).
  * Regenerate with:  python tools/gen_gl_abi.py
  *
- * Phase 3 ABI notes:
+ * ABI notes:
  *  - fn_id macros are the single source of truth shared by the guest stubs,
- *    src/virtpass/vp_cmdpost.c and the win32 host GL dispatch.
- *  - gl_call.args has 9 slots (glCompressedTexSubImage2D needs 9; the
- *    original Phase 3 plan said 6 - widened before first deployment, so this
- *    is an internal ABI change with zero consumers).
+ *    src/virtpass/vp_cmdpost.c and both host GL dispatches.
+ *  - gl_call.args has 12 slots. glTexSubImage3D (GLES3) needs 11 and
+ *    glCompressedTexSubImage2D (GLES2) 9; the extra slot keeps
+ *    GL_CALL_RETBUF_SLOT above every real parameter list. Guest and host are
+ *    rebuilt together, so widening it is an internal ABI change only.
  *  - Floats travel bit-packed through the int64_t slots; pointers travel as
  *    guest virtual addresses. Guest memory is NOT mapped into the host, so
  *    the host dispatch translates every data pointer argument with
  *    rvvm_user_guest_ptr() and, for calls that hand back a host-owned string
- *    (glGetString/eglQueryString), copies it through the guest scratch
- *    buffer offered in args[GL_CALL_RETBUF_SLOT].
+ *    (glGetString/glGetStringi/eglQueryString), copies it through the guest
+ *    scratch buffer offered in args[GL_CALL_RETBUF_SLOT].
+ *  - Opaque host values (EGLDisplay/Config/Surface/Context, GLsync) are only
+ *    passed back by the guest and never translated.
+ *  - The overloaded pointer arguments (glVertexAttribPointer/IPointer,
+ *    glDrawElements/Instanced, glDrawRangeElements) travel as their bare
+ *    value; the host reads it as a byte offset when a buffer is bound to the
+ *    matching target and as a guest address otherwise (vpgl_ptr()).
  */
 
 #ifndef VPGL_HOST_TYPES_H
@@ -28,7 +36,7 @@
 /*
  * Host-side GL/EGL function types matching the real EGL/GLES
  * implementations (win32: SwiftShader / ANGLE from the Android SDK
- * emulator directory; android: the system libEGL/libGLESv2).
+ * emulator directory; android: the system libEGL/libGLESv3).
  * All types are vpgl_-prefixed so this header never collides with
  * real GL/EGL headers.
  */
@@ -53,6 +61,8 @@ typedef float         vpgl_GLfloat;
 typedef float         vpgl_GLclampf;
 typedef ptrdiff_t     vpgl_GLintptr;
 typedef ptrdiff_t     vpgl_GLsizeiptr;
+typedef int64_t       vpgl_GLint64;
+typedef uint64_t      vpgl_GLuint64;
 typedef void*         vpgl_EGLDisplay;
 typedef void*         vpgl_EGLSurface;
 typedef void*         vpgl_EGLContext;
@@ -79,16 +89,22 @@ typedef vpgl_void* (vpgl_APIENTRY *vpgl_PFN_eglCreateWindowSurface)(vpgl_void* d
 typedef vpgl_EGLBoolean (vpgl_APIENTRY *vpgl_PFN_eglDestroyContext)(vpgl_void* dpy, vpgl_void* ctx);
 typedef vpgl_EGLBoolean (vpgl_APIENTRY *vpgl_PFN_eglDestroySurface)(vpgl_void* dpy, vpgl_void* surface);
 typedef vpgl_EGLBoolean (vpgl_APIENTRY *vpgl_PFN_eglGetConfigAttrib)(vpgl_void* dpy, vpgl_void* config, vpgl_EGLint attribute, vpgl_EGLint* value);
+typedef vpgl_void* (vpgl_APIENTRY *vpgl_PFN_eglGetCurrentDisplay)(void);
+typedef vpgl_void* (vpgl_APIENTRY *vpgl_PFN_eglGetCurrentSurface)(vpgl_EGLint readdraw);
 typedef vpgl_void* (vpgl_APIENTRY *vpgl_PFN_eglGetDisplay)(vpgl_void* display_id);
 typedef vpgl_EGLint (vpgl_APIENTRY *vpgl_PFN_eglGetError)(void);
 typedef vpgl_EGLBoolean (vpgl_APIENTRY *vpgl_PFN_eglInitialize)(vpgl_void* dpy, vpgl_EGLint* major, vpgl_EGLint* minor);
 typedef vpgl_EGLBoolean (vpgl_APIENTRY *vpgl_PFN_eglMakeCurrent)(vpgl_void* dpy, vpgl_void* draw, vpgl_void* read, vpgl_void* ctx);
+typedef vpgl_EGLBoolean (vpgl_APIENTRY *vpgl_PFN_eglQueryContext)(vpgl_void* dpy, vpgl_void* ctx, vpgl_EGLint attribute, vpgl_EGLint* value);
 typedef const vpgl_char* (vpgl_APIENTRY *vpgl_PFN_eglQueryString)(vpgl_void* dpy, vpgl_EGLint name);
 typedef vpgl_EGLBoolean (vpgl_APIENTRY *vpgl_PFN_eglQuerySurface)(vpgl_void* dpy, vpgl_void* surface, vpgl_EGLint attribute, vpgl_EGLint* value);
 typedef vpgl_EGLBoolean (vpgl_APIENTRY *vpgl_PFN_eglSwapBuffers)(vpgl_void* dpy, vpgl_void* surface);
 typedef vpgl_EGLBoolean (vpgl_APIENTRY *vpgl_PFN_eglTerminate)(vpgl_void* dpy);
+typedef vpgl_EGLBoolean (vpgl_APIENTRY *vpgl_PFN_eglSwapInterval)(vpgl_void* dpy, vpgl_EGLint interval);
+typedef vpgl_EGLBoolean (vpgl_APIENTRY *vpgl_PFN_eglBindAPI)(vpgl_EGLenum api);
+typedef vpgl_void* (vpgl_APIENTRY *vpgl_PFN_eglGetCurrentContext)(void);
 
-/* ---- GLES2 function pointer types ---- */
+/* ---- GL/GLES function pointer types ---- */
 typedef void (vpgl_APIENTRY *vpgl_PFN_glActiveTexture)(vpgl_GLenum texture);
 typedef void (vpgl_APIENTRY *vpgl_PFN_glAttachShader)(vpgl_GLuint program, vpgl_GLuint shader);
 typedef void (vpgl_APIENTRY *vpgl_PFN_glBindAttribLocation)(vpgl_GLuint program, vpgl_GLuint index, const vpgl_GLchar* name);
@@ -231,6 +247,109 @@ typedef void (vpgl_APIENTRY *vpgl_PFN_glVertexAttrib4f)(vpgl_GLuint index, vpgl_
 typedef void (vpgl_APIENTRY *vpgl_PFN_glVertexAttrib4fv)(vpgl_GLuint index, const vpgl_GLfloat* v);
 typedef void (vpgl_APIENTRY *vpgl_PFN_glVertexAttribPointer)(vpgl_GLuint index, vpgl_GLint size, vpgl_GLenum type, vpgl_GLboolean normalized, vpgl_GLsizei stride, const vpgl_void* pointer);
 typedef void (vpgl_APIENTRY *vpgl_PFN_glViewport)(vpgl_GLint x, vpgl_GLint y, vpgl_GLsizei width, vpgl_GLsizei height);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glReadBuffer)(vpgl_GLenum src);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glDrawRangeElements)(vpgl_GLenum mode, vpgl_GLuint start, vpgl_GLuint end, vpgl_GLsizei count, vpgl_GLenum type, const vpgl_void* indices);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glTexImage3D)(vpgl_GLenum target, vpgl_GLint level, vpgl_GLint internalformat, vpgl_GLsizei width, vpgl_GLsizei height, vpgl_GLsizei depth, vpgl_GLint border, vpgl_GLenum format, vpgl_GLenum type, const vpgl_void* pixels);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glTexSubImage3D)(vpgl_GLenum target, vpgl_GLint level, vpgl_GLint xoffset, vpgl_GLint yoffset, vpgl_GLint zoffset, vpgl_GLsizei width, vpgl_GLsizei height, vpgl_GLsizei depth, vpgl_GLenum format, vpgl_GLenum type, const vpgl_void* pixels);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glCopyTexSubImage3D)(vpgl_GLenum target, vpgl_GLint level, vpgl_GLint xoffset, vpgl_GLint yoffset, vpgl_GLint zoffset, vpgl_GLint x, vpgl_GLint y, vpgl_GLsizei width, vpgl_GLsizei height);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glCompressedTexImage3D)(vpgl_GLenum target, vpgl_GLint level, vpgl_GLenum internalformat, vpgl_GLsizei width, vpgl_GLsizei height, vpgl_GLsizei depth, vpgl_GLint border, vpgl_GLsizei imageSize, const vpgl_void* data);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glCompressedTexSubImage3D)(vpgl_GLenum target, vpgl_GLint level, vpgl_GLint xoffset, vpgl_GLint yoffset, vpgl_GLint zoffset, vpgl_GLsizei width, vpgl_GLsizei height, vpgl_GLsizei depth, vpgl_GLenum format, vpgl_GLsizei imageSize, const vpgl_void* data);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGenQueries)(vpgl_GLsizei n, vpgl_GLuint* ids);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glDeleteQueries)(vpgl_GLsizei n, const vpgl_GLuint* ids);
+typedef vpgl_GLboolean (vpgl_APIENTRY *vpgl_PFN_glIsQuery)(vpgl_GLuint id);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glBeginQuery)(vpgl_GLenum target, vpgl_GLuint id);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glEndQuery)(vpgl_GLenum target);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetQueryiv)(vpgl_GLenum target, vpgl_GLenum pname, vpgl_GLint* params);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetQueryObjectuiv)(vpgl_GLuint id, vpgl_GLenum pname, vpgl_GLuint* params);
+typedef vpgl_GLboolean (vpgl_APIENTRY *vpgl_PFN_glUnmapBuffer)(vpgl_GLenum target);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetBufferPointerv)(vpgl_GLenum target, vpgl_GLenum pname, vpgl_void** params);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glDrawBuffers)(vpgl_GLsizei n, const vpgl_GLenum* bufs);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniformMatrix2x3fv)(vpgl_GLint location, vpgl_GLsizei count, vpgl_GLboolean transpose, const vpgl_GLfloat* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniformMatrix3x2fv)(vpgl_GLint location, vpgl_GLsizei count, vpgl_GLboolean transpose, const vpgl_GLfloat* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniformMatrix2x4fv)(vpgl_GLint location, vpgl_GLsizei count, vpgl_GLboolean transpose, const vpgl_GLfloat* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniformMatrix4x2fv)(vpgl_GLint location, vpgl_GLsizei count, vpgl_GLboolean transpose, const vpgl_GLfloat* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniformMatrix3x4fv)(vpgl_GLint location, vpgl_GLsizei count, vpgl_GLboolean transpose, const vpgl_GLfloat* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniformMatrix4x3fv)(vpgl_GLint location, vpgl_GLsizei count, vpgl_GLboolean transpose, const vpgl_GLfloat* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glBlitFramebuffer)(vpgl_GLint srcX0, vpgl_GLint srcY0, vpgl_GLint srcX1, vpgl_GLint srcY1, vpgl_GLint dstX0, vpgl_GLint dstY0, vpgl_GLint dstX1, vpgl_GLint dstY1, vpgl_GLbitfield mask, vpgl_GLenum filter);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glRenderbufferStorageMultisample)(vpgl_GLenum target, vpgl_GLsizei samples, vpgl_GLenum internalformat, vpgl_GLsizei width, vpgl_GLsizei height);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glFramebufferTextureLayer)(vpgl_GLenum target, vpgl_GLenum attachment, vpgl_GLuint texture, vpgl_GLint level, vpgl_GLint layer);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glFlushMappedBufferRange)(vpgl_GLenum target, vpgl_GLintptr offset, vpgl_GLsizeiptr length);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glBindVertexArray)(vpgl_GLuint array);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glDeleteVertexArrays)(vpgl_GLsizei n, const vpgl_GLuint* arrays);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGenVertexArrays)(vpgl_GLsizei n, vpgl_GLuint* arrays);
+typedef vpgl_GLboolean (vpgl_APIENTRY *vpgl_PFN_glIsVertexArray)(vpgl_GLuint array);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetIntegeri_v)(vpgl_GLenum target, vpgl_GLuint index, vpgl_GLint* data);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glBeginTransformFeedback)(vpgl_GLenum primitiveMode);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glEndTransformFeedback)(void);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glBindBufferRange)(vpgl_GLenum target, vpgl_GLuint index, vpgl_GLuint buffer, vpgl_GLintptr offset, vpgl_GLsizeiptr size);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glBindBufferBase)(vpgl_GLenum target, vpgl_GLuint index, vpgl_GLuint buffer);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glTransformFeedbackVaryings)(vpgl_GLuint program, vpgl_GLsizei count, const vpgl_GLchar** varyings, vpgl_GLenum bufferMode);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetTransformFeedbackVarying)(vpgl_GLuint program, vpgl_GLuint index, vpgl_GLsizei bufSize, vpgl_GLsizei* length, vpgl_GLsizei* size, vpgl_GLenum* type, vpgl_GLchar* name);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glVertexAttribIPointer)(vpgl_GLuint index, vpgl_GLint size, vpgl_GLenum type, vpgl_GLsizei stride, const vpgl_void* pointer);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetVertexAttribIiv)(vpgl_GLuint index, vpgl_GLenum pname, vpgl_GLint* params);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetVertexAttribIuiv)(vpgl_GLuint index, vpgl_GLenum pname, vpgl_GLuint* params);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glVertexAttribI4i)(vpgl_GLuint index, vpgl_GLint x, vpgl_GLint y, vpgl_GLint z, vpgl_GLint w);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glVertexAttribI4ui)(vpgl_GLuint index, vpgl_GLuint x, vpgl_GLuint y, vpgl_GLuint z, vpgl_GLuint w);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glVertexAttribI4iv)(vpgl_GLuint index, const vpgl_GLint* v);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glVertexAttribI4uiv)(vpgl_GLuint index, const vpgl_GLuint* v);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetUniformuiv)(vpgl_GLuint program, vpgl_GLint location, vpgl_GLuint* params);
+typedef vpgl_GLint (vpgl_APIENTRY *vpgl_PFN_glGetFragDataLocation)(vpgl_GLuint program, const vpgl_GLchar* name);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniform1ui)(vpgl_GLint location, vpgl_GLuint v0);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniform2ui)(vpgl_GLint location, vpgl_GLuint v0, vpgl_GLuint v1);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniform3ui)(vpgl_GLint location, vpgl_GLuint v0, vpgl_GLuint v1, vpgl_GLuint v2);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniform4ui)(vpgl_GLint location, vpgl_GLuint v0, vpgl_GLuint v1, vpgl_GLuint v2, vpgl_GLuint v3);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniform1uiv)(vpgl_GLint location, vpgl_GLsizei count, const vpgl_GLuint* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniform2uiv)(vpgl_GLint location, vpgl_GLsizei count, const vpgl_GLuint* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniform3uiv)(vpgl_GLint location, vpgl_GLsizei count, const vpgl_GLuint* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniform4uiv)(vpgl_GLint location, vpgl_GLsizei count, const vpgl_GLuint* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glClearBufferiv)(vpgl_GLenum buffer, vpgl_GLint drawbuffer, const vpgl_GLint* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glClearBufferuiv)(vpgl_GLenum buffer, vpgl_GLint drawbuffer, const vpgl_GLuint* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glClearBufferfv)(vpgl_GLenum buffer, vpgl_GLint drawbuffer, const vpgl_GLfloat* value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glClearBufferfi)(vpgl_GLenum buffer, vpgl_GLint drawbuffer, vpgl_GLfloat depth, vpgl_GLint stencil);
+typedef const vpgl_GLubyte* (vpgl_APIENTRY *vpgl_PFN_glGetStringi)(vpgl_GLenum name, vpgl_GLuint index);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glCopyBufferSubData)(vpgl_GLenum readTarget, vpgl_GLenum writeTarget, vpgl_GLintptr readOffset, vpgl_GLintptr writeOffset, vpgl_GLsizeiptr size);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetUniformIndices)(vpgl_GLuint program, vpgl_GLsizei uniformCount, const vpgl_GLchar** uniformNames, vpgl_GLuint* uniformIndices);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetActiveUniformsiv)(vpgl_GLuint program, vpgl_GLsizei uniformCount, const vpgl_GLuint* uniformIndices, vpgl_GLenum pname, vpgl_GLint* params);
+typedef vpgl_GLuint (vpgl_APIENTRY *vpgl_PFN_glGetUniformBlockIndex)(vpgl_GLuint program, const vpgl_GLchar* uniformBlockName);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetActiveUniformBlockiv)(vpgl_GLuint program, vpgl_GLuint uniformBlockIndex, vpgl_GLenum pname, vpgl_GLint* params);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetActiveUniformBlockName)(vpgl_GLuint program, vpgl_GLuint uniformBlockIndex, vpgl_GLsizei bufSize, vpgl_GLsizei* length, vpgl_GLchar* uniformBlockName);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glUniformBlockBinding)(vpgl_GLuint program, vpgl_GLuint uniformBlockIndex, vpgl_GLuint uniformBlockBinding);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glDrawArraysInstanced)(vpgl_GLenum mode, vpgl_GLint first, vpgl_GLsizei count, vpgl_GLsizei instancecount);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glDrawElementsInstanced)(vpgl_GLenum mode, vpgl_GLsizei count, vpgl_GLenum type, const vpgl_void* indices, vpgl_GLsizei instancecount);
+typedef vpgl_void* (vpgl_APIENTRY *vpgl_PFN_glFenceSync)(vpgl_GLenum condition, vpgl_GLbitfield flags);
+typedef vpgl_GLboolean (vpgl_APIENTRY *vpgl_PFN_glIsSync)(vpgl_void* sync);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glDeleteSync)(vpgl_void* sync);
+typedef vpgl_GLenum (vpgl_APIENTRY *vpgl_PFN_glClientWaitSync)(vpgl_void* sync, vpgl_GLbitfield flags, vpgl_GLuint64 timeout);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glWaitSync)(vpgl_void* sync, vpgl_GLbitfield flags, vpgl_GLuint64 timeout);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetInteger64v)(vpgl_GLenum pname, vpgl_GLint64* data);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetSynciv)(vpgl_void* sync, vpgl_GLenum pname, vpgl_GLsizei bufSize, vpgl_GLsizei* length, vpgl_GLint* values);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetInteger64i_v)(vpgl_GLenum target, vpgl_GLuint index, vpgl_GLint64* data);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetBufferParameteri64v)(vpgl_GLenum target, vpgl_GLenum pname, vpgl_GLint64* params);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGenSamplers)(vpgl_GLsizei count, vpgl_GLuint* samplers);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glDeleteSamplers)(vpgl_GLsizei count, const vpgl_GLuint* samplers);
+typedef vpgl_GLboolean (vpgl_APIENTRY *vpgl_PFN_glIsSampler)(vpgl_GLuint sampler);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glBindSampler)(vpgl_GLuint unit, vpgl_GLuint sampler);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glSamplerParameteri)(vpgl_GLuint sampler, vpgl_GLenum pname, vpgl_GLint param);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glSamplerParameteriv)(vpgl_GLuint sampler, vpgl_GLenum pname, const vpgl_GLint* param);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glSamplerParameterf)(vpgl_GLuint sampler, vpgl_GLenum pname, vpgl_GLfloat param);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glSamplerParameterfv)(vpgl_GLuint sampler, vpgl_GLenum pname, const vpgl_GLfloat* param);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetSamplerParameteriv)(vpgl_GLuint sampler, vpgl_GLenum pname, vpgl_GLint* params);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetSamplerParameterfv)(vpgl_GLuint sampler, vpgl_GLenum pname, vpgl_GLfloat* params);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glVertexAttribDivisor)(vpgl_GLuint index, vpgl_GLuint divisor);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glBindTransformFeedback)(vpgl_GLenum target, vpgl_GLuint id);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glDeleteTransformFeedbacks)(vpgl_GLsizei n, const vpgl_GLuint* ids);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGenTransformFeedbacks)(vpgl_GLsizei n, vpgl_GLuint* ids);
+typedef vpgl_GLboolean (vpgl_APIENTRY *vpgl_PFN_glIsTransformFeedback)(vpgl_GLuint id);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glPauseTransformFeedback)(void);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glResumeTransformFeedback)(void);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetProgramBinary)(vpgl_GLuint program, vpgl_GLsizei bufSize, vpgl_GLsizei* length, vpgl_GLenum* binaryFormat, vpgl_void* binary);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glProgramBinary)(vpgl_GLuint program, vpgl_GLenum binaryFormat, const vpgl_void* binary, vpgl_GLsizei length);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glProgramParameteri)(vpgl_GLuint program, vpgl_GLenum pname, vpgl_GLint value);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glInvalidateFramebuffer)(vpgl_GLenum target, vpgl_GLsizei numAttachments, const vpgl_GLenum* attachments);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glInvalidateSubFramebuffer)(vpgl_GLenum target, vpgl_GLsizei numAttachments, const vpgl_GLenum* attachments, vpgl_GLint x, vpgl_GLint y, vpgl_GLsizei width, vpgl_GLsizei height);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glTexStorage2D)(vpgl_GLenum target, vpgl_GLsizei levels, vpgl_GLenum internalformat, vpgl_GLsizei width, vpgl_GLsizei height);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glTexStorage3D)(vpgl_GLenum target, vpgl_GLsizei levels, vpgl_GLenum internalformat, vpgl_GLsizei width, vpgl_GLsizei height, vpgl_GLsizei depth);
+typedef void (vpgl_APIENTRY *vpgl_PFN_glGetInternalformativ)(vpgl_GLenum target, vpgl_GLenum internalformat, vpgl_GLenum pname, vpgl_GLsizei bufSize, vpgl_GLint* params);
 
 /* ---- resolved entry points (NULL when missing) ---- */
 extern vpgl_PFN_eglChooseConfig p_eglChooseConfig;
@@ -240,14 +359,20 @@ extern vpgl_PFN_eglCreateWindowSurface p_eglCreateWindowSurface;
 extern vpgl_PFN_eglDestroyContext p_eglDestroyContext;
 extern vpgl_PFN_eglDestroySurface p_eglDestroySurface;
 extern vpgl_PFN_eglGetConfigAttrib p_eglGetConfigAttrib;
+extern vpgl_PFN_eglGetCurrentDisplay p_eglGetCurrentDisplay;
+extern vpgl_PFN_eglGetCurrentSurface p_eglGetCurrentSurface;
 extern vpgl_PFN_eglGetDisplay p_eglGetDisplay;
 extern vpgl_PFN_eglGetError p_eglGetError;
 extern vpgl_PFN_eglInitialize p_eglInitialize;
 extern vpgl_PFN_eglMakeCurrent p_eglMakeCurrent;
+extern vpgl_PFN_eglQueryContext p_eglQueryContext;
 extern vpgl_PFN_eglQueryString p_eglQueryString;
 extern vpgl_PFN_eglQuerySurface p_eglQuerySurface;
 extern vpgl_PFN_eglSwapBuffers p_eglSwapBuffers;
 extern vpgl_PFN_eglTerminate p_eglTerminate;
+extern vpgl_PFN_eglSwapInterval p_eglSwapInterval;
+extern vpgl_PFN_eglBindAPI p_eglBindAPI;
+extern vpgl_PFN_eglGetCurrentContext p_eglGetCurrentContext;
 
 extern vpgl_PFN_glActiveTexture p_glActiveTexture;
 extern vpgl_PFN_glAttachShader p_glAttachShader;
@@ -391,6 +516,109 @@ extern vpgl_PFN_glVertexAttrib4f p_glVertexAttrib4f;
 extern vpgl_PFN_glVertexAttrib4fv p_glVertexAttrib4fv;
 extern vpgl_PFN_glVertexAttribPointer p_glVertexAttribPointer;
 extern vpgl_PFN_glViewport p_glViewport;
+extern vpgl_PFN_glReadBuffer p_glReadBuffer;
+extern vpgl_PFN_glDrawRangeElements p_glDrawRangeElements;
+extern vpgl_PFN_glTexImage3D p_glTexImage3D;
+extern vpgl_PFN_glTexSubImage3D p_glTexSubImage3D;
+extern vpgl_PFN_glCopyTexSubImage3D p_glCopyTexSubImage3D;
+extern vpgl_PFN_glCompressedTexImage3D p_glCompressedTexImage3D;
+extern vpgl_PFN_glCompressedTexSubImage3D p_glCompressedTexSubImage3D;
+extern vpgl_PFN_glGenQueries p_glGenQueries;
+extern vpgl_PFN_glDeleteQueries p_glDeleteQueries;
+extern vpgl_PFN_glIsQuery p_glIsQuery;
+extern vpgl_PFN_glBeginQuery p_glBeginQuery;
+extern vpgl_PFN_glEndQuery p_glEndQuery;
+extern vpgl_PFN_glGetQueryiv p_glGetQueryiv;
+extern vpgl_PFN_glGetQueryObjectuiv p_glGetQueryObjectuiv;
+extern vpgl_PFN_glUnmapBuffer p_glUnmapBuffer;
+extern vpgl_PFN_glGetBufferPointerv p_glGetBufferPointerv;
+extern vpgl_PFN_glDrawBuffers p_glDrawBuffers;
+extern vpgl_PFN_glUniformMatrix2x3fv p_glUniformMatrix2x3fv;
+extern vpgl_PFN_glUniformMatrix3x2fv p_glUniformMatrix3x2fv;
+extern vpgl_PFN_glUniformMatrix2x4fv p_glUniformMatrix2x4fv;
+extern vpgl_PFN_glUniformMatrix4x2fv p_glUniformMatrix4x2fv;
+extern vpgl_PFN_glUniformMatrix3x4fv p_glUniformMatrix3x4fv;
+extern vpgl_PFN_glUniformMatrix4x3fv p_glUniformMatrix4x3fv;
+extern vpgl_PFN_glBlitFramebuffer p_glBlitFramebuffer;
+extern vpgl_PFN_glRenderbufferStorageMultisample p_glRenderbufferStorageMultisample;
+extern vpgl_PFN_glFramebufferTextureLayer p_glFramebufferTextureLayer;
+extern vpgl_PFN_glFlushMappedBufferRange p_glFlushMappedBufferRange;
+extern vpgl_PFN_glBindVertexArray p_glBindVertexArray;
+extern vpgl_PFN_glDeleteVertexArrays p_glDeleteVertexArrays;
+extern vpgl_PFN_glGenVertexArrays p_glGenVertexArrays;
+extern vpgl_PFN_glIsVertexArray p_glIsVertexArray;
+extern vpgl_PFN_glGetIntegeri_v p_glGetIntegeri_v;
+extern vpgl_PFN_glBeginTransformFeedback p_glBeginTransformFeedback;
+extern vpgl_PFN_glEndTransformFeedback p_glEndTransformFeedback;
+extern vpgl_PFN_glBindBufferRange p_glBindBufferRange;
+extern vpgl_PFN_glBindBufferBase p_glBindBufferBase;
+extern vpgl_PFN_glTransformFeedbackVaryings p_glTransformFeedbackVaryings;
+extern vpgl_PFN_glGetTransformFeedbackVarying p_glGetTransformFeedbackVarying;
+extern vpgl_PFN_glVertexAttribIPointer p_glVertexAttribIPointer;
+extern vpgl_PFN_glGetVertexAttribIiv p_glGetVertexAttribIiv;
+extern vpgl_PFN_glGetVertexAttribIuiv p_glGetVertexAttribIuiv;
+extern vpgl_PFN_glVertexAttribI4i p_glVertexAttribI4i;
+extern vpgl_PFN_glVertexAttribI4ui p_glVertexAttribI4ui;
+extern vpgl_PFN_glVertexAttribI4iv p_glVertexAttribI4iv;
+extern vpgl_PFN_glVertexAttribI4uiv p_glVertexAttribI4uiv;
+extern vpgl_PFN_glGetUniformuiv p_glGetUniformuiv;
+extern vpgl_PFN_glGetFragDataLocation p_glGetFragDataLocation;
+extern vpgl_PFN_glUniform1ui p_glUniform1ui;
+extern vpgl_PFN_glUniform2ui p_glUniform2ui;
+extern vpgl_PFN_glUniform3ui p_glUniform3ui;
+extern vpgl_PFN_glUniform4ui p_glUniform4ui;
+extern vpgl_PFN_glUniform1uiv p_glUniform1uiv;
+extern vpgl_PFN_glUniform2uiv p_glUniform2uiv;
+extern vpgl_PFN_glUniform3uiv p_glUniform3uiv;
+extern vpgl_PFN_glUniform4uiv p_glUniform4uiv;
+extern vpgl_PFN_glClearBufferiv p_glClearBufferiv;
+extern vpgl_PFN_glClearBufferuiv p_glClearBufferuiv;
+extern vpgl_PFN_glClearBufferfv p_glClearBufferfv;
+extern vpgl_PFN_glClearBufferfi p_glClearBufferfi;
+extern vpgl_PFN_glGetStringi p_glGetStringi;
+extern vpgl_PFN_glCopyBufferSubData p_glCopyBufferSubData;
+extern vpgl_PFN_glGetUniformIndices p_glGetUniformIndices;
+extern vpgl_PFN_glGetActiveUniformsiv p_glGetActiveUniformsiv;
+extern vpgl_PFN_glGetUniformBlockIndex p_glGetUniformBlockIndex;
+extern vpgl_PFN_glGetActiveUniformBlockiv p_glGetActiveUniformBlockiv;
+extern vpgl_PFN_glGetActiveUniformBlockName p_glGetActiveUniformBlockName;
+extern vpgl_PFN_glUniformBlockBinding p_glUniformBlockBinding;
+extern vpgl_PFN_glDrawArraysInstanced p_glDrawArraysInstanced;
+extern vpgl_PFN_glDrawElementsInstanced p_glDrawElementsInstanced;
+extern vpgl_PFN_glFenceSync p_glFenceSync;
+extern vpgl_PFN_glIsSync p_glIsSync;
+extern vpgl_PFN_glDeleteSync p_glDeleteSync;
+extern vpgl_PFN_glClientWaitSync p_glClientWaitSync;
+extern vpgl_PFN_glWaitSync p_glWaitSync;
+extern vpgl_PFN_glGetInteger64v p_glGetInteger64v;
+extern vpgl_PFN_glGetSynciv p_glGetSynciv;
+extern vpgl_PFN_glGetInteger64i_v p_glGetInteger64i_v;
+extern vpgl_PFN_glGetBufferParameteri64v p_glGetBufferParameteri64v;
+extern vpgl_PFN_glGenSamplers p_glGenSamplers;
+extern vpgl_PFN_glDeleteSamplers p_glDeleteSamplers;
+extern vpgl_PFN_glIsSampler p_glIsSampler;
+extern vpgl_PFN_glBindSampler p_glBindSampler;
+extern vpgl_PFN_glSamplerParameteri p_glSamplerParameteri;
+extern vpgl_PFN_glSamplerParameteriv p_glSamplerParameteriv;
+extern vpgl_PFN_glSamplerParameterf p_glSamplerParameterf;
+extern vpgl_PFN_glSamplerParameterfv p_glSamplerParameterfv;
+extern vpgl_PFN_glGetSamplerParameteriv p_glGetSamplerParameteriv;
+extern vpgl_PFN_glGetSamplerParameterfv p_glGetSamplerParameterfv;
+extern vpgl_PFN_glVertexAttribDivisor p_glVertexAttribDivisor;
+extern vpgl_PFN_glBindTransformFeedback p_glBindTransformFeedback;
+extern vpgl_PFN_glDeleteTransformFeedbacks p_glDeleteTransformFeedbacks;
+extern vpgl_PFN_glGenTransformFeedbacks p_glGenTransformFeedbacks;
+extern vpgl_PFN_glIsTransformFeedback p_glIsTransformFeedback;
+extern vpgl_PFN_glPauseTransformFeedback p_glPauseTransformFeedback;
+extern vpgl_PFN_glResumeTransformFeedback p_glResumeTransformFeedback;
+extern vpgl_PFN_glGetProgramBinary p_glGetProgramBinary;
+extern vpgl_PFN_glProgramBinary p_glProgramBinary;
+extern vpgl_PFN_glProgramParameteri p_glProgramParameteri;
+extern vpgl_PFN_glInvalidateFramebuffer p_glInvalidateFramebuffer;
+extern vpgl_PFN_glInvalidateSubFramebuffer p_glInvalidateSubFramebuffer;
+extern vpgl_PFN_glTexStorage2D p_glTexStorage2D;
+extern vpgl_PFN_glTexStorage3D p_glTexStorage3D;
+extern vpgl_PFN_glGetInternalformativ p_glGetInternalformativ;
 
 /* The fn_id macros and the gl_call struct live in virtpass/vp_gl.h:
  * hosts include that header, the same one the guest and

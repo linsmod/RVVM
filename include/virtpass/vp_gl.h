@@ -1,21 +1,29 @@
 /*
  * GENERATED FILE - produced by tools/gen_gl_abi.py - DO NOT EDIT BY HAND.
  *
- * Source of truth: NDK sysroot headers GLES2/gl2.h + EGL/egl.h (parsed).
+ * Source of truth: NDK sysroot headers GLES2/gl2.h + GLES3/gl3.h + EGL/egl.h
+ * (parsed; gl3.h is merged after gl2.h so the GLES2 ids never move).
  * Regenerate with:  python tools/gen_gl_abi.py
  *
- * Phase 3 ABI notes:
+ * ABI notes:
  *  - fn_id macros are the single source of truth shared by the guest stubs,
- *    src/virtpass/vp_cmdpost.c and the win32 host GL dispatch.
- *  - gl_call.args has 9 slots (glCompressedTexSubImage2D needs 9; the
- *    original Phase 3 plan said 6 - widened before first deployment, so this
- *    is an internal ABI change with zero consumers).
+ *    src/virtpass/vp_cmdpost.c and both host GL dispatches.
+ *  - gl_call.args has 12 slots. glTexSubImage3D (GLES3) needs 11 and
+ *    glCompressedTexSubImage2D (GLES2) 9; the extra slot keeps
+ *    GL_CALL_RETBUF_SLOT above every real parameter list. Guest and host are
+ *    rebuilt together, so widening it is an internal ABI change only.
  *  - Floats travel bit-packed through the int64_t slots; pointers travel as
  *    guest virtual addresses. Guest memory is NOT mapped into the host, so
  *    the host dispatch translates every data pointer argument with
  *    rvvm_user_guest_ptr() and, for calls that hand back a host-owned string
- *    (glGetString/eglQueryString), copies it through the guest scratch
- *    buffer offered in args[GL_CALL_RETBUF_SLOT].
+ *    (glGetString/glGetStringi/eglQueryString), copies it through the guest
+ *    scratch buffer offered in args[GL_CALL_RETBUF_SLOT].
+ *  - Opaque host values (EGLDisplay/Config/Surface/Context, GLsync) are only
+ *    passed back by the guest and never translated.
+ *  - The overloaded pointer arguments (glVertexAttribPointer/IPointer,
+ *    glDrawElements/Instanced, glDrawRangeElements) travel as their bare
+ *    value; the host reads it as a byte offset when a buffer is bound to the
+ *    matching target and as a guest address otherwise (vpgl_ptr()).
  */
 
 #ifndef VIRTPASS_GL
@@ -24,7 +32,8 @@
 #include <stdint.h>
 
 /* ============================================================
- * GLES2 core types (khronos widths, riscv64 LP64 guest)
+ * GL types (khronos widths, riscv64 LP64 guest)
+ * GLES2 core, plus the GLES3 additions (64-bit integers, GLsync)
  * ============================================================ */
 typedef void             GLvoid;
 typedef unsigned int     GLenum;
@@ -42,6 +51,11 @@ typedef float            GLclampf;
 typedef char             GLchar;
 typedef long             GLintptr;    /* khronos_intptr_t */
 typedef long             GLsizeiptr;  /* khronos_ssize_t  */
+typedef long             GLint64;     /* khronos_int64_t  */
+typedef unsigned long    GLuint64;    /* khronos_uint64_t */
+/* Fence/sync object. Never dereferenced: the guest only hands it back, so the
+ * opaque pointer form is all the guest side needs. */
+typedef void*            GLsync;
 
 /* ============================================================
  * GLES2 constants (subset used by guests + host smoke tests)
@@ -101,6 +115,8 @@ typedef long             GLsizeiptr;  /* khronos_ssize_t  */
 #define GL_LINK_STATUS         0x8B82
 #define GL_ARRAY_BUFFER        0x8892
 #define GL_ELEMENT_ARRAY_BUFFER 0x8893
+#define GL_ARRAY_BUFFER_BINDING 0x8894
+#define GL_ELEMENT_ARRAY_BUFFER_BINDING 0x8895
 #define GL_STATIC_DRAW         0x88E4
 #define GL_STREAM_DRAW         0x88E0
 #define GL_DYNAMIC_DRAW        0x88E8
@@ -139,6 +155,59 @@ typedef long             GLsizeiptr;  /* khronos_ssize_t  */
 #define GL_INFO_LOG_LENGTH     0x8B84
 
 /* ============================================================
+ * GLES3 constants (subset used by guests + host smoke tests)
+ * ============================================================ */
+#define GL_MAJOR_VERSION       0x821B
+#define GL_MINOR_VERSION       0x821C
+#define GL_NUM_EXTENSIONS      0x821D
+
+#define GL_MAX_3D_TEXTURE_SIZE 0x8073
+#define GL_MAX_ARRAY_TEXTURE_LAYERS 0x88FF
+#define GL_MAX_ELEMENT_INDEX   0x8D6B
+#define GL_MAX_COLOR_ATTACHMENTS 0x8CDF
+
+#define GL_R8                  0x8229
+#define GL_RGB8                0x8051
+#define GL_RGBA32F             0x8814
+#define GL_RGB32F              0x8815
+#define GL_DEPTH_COMPONENT24   0x81A6
+#define GL_DEPTH24_STENCIL8    0x88F0
+
+#define GL_TEXTURE_3D          0x806F
+#define GL_TEXTURE_WRAP_R      0x8072
+#define GL_TEXTURE_COMPARE_MODE 0x884C
+#define GL_TEXTURE_COMPARE_FUNC 0x884D
+
+#define GL_UNIFORM_BUFFER      0x8A11
+#define GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT 0x8A34
+#define GL_MAX_UNIFORM_BLOCK_SIZE 0x8A30
+#define GL_UNIFORM_BLOCK_DATA_SIZE 0x8A40
+#define GL_ACTIVE_UNIFORM_BLOCKS 0x8A36
+#define GL_INVALID_INDEX       0xFFFFFFFF
+#define GL_BUFFER_SIZE         0x8764
+#define GL_SHADING_LANGUAGE_VERSION 0x8B8C
+
+#define GL_VERTEX_ARRAY_BINDING 0x85B5
+#define GL_READ_BUFFER         0x0C02
+#define GL_READ_FRAMEBUFFER    0x8CA8
+#define GL_DRAW_FRAMEBUFFER    0x8CA9
+#define GL_COLOR_ATTACHMENT1   0x8CE1
+#define GL_FRAMEBUFFER_SRGB    0x8DB9
+
+#define GL_ANY_SAMPLES_PASSED  0x8C2F
+#define GL_SAMPLES_PASSED      0x8914
+#define GL_QUERY_RESULT        0x8866
+#define GL_QUERY_RESULT_AVAILABLE 0x8867
+
+#define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#define GL_SYNC_FLUSH_COMMANDS_BIT    0x00000001
+#define GL_ALREADY_SIGNALED    0x911A
+#define GL_TIMEOUT_EXPIRED     0x911B
+#define GL_CONDITION_SATISFIED 0x911C
+#define GL_WAIT_FAILED         0x911D
+#define GL_TIMEOUT_IGNORED     0xFFFFFFFFFFFFFFFFull
+
+/* ============================================================
  * EGL core types (opaque handles travel as uintptr values)
  * ============================================================ */
 typedef void*    EGLDisplay;
@@ -162,14 +231,15 @@ typedef uint32_t EGLenum;
 #define EGL_NOT_INITIALIZED    0x3001
 #define EGL_BAD_ACCESS         0x3002
 #define EGL_BAD_ALLOC          0x3003
-#define EGL_BAD_MATCH          0x3004
-#define EGL_BAD_ATTRIBUTE      0x3005
-#define EGL_BAD_CONFIG         0x3006
-#define EGL_BAD_CONTEXT        0x3007
-#define EGL_BAD_CURRENT_SURFACE 0x3008
-#define EGL_BAD_DISPLAY        0x3009
-#define EGL_BAD_MATCH2         0x300A /* reserved */
+#define EGL_BAD_ATTRIBUTE      0x3004
+#define EGL_BAD_CONFIG         0x3005
+#define EGL_BAD_CONTEXT        0x3006
+#define EGL_BAD_CURRENT_SURFACE 0x3007
+#define EGL_BAD_DISPLAY        0x3008
+#define EGL_BAD_MATCH          0x3009
+#define EGL_BAD_NATIVE_PIXMAP  0x300A
 #define EGL_BAD_NATIVE_WINDOW  0x300B
+#define EGL_BAD_PARAMETER      0x300C
 #define EGL_BAD_SURFACE        0x300D
 #define EGL_CONTEXT_LOST       0x300E
 
@@ -192,6 +262,7 @@ typedef uint32_t EGLenum;
 #define EGL_OPENGL_ES_BIT    0x0001
 #define EGL_OPENGL_ES2_BIT   0x0004
 #define EGL_OPENGL_ES3_BIT   0x0040
+#define EGL_OPENGL_ES3_BIT_KHR 0x0040
 
 #define EGL_WIDTH            0x3057
 #define EGL_HEIGHT           0x3056
@@ -210,6 +281,12 @@ typedef uint32_t EGLenum;
 #define EGL_READ             0x305A
 
 #define EGL_CONTEXT_CLIENT_VERSION 0x3098
+/* ES 3.x contexts. EGL_CONTEXT_MAJOR_VERSION is the very same token as
+ * EGL_CONTEXT_CLIENT_VERSION (both 0x3098) - it is what additionally selects
+ * the API version together with the minor version below (3.1/3.2 contexts). */
+#define EGL_CONTEXT_MAJOR_VERSION  0x3098
+#define EGL_CONTEXT_MINOR_VERSION  0x30FB
+#define EGL_CONTEXT_OPENGL_DEBUG   0x31B0
 
 /* ============================================================
  * Function IDs (single source of truth)
@@ -358,6 +435,109 @@ typedef uint32_t EGLenum;
 #define GL_FN_VERTEXATTRIB4FV 140
 #define GL_FN_VERTEXATTRIBPOINTER 141
 #define GL_FN_VIEWPORT 142
+#define GL_FN_READBUFFER 143
+#define GL_FN_DRAWRANGEELEMENTS 144
+#define GL_FN_TEXIMAGE3D 145
+#define GL_FN_TEXSUBIMAGE3D 146
+#define GL_FN_COPYTEXSUBIMAGE3D 147
+#define GL_FN_COMPRESSEDTEXIMAGE3D 148
+#define GL_FN_COMPRESSEDTEXSUBIMAGE3D 149
+#define GL_FN_GENQUERIES 150
+#define GL_FN_DELETEQUERIES 151
+#define GL_FN_ISQUERY 152
+#define GL_FN_BEGINQUERY 153
+#define GL_FN_ENDQUERY 154
+#define GL_FN_GETQUERYIV 155
+#define GL_FN_GETQUERYOBJECTUIV 156
+#define GL_FN_UNMAPBUFFER 157
+#define GL_FN_GETBUFFERPOINTERV 158
+#define GL_FN_DRAWBUFFERS 159
+#define GL_FN_UNIFORMMATRIX2X3FV 160
+#define GL_FN_UNIFORMMATRIX3X2FV 161
+#define GL_FN_UNIFORMMATRIX2X4FV 162
+#define GL_FN_UNIFORMMATRIX4X2FV 163
+#define GL_FN_UNIFORMMATRIX3X4FV 164
+#define GL_FN_UNIFORMMATRIX4X3FV 165
+#define GL_FN_BLITFRAMEBUFFER 166
+#define GL_FN_RENDERBUFFERSTORAGEMULTISAMPLE 167
+#define GL_FN_FRAMEBUFFERTEXTURELAYER 168
+#define GL_FN_FLUSHMAPPEDBUFFERRANGE 169
+#define GL_FN_BINDVERTEXARRAY 170
+#define GL_FN_DELETEVERTEXARRAYS 171
+#define GL_FN_GENVERTEXARRAYS 172
+#define GL_FN_ISVERTEXARRAY 173
+#define GL_FN_GETINTEGERI_V 174
+#define GL_FN_BEGINTRANSFORMFEEDBACK 175
+#define GL_FN_ENDTRANSFORMFEEDBACK 176
+#define GL_FN_BINDBUFFERRANGE 177
+#define GL_FN_BINDBUFFERBASE 178
+#define GL_FN_TRANSFORMFEEDBACKVARYINGS 179
+#define GL_FN_GETTRANSFORMFEEDBACKVARYING 180
+#define GL_FN_VERTEXATTRIBIPOINTER 181
+#define GL_FN_GETVERTEXATTRIBIIV 182
+#define GL_FN_GETVERTEXATTRIBIUIV 183
+#define GL_FN_VERTEXATTRIBI4I 184
+#define GL_FN_VERTEXATTRIBI4UI 185
+#define GL_FN_VERTEXATTRIBI4IV 186
+#define GL_FN_VERTEXATTRIBI4UIV 187
+#define GL_FN_GETUNIFORMUIV 188
+#define GL_FN_GETFRAGDATALOCATION 189
+#define GL_FN_UNIFORM1UI 190
+#define GL_FN_UNIFORM2UI 191
+#define GL_FN_UNIFORM3UI 192
+#define GL_FN_UNIFORM4UI 193
+#define GL_FN_UNIFORM1UIV 194
+#define GL_FN_UNIFORM2UIV 195
+#define GL_FN_UNIFORM3UIV 196
+#define GL_FN_UNIFORM4UIV 197
+#define GL_FN_CLEARBUFFERIV 198
+#define GL_FN_CLEARBUFFERUIV 199
+#define GL_FN_CLEARBUFFERFV 200
+#define GL_FN_CLEARBUFFERFI 201
+#define GL_FN_GETSTRINGI 202
+#define GL_FN_COPYBUFFERSUBDATA 203
+#define GL_FN_GETUNIFORMINDICES 204
+#define GL_FN_GETACTIVEUNIFORMSIV 205
+#define GL_FN_GETUNIFORMBLOCKINDEX 206
+#define GL_FN_GETACTIVEUNIFORMBLOCKIV 207
+#define GL_FN_GETACTIVEUNIFORMBLOCKNAME 208
+#define GL_FN_UNIFORMBLOCKBINDING 209
+#define GL_FN_DRAWARRAYSINSTANCED 210
+#define GL_FN_DRAWELEMENTSINSTANCED 211
+#define GL_FN_FENCESYNC 212
+#define GL_FN_ISSYNC 213
+#define GL_FN_DELETESYNC 214
+#define GL_FN_CLIENTWAITSYNC 215
+#define GL_FN_WAITSYNC 216
+#define GL_FN_GETINTEGER64V 217
+#define GL_FN_GETSYNCIV 218
+#define GL_FN_GETINTEGER64I_V 219
+#define GL_FN_GETBUFFERPARAMETERI64V 220
+#define GL_FN_GENSAMPLERS 221
+#define GL_FN_DELETESAMPLERS 222
+#define GL_FN_ISSAMPLER 223
+#define GL_FN_BINDSAMPLER 224
+#define GL_FN_SAMPLERPARAMETERI 225
+#define GL_FN_SAMPLERPARAMETERIV 226
+#define GL_FN_SAMPLERPARAMETERF 227
+#define GL_FN_SAMPLERPARAMETERFV 228
+#define GL_FN_GETSAMPLERPARAMETERIV 229
+#define GL_FN_GETSAMPLERPARAMETERFV 230
+#define GL_FN_VERTEXATTRIBDIVISOR 231
+#define GL_FN_BINDTRANSFORMFEEDBACK 232
+#define GL_FN_DELETETRANSFORMFEEDBACKS 233
+#define GL_FN_GENTRANSFORMFEEDBACKS 234
+#define GL_FN_ISTRANSFORMFEEDBACK 235
+#define GL_FN_PAUSETRANSFORMFEEDBACK 236
+#define GL_FN_RESUMETRANSFORMFEEDBACK 237
+#define GL_FN_GETPROGRAMBINARY 238
+#define GL_FN_PROGRAMBINARY 239
+#define GL_FN_PROGRAMPARAMETERI 240
+#define GL_FN_INVALIDATEFRAMEBUFFER 241
+#define GL_FN_INVALIDATESUBFRAMEBUFFER 242
+#define GL_FN_TEXSTORAGE2D 243
+#define GL_FN_TEXSTORAGE3D 244
+#define GL_FN_GETINTERNALFORMATIV 245
 
 #define EGL_FN_BASE 0x100
 #define EGL_FN_CHOOSECONFIG 0x100
@@ -367,19 +547,28 @@ typedef uint32_t EGLenum;
 #define EGL_FN_DESTROYCONTEXT 0x104
 #define EGL_FN_DESTROYSURFACE 0x105
 #define EGL_FN_GETCONFIGATTRIB 0x106
-#define EGL_FN_GETDISPLAY 0x107
-#define EGL_FN_GETERROR 0x108
-#define EGL_FN_INITIALIZE 0x109
-#define EGL_FN_MAKECURRENT 0x10A
-#define EGL_FN_QUERYSTRING 0x10B
-#define EGL_FN_QUERYSURFACE 0x10C
-#define EGL_FN_SWAPBUFFERS 0x10D
-#define EGL_FN_TERMINATE 0x10E
+#define EGL_FN_GETCURRENTDISPLAY 0x107
+#define EGL_FN_GETCURRENTSURFACE 0x108
+#define EGL_FN_GETDISPLAY 0x109
+#define EGL_FN_GETERROR 0x10A
+#define EGL_FN_INITIALIZE 0x10B
+#define EGL_FN_MAKECURRENT 0x10C
+#define EGL_FN_QUERYCONTEXT 0x10D
+#define EGL_FN_QUERYSTRING 0x10E
+#define EGL_FN_QUERYSURFACE 0x10F
+#define EGL_FN_SWAPBUFFERS 0x110
+#define EGL_FN_TERMINATE 0x111
+#define EGL_FN_SWAPINTERVAL 0x112
+#define EGL_FN_BINDAPI 0x113
+#define EGL_FN_GETCURRENTCONTEXT 0x114
 
-#define GL_CALL_MAX_ARGS 9
+#define GL_CALL_MAX_ARGS 12
 /* gl_call.args[] slot carrying the guest scratch buffer for the
- * calls returning a host-owned string (glGetString / eglQueryString).
- * The buffer must outlive the call: the stub owns it statically. */
+ * calls returning a host-owned string (glGetString/glGetStringi/
+ * eglQueryString). GL_CALL_MAX_ARGS is one wider than the widest real
+ * call (glTexSubImage3D, 11), so this slot can never collide with a
+ * parameter. The buffer must outlive the call: the stub owns it
+ * statically. */
 #define GL_CALL_RETBUF_SLOT (GL_CALL_MAX_ARGS - 1)
 #define GL_CALL_RETBUF_CAP  8192
 
@@ -398,10 +587,12 @@ typedef uint32_t EGLenum;
  *
  * args[GL_CALL_RETBUF_SLOT] holds the address of a guest scratch buffer
  * (GL_CALL_RETBUF_CAP bytes) for calls that hand back a host-owned string
- * (glGetString/eglQueryString): the host copies the string there and answers
- * with that guest address. The stub keeps it in a static, not on its stack -
- * the pointer outlives the call. Only those two single-argument calls use the
- * slot; everywhere else it is just the last parameter (or unused).
+ * (glGetString/glGetStringi/eglQueryString): the host copies the string there
+ * and answers with that guest address. The stub keeps it in a static, not on
+ * its stack - the pointer outlives the call. Only the string-returning calls
+ * use the slot (glGetStringi passes its index in args[1]); everywhere else it
+ * is unused, and nothing can reach it as a parameter because it sits one slot
+ * above the widest call.
  * ============================================================ */
 typedef struct {
     uint32_t fn_id;                    /* GL_FN_* / EGL_FN_*            */
@@ -425,15 +616,21 @@ void* eglCreateWindowSurface(void* dpy, void* config, void* win, const int32_t* 
 uint32_t eglDestroyContext(void* dpy, void* ctx);
 uint32_t eglDestroySurface(void* dpy, void* surface);
 uint32_t eglGetConfigAttrib(void* dpy, void* config, int32_t attribute, int32_t* value);
+void* eglGetCurrentDisplay(void);
+void* eglGetCurrentSurface(int32_t readdraw);
 void* eglGetDisplay(void* display_id);
 int32_t eglGetError(void);
 void* eglGetProcAddress(const char* procname);
 uint32_t eglInitialize(void* dpy, int32_t* major, int32_t* minor);
 uint32_t eglMakeCurrent(void* dpy, void* draw, void* read, void* ctx);
+uint32_t eglQueryContext(void* dpy, void* ctx, int32_t attribute, int32_t* value);
 const char* eglQueryString(void* dpy, int32_t name);
 uint32_t eglQuerySurface(void* dpy, void* surface, int32_t attribute, int32_t* value);
 uint32_t eglSwapBuffers(void* dpy, void* surface);
 uint32_t eglTerminate(void* dpy);
+uint32_t eglSwapInterval(void* dpy, int32_t interval);
+uint32_t eglBindAPI(uint32_t api);
+void* eglGetCurrentContext(void);
 
 void glActiveTexture(uint32_t texture);
 void glAttachShader(uint32_t program, uint32_t shader);
@@ -577,5 +774,108 @@ void glVertexAttrib4f(uint32_t index, float x, float y, float z, float w);
 void glVertexAttrib4fv(uint32_t index, const float* v);
 void glVertexAttribPointer(uint32_t index, int32_t size, uint32_t type, uint8_t normalized, int32_t stride, const void* pointer);
 void glViewport(int32_t x, int32_t y, int32_t width, int32_t height);
+void glReadBuffer(uint32_t src);
+void glDrawRangeElements(uint32_t mode, uint32_t start, uint32_t end, int32_t count, uint32_t type, const void* indices);
+void glTexImage3D(uint32_t target, int32_t level, int32_t internalformat, int32_t width, int32_t height, int32_t depth, int32_t border, uint32_t format, uint32_t type, const void* pixels);
+void glTexSubImage3D(uint32_t target, int32_t level, int32_t xoffset, int32_t yoffset, int32_t zoffset, int32_t width, int32_t height, int32_t depth, uint32_t format, uint32_t type, const void* pixels);
+void glCopyTexSubImage3D(uint32_t target, int32_t level, int32_t xoffset, int32_t yoffset, int32_t zoffset, int32_t x, int32_t y, int32_t width, int32_t height);
+void glCompressedTexImage3D(uint32_t target, int32_t level, uint32_t internalformat, int32_t width, int32_t height, int32_t depth, int32_t border, int32_t imageSize, const void* data);
+void glCompressedTexSubImage3D(uint32_t target, int32_t level, int32_t xoffset, int32_t yoffset, int32_t zoffset, int32_t width, int32_t height, int32_t depth, uint32_t format, int32_t imageSize, const void* data);
+void glGenQueries(int32_t n, uint32_t* ids);
+void glDeleteQueries(int32_t n, const uint32_t* ids);
+uint8_t glIsQuery(uint32_t id);
+void glBeginQuery(uint32_t target, uint32_t id);
+void glEndQuery(uint32_t target);
+void glGetQueryiv(uint32_t target, uint32_t pname, int32_t* params);
+void glGetQueryObjectuiv(uint32_t id, uint32_t pname, uint32_t* params);
+uint8_t glUnmapBuffer(uint32_t target);
+void glGetBufferPointerv(uint32_t target, uint32_t pname, void** params);
+void glDrawBuffers(int32_t n, const uint32_t* bufs);
+void glUniformMatrix2x3fv(int32_t location, int32_t count, uint8_t transpose, const float* value);
+void glUniformMatrix3x2fv(int32_t location, int32_t count, uint8_t transpose, const float* value);
+void glUniformMatrix2x4fv(int32_t location, int32_t count, uint8_t transpose, const float* value);
+void glUniformMatrix4x2fv(int32_t location, int32_t count, uint8_t transpose, const float* value);
+void glUniformMatrix3x4fv(int32_t location, int32_t count, uint8_t transpose, const float* value);
+void glUniformMatrix4x3fv(int32_t location, int32_t count, uint8_t transpose, const float* value);
+void glBlitFramebuffer(int32_t srcX0, int32_t srcY0, int32_t srcX1, int32_t srcY1, int32_t dstX0, int32_t dstY0, int32_t dstX1, int32_t dstY1, uint32_t mask, uint32_t filter);
+void glRenderbufferStorageMultisample(uint32_t target, int32_t samples, uint32_t internalformat, int32_t width, int32_t height);
+void glFramebufferTextureLayer(uint32_t target, uint32_t attachment, uint32_t texture, int32_t level, int32_t layer);
+void glFlushMappedBufferRange(uint32_t target, long offset, long length);
+void glBindVertexArray(uint32_t array);
+void glDeleteVertexArrays(int32_t n, const uint32_t* arrays);
+void glGenVertexArrays(int32_t n, uint32_t* arrays);
+uint8_t glIsVertexArray(uint32_t array);
+void glGetIntegeri_v(uint32_t target, uint32_t index, int32_t* data);
+void glBeginTransformFeedback(uint32_t primitiveMode);
+void glEndTransformFeedback(void);
+void glBindBufferRange(uint32_t target, uint32_t index, uint32_t buffer, long offset, long size);
+void glBindBufferBase(uint32_t target, uint32_t index, uint32_t buffer);
+void glTransformFeedbackVaryings(uint32_t program, int32_t count, const char** varyings, uint32_t bufferMode);
+void glGetTransformFeedbackVarying(uint32_t program, uint32_t index, int32_t bufSize, int32_t* length, int32_t* size, uint32_t* type, char* name);
+void glVertexAttribIPointer(uint32_t index, int32_t size, uint32_t type, int32_t stride, const void* pointer);
+void glGetVertexAttribIiv(uint32_t index, uint32_t pname, int32_t* params);
+void glGetVertexAttribIuiv(uint32_t index, uint32_t pname, uint32_t* params);
+void glVertexAttribI4i(uint32_t index, int32_t x, int32_t y, int32_t z, int32_t w);
+void glVertexAttribI4ui(uint32_t index, uint32_t x, uint32_t y, uint32_t z, uint32_t w);
+void glVertexAttribI4iv(uint32_t index, const int32_t* v);
+void glVertexAttribI4uiv(uint32_t index, const uint32_t* v);
+void glGetUniformuiv(uint32_t program, int32_t location, uint32_t* params);
+int32_t glGetFragDataLocation(uint32_t program, const char* name);
+void glUniform1ui(int32_t location, uint32_t v0);
+void glUniform2ui(int32_t location, uint32_t v0, uint32_t v1);
+void glUniform3ui(int32_t location, uint32_t v0, uint32_t v1, uint32_t v2);
+void glUniform4ui(int32_t location, uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3);
+void glUniform1uiv(int32_t location, int32_t count, const uint32_t* value);
+void glUniform2uiv(int32_t location, int32_t count, const uint32_t* value);
+void glUniform3uiv(int32_t location, int32_t count, const uint32_t* value);
+void glUniform4uiv(int32_t location, int32_t count, const uint32_t* value);
+void glClearBufferiv(uint32_t buffer, int32_t drawbuffer, const int32_t* value);
+void glClearBufferuiv(uint32_t buffer, int32_t drawbuffer, const uint32_t* value);
+void glClearBufferfv(uint32_t buffer, int32_t drawbuffer, const float* value);
+void glClearBufferfi(uint32_t buffer, int32_t drawbuffer, float depth, int32_t stencil);
+const uint8_t* glGetStringi(uint32_t name, uint32_t index);
+void glCopyBufferSubData(uint32_t readTarget, uint32_t writeTarget, long readOffset, long writeOffset, long size);
+void glGetUniformIndices(uint32_t program, int32_t uniformCount, const char** uniformNames, uint32_t* uniformIndices);
+void glGetActiveUniformsiv(uint32_t program, int32_t uniformCount, const uint32_t* uniformIndices, uint32_t pname, int32_t* params);
+uint32_t glGetUniformBlockIndex(uint32_t program, const char* uniformBlockName);
+void glGetActiveUniformBlockiv(uint32_t program, uint32_t uniformBlockIndex, uint32_t pname, int32_t* params);
+void glGetActiveUniformBlockName(uint32_t program, uint32_t uniformBlockIndex, int32_t bufSize, int32_t* length, char* uniformBlockName);
+void glUniformBlockBinding(uint32_t program, uint32_t uniformBlockIndex, uint32_t uniformBlockBinding);
+void glDrawArraysInstanced(uint32_t mode, int32_t first, int32_t count, int32_t instancecount);
+void glDrawElementsInstanced(uint32_t mode, int32_t count, uint32_t type, const void* indices, int32_t instancecount);
+void* glFenceSync(uint32_t condition, uint32_t flags);
+uint8_t glIsSync(void* sync);
+void glDeleteSync(void* sync);
+uint32_t glClientWaitSync(void* sync, uint32_t flags, uint64_t timeout);
+void glWaitSync(void* sync, uint32_t flags, uint64_t timeout);
+void glGetInteger64v(uint32_t pname, int64_t* data);
+void glGetSynciv(void* sync, uint32_t pname, int32_t bufSize, int32_t* length, int32_t* values);
+void glGetInteger64i_v(uint32_t target, uint32_t index, int64_t* data);
+void glGetBufferParameteri64v(uint32_t target, uint32_t pname, int64_t* params);
+void glGenSamplers(int32_t count, uint32_t* samplers);
+void glDeleteSamplers(int32_t count, const uint32_t* samplers);
+uint8_t glIsSampler(uint32_t sampler);
+void glBindSampler(uint32_t unit, uint32_t sampler);
+void glSamplerParameteri(uint32_t sampler, uint32_t pname, int32_t param);
+void glSamplerParameteriv(uint32_t sampler, uint32_t pname, const int32_t* param);
+void glSamplerParameterf(uint32_t sampler, uint32_t pname, float param);
+void glSamplerParameterfv(uint32_t sampler, uint32_t pname, const float* param);
+void glGetSamplerParameteriv(uint32_t sampler, uint32_t pname, int32_t* params);
+void glGetSamplerParameterfv(uint32_t sampler, uint32_t pname, float* params);
+void glVertexAttribDivisor(uint32_t index, uint32_t divisor);
+void glBindTransformFeedback(uint32_t target, uint32_t id);
+void glDeleteTransformFeedbacks(int32_t n, const uint32_t* ids);
+void glGenTransformFeedbacks(int32_t n, uint32_t* ids);
+uint8_t glIsTransformFeedback(uint32_t id);
+void glPauseTransformFeedback(void);
+void glResumeTransformFeedback(void);
+void glGetProgramBinary(uint32_t program, int32_t bufSize, int32_t* length, uint32_t* binaryFormat, void* binary);
+void glProgramBinary(uint32_t program, uint32_t binaryFormat, const void* binary, int32_t length);
+void glProgramParameteri(uint32_t program, uint32_t pname, int32_t value);
+void glInvalidateFramebuffer(uint32_t target, int32_t numAttachments, const uint32_t* attachments);
+void glInvalidateSubFramebuffer(uint32_t target, int32_t numAttachments, const uint32_t* attachments, int32_t x, int32_t y, int32_t width, int32_t height);
+void glTexStorage2D(uint32_t target, int32_t levels, uint32_t internalformat, int32_t width, int32_t height);
+void glTexStorage3D(uint32_t target, int32_t levels, uint32_t internalformat, int32_t width, int32_t height, int32_t depth);
+void glGetInternalformativ(uint32_t target, uint32_t internalformat, uint32_t pname, int32_t bufSize, int32_t* params);
 
 #endif /* VIRTPASS_GL */

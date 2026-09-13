@@ -1,21 +1,29 @@
 /*
  * GENERATED FILE - produced by tools/gen_gl_abi.py - DO NOT EDIT BY HAND.
  *
- * Source of truth: NDK sysroot headers GLES2/gl2.h + EGL/egl.h (parsed).
+ * Source of truth: NDK sysroot headers GLES2/gl2.h + GLES3/gl3.h + EGL/egl.h
+ * (parsed; gl3.h is merged after gl2.h so the GLES2 ids never move).
  * Regenerate with:  python tools/gen_gl_abi.py
  *
- * Phase 3 ABI notes:
+ * ABI notes:
  *  - fn_id macros are the single source of truth shared by the guest stubs,
- *    src/virtpass/vp_cmdpost.c and the win32 host GL dispatch.
- *  - gl_call.args has 9 slots (glCompressedTexSubImage2D needs 9; the
- *    original Phase 3 plan said 6 - widened before first deployment, so this
- *    is an internal ABI change with zero consumers).
+ *    src/virtpass/vp_cmdpost.c and both host GL dispatches.
+ *  - gl_call.args has 12 slots. glTexSubImage3D (GLES3) needs 11 and
+ *    glCompressedTexSubImage2D (GLES2) 9; the extra slot keeps
+ *    GL_CALL_RETBUF_SLOT above every real parameter list. Guest and host are
+ *    rebuilt together, so widening it is an internal ABI change only.
  *  - Floats travel bit-packed through the int64_t slots; pointers travel as
  *    guest virtual addresses. Guest memory is NOT mapped into the host, so
  *    the host dispatch translates every data pointer argument with
  *    rvvm_user_guest_ptr() and, for calls that hand back a host-owned string
- *    (glGetString/eglQueryString), copies it through the guest scratch
- *    buffer offered in args[GL_CALL_RETBUF_SLOT].
+ *    (glGetString/glGetStringi/eglQueryString), copies it through the guest
+ *    scratch buffer offered in args[GL_CALL_RETBUF_SLOT].
+ *  - Opaque host values (EGLDisplay/Config/Surface/Context, GLsync) are only
+ *    passed back by the guest and never translated.
+ *  - The overloaded pointer arguments (glVertexAttribPointer/IPointer,
+ *    glDrawElements/Instanced, glDrawRangeElements) travel as their bare
+ *    value; the host reads it as a byte offset when a buffer is bound to the
+ *    matching target and as a guest address otherwise (vpgl_ptr()).
  */
 
 #ifndef VPGL_HOST_ENTRIES_H
@@ -31,14 +39,20 @@ vpgl_PFN_eglCreateWindowSurface p_eglCreateWindowSurface;
 vpgl_PFN_eglDestroyContext p_eglDestroyContext;
 vpgl_PFN_eglDestroySurface p_eglDestroySurface;
 vpgl_PFN_eglGetConfigAttrib p_eglGetConfigAttrib;
+vpgl_PFN_eglGetCurrentDisplay p_eglGetCurrentDisplay;
+vpgl_PFN_eglGetCurrentSurface p_eglGetCurrentSurface;
 vpgl_PFN_eglGetDisplay p_eglGetDisplay;
 vpgl_PFN_eglGetError p_eglGetError;
 vpgl_PFN_eglInitialize p_eglInitialize;
 vpgl_PFN_eglMakeCurrent p_eglMakeCurrent;
+vpgl_PFN_eglQueryContext p_eglQueryContext;
 vpgl_PFN_eglQueryString p_eglQueryString;
 vpgl_PFN_eglQuerySurface p_eglQuerySurface;
 vpgl_PFN_eglSwapBuffers p_eglSwapBuffers;
 vpgl_PFN_eglTerminate p_eglTerminate;
+vpgl_PFN_eglSwapInterval p_eglSwapInterval;
+vpgl_PFN_eglBindAPI p_eglBindAPI;
+vpgl_PFN_eglGetCurrentContext p_eglGetCurrentContext;
 
 vpgl_PFN_glActiveTexture p_glActiveTexture;
 vpgl_PFN_glAttachShader p_glAttachShader;
@@ -182,5 +196,379 @@ vpgl_PFN_glVertexAttrib4f p_glVertexAttrib4f;
 vpgl_PFN_glVertexAttrib4fv p_glVertexAttrib4fv;
 vpgl_PFN_glVertexAttribPointer p_glVertexAttribPointer;
 vpgl_PFN_glViewport p_glViewport;
+vpgl_PFN_glReadBuffer p_glReadBuffer;
+vpgl_PFN_glDrawRangeElements p_glDrawRangeElements;
+vpgl_PFN_glTexImage3D p_glTexImage3D;
+vpgl_PFN_glTexSubImage3D p_glTexSubImage3D;
+vpgl_PFN_glCopyTexSubImage3D p_glCopyTexSubImage3D;
+vpgl_PFN_glCompressedTexImage3D p_glCompressedTexImage3D;
+vpgl_PFN_glCompressedTexSubImage3D p_glCompressedTexSubImage3D;
+vpgl_PFN_glGenQueries p_glGenQueries;
+vpgl_PFN_glDeleteQueries p_glDeleteQueries;
+vpgl_PFN_glIsQuery p_glIsQuery;
+vpgl_PFN_glBeginQuery p_glBeginQuery;
+vpgl_PFN_glEndQuery p_glEndQuery;
+vpgl_PFN_glGetQueryiv p_glGetQueryiv;
+vpgl_PFN_glGetQueryObjectuiv p_glGetQueryObjectuiv;
+vpgl_PFN_glUnmapBuffer p_glUnmapBuffer;
+vpgl_PFN_glGetBufferPointerv p_glGetBufferPointerv;
+vpgl_PFN_glDrawBuffers p_glDrawBuffers;
+vpgl_PFN_glUniformMatrix2x3fv p_glUniformMatrix2x3fv;
+vpgl_PFN_glUniformMatrix3x2fv p_glUniformMatrix3x2fv;
+vpgl_PFN_glUniformMatrix2x4fv p_glUniformMatrix2x4fv;
+vpgl_PFN_glUniformMatrix4x2fv p_glUniformMatrix4x2fv;
+vpgl_PFN_glUniformMatrix3x4fv p_glUniformMatrix3x4fv;
+vpgl_PFN_glUniformMatrix4x3fv p_glUniformMatrix4x3fv;
+vpgl_PFN_glBlitFramebuffer p_glBlitFramebuffer;
+vpgl_PFN_glRenderbufferStorageMultisample p_glRenderbufferStorageMultisample;
+vpgl_PFN_glFramebufferTextureLayer p_glFramebufferTextureLayer;
+vpgl_PFN_glFlushMappedBufferRange p_glFlushMappedBufferRange;
+vpgl_PFN_glBindVertexArray p_glBindVertexArray;
+vpgl_PFN_glDeleteVertexArrays p_glDeleteVertexArrays;
+vpgl_PFN_glGenVertexArrays p_glGenVertexArrays;
+vpgl_PFN_glIsVertexArray p_glIsVertexArray;
+vpgl_PFN_glGetIntegeri_v p_glGetIntegeri_v;
+vpgl_PFN_glBeginTransformFeedback p_glBeginTransformFeedback;
+vpgl_PFN_glEndTransformFeedback p_glEndTransformFeedback;
+vpgl_PFN_glBindBufferRange p_glBindBufferRange;
+vpgl_PFN_glBindBufferBase p_glBindBufferBase;
+vpgl_PFN_glTransformFeedbackVaryings p_glTransformFeedbackVaryings;
+vpgl_PFN_glGetTransformFeedbackVarying p_glGetTransformFeedbackVarying;
+vpgl_PFN_glVertexAttribIPointer p_glVertexAttribIPointer;
+vpgl_PFN_glGetVertexAttribIiv p_glGetVertexAttribIiv;
+vpgl_PFN_glGetVertexAttribIuiv p_glGetVertexAttribIuiv;
+vpgl_PFN_glVertexAttribI4i p_glVertexAttribI4i;
+vpgl_PFN_glVertexAttribI4ui p_glVertexAttribI4ui;
+vpgl_PFN_glVertexAttribI4iv p_glVertexAttribI4iv;
+vpgl_PFN_glVertexAttribI4uiv p_glVertexAttribI4uiv;
+vpgl_PFN_glGetUniformuiv p_glGetUniformuiv;
+vpgl_PFN_glGetFragDataLocation p_glGetFragDataLocation;
+vpgl_PFN_glUniform1ui p_glUniform1ui;
+vpgl_PFN_glUniform2ui p_glUniform2ui;
+vpgl_PFN_glUniform3ui p_glUniform3ui;
+vpgl_PFN_glUniform4ui p_glUniform4ui;
+vpgl_PFN_glUniform1uiv p_glUniform1uiv;
+vpgl_PFN_glUniform2uiv p_glUniform2uiv;
+vpgl_PFN_glUniform3uiv p_glUniform3uiv;
+vpgl_PFN_glUniform4uiv p_glUniform4uiv;
+vpgl_PFN_glClearBufferiv p_glClearBufferiv;
+vpgl_PFN_glClearBufferuiv p_glClearBufferuiv;
+vpgl_PFN_glClearBufferfv p_glClearBufferfv;
+vpgl_PFN_glClearBufferfi p_glClearBufferfi;
+vpgl_PFN_glGetStringi p_glGetStringi;
+vpgl_PFN_glCopyBufferSubData p_glCopyBufferSubData;
+vpgl_PFN_glGetUniformIndices p_glGetUniformIndices;
+vpgl_PFN_glGetActiveUniformsiv p_glGetActiveUniformsiv;
+vpgl_PFN_glGetUniformBlockIndex p_glGetUniformBlockIndex;
+vpgl_PFN_glGetActiveUniformBlockiv p_glGetActiveUniformBlockiv;
+vpgl_PFN_glGetActiveUniformBlockName p_glGetActiveUniformBlockName;
+vpgl_PFN_glUniformBlockBinding p_glUniformBlockBinding;
+vpgl_PFN_glDrawArraysInstanced p_glDrawArraysInstanced;
+vpgl_PFN_glDrawElementsInstanced p_glDrawElementsInstanced;
+vpgl_PFN_glFenceSync p_glFenceSync;
+vpgl_PFN_glIsSync p_glIsSync;
+vpgl_PFN_glDeleteSync p_glDeleteSync;
+vpgl_PFN_glClientWaitSync p_glClientWaitSync;
+vpgl_PFN_glWaitSync p_glWaitSync;
+vpgl_PFN_glGetInteger64v p_glGetInteger64v;
+vpgl_PFN_glGetSynciv p_glGetSynciv;
+vpgl_PFN_glGetInteger64i_v p_glGetInteger64i_v;
+vpgl_PFN_glGetBufferParameteri64v p_glGetBufferParameteri64v;
+vpgl_PFN_glGenSamplers p_glGenSamplers;
+vpgl_PFN_glDeleteSamplers p_glDeleteSamplers;
+vpgl_PFN_glIsSampler p_glIsSampler;
+vpgl_PFN_glBindSampler p_glBindSampler;
+vpgl_PFN_glSamplerParameteri p_glSamplerParameteri;
+vpgl_PFN_glSamplerParameteriv p_glSamplerParameteriv;
+vpgl_PFN_glSamplerParameterf p_glSamplerParameterf;
+vpgl_PFN_glSamplerParameterfv p_glSamplerParameterfv;
+vpgl_PFN_glGetSamplerParameteriv p_glGetSamplerParameteriv;
+vpgl_PFN_glGetSamplerParameterfv p_glGetSamplerParameterfv;
+vpgl_PFN_glVertexAttribDivisor p_glVertexAttribDivisor;
+vpgl_PFN_glBindTransformFeedback p_glBindTransformFeedback;
+vpgl_PFN_glDeleteTransformFeedbacks p_glDeleteTransformFeedbacks;
+vpgl_PFN_glGenTransformFeedbacks p_glGenTransformFeedbacks;
+vpgl_PFN_glIsTransformFeedback p_glIsTransformFeedback;
+vpgl_PFN_glPauseTransformFeedback p_glPauseTransformFeedback;
+vpgl_PFN_glResumeTransformFeedback p_glResumeTransformFeedback;
+vpgl_PFN_glGetProgramBinary p_glGetProgramBinary;
+vpgl_PFN_glProgramBinary p_glProgramBinary;
+vpgl_PFN_glProgramParameteri p_glProgramParameteri;
+vpgl_PFN_glInvalidateFramebuffer p_glInvalidateFramebuffer;
+vpgl_PFN_glInvalidateSubFramebuffer p_glInvalidateSubFramebuffer;
+vpgl_PFN_glTexStorage2D p_glTexStorage2D;
+vpgl_PFN_glTexStorage3D p_glTexStorage3D;
+vpgl_PFN_glGetInternalformativ p_glGetInternalformativ;
+
+/* ---- entry-point name lists (X-macro) ---- */
+#define VPGL_EGL_ENTRY_LIST(X) \
+    X(BindAPI); \
+    X(ChooseConfig); \
+    X(CreateContext); \
+    X(CreatePbufferSurface); \
+    X(CreateWindowSurface); \
+    X(DestroyContext); \
+    X(DestroySurface); \
+    X(GetConfigAttrib); \
+    X(GetCurrentContext); \
+    X(GetCurrentDisplay); \
+    X(GetCurrentSurface); \
+    X(GetDisplay); \
+    X(GetError); \
+    X(Initialize); \
+    X(MakeCurrent); \
+    X(QueryContext); \
+    X(QueryString); \
+    X(QuerySurface); \
+    X(SwapBuffers); \
+    X(SwapInterval); \
+    X(Terminate);
+
+#define VPGL_GL_ENTRY_LIST(X) \
+    X(ActiveTexture); \
+    X(AttachShader); \
+    X(BeginQuery); \
+    X(BeginTransformFeedback); \
+    X(BindAttribLocation); \
+    X(BindBuffer); \
+    X(BindBufferBase); \
+    X(BindBufferRange); \
+    X(BindFramebuffer); \
+    X(BindRenderbuffer); \
+    X(BindSampler); \
+    X(BindTexture); \
+    X(BindTransformFeedback); \
+    X(BindVertexArray); \
+    X(BlendColor); \
+    X(BlendEquation); \
+    X(BlendEquationSeparate); \
+    X(BlendFunc); \
+    X(BlendFuncSeparate); \
+    X(BlitFramebuffer); \
+    X(BufferData); \
+    X(BufferSubData); \
+    X(CheckFramebufferStatus); \
+    X(Clear); \
+    X(ClearBufferfi); \
+    X(ClearBufferfv); \
+    X(ClearBufferiv); \
+    X(ClearBufferuiv); \
+    X(ClearColor); \
+    X(ClearDepthf); \
+    X(ClearStencil); \
+    X(ClientWaitSync); \
+    X(ColorMask); \
+    X(CompileShader); \
+    X(CompressedTexImage2D); \
+    X(CompressedTexImage3D); \
+    X(CompressedTexSubImage2D); \
+    X(CompressedTexSubImage3D); \
+    X(CopyBufferSubData); \
+    X(CopyTexImage2D); \
+    X(CopyTexSubImage2D); \
+    X(CopyTexSubImage3D); \
+    X(CreateProgram); \
+    X(CreateShader); \
+    X(CullFace); \
+    X(DeleteBuffers); \
+    X(DeleteFramebuffers); \
+    X(DeleteProgram); \
+    X(DeleteQueries); \
+    X(DeleteRenderbuffers); \
+    X(DeleteSamplers); \
+    X(DeleteShader); \
+    X(DeleteSync); \
+    X(DeleteTextures); \
+    X(DeleteTransformFeedbacks); \
+    X(DeleteVertexArrays); \
+    X(DepthFunc); \
+    X(DepthMask); \
+    X(DepthRangef); \
+    X(DetachShader); \
+    X(Disable); \
+    X(DisableVertexAttribArray); \
+    X(DrawArrays); \
+    X(DrawArraysInstanced); \
+    X(DrawBuffers); \
+    X(DrawElements); \
+    X(DrawElementsInstanced); \
+    X(DrawRangeElements); \
+    X(Enable); \
+    X(EnableVertexAttribArray); \
+    X(EndQuery); \
+    X(EndTransformFeedback); \
+    X(FenceSync); \
+    X(Finish); \
+    X(Flush); \
+    X(FlushMappedBufferRange); \
+    X(FramebufferRenderbuffer); \
+    X(FramebufferTexture2D); \
+    X(FramebufferTextureLayer); \
+    X(FrontFace); \
+    X(GenBuffers); \
+    X(GenFramebuffers); \
+    X(GenQueries); \
+    X(GenRenderbuffers); \
+    X(GenSamplers); \
+    X(GenTextures); \
+    X(GenTransformFeedbacks); \
+    X(GenVertexArrays); \
+    X(GenerateMipmap); \
+    X(GetActiveAttrib); \
+    X(GetActiveUniform); \
+    X(GetActiveUniformBlockName); \
+    X(GetActiveUniformBlockiv); \
+    X(GetActiveUniformsiv); \
+    X(GetAttachedShaders); \
+    X(GetAttribLocation); \
+    X(GetBooleanv); \
+    X(GetBufferParameteri64v); \
+    X(GetBufferParameteriv); \
+    X(GetBufferPointerv); \
+    X(GetError); \
+    X(GetFloatv); \
+    X(GetFragDataLocation); \
+    X(GetFramebufferAttachmentParameteriv); \
+    X(GetInteger64i_v); \
+    X(GetInteger64v); \
+    X(GetIntegeri_v); \
+    X(GetIntegerv); \
+    X(GetInternalformativ); \
+    X(GetProgramBinary); \
+    X(GetProgramInfoLog); \
+    X(GetProgramiv); \
+    X(GetQueryObjectuiv); \
+    X(GetQueryiv); \
+    X(GetRenderbufferParameteriv); \
+    X(GetSamplerParameterfv); \
+    X(GetSamplerParameteriv); \
+    X(GetShaderInfoLog); \
+    X(GetShaderPrecisionFormat); \
+    X(GetShaderSource); \
+    X(GetShaderiv); \
+    X(GetString); \
+    X(GetStringi); \
+    X(GetSynciv); \
+    X(GetTexParameterfv); \
+    X(GetTexParameteriv); \
+    X(GetTransformFeedbackVarying); \
+    X(GetUniformBlockIndex); \
+    X(GetUniformIndices); \
+    X(GetUniformLocation); \
+    X(GetUniformfv); \
+    X(GetUniformiv); \
+    X(GetUniformuiv); \
+    X(GetVertexAttribIiv); \
+    X(GetVertexAttribIuiv); \
+    X(GetVertexAttribPointerv); \
+    X(GetVertexAttribfv); \
+    X(GetVertexAttribiv); \
+    X(Hint); \
+    X(InvalidateFramebuffer); \
+    X(InvalidateSubFramebuffer); \
+    X(IsBuffer); \
+    X(IsEnabled); \
+    X(IsFramebuffer); \
+    X(IsProgram); \
+    X(IsQuery); \
+    X(IsRenderbuffer); \
+    X(IsSampler); \
+    X(IsShader); \
+    X(IsSync); \
+    X(IsTexture); \
+    X(IsTransformFeedback); \
+    X(IsVertexArray); \
+    X(LineWidth); \
+    X(LinkProgram); \
+    X(PauseTransformFeedback); \
+    X(PixelStorei); \
+    X(PolygonOffset); \
+    X(ProgramBinary); \
+    X(ProgramParameteri); \
+    X(ReadBuffer); \
+    X(ReadPixels); \
+    X(ReleaseShaderCompiler); \
+    X(RenderbufferStorage); \
+    X(RenderbufferStorageMultisample); \
+    X(ResumeTransformFeedback); \
+    X(SampleCoverage); \
+    X(SamplerParameterf); \
+    X(SamplerParameterfv); \
+    X(SamplerParameteri); \
+    X(SamplerParameteriv); \
+    X(Scissor); \
+    X(ShaderBinary); \
+    X(ShaderSource); \
+    X(StencilFunc); \
+    X(StencilFuncSeparate); \
+    X(StencilMask); \
+    X(StencilMaskSeparate); \
+    X(StencilOp); \
+    X(StencilOpSeparate); \
+    X(TexImage2D); \
+    X(TexImage3D); \
+    X(TexParameterf); \
+    X(TexParameterfv); \
+    X(TexParameteri); \
+    X(TexParameteriv); \
+    X(TexStorage2D); \
+    X(TexStorage3D); \
+    X(TexSubImage2D); \
+    X(TexSubImage3D); \
+    X(TransformFeedbackVaryings); \
+    X(Uniform1f); \
+    X(Uniform1fv); \
+    X(Uniform1i); \
+    X(Uniform1iv); \
+    X(Uniform1ui); \
+    X(Uniform1uiv); \
+    X(Uniform2f); \
+    X(Uniform2fv); \
+    X(Uniform2i); \
+    X(Uniform2iv); \
+    X(Uniform2ui); \
+    X(Uniform2uiv); \
+    X(Uniform3f); \
+    X(Uniform3fv); \
+    X(Uniform3i); \
+    X(Uniform3iv); \
+    X(Uniform3ui); \
+    X(Uniform3uiv); \
+    X(Uniform4f); \
+    X(Uniform4fv); \
+    X(Uniform4i); \
+    X(Uniform4iv); \
+    X(Uniform4ui); \
+    X(Uniform4uiv); \
+    X(UniformBlockBinding); \
+    X(UniformMatrix2fv); \
+    X(UniformMatrix2x3fv); \
+    X(UniformMatrix2x4fv); \
+    X(UniformMatrix3fv); \
+    X(UniformMatrix3x2fv); \
+    X(UniformMatrix3x4fv); \
+    X(UniformMatrix4fv); \
+    X(UniformMatrix4x2fv); \
+    X(UniformMatrix4x3fv); \
+    X(UnmapBuffer); \
+    X(UseProgram); \
+    X(ValidateProgram); \
+    X(VertexAttrib1f); \
+    X(VertexAttrib1fv); \
+    X(VertexAttrib2f); \
+    X(VertexAttrib2fv); \
+    X(VertexAttrib3f); \
+    X(VertexAttrib3fv); \
+    X(VertexAttrib4f); \
+    X(VertexAttrib4fv); \
+    X(VertexAttribDivisor); \
+    X(VertexAttribI4i); \
+    X(VertexAttribI4iv); \
+    X(VertexAttribI4ui); \
+    X(VertexAttribI4uiv); \
+    X(VertexAttribIPointer); \
+    X(VertexAttribPointer); \
+    X(Viewport); \
+    X(WaitSync);
 
 #endif /* VPGL_HOST_ENTRIES_H */

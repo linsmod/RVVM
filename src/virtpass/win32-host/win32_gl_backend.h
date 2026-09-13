@@ -1,21 +1,29 @@
 /*
  * GENERATED FILE - produced by tools/gen_gl_abi.py - DO NOT EDIT BY HAND.
  *
- * Source of truth: NDK sysroot headers GLES2/gl2.h + EGL/egl.h (parsed).
+ * Source of truth: NDK sysroot headers GLES2/gl2.h + GLES3/gl3.h + EGL/egl.h
+ * (parsed; gl3.h is merged after gl2.h so the GLES2 ids never move).
  * Regenerate with:  python tools/gen_gl_abi.py
  *
- * Phase 3 ABI notes:
+ * ABI notes:
  *  - fn_id macros are the single source of truth shared by the guest stubs,
- *    src/virtpass/vp_cmdpost.c and the win32 host GL dispatch.
- *  - gl_call.args has 9 slots (glCompressedTexSubImage2D needs 9; the
- *    original Phase 3 plan said 6 - widened before first deployment, so this
- *    is an internal ABI change with zero consumers).
+ *    src/virtpass/vp_cmdpost.c and both host GL dispatches.
+ *  - gl_call.args has 12 slots. glTexSubImage3D (GLES3) needs 11 and
+ *    glCompressedTexSubImage2D (GLES2) 9; the extra slot keeps
+ *    GL_CALL_RETBUF_SLOT above every real parameter list. Guest and host are
+ *    rebuilt together, so widening it is an internal ABI change only.
  *  - Floats travel bit-packed through the int64_t slots; pointers travel as
  *    guest virtual addresses. Guest memory is NOT mapped into the host, so
  *    the host dispatch translates every data pointer argument with
  *    rvvm_user_guest_ptr() and, for calls that hand back a host-owned string
- *    (glGetString/eglQueryString), copies it through the guest scratch
- *    buffer offered in args[GL_CALL_RETBUF_SLOT].
+ *    (glGetString/glGetStringi/eglQueryString), copies it through the guest
+ *    scratch buffer offered in args[GL_CALL_RETBUF_SLOT].
+ *  - Opaque host values (EGLDisplay/Config/Surface/Context, GLsync) are only
+ *    passed back by the guest and never translated.
+ *  - The overloaded pointer arguments (glVertexAttribPointer/IPointer,
+ *    glDrawElements/Instanced, glDrawRangeElements) travel as their bare
+ *    value; the host reads it as a byte offset when a buffer is bound to the
+ *    matching target and as a guest address otherwise (vpgl_ptr()).
  */
 
 #ifndef WIN32_GL_BACKEND_H

@@ -185,171 +185,22 @@ bool win32_gl_backend_load(void)
 
     /* GetProcAddress returns a generic FARPROC: cast through void* so the
      * function-pointer-to-function-pointer conversion is out of -Wcast-function-type
-     * (same idiom as posix_shim.c / win32_cmdpost_bridge.c). */
-    #define LOAD(name) p_egl##name = (vpgl_PFN_egl##name)(void*)GetProcAddress(g_h_egl, "egl" #name)
-    LOAD(ChooseConfig);
-    LOAD(CreateContext);
-    LOAD(CreatePbufferSurface);
-    LOAD(CreateWindowSurface);
-    LOAD(DestroyContext);
-    LOAD(DestroySurface);
-    LOAD(GetConfigAttrib);
-    LOAD(GetDisplay);
-    LOAD(GetError);
-    /* eglGetProcAddress is not loaded: the guest stub answers it from its own
-     * entry points, so no host function address ever reaches the guest. */
-    LOAD(Initialize);
-    LOAD(MakeCurrent);
-    LOAD(QueryString);
-    LOAD(QuerySurface);
-    LOAD(SwapBuffers);
-    LOAD(Terminate);
-    #undef LOAD
+     * (same idiom as posix_shim.c / win32_cmdpost_bridge.c).
+     *
+     * The names come from the generated vp_gl_host_entries.h rather than a
+     * hand-kept list, so the loader can no longer fall behind the ABI. ANGLE's
+     * and SwiftShader's libGLESv2.dll both export the whole GLES2 + GLES3 core;
+     * anything missing only leaves its p_* NULL, which the dispatch reports via
+     * vpgl_missing(). eglGetProcAddress is deliberately not loaded: the guest
+     * stub answers it from its own entry points, so no host function address
+     * ever reaches the guest. */
+    #define LOAD_EGL(name) p_egl##name = (vpgl_PFN_egl##name)(void*)GetProcAddress(g_h_egl, "egl" #name)
+    VPGL_EGL_ENTRY_LIST(LOAD_EGL)
+    #undef LOAD_EGL
 
-    #define LOAD(name) p_gl##name = (vpgl_PFN_gl##name)(void*)GetProcAddress(g_h_gles, "gl" #name)
-    LOAD(ActiveTexture);
-    LOAD(AttachShader);
-    LOAD(BindAttribLocation);
-    LOAD(BindBuffer);
-    LOAD(BindFramebuffer);
-    LOAD(BindRenderbuffer);
-    LOAD(BindTexture);
-    LOAD(BlendColor);
-    LOAD(BlendEquation);
-    LOAD(BlendEquationSeparate);
-    LOAD(BlendFunc);
-    LOAD(BlendFuncSeparate);
-    LOAD(BufferData);
-    LOAD(BufferSubData);
-    LOAD(CheckFramebufferStatus);
-    LOAD(Clear);
-    LOAD(ClearColor);
-    LOAD(ClearDepthf);
-    LOAD(ClearStencil);
-    LOAD(ColorMask);
-    LOAD(CompileShader);
-    LOAD(CompressedTexImage2D);
-    LOAD(CompressedTexSubImage2D);
-    LOAD(CopyTexImage2D);
-    LOAD(CopyTexSubImage2D);
-    LOAD(CreateProgram);
-    LOAD(CreateShader);
-    LOAD(CullFace);
-    LOAD(DeleteBuffers);
-    LOAD(DeleteFramebuffers);
-    LOAD(DeleteProgram);
-    LOAD(DeleteRenderbuffers);
-    LOAD(DeleteShader);
-    LOAD(DeleteTextures);
-    LOAD(DepthFunc);
-    LOAD(DepthMask);
-    LOAD(DepthRangef);
-    LOAD(DetachShader);
-    LOAD(Disable);
-    LOAD(DisableVertexAttribArray);
-    LOAD(DrawArrays);
-    LOAD(DrawElements);
-    LOAD(Enable);
-    LOAD(EnableVertexAttribArray);
-    LOAD(Finish);
-    LOAD(Flush);
-    LOAD(FramebufferRenderbuffer);
-    LOAD(FramebufferTexture2D);
-    LOAD(FrontFace);
-    LOAD(GenBuffers);
-    LOAD(GenerateMipmap);
-    LOAD(GenFramebuffers);
-    LOAD(GenRenderbuffers);
-    LOAD(GenTextures);
-    LOAD(GetActiveAttrib);
-    LOAD(GetActiveUniform);
-    LOAD(GetAttachedShaders);
-    LOAD(GetAttribLocation);
-    LOAD(GetBooleanv);
-    LOAD(GetBufferParameteriv);
-    LOAD(GetError);
-    LOAD(GetFloatv);
-    LOAD(GetFramebufferAttachmentParameteriv);
-    LOAD(GetIntegerv);
-    LOAD(GetProgramiv);
-    LOAD(GetProgramInfoLog);
-    LOAD(GetRenderbufferParameteriv);
-    LOAD(GetShaderiv);
-    LOAD(GetShaderInfoLog);
-    LOAD(GetShaderPrecisionFormat);
-    LOAD(GetShaderSource);
-    LOAD(GetString);
-    LOAD(GetTexParameterfv);
-    LOAD(GetTexParameteriv);
-    LOAD(GetUniformfv);
-    LOAD(GetUniformiv);
-    LOAD(GetUniformLocation);
-    LOAD(GetVertexAttribfv);
-    LOAD(GetVertexAttribiv);
-    LOAD(GetVertexAttribPointerv);
-    LOAD(Hint);
-    LOAD(IsBuffer);
-    LOAD(IsEnabled);
-    LOAD(IsFramebuffer);
-    LOAD(IsProgram);
-    LOAD(IsRenderbuffer);
-    LOAD(IsShader);
-    LOAD(IsTexture);
-    LOAD(LineWidth);
-    LOAD(LinkProgram);
-    LOAD(PixelStorei);
-    LOAD(PolygonOffset);
-    LOAD(ReadPixels);
-    LOAD(ReleaseShaderCompiler);
-    LOAD(RenderbufferStorage);
-    LOAD(SampleCoverage);
-    LOAD(Scissor);
-    LOAD(ShaderBinary);
-    LOAD(ShaderSource);
-    LOAD(StencilFunc);
-    LOAD(StencilFuncSeparate);
-    LOAD(StencilMask);
-    LOAD(StencilMaskSeparate);
-    LOAD(StencilOp);
-    LOAD(StencilOpSeparate);
-    LOAD(TexImage2D);
-    LOAD(TexParameterf);
-    LOAD(TexParameterfv);
-    LOAD(TexParameteri);
-    LOAD(TexParameteriv);
-    LOAD(TexSubImage2D);
-    LOAD(Uniform1f);
-    LOAD(Uniform1fv);
-    LOAD(Uniform1i);
-    LOAD(Uniform1iv);
-    LOAD(Uniform2f);
-    LOAD(Uniform2fv);
-    LOAD(Uniform2i);
-    LOAD(Uniform2iv);
-    LOAD(Uniform3f);
-    LOAD(Uniform3fv);
-    LOAD(Uniform3i);
-    LOAD(Uniform3iv);
-    LOAD(Uniform4f);
-    LOAD(Uniform4fv);
-    LOAD(Uniform4i);
-    LOAD(Uniform4iv);
-    LOAD(UniformMatrix2fv);
-    LOAD(UniformMatrix3fv);
-    LOAD(UniformMatrix4fv);
-    LOAD(UseProgram);
-    LOAD(ValidateProgram);
-    LOAD(VertexAttrib1f);
-    LOAD(VertexAttrib1fv);
-    LOAD(VertexAttrib2f);
-    LOAD(VertexAttrib2fv);
-    LOAD(VertexAttrib3f);
-    LOAD(VertexAttrib3fv);
-    LOAD(VertexAttrib4f);
-    LOAD(VertexAttrib4fv);
-    LOAD(VertexAttribPointer);
-    LOAD(Viewport);
-    #undef LOAD
+    #define LOAD_GL(name) p_gl##name = (vpgl_PFN_gl##name)(void*)GetProcAddress(g_h_gles, "gl" #name)
+    VPGL_GL_ENTRY_LIST(LOAD_GL)
+    #undef LOAD_GL
 
     if (!p_eglGetDisplay || !p_eglCreatePbufferSurface) {
         gl_log("GL backend: missing critical symbols");

@@ -32,22 +32,27 @@ static void* vpgl_gptr(int64_t v)
     return v ? rvvm_user_guest_ptr((uint64_t)v) : NULL;
 }
 
-/* glVertexAttribPointer/glDrawElements overload their pointer argument: it is
- * a guest address for a client-side array, but a byte offset into the bound
- * buffer object for VBO rendering. The value alone cannot distinguish the two
- * (a large VBO offset is still a number inside the guest address window), so
- * the guest stub tags the address form with GLSTUB_OFFSET_PTR_TAG. Here we
- * strip the tag, translate, and pass bare offsets through unchanged. */
-#define VPGL_OFFSET_PTR_TAG ((int64_t)1 << 62)
+/* glVertexAttribPointer/IPointer and glDrawElements/Instanced/glDrawRangeElements
+ * overload their pointer argument: a guest address for a client-side array, but
+ * a byte offset into a buffer object for VBO rendering. GL decides by the bound
+ * buffer, so ask live GL state instead of guessing from the value (a small
+ * offset is indistinguishable from a small guest address). Binding a buffer
+ * while passing a client array is already undefined GL behaviour, so the
+ * binding is an exact discriminator. */
+enum { VPGL_PTR_ARRAY, VPGL_PTR_ELEMENT };
 
-static void* vpgl_gptr_or_off(int64_t v)
+static void* vpgl_ptr(int64_t v, int kind)
 {
-    if (v & VPGL_OFFSET_PTR_TAG) {
-        return vpgl_gptr(v & ~VPGL_OFFSET_PTR_TAG);
+    vpgl_GLint bound = 0;
+    const vpgl_GLenum target = (kind == VPGL_PTR_ARRAY)
+                                   ? (vpgl_GLenum)GL_ARRAY_BUFFER_BINDING
+                                   : (vpgl_GLenum)GL_ELEMENT_ARRAY_BUFFER_BINDING;
+    if (p_glGetIntegerv) p_glGetIntegerv(target, &bound);
+    if (bound) {
+        /* Offset form: hand the number to GL untouched. */
+        return (void*)(uintptr_t)v;
     }
-    /* Untagged: a byte offset into the bound buffer object (or 0, which GL
-     * reads as offset 0 for VBO draws and as "no data" for client arrays). */
-    return (void*)(uintptr_t)v;
+    return vpgl_gptr(v);
 }
 
 /* glShaderSource passes `count` guest string pointers. Build the array of
@@ -92,6 +97,20 @@ static int64_t vpgl_string_out(const int64_t* a, const char* str)
     memcpy(dst, str, len);
     dst[len] = '\0';
     return (int64_t)ga;
+}
+
+/* A marshalled call whose host entry point was never resolved: an export
+ * missing from the GL DLL, or a loader that fell behind the ABI. Without this
+ * the call would be an invisible no-op and the guest would see a black frame
+ * or a wrong result instead of an error. Capped, because a render loop can hit
+ * the same call thousands of times per frame. */
+static void vpgl_missing(const char* name)
+{
+    static int reported;
+    if (reported >= 32) return;
+    reported++;
+    fprintf(stderr, "[gl] %s not resolved by the host GL backend (call dropped)\n", name);
+    fflush(stderr);
 }
 
 #include "virtpass/vp_gl_dispatch_tables.h"
