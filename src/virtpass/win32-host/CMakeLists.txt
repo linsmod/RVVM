@@ -3,8 +3,8 @@
 # Builds the host bridge (window/input/lifecycle), vp_cmdpost (single copy
 # in src/virtpass) and the full RVVM core for real guest execution. The POSIX
 # layer is shimmed via include/mingw_compat/ headers + src/win/posix_shim.c
-# implementations (semantic gaps like epoll/eventfd/futex/fork/sockets remain
-# ENOSYS - see README "Known gaps").
+# (plus src/win/win_socket.c for WinSock-backed sockets); semantic gaps like
+# eventfd/futex/fork remain - see README "Known gaps".
 
 cmake_minimum_required(VERSION 3.15)
 project(rvvm_winhost C)
@@ -21,6 +21,7 @@ add_executable(rvvm_winhost
     ${RVVM_ROOT}/src/virtpass/vp_cmdpost.c
     # POSIX shim implementations for MinGW (see include/mingw_compat/)
     ${RVVM_ROOT}/src/win/posix_shim.c
+    ${RVVM_ROOT}/src/win/win_socket.c
     # Core
     ${RVVM_ROOT}/src/core/rvvm.c
     ${RVVM_ROOT}/src/core/rvvm_user.c
@@ -98,4 +99,4 @@ target_include_directories(vterm PUBLIC "${LIBVTERM_DIR}/include" "${LIBVTERM_DI
 target_compile_options(vterm PRIVATE
     -Wno-error -Wno-unused -Wno-uninitialized -Wno-unused-parameter)
 
-target_link_libraries(rvvm_winhost PRIVATE user32 gdi32 vterm)
+target_link_libraries(rvvm_winhost PRIVATE user32 gdi32 vterm ws2_32)

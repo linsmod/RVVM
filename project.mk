@@ -148,7 +148,8 @@ override SRC_USE_LIBRETRO  := $(SRCDIR)/bindings/libretro/libretro.c
 override SRC_USE_VERTPASS  := $(SRCDIR)/virtpass/vp_cmdpost.c $(SRCDIR)/virtpass/vp_sensor.c
 override SRC_USE_JNI       := $(SRCDIR)/bindings/jni/rvvm_jni.c
 # Win32 implementations of the POSIX API declared in include/mingw_compat
-override SRC_USE_WIN32_COMPAT := $(SRCDIR)/win/posix_shim.c
+# (win_socket.c is the WinSock 2 backend behind the BSD socket shim)
+override SRC_USE_WIN32_COMPAT := $(SRCDIR)/win/posix_shim.c $(SRCDIR)/win/win_socket.c
 
 # Useflag dependencies
 override RVJIT_SUPPORTS_ARCH := $(if $(filter i386 x86_64 arm% riscv% loongarch64,$(ARCH)),1)

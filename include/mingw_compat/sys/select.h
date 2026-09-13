@@ -30,7 +30,14 @@ static inline int _fd_isset(int fd, const fd_set* s) {
     return 0;
 }
 
-int select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds,
-           struct timeval* timeout);
+/*
+ * ws2_32 exports the unprefixed select() (src/util/networking.c uses it with
+ * WinSock's own fd_set), so the userland bridge gets its own namespace here.
+ * The redirect is a function-like macro: it only expands on a call.
+ */
+int rvvm_win_select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds,
+                    struct timeval* timeout);
+
+#define select(...) rvvm_win_select(__VA_ARGS__)
 
 #endif /* RVVM_MINGW_SYS_SELECT_H */

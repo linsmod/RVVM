@@ -169,13 +169,21 @@ Debug switches:
 
 1. **Semantic layer is partial.** The full core builds and runs real guests,
    but these syscalls return ENOSYS or take fallback paths in `posix_shim.c`:
-   - `epoll`, `eventfd`, `futex`: Linux-only paths (also `__linux__`-guarded
-     in `rvvm_user.c` itself)
+   - `eventfd`, `futex`: Linux-only paths (also `__linux__`-guarded in
+     `rvvm_user.c` itself)
    - `fork`/`wait4`: no process model on Windows
-   - sockets: `sys/socket.h` shims exist, but socket syscalls are stubbed
+   - `statx`, `mremap`: no syscall case in `rvvm_user.c` for this host
    - signals: `sigaction` semantics are approximated, no real POSIX signal
      delivery (`tkill` returns ENOSYS, so musl `abort()` ends via
      `exit_group(127)`)
+   Networking works: `src/win/win_socket.c` backs the BSD socket shim with
+   WinSock 2 (AF_INET/AF_INET6 sockets, `socketpair` over a loopback TCP pair,
+   and an epoll emulated over `poll()`), translating the guest's Linux UAPI
+   constants and anchoring each socket onto a CRT fd so read()/write()/
+   close()/poll() keep working. Sockets take their own namespace
+   (`rvvm_win_*`) because `src/util/networking.c` links the native WinSock
+   names directly. `SCM_RIGHTS` fd passing is the one socket feature still
+   refused (`EINVAL`).
    A guest exercising those paths will fail; CPU-bound or file/graphics
    based guests are the reachable target.
    The Makefile build reuses the regular `USE_WIN32_GUI`/`USE_WIN32_COMPAT`
@@ -204,9 +212,8 @@ Debug switches:
 
 ## Suggested next steps
 
-1. Semantic emulation category by category (sockets, epoll/eventfd/futex
-   equivalents, real signal delivery) - the main blocker for dynamic-linker
-   and networked guests.
+1. Semantic emulation category by category (eventfd/futex equivalents, real
+   signal delivery) - the main blocker for dynamic-linker guests.
 2. Add the key-event queue (gap 3), then verify `test_game_activity` input
    end-to-end instead of logging.
 3. Drop the leftover `CMakeLists.txt`/`CMakePresets.json`/`mingw_toolchain.cmake`

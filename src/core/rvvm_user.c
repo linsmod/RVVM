@@ -103,10 +103,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <sys/resource.h> // getrusage()
 #include <grp.h>          // setgroups()
 
+// Event notification: native epoll on Linux, emulated over poll() on win32
+// (see src/win/posix_shim.c)
+#if defined(__linux__) || defined(_WIN32)
+#include <sys/epoll.h>   // epoll_create1(), epoll_ctl(), epoll_wait()
+#endif
+
 // Linux-specific stuff
 #ifdef __linux__
 #include <sys/eventfd.h> // eventfd()
-#include <sys/epoll.h>   // epoll_create1(), etc
 #include <sys/sysinfo.h> // sysinfo()
 #include <sys/fsuid.h>   // setfsuid(), setfsgid()
 #include <sys/vfs.h>     // struct statfs
@@ -2165,6 +2170,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_eventfd2(%lx, %lx)", a0, a1);
                     a0 = errno_ret(eventfd(a0, a1));
                     break;
+#endif
+#if defined(__linux__) || defined(_WIN32)
                 case 20: // epoll_create1
                     rvvm_info("sys_epoll_create1(%lx)", a0);
                     a0 = errno_ret(epoll_create1(a0));
@@ -2190,6 +2197,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 22: { // epoll_pwait (sigmask ignored)
                     rvvm_info("sys_epoll_pwait(%lx, %lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4, a5);
+                    if (!a1 && a2) {
+                        // A NULL event buffer is refused up front, like the kernel
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
                     struct epoll_event stack_evs[128];
                     struct epoll_event* host_evs = stack_evs;
                     size_t maxev = a2 > 128 ? 128 : a2;
@@ -3072,7 +3084,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * break the emulator's own access to it. */
                     a0 = 0;
                     break;
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
                 case 233: // madvise
                     rvvm_info("sys_madvise(%lx, %lx, %lx)", a0, a1, a2);
                     a0 = 0;

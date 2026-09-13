@@ -2,10 +2,11 @@
  * posix_shim.c - Win32 implementations for the POSIX functions declared
  * in the mingw_compat/ headers. Covers the compile layer for the RVVM
  * core build: everything here either is implemented on top of
- * Win32 (mmap/memory, clocks, file *at() family, ...) or is an explicit
- * ENOSYS stub for semantics Windows cannot provide without a full
- * emulation layer (fork/epoll/eventfd/futex/sockets/... - see README
- * "Known gaps").
+ * Win32 (mmap/memory, clocks, file *at() family, poll/select, epoll over
+ * poll(), ...) or is an explicit ENOSYS stub for semantics Windows cannot
+ * provide without a full emulation layer (fork/eventfd/futex - see README
+ * "Known gaps"). Sockets live in win_socket.c; the CRT fd layer below
+ * dispatches to it so read()/write()/close()/dup() work on a socket fd.
  *
  * Design notes:
  *  - fds are CRT fds (from _open/_open_osfhandle/_pipe), converted to
@@ -58,6 +59,16 @@
 #include <sys/times.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <sys/epoll.h>
+
+/* WinSock-backed sockets (and their CRT fd anchors) - see win_socket.c */
+#include "win_socket.h"
+
+/* The POSIX spellings of read/write/close/dup are MSVC-deprecated aliases in
+ * MinGW's <io.h>; this file provides the real implementations on purpose. */
+#if defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -587,6 +598,63 @@ ssize_t pwrite(int fd, const void* buf, size_t count, long long offset)
 /* fd operations                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Sockets are anchored onto CRT fds (see win_socket.c), so the descriptor
+ * data path has to dispatch them before falling back to the CRT. The POSIX
+ * signatures of read/write/close/dup are the MinGW <io.h> ones on purpose:
+ * this is exactly the symbol those callers resolve against. */
+
+static int shim_epoll_anchor_release(int fd);
+
+int read(int fd, void* buf, unsigned int count)
+{
+    if (win_socket_is_fd(fd)) {
+        return (int)win_socket_read(fd, buf, count);
+    }
+    return _read(fd, buf, count);
+}
+
+int write(int fd, const void* buf, unsigned int count)
+{
+    if (win_socket_is_fd(fd)) {
+        return (int)win_socket_write(fd, buf, count);
+    }
+    return _write(fd, buf, count);
+}
+
+int close(int fd)
+{
+    if (win_socket_is_fd(fd)) {
+        return win_socket_close(fd);
+    }
+    if (shim_epoll_anchor_release(fd)) {
+        return 0;
+    }
+    return _close(fd);
+}
+
+int dup(int fd)
+{
+    if (win_socket_is_fd(fd)) {
+        return win_socket_dup(fd);
+    }
+    return _dup(fd);
+}
+
+int dup2(int oldfd, int newfd)
+{
+    if (oldfd == newfd) {
+        return newfd;
+    }
+    if (win_socket_is_fd(oldfd) || win_socket_is_fd(newfd)) {
+        /* Moving a socket to a fixed descriptor would mean relocating its CRT
+         * anchor; the guests that rely on dup2-on-socket (fork/exec plumbing)
+         * have no Windows equivalent anyway. */
+        errno = ENOSYS;
+        return -1;
+    }
+    return _dup2(oldfd, newfd);
+}
+
 int pipe(int fds[2])
 {
     return _pipe(fds, 65536, _O_BINARY);
@@ -615,7 +683,7 @@ int fdatasync(int fd)
 int dup3(int oldfd, int newfd, int flags)
 {
     (void)flags;
-    return _dup2(oldfd, newfd);
+    return dup2(oldfd, newfd);
 }
 
 int fcntl(int fd, int cmd, ...)
@@ -646,6 +714,12 @@ int fcntl(int fd, int cmd, ...)
         if (fd < 0 || fd >= 4096) {
             errno = EBADF;
             return -1;
+        }
+        if (win_socket_is_fd(fd)) {
+            /* The guest passes the Linux UAPI O_NONBLOCK (0x800), not MinGW's */
+            if (win_socket_set_nonblock(fd, !!(arg & 0x800)) < 0) {
+                return -1;
+            }
         }
         fd_flags[fd] = (int)arg;
         return 0;
@@ -1006,7 +1080,7 @@ static short shim_poll_revents(int fd, short events)
 }
 
 /*
- * Real poll() over Win32 kernel objects.
+ * poll() over Win32 kernel objects - the no-socket case.
  *
  * Unlike a real Linux guest, rvvm-user passes syscalls straight through, so
  * the guest's pipe()/read()/poll() share our CRT fd table and the underlying
@@ -1017,8 +1091,11 @@ static short shim_poll_revents(int fd, short events)
  * guest parks in poll() on the pipe it owns and the host's frame clock wakes
  * it with a plain write(). The old Sleep()-and-return-0 stub could not wake
  * anyone, so the guest would have had to spin.
+ *
+ * Called by poll() for fd sets without WinSock sockets: those are not waitable
+ * objects and take the WSAPoll() path there instead.
  */
-int poll(struct pollfd* fds, nfds_t nfds, int timeout)
+static int shim_poll_objects(struct pollfd* fds, nfds_t nfds, int timeout)
 {
     HANDLE    handles[SHIM_POLL_MAX_WAIT];
     int       map[SHIM_POLL_MAX_WAIT];   /* fds[i] -> index into handles, or -1 */
@@ -1144,20 +1221,492 @@ int poll(struct pollfd* fds, nfds_t nfds, int timeout)
     }
 }
 
-int select(int nfds, fd_set* rset, fd_set* wset, fd_set* eset, struct timeval* timeout)
+int poll(struct pollfd* fds, nfds_t nfds, int timeout)
 {
+    int       sidx[SHIM_POLL_MAX_WAIT];  /* socket subset: fds[] index */
+    short     sev[SHIM_POLL_MAX_WAIT];
+    short     srev[SHIM_POLL_MAX_WAIT];
+    unsigned  nsockets = 0;
+    unsigned  nvalid = 0;
+    int       ready = 0;
+    ULONGLONG deadline = 0;
+    nfds_t    i;
+    unsigned  k;
+
+    if (!fds || nfds <= 0) {
+        /* Nothing to wait on: only the timeout is meaningful */
+        Sleep(timeout > 0 ? (DWORD)timeout : 1);
+        return 0;
+    }
+
+    if (nfds > SHIM_POLL_MAX_WAIT) {
+        /* More fds than WaitForMultipleObjects() can take at once. Keep the
+         * old pacing behaviour rather than blocking on a partial set. */
+        for (i = 0; i < nfds; i++) {
+            fds[i].revents = 0;
+        }
+        Sleep(timeout > 0 ? (DWORD)timeout : 1);
+        return 0;
+    }
+
+    if (timeout >= 0) {
+        deadline = GetTickCount64() + (ULONGLONG)timeout;
+    }
+
+    for (i = 0; i < nfds; i++) {
+        fds[i].revents = 0;
+        if (fds[i].fd < 0) {
+            continue;
+        }
+        nvalid++;
+        if (win_socket_is_fd(fds[i].fd)) {
+            nsockets++;
+        }
+    }
+
+    /*
+     * A WinSock socket is not a waitable kernel object, so sockets can only be
+     * waited on with WSAPoll(). Three cases:
+     *   - sockets only       -> one WSAPoll() call, timeout exactly honoured
+     *   - kernel objects only-> WaitForMultipleObjects() as before (this is the
+     *                           vsync pipe path the virtpass hosts rely on)
+     *   - mixed              -> 1 ms polls; the rare case that cannot be served
+     *                           by a single host wait
+     */
+    if (nsockets && nsockets == nvalid) {
+        int sfd[SHIM_POLL_MAX_WAIT];
+        unsigned n = 0;
+        int r;
+        for (i = 0; i < nfds; i++) {
+            if (fds[i].fd < 0) {
+                continue;
+            }
+            sidx[n] = (int)i;
+            sev[n] = fds[i].events;
+            srev[n] = 0;
+            n++;
+        }
+        for (k = 0; k < n; k++) {
+            sfd[k] = fds[sidx[k]].fd;
+        }
+        r = win_socket_wait_many(sfd, sev, srev, (int)n, timeout);
+        if (r < 0) {
+            return -1;
+        }
+        if (r == 0) {
+            return 0;
+        }
+        for (k = 0; k < n; k++) {
+            if (srev[k]) {
+                fds[sidx[k]].revents = srev[k];
+                ready++;
+            }
+        }
+        return ready;
+    }
+
+    if (nsockets) {
+        /* Mixed set: probe everything without blocking */
+        for (;;) {
+            int done = 0;
+            for (i = 0; i < nfds; i++) {
+                if (fds[i].fd < 0 || fds[i].revents) {
+                    continue;
+                }
+                if (win_socket_is_fd(fds[i].fd)) {
+                    int r = win_socket_wait(fds[i].fd, fds[i].events, 0);
+                    if (r < 0) {
+                        fds[i].revents = POLLNVAL;
+                        done++;
+                    } else if (r) {
+                        fds[i].revents = (short)r;
+                        done++;
+                    }
+                } else {
+                    HANDLE h = (HANDLE)_get_osfhandle(fds[i].fd);
+                    if (h == INVALID_HANDLE_VALUE || h == NULL) {
+                        fds[i].revents = POLLNVAL;
+                        done++;
+                    } else if (WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
+                        fds[i].revents = shim_poll_revents(fds[i].fd, fds[i].events);
+                        if (fds[i].revents) {
+                            done++;
+                        }
+                    }
+                }
+            }
+            if (done) {
+                return done;
+            }
+            if (timeout == 0) {
+                return 0;
+            }
+            if (timeout > 0 && GetTickCount64() >= deadline) {
+                return 0;
+            }
+            Sleep(1);
+        }
+    }
+
+    /* No sockets: the plain Win32 object wait handles the whole set */
+    return shim_poll_objects(fds, nfds, timeout);
+}
+
+/*
+ * select() over poll(), so that sockets, pipes and regular files share one
+ * readiness path (there is no CRT select() on Windows, and WinSock's version
+ * only knows WinSock sockets - the guest's fd space is a CRT one here).
+ */
+int rvvm_win_select(int nfds, fd_set* rset, fd_set* wset, fd_set* eset,
+                    struct timeval* timeout)
+{
+    struct pollfd pfds[FD_SETSIZE];
+    unsigned char which[FD_SETSIZE];    /* bit 1: read, 2: write, 4: except */
+    fd_set ro, wo, eo;
+    nfds_t n = 0;
+    int timeout_ms = -1;
+    int ready, i;
+    unsigned k;
+
     (void)nfds;
-    if (rset) FD_ZERO(rset);
-    if (wset) FD_ZERO(wset);
-    if (eset) FD_ZERO(eset);
-    Sleep(timeout ? (DWORD)(timeout->tv_sec * 1000 + timeout->tv_usec / 1000) : 1);
-    return 0;
+
+    if (timeout) {
+        timeout_ms = (int)(timeout->tv_sec * 1000 + timeout->tv_usec / 1000);
+        if (timeout_ms < 0) {
+            timeout_ms = 0;
+        }
+    }
+
+#define SHIM_SELECT_ADD(set, bit, ev)                                     \
+    do {                                                                  \
+        const fd_set* s_ = (set);                                         \
+        if (s_) {                                                         \
+            for (k = 0; k < s_->fd_count; k++) {                          \
+                int fd_ = s_->fd_array[k];                                \
+                nfds_t j_;                                                \
+                for (j_ = 0; j_ < n; j_++) {                              \
+                    if (pfds[j_].fd == fd_) {                             \
+                        pfds[j_].events |= (ev);                          \
+                        which[j_] |= (bit);                               \
+                        break;                                            \
+                    }                                                     \
+                }                                                         \
+                if (j_ == n && n < FD_SETSIZE) {                          \
+                    pfds[n].fd = fd_;                                     \
+                    pfds[n].events = (ev);                                \
+                    pfds[n].revents = 0;                                  \
+                    which[n] = (bit);                                     \
+                    n++;                                                  \
+                }                                                         \
+            }                                                             \
+        }                                                                 \
+    } while (0)
+
+    SHIM_SELECT_ADD(rset, 1, POLLIN);
+    SHIM_SELECT_ADD(wset, 2, POLLOUT);
+    SHIM_SELECT_ADD(eset, 4, POLLPRI);
+#undef SHIM_SELECT_ADD
+
+    ready = poll(pfds, n, timeout_ms);
+    if (ready < 0) {
+        return -1;
+    }
+
+    FD_ZERO(&ro);
+    FD_ZERO(&wo);
+    FD_ZERO(&eo);
+    ready = 0;
+    for (i = 0; i < (int)n; i++) {
+        short rev = pfds[i].revents;
+        int hit = 0;
+        if (!rev) {
+            continue;
+        }
+        if ((which[i] & 1) && (rev & (POLLIN | POLLHUP | POLLERR))) {
+            FD_SET(pfds[i].fd, &ro);
+            hit = 1;
+        }
+        if ((which[i] & 2) && (rev & (POLLOUT | POLLERR))) {
+            FD_SET(pfds[i].fd, &wo);
+            hit = 1;
+        }
+        if ((which[i] & 4) && (rev & POLLPRI)) {
+            FD_SET(pfds[i].fd, &eo);
+            hit = 1;
+        }
+        if (hit) {
+            ready++;
+        }
+    }
+
+    if (rset) *rset = ro;
+    if (wset) *wset = wo;
+    if (eset) *eset = eo;
+    return ready;
+}
+
+/* ------------------------------------------------------------------ */
+/* epoll - emulated over poll()                                        */
+/*                                                                     */
+/* Windows has neither epoll nor kqueue, and the guest's event loop is  */
+/* the one place where a plain poll() is not enough on its own: epoll   */
+/* keeps a persistent interest set. The instance is anchored to a CRT   */
+/* fd (same trick as sockets) so close()/dup() keep working.            */
+/* ------------------------------------------------------------------ */
+
+#define SHIM_EPOLL_MAX_FDS       64
+#define SHIM_EPOLL_MAX_INSTANCES 32
+
+typedef struct {
+    int      fd;
+    uint32_t events;
+    uint64_t data;
+} shim_epoll_item_t;
+
+typedef struct {
+    int               used;
+    size_t            count;
+    int               anchor;
+    shim_epoll_item_t items[SHIM_EPOLL_MAX_FDS];
+} shim_epoll_t;
+
+static SRWLOCK      shim_epoll_lock = SRWLOCK_INIT;
+static shim_epoll_t shim_epolls[SHIM_EPOLL_MAX_INSTANCES];
+
+static int shim_epoll_lookup(int epfd)
+{
+    int i;
+    if (epfd < 0) {
+        return -1;
+    }
+    for (i = 0; i < SHIM_EPOLL_MAX_INSTANCES; i++) {
+        if (shim_epolls[i].used && shim_epolls[i].anchor == epfd) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int shim_epoll_anchor_release(int fd)
+{
+    int i;
+    int found = 0;
+    AcquireSRWLockExclusive(&shim_epoll_lock);
+    i = shim_epoll_lookup(fd);
+    if (i >= 0) {
+        shim_epolls[i].used = 0;
+        shim_epolls[i].count = 0;
+        shim_epolls[i].anchor = -1;
+        found = 1;
+    }
+    ReleaseSRWLockExclusive(&shim_epoll_lock);
+    if (found) {
+        win_socket_free_anchor(fd);
+    }
+    return found;
+}
+
+static uint32_t shim_epoll_to_poll(uint32_t events)
+{
+    uint32_t p = 0;
+    if (events & (EPOLLIN | EPOLLRDNORM))  p |= POLLIN;
+    if (events & (EPOLLOUT | EPOLLWRNORM)) p |= POLLOUT;
+    if (events & EPOLLPRI)                 p |= POLLPRI;
+    return p;
+}
+
+static uint32_t shim_poll_to_epoll(short revents)
+{
+    uint32_t e = 0;
+    if (revents & POLLIN)  e |= EPOLLIN;
+    if (revents & POLLOUT) e |= EPOLLOUT;
+    if (revents & POLLPRI) e |= EPOLLPRI;
+    if (revents & POLLERR)                 e |= EPOLLERR;
+    if (revents & POLLHUP)                 e |= EPOLLHUP;
+    if (revents & POLLNVAL)                e |= EPOLLERR;
+    return e;
+}
+
+int epoll_create1(int flags)
+{
+    int i, anchor, slot = -1;
+
+    (void)flags;
+    anchor = win_socket_alloc_anchor();
+    if (anchor < 0) {
+        return -1;
+    }
+    AcquireSRWLockExclusive(&shim_epoll_lock);
+    for (i = 0; i < SHIM_EPOLL_MAX_INSTANCES; i++) {
+        if (!shim_epolls[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot >= 0) {
+        shim_epolls[slot].used = 1;
+        shim_epolls[slot].count = 0;
+        shim_epolls[slot].anchor = anchor;
+    }
+    ReleaseSRWLockExclusive(&shim_epoll_lock);
+    if (slot < 0) {
+        win_socket_free_anchor(anchor);
+        errno = EMFILE;
+        return -1;
+    }
+    return anchor;
+}
+
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event* event)
+{
+    int slot = shim_epoll_lookup(epfd);
+    int ret = 0;
+    size_t i;
+
+    if (slot < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    if (op != EPOLL_CTL_DEL && !event) {
+        errno = EFAULT;
+        return -1;
+    }
+
+    AcquireSRWLockExclusive(&shim_epoll_lock);
+    switch (op) {
+    case EPOLL_CTL_ADD: {
+        shim_epoll_t* ep = &shim_epolls[slot];
+        for (i = 0; i < ep->count; i++) {
+            if (ep->items[i].fd == fd) {
+                ret = -1;
+                errno = EEXIST;
+                goto done;
+            }
+        }
+        if (ep->count >= SHIM_EPOLL_MAX_FDS) {
+            ret = -1;
+            errno = ENOSPC;
+            goto done;
+        }
+        ep->items[ep->count].fd = fd;
+        ep->items[ep->count].events = event->events;
+        ep->items[ep->count].data = event->data.u64;
+        ep->count++;
+        break;
+    }
+    case EPOLL_CTL_MOD: {
+        shim_epoll_t* ep = &shim_epolls[slot];
+        for (i = 0; i < ep->count; i++) {
+            if (ep->items[i].fd == fd) {
+                ep->items[i].events = event->events;
+                ep->items[i].data = event->data.u64;
+                break;
+            }
+        }
+        if (i == ep->count) {
+            ret = -1;
+            errno = ENOENT;
+        }
+        break;
+    }
+    case EPOLL_CTL_DEL: {
+        shim_epoll_t* ep = &shim_epolls[slot];
+        for (i = 0; i < ep->count; i++) {
+            if (ep->items[i].fd == fd) {
+                ep->items[i] = ep->items[ep->count - 1];
+                ep->count--;
+                break;
+            }
+        }
+        if (i == ep->count) {
+            ret = -1;
+            errno = ENOENT;
+        }
+        break;
+    }
+    default:
+        ret = -1;
+        errno = EINVAL;
+        break;
+    }
+
+done:
+    ReleaseSRWLockExclusive(&shim_epoll_lock);
+    return ret;
+}
+
+int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout)
+{
+    struct pollfd pfds[SHIM_EPOLL_MAX_FDS];
+    shim_epoll_item_t items[SHIM_EPOLL_MAX_FDS];
+    int slot = shim_epoll_lookup(epfd);
+    size_t count, i;
+    int n = 0, ready, out = 0;
+
+    if (slot < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    if (!events || maxevents <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    AcquireSRWLockExclusive(&shim_epoll_lock);
+    count = shim_epolls[slot].count;
+    for (i = 0; i < count; i++) {
+        items[i] = shim_epolls[slot].items[i];
+    }
+    ReleaseSRWLockExclusive(&shim_epoll_lock);
+
+    for (i = 0; i < count; i++) {
+        pfds[n].fd = items[i].fd;
+        pfds[n].events = (short)shim_epoll_to_poll(items[i].events);
+        pfds[n].revents = 0;
+        n++;
+    }
+
+    if (!n) {
+        /* Nothing registered: only the timeout is meaningful */
+        if (timeout > 0) {
+            Sleep((DWORD)timeout);
+        }
+        return 0;
+    }
+
+    ready = poll(pfds, (nfds_t)n, timeout);
+    if (ready < 0) {
+        return -1;
+    }
+    if (ready == 0) {
+        return 0;
+    }
+
+    for (i = 0; i < count && out < maxevents; i++) {
+        uint32_t ev;
+        if (!pfds[i].revents) {
+            continue;
+        }
+        ev = shim_poll_to_epoll(pfds[i].revents);
+        /* Only report what was subscribed, plus the always-reported errors */
+        events[out].events = ev & (items[i].events | EPOLLERR | EPOLLHUP);
+        events[out].data.u64 = items[i].data;
+        out++;
+    }
+    return out;
 }
 
 int ioctl(int fd, unsigned long req, ...)
 {
-    (void)fd;
-    (void)req;
+    va_list ap;
+    void* arg = NULL;
+    va_start(ap, req);
+    arg = va_arg(ap, void*);
+    va_end(ap);
+    if (win_socket_is_fd(fd)) {
+        return win_socket_ioctl(fd, req, arg);
+    }
+    (void)arg;
     errno = ENOTTY;
     return -1;
 }
@@ -1197,114 +1746,162 @@ int shmdt(const void* shmaddr)
 }
 
 /* ------------------------------------------------------------------ */
-/* Sockets - ENOSYS stubs (see README "Known gaps")                    */
+/* Sockets - WinSock-backed (see win_socket.c)                         */
+/*                                                                     */
+/* The POSIX spellings are redirected to rvvm_win_* by the socket shim  */
+/* header, so what is written below is the bridge's own namespace - the */
+/* unprefixed names belong to ws2_32 (src/util/networking.c).          */
 /* ------------------------------------------------------------------ */
 
 int socket(int domain, int type, int protocol)
 {
-    (void)domain; (void)type; (void)protocol;
-    errno = ENOSYS;
-    return -1;
+    return win_socket_create(domain, type, protocol);
 }
 
 int socketpair(int domain, int type, int protocol, int sv[2])
 {
-    (void)domain; (void)type; (void)protocol; (void)sv;
-    errno = ENOSYS;
-    return -1;
+    if (!sv) {
+        errno = EFAULT;
+        return -1;
+    }
+    return win_socket_pair(domain, type, protocol, sv);
 }
 
 int bind(int fd, const struct sockaddr* addr, socklen_t len)
 {
-    (void)fd; (void)addr; (void)len;
-    errno = ENOSYS;
-    return -1;
+    if (!addr && len) {
+        errno = EFAULT;
+        return -1;
+    }
+    return win_socket_bind(fd, addr, (int)len);
 }
 
 int listen(int fd, int backlog)
 {
-    (void)fd; (void)backlog;
-    errno = ENOSYS;
-    return -1;
+    return win_socket_listen(fd, backlog);
 }
 
 int accept(int fd, struct sockaddr* addr, socklen_t* addrlen)
 {
-    (void)fd; (void)addr; (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    if ((addr && !addrlen) || (addrlen && !addr)) {
+        errno = EFAULT;
+        return -1;
+    }
+    return win_socket_accept(fd, addr, (int*)addrlen, 0);
+}
+
+int accept4(int fd, struct sockaddr* addr, socklen_t* addrlen, int flags)
+{
+    if ((addr && !addrlen) || (addrlen && !addr)) {
+        errno = EFAULT;
+        return -1;
+    }
+    return win_socket_accept(fd, addr, (int*)addrlen, flags);
 }
 
 int connect(int fd, const struct sockaddr* addr, socklen_t len)
 {
-    (void)fd; (void)addr; (void)len;
-    errno = ENOSYS;
-    return -1;
+    if (!addr) {
+        errno = EFAULT;
+        return -1;
+    }
+    return win_socket_connect(fd, addr, (int)len);
 }
 
 int getsockname(int fd, struct sockaddr* addr, socklen_t* addrlen)
 {
-    (void)fd; (void)addr; (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    if (!addr || !addrlen) {
+        errno = EFAULT;
+        return -1;
+    }
+    return win_socket_getsockname(fd, addr, (int*)addrlen);
 }
 
 int getpeername(int fd, struct sockaddr* addr, socklen_t* addrlen)
 {
-    (void)fd; (void)addr; (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    if (!addr || !addrlen) {
+        errno = EFAULT;
+        return -1;
+    }
+    return win_socket_getpeername(fd, addr, (int*)addrlen);
 }
 
 ssize_t sendto(int fd, const void* buf, size_t len, int flags,
                const struct sockaddr* addr, socklen_t addrlen)
 {
-    (void)fd; (void)buf; (void)len; (void)flags; (void)addr; (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    if (!buf && len) {
+        errno = EFAULT;
+        return -1;
+    }
+    return (ssize_t)win_socket_sendto(fd, buf, len, flags, addr, (int)addrlen);
 }
 
 ssize_t recvfrom(int fd, void* buf, size_t len, int flags,
                  struct sockaddr* addr, socklen_t* addrlen)
 {
-    (void)fd; (void)buf; (void)len; (void)flags; (void)addr; (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    if (!buf && len) {
+        errno = EFAULT;
+        return -1;
+    }
+    return (ssize_t)win_socket_recvfrom(fd, buf, len, flags, addr, (int*)addrlen);
 }
 
 int setsockopt(int fd, int level, int optname, const void* optval, socklen_t optlen)
 {
-    (void)fd; (void)level; (void)optname; (void)optval; (void)optlen;
-    errno = ENOSYS;
-    return -1;
+    return win_socket_setsockopt(fd, level, optname, optval, (int)optlen);
 }
 
 int getsockopt(int fd, int level, int optname, void* optval, socklen_t* optlen)
 {
-    (void)fd; (void)level; (void)optname; (void)optval; (void)optlen;
-    errno = ENOSYS;
-    return -1;
+    if (!optlen) {
+        errno = EFAULT;
+        return -1;
+    }
+    return win_socket_getsockopt(fd, level, optname, optval, (int*)optlen);
 }
 
 int shutdown(int fd, int how)
 {
-    (void)fd; (void)how;
-    errno = ENOSYS;
-    return -1;
+    return win_socket_shutdown(fd, how);
 }
 
 ssize_t sendmsg(int fd, const struct msghdr* msg, int flags)
 {
-    (void)fd; (void)msg; (void)flags;
-    errno = ENOSYS;
-    return -1;
+    if (!msg) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (msg->msg_control && msg->msg_controllen) {
+        /* Ancillary data (SCM_RIGHTS fd passing) has no Windows bridge */
+        errno = EINVAL;
+        return -1;
+    }
+    return (ssize_t)win_socket_send_iov(fd, msg->msg_iov, (int)msg->msg_iovlen,
+                                        flags, msg->msg_name, (int)msg->msg_namelen);
 }
 
 ssize_t recvmsg(int fd, struct msghdr* msg, int flags)
 {
-    (void)fd; (void)msg; (void)flags;
-    errno = ENOSYS;
-    return -1;
+    int namelen;
+    ssize_t ret;
+    if (!msg) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (msg->msg_control && msg->msg_controllen) {
+        /* No control messages are ever delivered: report an empty cmsg list
+         * instead of leaving the guest parsing stale bytes. */
+        msg->msg_controllen = 0;
+    }
+    namelen = (int)msg->msg_namelen;
+    ret = (ssize_t)win_socket_recv_iov(fd, msg->msg_iov, (int)msg->msg_iovlen, flags,
+                                       msg->msg_name ? msg->msg_name : NULL,
+                                       msg->msg_name ? &namelen : NULL);
+    if (ret >= 0 && msg->msg_name) {
+        msg->msg_namelen = (socklen_t)namelen;
+    }
+    msg->msg_flags = 0;
+    return ret;
 }
 
 /* ------------------------------------------------------------------ */

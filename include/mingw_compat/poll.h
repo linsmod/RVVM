@@ -1,5 +1,7 @@
 /*
- * poll.h - MinGW shim (pollfd + poll, returns -1/ENOSYS).
+ * poll.h - MinGW shim (pollfd + poll). Implemented over Win32 kernel objects
+ * and WSAPoll() in src/win/posix_shim.c; the event bits use the Linux UAPI
+ * numbering because that is what the guest passes in.
  */
 
 #ifndef RVVM_MINGW_POLL_H
