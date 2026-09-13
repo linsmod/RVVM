@@ -23,6 +23,12 @@ PUSH_OPTIMIZATION_SIZE
 // Win32 VMA implementation using VirtualAlloc(), VirtualFree(), VirtualProtect(), MapViewOfFile(), etc
 #include <windows.h>
 
+#if defined(HOST_TARGET_WINNT) && !defined(_MSC_VER)
+// POSIX-on-Win32 shim: memfd_create(), ftruncate(), close() for anon FDs
+#include <unistd.h>
+#define VMA_WIN32_POSIX_SHIM 1
+#endif
+
 /*
  * TODO: Better mmap() emulation on Win32?
  * - Proper vma_remap()
@@ -270,7 +276,29 @@ static inline void vma_align_inward(void** addr, size_t* size)
 int vma_anon_memfd(size_t size)
 {
     int memfd = -1;
-#if defined(VMA_MMAP_IMPL)
+#if defined(VMA_WIN32_IMPL)
+    /*
+     * Win32 has no memfd, but the POSIX-on-Win32 compat layer (see
+     * src/win/posix_shim.c, linked into the Win32 host) emulates one with a
+     * delete-on-close file in %TEMP%. That is sufficient here: the only
+     * consumer of an anon FD on this host probes guest memory readability via
+     * write(), see proc_mem_readable() in rvvm_user.c. fd-backed mappings are
+     * not offered at all on Win32, vma_mmap() goes through rvfile_t there.
+     */
+#if defined(VMA_WIN32_POSIX_SHIM)
+    size = align_size_up(size, vma_granularity());
+    memfd = memfd_create("vma_anon", 0);
+    if (memfd >= 0 && ftruncate(memfd, (off_t)size) < 0) {
+        close(memfd);
+        memfd = -1;
+    }
+#else
+    UNUSED(size);
+#endif
+    if (memfd < 0) {
+        rvvm_warn("Anonymous memfd is not supported!");
+    }
+#elif defined(VMA_MMAP_IMPL)
     size = align_size_up(size, vma_granularity());
 #if defined(HOST_TARGET_LINUX) && defined(__NR_memfd_create) && defined(MFD_CLOEXEC)
     memfd = syscall(__NR_memfd_create, "vma_anon", MFD_CLOEXEC);

@@ -3320,37 +3320,43 @@ static void* rvvm_user_thread_wrap(void* arg)
 
             rvvm_addr_t pc = rvvm_read_cpu_reg(cpu, RVVM_REGID_PC);
             rvvm_addr_t pc_al = EVAL_MAX(pc - 16, pc & ~0xFFF);
+            rvvm_addr_t pc_fault = pc; // The backtrace walk below moves pc
 
             rvvm_warn("Backtrace:");
-            void **fp = NULL;
-            void** next_fp = (void*)rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 8);
+            void** fp = NULL;
+            rvvm_addr_t next_fp = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 8);
+            // Guest load addresses: elf->base is a host pointer
+            rvvm_addr_t elf_base = uctx()->elf.base ? to_addr(uctx()->elf.base) : 0;
+            rvvm_addr_t interp_base = uctx()->interp.base ? to_addr(uctx()->interp.base) : 0;
             do {
                 rvvm_warn(" PC %lx", pc);
-                if (pc >= (size_t)uctx()->elf.base && pc < (size_t)uctx()->elf.base + uctx()->elf.buf_size) {
-                    rvvm_warn("  @ Main binary, reloc: %lx", pc - (size_t)uctx()->elf.base);
+                if (pc >= elf_base && pc < elf_base + uctx()->elf.buf_size) {
+                    rvvm_warn("  @ Main binary, reloc: %lx", pc - elf_base);
                 }
-                if (pc >= (size_t)uctx()->interp.base && pc < (size_t)uctx()->interp.base + uctx()->interp.buf_size) {
-                    rvvm_warn("  @ Interpreter, reloc: %lx)", pc - (size_t)uctx()->interp.base);
+                if (pc >= interp_base && pc < interp_base + uctx()->interp.buf_size) {
+                    rvvm_warn("  @ Interpreter, reloc: %lx", pc - interp_base);
                 }
-                if (next_fp <= fp) break;
-                if (!proc_mem_readable(fp, 8)) {
+                if (next_fp <= (rvvm_addr_t)(size_t)fp) break;
+                void** frame = to_ptr_sz(next_fp, sizeof(void*));
+                if (!frame || !proc_mem_readable(frame, sizeof(void*))) {
                     rvvm_warn(" * * * Frame pointer points to inaccessible memory!");
                     break;
                 }
-                next_fp = fp[-2];
-                rvvm_warn("Next FP: %p", next_fp);
-                pc = (size_t)fp[-1];
-                fp = next_fp;
+                fp = (void**)(size_t)next_fp;
+                next_fp = (rvvm_addr_t)(size_t)frame[-2];
+                rvvm_warn(" Next FP: %lx", next_fp);
+                pc = (rvvm_addr_t)(size_t)frame[-1];
             } while (true);
 
-            if (proc_mem_readable((void*)pc_al, 32)) {
+            uint8_t* pc_host = to_ptr_sz(pc_al, 32);
+            if (pc_host && proc_mem_readable(pc_host, 32)) {
                 rvvm_warn("Instruction bytes around PC:");
                 for (size_t i=0; i<32; ++i) {
-                    printf("%02x", *(uint8_t*)(pc_al + i));
+                    printf("%02x", pc_host[i]);
                 }
                 printf("\n");
                 for (size_t i=0; i<32; ++i) {
-                    printf("%s", (pc_al + i == pc) ? "^ " : "  ");
+                    printf("%s", (pc_al + i == pc_fault) ? "^ " : "  ");
                 }
                 printf("\n");
             } else {
