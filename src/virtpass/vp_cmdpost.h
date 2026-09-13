@@ -8,14 +8,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Ring buffer for sensor events */
-#include "virtpass/vp_sensor_ringbuf.h"
+/* Sensor subsystem: vp_sensor_ops_t, vp_sensor_set_ops(), vp_sensor_ingest()
+ * and the vp_sensor_dispatch() entry point used by the dispatcher below. */
+#include "vp_sensor.h"
 
 /* Shared PCM ring + AAudio transport ABI */
 #include "virtpass/vp_audio_ringbuf.h"
-
-/* Sensor event type (alias for compatibility) */
-typedef sensor_event_t cmdpost_ASensorEvent;
 
 /* ============================================================
  * Window buffer structure (must match Guest-side)
@@ -38,11 +36,6 @@ typedef struct {
 /* ============================================================
  * Callback function types
  * ============================================================ */
-
-/* Sensor callbacks */
-typedef void (*sensor_init_callback)(void);
-typedef void (*sensor_enable_callback)(int handle, bool enable);
-typedef void (*sensor_data_callback)(sensor_event_t* event);
 
 /* Window callbacks */
 typedef int32_t (*window_lock_callback)(void* window, void* outBuffer, void* dirtyBounds);
@@ -145,10 +138,6 @@ void cmdpost_clear_motion_events(void);
 void cmdpost_clear_key_events(void);
 
 /* Set callback functions (called from JNI/Android side) */
-void cmdpost_set_sensor_callbacks(sensor_init_callback init,
-                                   sensor_enable_callback enable,
-                                   sensor_data_callback data);
-
 void cmdpost_set_window_callbacks(window_lock_callback lock,
                                    window_unlock_callback unlock);
 
@@ -223,12 +212,6 @@ typedef struct vp_audio_ops {
 
 /* Register the host audio backend. Pass NULL to detach (used on teardown). */
 void cmdpost_set_audio_callbacks(const vp_audio_ops_t* ops);
-
-/* Initialize the sensor ring buffer */
-void cmdpost_init_sensor_ringbuf(sensor_ringbuf_t* ringbuf);
-
-/* Push a sensor event from the host side */
-void cmdpost_push_sensor_event(const sensor_event_t* event);
 
 /* Unified Android NDK API proxy syscall (sub-command passed in a0). The
  * numbers themselves live in virtpass/vp_syscall.h, shared verbatim with the

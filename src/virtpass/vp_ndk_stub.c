@@ -80,15 +80,27 @@ static inline long virtpass_syscall(long nr, long a0, long a1, long a2, long a3,
 
 /* ============================================================
  * Sensor API Stubs (android/sensor.h)
- * ============================================================ */
+ * ============================================================
+ * The device facts (which sensors exist, their names, ranges, FIFO counts and
+ * capabilities) belong to the host: the pool below is filled once from
+ * VP_SENSOR_LIST, and every ASensor_getXxx() then answers from it locally,
+ * exactly like the NDK accessors read their ASensor object.
+ *
+ * Event delivery mirrors the NDK too. A queue that was created with a Looper
+ * owns a pipe whose read end is registered with that Looper; the host writes
+ * one byte into the write end whenever the queue goes from empty to
+ * non-empty, so the canonical
+ *
+ *     while (running) ALooper_pollAll(-1, NULL, NULL, NULL);
+ *
+ * wakes up on sensor data. The stub drains the read end before consulting the
+ * queue, which is what bounds the pipe to one byte and keeps the host's
+ * write() from ever blocking. Hosts without VP_SENSOR_CAP_FD_WAKEUP leave the
+ * guest with ASensorEventQueue_hasEvents() polling, and a host with no sensor
+ * backend at all returns an empty list.
+ */
 
-/* Opaque types (same as NDK) */
-typedef struct ASensorManager ASensorManager;
-typedef struct ASensorEventQueue ASensorEventQueue;
-typedef struct ASensor ASensor;
-typedef struct ALooper ALooper;
-
-/* Sensor type constants */
+/* Sensor type constants (values mirror <android/sensor.h>) */
 #define ASENSOR_TYPE_ACCELEROMETER       1
 #define ASENSOR_TYPE_MAGNETIC_FIELD      2
 #define ASENSOR_TYPE_GYROSCOPE           4
@@ -96,48 +108,89 @@ typedef struct ALooper ALooper;
 #define ASENSOR_TYPE_PRESSURE            6
 #define ASENSOR_TYPE_PROXIMITY           8
 
-/* ASensorEvent is defined (packed, ABI stable) in virtpass/vp_android.h */
-
-/* Stub sensor manager (just an ID) */
 struct ASensorManager {
     int32_t id;
 };
 
-/* Stub sensor (just a type + handle) */
+/* One cached descriptor. The strings are owned here, so the accessors can
+ * hand out stable pointers for the lifetime of the process. */
 struct ASensor {
-    int32_t type;
     int32_t handle;
-    char name[64];
-    char vendor[64];
-    float resolution;
-    int32_t min_delay;
+    int32_t type;
+    int32_t reporting_mode;
+    int32_t min_delay_us;
+    int32_t fifo_max_events;
+    int32_t fifo_reserved_events;
+    float   resolution;
+    bool    wake_up;
+    char    string_type[VP_SENSOR_STRING_TYPE_MAX];
+    char    name[VP_SENSOR_NAME_MAX];
+    char    vendor[VP_SENSOR_VENDOR_MAX];
 };
 
-/* Stub event queue */
 struct ASensorEventQueue {
-    int32_t id;
-    int32_t fd;
+    bool                 used;
+    int32_t              id;
+    int                  wake_read_fd;  /* -1 when there is no fd wakeup */
+    ALooper_callbackFunc cb;            /* only for ALOOPER_POLL_CALLBACK */
+    void*                cb_data;
 };
 
-/* Static instances for simplicity */
 static ASensorManager g_sensor_manager = { .id = 0 };
-static ASensorEventQueue g_sensor_queue = { .id = 0, .fd = -1 };
-static ASensor g_sensors[8] = {
-    { .type = ASENSOR_TYPE_ACCELEROMETER, .handle = 0, .name = "accel", .vendor = "stub", .resolution = 0.01f, .min_delay = 10000 },
-    { .type = ASENSOR_TYPE_MAGNETIC_FIELD, .handle = 1, .name = "mag", .vendor = "stub", .resolution = 0.1f, .min_delay = 10000 },
-    { .type = ASENSOR_TYPE_GYROSCOPE, .handle = 2, .name = "gyro", .vendor = "stub", .resolution = 0.01f, .min_delay = 10000 },
-    { .type = ASENSOR_TYPE_LIGHT, .handle = 3, .name = "light", .vendor = "stub", .resolution = 1.0f, .min_delay = 0 },
-    { .type = ASENSOR_TYPE_PRESSURE, .handle = 4, .name = "pressure", .vendor = "stub", .resolution = 0.1f, .min_delay = 0 },
-    { .type = ASENSOR_TYPE_PROXIMITY, .handle = 5, .name = "proximity", .vendor = "stub", .resolution = 1.0f, .min_delay = 0 },
-};
+static ASensor g_sensor_pool[VP_SENSOR_MAX_HANDLES];
+static ASensor const* g_sensor_refs[VP_SENSOR_MAX_HANDLES];
+static int32_t g_sensor_count = 0;
+static bool g_sensor_ready = false;
+static uint32_t g_sensor_caps = 0;
 
-#define SENSOR_COUNT (sizeof(g_sensors) / sizeof(g_sensors[0]))
+static ASensorEventQueue g_sensor_queues[VP_SENSOR_MAX_QUEUES];
+
+/* Enumerate the host's sensors once and cache them as ASensor objects. */
+static int vp_sensor_pool_load(void)
+{
+    vp_sensor_info_t raw[VP_SENSOR_MAX_HANDLES];
+
+    if (g_sensor_count > 0 || !(g_sensor_caps & VP_SENSOR_CAP_LIST)) {
+        return g_sensor_count;
+    }
+
+    int32_t n = (int32_t)virtpass_syscall(SYS_ANDROID_CALL, VP_SENSOR_LIST,
+                                         (long)raw, VP_SENSOR_MAX_HANDLES,
+                                         0, 0, 0, 0);
+    if (n < 0) n = 0;
+    if (n > VP_SENSOR_MAX_HANDLES) n = VP_SENSOR_MAX_HANDLES;
+
+    for (int32_t i = 0; i < n; i++) {
+        ASensor* dst = &g_sensor_pool[i];
+        memset(dst, 0, sizeof(*dst));
+        dst->handle = raw[i].handle;
+        dst->type = raw[i].type;
+        dst->reporting_mode = raw[i].reporting_mode;
+        dst->min_delay_us = raw[i].min_delay_us;
+        dst->fifo_max_events = raw[i].fifo_max_events;
+        dst->fifo_reserved_events = raw[i].fifo_reserved_events;
+        dst->resolution = raw[i].resolution;
+        dst->wake_up = raw[i].wake_up != 0;
+        memcpy(dst->string_type, raw[i].string_type, sizeof(dst->string_type) - 1);
+        memcpy(dst->name, raw[i].name, sizeof(dst->name) - 1);
+        memcpy(dst->vendor, raw[i].vendor, sizeof(dst->vendor) - 1);
+        g_sensor_refs[i] = dst;
+    }
+    g_sensor_count = n;
+    return n;
+}
 
 /* NDK API: Get sensor manager instance */
 ASensorManager* ASensorManager_getInstanceForPackage(const char* packageName)
 {
-    /* Tell host to initialize sensor system */
-    virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_SENSOR_INIT, 0, 0, 0, 0, 0, 0);
+    (void)packageName;  /* the host owns the per-package instance identity */
+
+    if (!g_sensor_ready) {
+        g_sensor_ready = true;
+        long caps = virtpass_syscall(SYS_ANDROID_CALL, VP_SENSOR_MANAGER_INIT,
+                                     0, 0, 0, 0, 0, 0);
+        g_sensor_caps = caps > 0 ? (uint32_t)caps : 0;
+    }
     return &g_sensor_manager;
 }
 
@@ -147,193 +200,274 @@ ASensorManager* ASensorManager_getInstance(void)
 }
 
 /* NDK API: Get list of available sensors */
-int ASensorManager_getSensorList(ASensorManager* manager, ASensor const** list)
+int ASensorManager_getSensorList(ASensorManager* manager, ASensorList* list)
 {
     (void)manager;
+
+    ASensorManager_getInstanceForPackage(NULL);
+    int count = vp_sensor_pool_load();
     if (list) {
-        static ASensor const* sensor_ptrs[SENSOR_COUNT];
-        for (size_t i = 0; i < SENSOR_COUNT; i++) {
-            sensor_ptrs[i] = &g_sensors[i];
-        }
-        *list = sensor_ptrs[0];
+        /* Owned by us, never freed: the NDK contract says the caller must not
+         * modify or free it. */
+        *list = count > 0 ? g_sensor_refs : (ASensorList)0;
     }
-    return (int)SENSOR_COUNT;
+    return count;
+}
+
+/* NDK API: Get default sensor by type. wakeUp selects the wake-up variant,
+ * falling back to whatever the host has for that type. */
+ASensor const* ASensorManager_getDefaultSensorEx(ASensorManager* manager, int type, bool wakeUp)
+{
+    (void)manager;
+
+    ASensorManager_getInstanceForPackage(NULL);
+    int count = vp_sensor_pool_load();
+
+    for (int i = 0; i < count; i++) {
+        if (g_sensor_pool[i].type == type && g_sensor_pool[i].wake_up == wakeUp) {
+            return &g_sensor_pool[i];
+        }
+    }
+    for (int i = 0; i < count; i++) {
+        if (g_sensor_pool[i].type == type) {
+            return &g_sensor_pool[i];
+        }
+    }
+    return (ASensor const*)0;
 }
 
 /* NDK API: Get default sensor by type */
 ASensor const* ASensorManager_getDefaultSensor(ASensorManager* manager, int type)
 {
-    (void)manager;
-    for (size_t i = 0; i < SENSOR_COUNT; i++) {
-        if (g_sensors[i].type == type) {
-            return &g_sensors[i];
-        }
-    }
-    return (void*)0;
+    return ASensorManager_getDefaultSensorEx(manager, type, false);
 }
 
-ASensor const* ASensorManager_getDefaultSensorEx(ASensorManager* manager, int type, bool wakeUp)
+/* NDK API: Get dynamic sensor list (Virtpass has none) */
+int ASensorManager_getDynamicSensorList(ASensorManager* manager, ASensorList* list)
 {
-    (void)wakeUp;
-    return ASensorManager_getDefaultSensor(manager, type);
+    (void)manager;
+    if (list) {
+        *list = (ASensorList)0;
+    }
+    return 0;
+}
+
+/* Consume every pending wake byte. Called before any queue consultation, so
+ * the host can arm the fd again without ever filling the pipe. */
+static void vp_sensor_queue_drain(ASensorEventQueue* queue)
+{
+    if (queue->wake_read_fd < 0) {
+        return;
+    }
+    uint8_t buf[16];
+    for (;;) {
+        ssize_t got = read(queue->wake_read_fd, buf, sizeof(buf));
+        if (got <= 0) {
+            break;
+        }
+        if ((size_t)got < sizeof(buf)) {
+            break;  /* most likely drained already */
+        }
+    }
+}
+
+/* Looper callback for a queue created with ident == ALOOPER_POLL_CALLBACK: the
+ * fd belongs to the stub, so the stub drains it and then hands control to the
+ * callback the guest registered, exactly like the NDK's sensors fd. */
+static int vp_sensor_queue_fd_ready(int fd, int events, void* data)
+{
+    ASensorEventQueue* queue = data;
+    vp_sensor_queue_drain(queue);
+    if (queue->cb) {
+        queue->cb(fd, events, queue->cb_data);
+    }
+    return 1;  /* keep the fd registered until destroyEventQueue() */
+}
+
+static ASensorEventQueue* vp_sensor_queue_alloc(void)
+{
+    for (size_t i = 0; i < (sizeof(g_sensor_queues) / sizeof(g_sensor_queues[0])); i++) {
+        if (!g_sensor_queues[i].used) {
+            memset(&g_sensor_queues[i], 0, sizeof(g_sensor_queues[i]));
+            g_sensor_queues[i].used = true;
+            g_sensor_queues[i].wake_read_fd = -1;
+            return &g_sensor_queues[i];
+        }
+    }
+    return (ASensorEventQueue*)0;
+}
+
+static void vp_sensor_queue_free(ASensorEventQueue* queue)
+{
+    memset(queue, 0, sizeof(*queue));
+    queue->wake_read_fd = -1;
 }
 
 /* NDK API: Create event queue */
 ASensorEventQueue* ASensorManager_createEventQueue(ASensorManager* manager,
-        ALooper* looper, int ident, void* callback, void* data)
+        ALooper* looper, int ident, ALooper_callbackFunc callback, void* data)
 {
     (void)manager;
-    (void)looper;
-    (void)ident;
-    (void)callback;
-    (void)data;
-    /* Tell host to create sensor event queue */
-    virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_SENSOR_INIT, 1, 0, 0, 0, 0, 0);
-    return &g_sensor_queue;
+
+    ASensorManager_getInstanceForPackage(NULL);
+
+    ASensorEventQueue* queue = vp_sensor_queue_alloc();
+    if (!queue) {
+        return (ASensorEventQueue*)0;
+    }
+
+    /* The host answers with one byte per empty -> non-empty edge, so the write
+     * end is what travels; the read end stays registered with our Looper. */
+    int wake_write_fd = -1;
+    if (looper && (g_sensor_caps & VP_SENSOR_CAP_FD_WAKEUP)) {
+        int fds[2];
+        if (pipe(fds) == 0) {
+            int fl = fcntl(fds[0], F_GETFL, 0);
+            if (fl >= 0) {
+                /* Draining must never stall the Looper pump. */
+                fcntl(fds[0], F_SETFL, fl | O_NONBLOCK);
+            }
+            queue->wake_read_fd = fds[0];
+            wake_write_fd = fds[1];
+        } else {
+            fprintf(stderr, "vp_ndk_stub: sensor pipe() failed: %s\n", strerror(errno));
+        }
+    }
+
+    int32_t id = (int32_t)virtpass_syscall(SYS_ANDROID_CALL, VP_SENSOR_QUEUE_CREATE,
+                                          wake_write_fd, 0, 0, 0, 0, 0);
+    if (id < 0) {
+        if (wake_write_fd >= 0) {
+            close(wake_write_fd);
+            close(queue->wake_read_fd);
+        }
+        vp_sensor_queue_free(queue);
+        return (ASensorEventQueue*)0;
+    }
+    queue->id = id;
+
+    if (wake_write_fd >= 0 && looper) {
+        int added;
+        if (ident == ALOOPER_POLL_CALLBACK) {
+            queue->cb = callback;
+            queue->cb_data = data;
+            added = ALooper_addFd(looper, queue->wake_read_fd, ALOOPER_POLL_CALLBACK,
+                                  ALOOPER_EVENT_INPUT, vp_sensor_queue_fd_ready, queue);
+        } else {
+            added = ALooper_addFd(looper, queue->wake_read_fd, ident,
+                                  ALOOPER_EVENT_INPUT, callback, data);
+        }
+        if (added != 0) {
+            /* Unusable as a wake source; the queue still works through
+             * hasEvents(). Close the pair so nothing is left dangling. */
+            fprintf(stderr, "vp_ndk_stub: ALooper_addFd failed for the sensor wake fd\n");
+            close(wake_write_fd);
+            close(queue->wake_read_fd);
+            queue->wake_read_fd = -1;
+        }
+    }
+    return queue;
 }
 
 /* NDK API: Destroy event queue */
 int ASensorManager_destroyEventQueue(ASensorManager* manager, ASensorEventQueue* queue)
 {
     (void)manager;
-    (void)queue;
+    if (!queue) {
+        return -1;
+    }
+    if (queue->wake_read_fd >= 0) {
+        ALooper_removeFd((ALooper*)0, queue->wake_read_fd);
+        close(queue->wake_read_fd);
+        queue->wake_read_fd = -1;
+    }
+    virtpass_syscall(SYS_ANDROID_CALL, VP_SENSOR_QUEUE_DESTROY, queue->id, 0, 0, 0, 0, 0);
+    vp_sensor_queue_free(queue);
     return 0;
 }
 
 /* NDK API: Enable sensor */
 int ASensorEventQueue_enableSensor(ASensorEventQueue* queue, ASensor const* sensor)
 {
-    (void)queue;
-    if (!sensor) return -1;
-    /* Tell host to enable this sensor */
-    virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_SENSOR_ENABLE, sensor->handle, 1, 0, 0, 0, 0);
-    return 0;
+    if (!queue || !sensor) {
+        return -1;
+    }
+    long rc = virtpass_syscall(SYS_ANDROID_CALL, VP_SENSOR_QUEUE_ENABLE,
+                               queue->id, sensor->handle, 0, 0, 0, 0);
+    return rc == VP_SENSOR_OK ? 0 : -1;
 }
 
 /* NDK API: Disable sensor */
 int ASensorEventQueue_disableSensor(ASensorEventQueue* queue, ASensor const* sensor)
 {
-    (void)queue;
-    if (!sensor) return -1;
-    virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_SENSOR_ENABLE, sensor->handle, 0, 0, 0, 0, 0);
-    return 0;
+    if (!queue || !sensor) {
+        return -1;
+    }
+    long rc = virtpass_syscall(SYS_ANDROID_CALL, VP_SENSOR_QUEUE_DISABLE,
+                               queue->id, sensor->handle, 0, 0, 0, 0);
+    return rc == VP_SENSOR_OK ? 0 : -1;
 }
 
-/* NDK API: Set event rate */
+/* NDK API: Set event rate (microseconds per event; 0 = host default) */
 int ASensorEventQueue_setEventRate(ASensorEventQueue* queue, ASensor const* sensor, int32_t usec)
 {
-    (void)queue;
-    (void)sensor;
-    (void)usec;
-    return 0;
+    if (!queue || !sensor) {
+        return -1;
+    }
+    long rc = virtpass_syscall(SYS_ANDROID_CALL, VP_SENSOR_QUEUE_SET_RATE,
+                               queue->id, sensor->handle, usec, 0, 0, 0);
+    return rc == VP_SENSOR_OK ? 0 : -1;
 }
 
-/* NDK API: Check for pending events */
-int ASensorEventQueue_hasEvents(ASensorEventQueue* queue)
-{
-    (void)queue;
-    /* Ask host if there are events */
-    return (int)virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_SENSOR_READ, 0, 0, 0, 0, 0, 0);
-}
-
-/* NDK API: Get sensor events */
-ssize_t ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count)
-{
-    (void)queue;
-    if (!events || count == 0) return 0;
-    /* Ask host to fill events buffer */
-    return (ssize_t)virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_SENSOR_READ,
-                                    (long)events, (long)count, 0, 0, 0, 0);
-}
-
-/* NDK API: Get sensor name */
-const char* ASensor_getName(ASensor const* sensor)
-{
-    if (!sensor) return "unknown";
-    return sensor->name;
-}
-
-/* NDK API: Get sensor vendor */
-const char* ASensor_getVendor(ASensor const* sensor)
-{
-    if (!sensor) return "unknown";
-    return sensor->vendor;
-}
-
-/* NDK API: Get sensor type */
-int ASensor_getType(ASensor const* sensor)
-{
-    if (!sensor) return -1;
-    return sensor->type;
-}
-
-/* NDK API: Get sensor resolution */
-float ASensor_getResolution(ASensor const* sensor)
-{
-    if (!sensor) return 0.0f;
-    return sensor->resolution;
-}
-
-/* NDK API: Get minimum delay */
-int ASensor_getMinDelay(ASensor const* sensor)
-{
-    if (!sensor) return 0;
-    return sensor->min_delay;
-}
-
-/* NDK API: Get FIFO counts */
-int ASensor_getFifoMaxEventCount(ASensor const* sensor)
-{
-    (void)sensor;
-    return 0;
-}
-
-int ASensor_getFifoReservedEventCount(ASensor const* sensor)
-{
-    (void)sensor;
-    return 0;
-}
-
-/* NDK API: Get string type */
-const char* ASensor_getStringType(ASensor const* sensor)
-{
-    (void)sensor;
-    return "";
-}
-
-/* NDK API: Get reporting mode */
-int ASensor_getReportingMode(ASensor const* sensor)
-{
-    (void)sensor;
-    return 0; /* AREPORTING_MODE_CONTINUOUS */
-}
-
-/* NDK API: Is wake-up sensor */
-bool ASensor_isWakeUpSensor(ASensor const* sensor)
-{
-    (void)sensor;
-    return false;
-}
-
-/* NDK API: Get handle */
-int ASensor_getHandle(ASensor const* sensor)
-{
-    if (!sensor) return -1;
-    return sensor->handle;
-}
-
-/* NDK API: Register sensor with custom params */
+/* NDK API: Register sensor with custom params (rate + batching), then enable */
 int ASensorEventQueue_registerSensor(ASensorEventQueue* queue, ASensor const* sensor,
         int32_t samplingPeriodUs, int64_t maxBatchReportLatencyUs)
 {
-    (void)queue;
-    if (!sensor) return -1;
-    (void)samplingPeriodUs;
-    (void)maxBatchReportLatencyUs;
+    if (!queue || !sensor) {
+        return -1;
+    }
+    long rc = virtpass_syscall(SYS_ANDROID_CALL, VP_SENSOR_QUEUE_SET_RATE,
+                               queue->id, sensor->handle,
+                               samplingPeriodUs, maxBatchReportLatencyUs, 0, 0);
+    if (rc != VP_SENSOR_OK) {
+        return -1;
+    }
     return ASensorEventQueue_enableSensor(queue, sensor);
 }
 
-/* NDK API: Request additional info events */
+/* NDK API: Check for pending events (1 = events, 0 = none, <0 = error) */
+int ASensorEventQueue_hasEvents(ASensorEventQueue* queue)
+{
+    if (!queue) {
+        return -1;
+    }
+    vp_sensor_queue_drain(queue);
+    long pending = virtpass_syscall(SYS_ANDROID_CALL, VP_SENSOR_QUEUE_HAS,
+                                    queue->id, 0, 0, 0, 0, 0);
+    if (pending < 0) {
+        return -1;
+    }
+    return pending > 0 ? 1 : 0;
+}
+
+/* NDK API: Get sensor events. events is the caller's own array: the host
+ * copies out into it, which is the whole data path (no shared memory). */
+ssize_t ASensorEventQueue_getEvents(ASensorEventQueue* queue, ASensorEvent* events, size_t count)
+{
+    if (!queue) {
+        return -1;
+    }
+    if (!events || count == 0) {
+        return 0;
+    }
+    vp_sensor_queue_drain(queue);
+    ssize_t got = (ssize_t)virtpass_syscall(SYS_ANDROID_CALL, VP_SENSOR_QUEUE_READ,
+                                            queue->id, (long)events, (long)count,
+                                            0, 0, 0);
+    return got < 0 ? -1 : got;
+}
+
+/* NDK API: Request additional info events (not part of the Virtpass subset) */
 int ASensorEventQueue_requestAdditionalInfoEvents(ASensorEventQueue* queue, bool enable)
 {
     (void)queue;
@@ -341,7 +475,8 @@ int ASensorEventQueue_requestAdditionalInfoEvents(ASensorEventQueue* queue, bool
     return 0;
 }
 
-/* NDK API: Direct channel support */
+/* NDK API: Direct channel support. Virtpass has no Direct Channel backend, so
+ * the guest never gets told it may use one. */
 bool ASensor_isDirectChannelTypeSupported(ASensor const* sensor, int channelType)
 {
     (void)sensor;
@@ -352,15 +487,63 @@ bool ASensor_isDirectChannelTypeSupported(ASensor const* sensor, int channelType
 int ASensor_getHighestDirectReportRateLevel(ASensor const* sensor)
 {
     (void)sensor;
-    return 0; /* ASENSOR_DIRECT_RATE_STOP */
+    return ASENSOR_DIRECT_RATE_STOP;
 }
 
-/* NDK API: Get dynamic sensor list */
-int ASensorManager_getDynamicSensorList(ASensorManager* manager, ASensor const** list)
+/* NDK API: Sensor info accessors (all local reads of the cached descriptor) */
+const char* ASensor_getName(ASensor const* sensor)
 {
-    (void)manager;
-    (void)list;
-    return 0;
+    return sensor ? sensor->name : "";
+}
+
+const char* ASensor_getVendor(ASensor const* sensor)
+{
+    return sensor ? sensor->vendor : "";
+}
+
+const char* ASensor_getStringType(ASensor const* sensor)
+{
+    return sensor ? sensor->string_type : "";
+}
+
+int ASensor_getType(ASensor const* sensor)
+{
+    return sensor ? sensor->type : -1;
+}
+
+int ASensor_getHandle(ASensor const* sensor)
+{
+    return sensor ? sensor->handle : -1;
+}
+
+float ASensor_getResolution(ASensor const* sensor)
+{
+    return sensor ? sensor->resolution : 0.0f;
+}
+
+int ASensor_getMinDelay(ASensor const* sensor)
+{
+    return sensor ? sensor->min_delay_us : 0;
+}
+
+int ASensor_getFifoMaxEventCount(ASensor const* sensor)
+{
+    return sensor ? sensor->fifo_max_events : 0;
+}
+
+int ASensor_getFifoReservedEventCount(ASensor const* sensor)
+{
+    return sensor ? sensor->fifo_reserved_events : 0;
+}
+
+int ASensor_getReportingMode(ASensor const* sensor)
+{
+    return sensor ? sensor->reporting_mode : AREPORTING_MODE_INVALID;
+}
+
+bool ASensor_isWakeUpSensor(ASensor const* sensor)
+{
+    return sensor ? sensor->wake_up : false;
 }
 
 /* ============================================================

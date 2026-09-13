@@ -16,8 +16,12 @@ backend behind each callback differs.
 
 ## Shared layer (`src/virtpass`)
 
-- `vp_cmdpost.c/.h` — the ABI proxy core: ring buffers, lifecycle/input/sensor
-  queues and the callback registration points every host fills in.
+- `vp_cmdpost.c/.h` — the ABI proxy core: lifecycle/input queues, the GL/EGL
+  and AAudio entries, and the callback registration points every host fills in.
+- `vp_sensor.c/.h` — the host-side sensor subsystem: it caches the device
+  descriptors, owns the event queues with their bounded staging FIFO and the
+  Looper wake fd, and exposes one `vp_sensor_ops_t` for a platform backend to
+  implement. Guest-visible wire format: `virtpass/vp_sensor_abi.h`.
 - Guest stubs: `vp_ndk_stub.c` (NDK APIs), `vp_gl_stub.c` (EGL/GLES), and
   `vp_aaudio_stub.c` (AAudio). GL calls are marshalled through
   `SYS_GL_CALL`/`SYS_EGL_CALL` with guest addresses in `args[]`.
@@ -43,6 +47,8 @@ backend behind each callback differs.
   `eglSwapBuffers` blits the pbuffer through the DIB. All 157 entry points go
   through the shared generated dispatch.
 - Audio: `win32_aaudio_wasapi.c` implements the AAudio ops over WASAPI.
+- Sensors: `win32_sensor_stub.c` provides three virtual sensors, driven from
+  the WM_TIMER on the UI thread and fed into `vp_sensor_ingest()`.
 - Vsync: a 60 Hz clock driven by DwmFlush.
 
 ## Android (`android-host/`)
@@ -63,6 +69,9 @@ backend behind each callback differs.
   (EGL_NO_SURFACE) instead of silently diverting to an invisible surface.
 - Audio: `vp_aaudio_android.c` pumps the guest's SPSC ring into an
   AAudioStream.
+- Sensors: `vp_sensor_android.c` implements the sensor ops directly on the
+  platform `ASensorManager` / `ASensorEventQueue`, which is drained on its own
+  looper thread; no sensor data crosses Java.
 - Vsync: a dedicated thread owns the per-thread AChoreographer and publishes
   frame times; guests consume them via Looper fd wakeup or a blocking wait.
 - Diagnostics: guest stdout/stderr (write and writev) land in logcat under the
@@ -84,6 +93,13 @@ backend behind each callback differs.
 - Android: `pwsh ./build_virtpass-android.ps1` (make target `android`, which
   first cross-compiles every guest in `guest-samples/` for
   riscv64-linux-musl via zig cc into the APK assets).
+
+## Sensor conformance test
+
+`guest-samples/test_sensor_guest.c` is the regression gate for the sensor
+path: it enumerates the sensors, runs a Looper-driven queue and asserts that
+every event carries the guest-visible handle and type it enabled. See the file
+header for what it pins down.
 
 headers [text](include/virtpass)
 win host [text](src/virtpass/win32-host)

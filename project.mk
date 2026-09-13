@@ -145,7 +145,7 @@ override SRC_USE_JIT       := $(SRCDIR)/rvjit/rvjit.c $(SRCDIR)/rvjit/rvjit_emit
 override SRC_USE_RV32      := $(SRCDIR)/cpu/riscv32_interpreter.c
 override SRC_USE_RV64      := $(SRCDIR)/cpu/riscv64_interpreter.c
 override SRC_USE_LIBRETRO  := $(SRCDIR)/bindings/libretro/libretro.c
-override SRC_USE_VERTPASS  := $(SRCDIR)/virtpass/vp_cmdpost.c
+override SRC_USE_VERTPASS  := $(SRCDIR)/virtpass/vp_cmdpost.c $(SRCDIR)/virtpass/vp_sensor.c
 override SRC_USE_JNI       := $(SRCDIR)/bindings/jni/rvvm_jni.c
 # Win32 implementations of the POSIX API declared in include/mingw_compat
 override SRC_USE_WIN32_COMPAT := $(SRCDIR)/win/posix_shim.c
@@ -258,7 +258,8 @@ override bin_src_rvvm_winhost  := $(SRCDIR)/virtpass/win32-host/win32_main.c \
                                   $(SRCDIR)/virtpass/win32-host/win32_cmdpost_bridge.c \
                                   $(SRCDIR)/virtpass/win32-host/win32_gl_backend.c \
                                   $(SRCDIR)/virtpass/win32-host/win32_gl_dispatch.c \
-                                  $(SRCDIR)/virtpass/win32-host/win32_aaudio_wasapi.c
+                                  $(SRCDIR)/virtpass/win32-host/win32_aaudio_wasapi.c \
+                                  $(SRCDIR)/virtpass/win32-host/win32_sensor_stub.c
 override bin_libs_rvvm_winhost := rvvm
 endif
 endif
@@ -339,7 +340,7 @@ override ANDROID_GUEST_AR    := zig ar
 # userland debugger; -fno-sanitize=undefined is a zig cc requirement
 override ANDROID_GUEST_FLAGS := -target riscv64-linux-musl -O0 -g -I$(INCDIR) -fno-sanitize=undefined
 # Whole guest ABI header directory: listing the headers by hand silently missed
-# vp_aaudio.h / vp_sensor_ringbuf.h, so edits to those never rebuilt a guest.
+# vp_aaudio.h / vp_sensor_abi.h, so edits to those never rebuilt a guest.
 override ANDROID_GUEST_HEADS := $(filter %.h,$(call ls_dir,$(INCDIR)/virtpass))
 override ANDROID_GUEST_LIBS  := $(ANDROID_GUEST_DIR)/libandroid_stubs.a $(ANDROID_GUEST_DIR)/libgles_stubs.a
 override android_guest_assets := $(addprefix $(ANDROID_ASSETS_DIR)/,$(addsuffix .exe,$(ANDROID_GUEST_SAMPLES)))

@@ -48,34 +48,6 @@ public class RvvmNative {
                                                      int screenLong, int screenRound);
 
     /**
-     * Enable a specific sensor.
-     * @param sensorType The sensor type (e.g., Sensor.TYPE_ACCELEROMETER)
-     */
-    public static native void nativeEnableSensor(int sensorType);
-
-    /**
-     * Disable a specific sensor.
-     * @param sensorType The sensor type to disable
-     */
-    public static native void nativeDisableSensor(int sensorType);
-
-    /**
-     * Poll for sensor events.
-     * @return true if events were available, false otherwise
-     */
-    public static native boolean nativePollEvents();
-
-    /**
-     * Push sensor data directly to the ring buffer.
-     * @param x X-axis value
-     * @param y Y-axis value
-     * @param z Z-axis value
-     * @param sensorType The sensor type
-     * @param timestamp Timestamp in nanoseconds
-     */
-    public static native void nativePushSensorData(float x, float y, float z, int sensorType, long timestamp);
-
-    /**
      * Get the library version.
      * @return Version string
      */

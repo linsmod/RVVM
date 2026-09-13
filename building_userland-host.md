@@ -291,6 +291,7 @@ repo root (H:\github_repos\RVVM)
 │   │   └── rvvm_user.c                 # User-mode runner (Android proxy syscall cases)
 │   ├── virtpass/                       # VirtPass shared layer
 │   │   ├── vp_cmdpost.{c,h}            # Host-side syscall dispatch + callback typedefs
+│   │   ├── vp_sensor.{c,h}             # Host-side sensor subsystem (queues, FIFO, ops)
 │   │   ├── vp_ndk_stub.c               # Guest-side NDK proxy (riscv64)
 │   │   ├── vp_gl_stub.c                # Guest-side GL/EGL proxy (riscv64)
 │   │   ├── guest-samples/              # Test guest programs (sources)
@@ -303,6 +304,7 @@ repo root (H:\github_repos\RVVM)
 │   │           ├── cpp/
 │   │           │   ├── CMakeLists.txt  # rvvm_core + cmdpost + rvvm_jni
 │   │           │   ├── jni_bridge.c    # JNI callbacks for Android
+│   │           │   ├── vp_sensor_android.c # Sensor backend (platform ASensorManager)
 │   │           │   └── ndk_compat.c    # memfd_create/statx for API < 30
 │   │           ├── java/com/rvvm/android/
 │   │           └── assets/             # guest ELFs pushed into the APK
@@ -313,7 +315,7 @@ repo root (H:\github_repos\RVVM)
 │   ├── virtpass/                       # Public virtpass headers
 │   │   ├── vp_android.h
 │   │   ├── vp_gl.h
-│   │   └── vp_sensor_ringbuf.h
+│   │   └── vp_sensor_abi.h             # Sensor wire protocol (no ring buffer/shared memory)
 │   └── mingw_compat/                   # POSIX header shims for MinGW (sys/uio.h, ...)
 │
 ├── src/virtpass/win32-host/            # Win32 virtpass host (rvvm_winhost bin target)
@@ -322,6 +324,7 @@ repo root (H:\github_repos\RVVM)
 │   ├── win32_gl_dispatch.c            # GL dispatch callbacks
 │   ├── win32_gl_dispatch_tables.h     # generated: generic dispatch switches
 │   ├── win32_cmdpost_bridge.c         # Host callbacks (present_frame, etc.)
+│   ├── win32_sensor_stub.c            # Virtual sensors (ops table + WM_TIMER tick)
 │   └── win32_main.c                   # Win32 UI entry point
 │
 ├── Makefile / project.mk               # Build system (bin, android*, test, clean)
@@ -334,9 +337,10 @@ repo root (H:\github_repos\RVVM)
 ### Code sharing rules
 
 - `src/virtpass/vp_cmdpost.{c,h}` — **single copy**, referenced by all platforms
+- `src/virtpass/vp_sensor.{c,h}` — **single copy** host-side sensor subsystem; each host only supplies a `vp_sensor_ops_t` backend
 - `src/core/rvvm_user.c` — **single copy**, contains platform-agnostic dispatch
 - `src/virtpass/vp_ndk_stub.c`, `src/virtpass/vp_gl_stub.c` — **guest-side** riscv64 stubs
-- `include/virtpass/` — public headers shared by host and guest sides
+- `include/virtpass/` — headers shared by host and guest sides. `vp_sensor_abi.h` holds the sensor wire protocol only (no ring buffer, no shared memory); the host-side internals live in `src/virtpass/vp_sensor.h`
 - `src/virtpass/guest-samples/` — guest test programs (sources)
 - `src/virtpass/android-host/` — Android app (gradle project + NDK CMake)
 - `src/win/posix_shim.c` + `include/mingw_compat/` — POSIX layer for the Win32/MinGW host

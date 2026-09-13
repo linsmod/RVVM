@@ -8,10 +8,6 @@ import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.graphics.SurfaceTexture;
-import android.hardware.Sensor;
-import android.hardware.SensorEvent;
-import android.hardware.SensorEventListener;
-import android.hardware.SensorManager;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.GestureDetector;
@@ -42,9 +38,12 @@ import java.util.HashMap;
 
 /**
  * Main Activity for RVVM Android host app.
- * This activity manages the RVVM process and sensor integration.
+ * This activity manages the RVVM process: guest launch, surface and console.
+ * Sensors are not handled here - the native sensor backend (vp_sensor_android.c)
+ * owns the platform ASensorManager and feeds the guest directly, so no sensor
+ * data crosses Java.
  */
-public class MainActivity extends Activity implements SensorEventListener, SurfaceHolder.Callback2 {
+public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
 
     private static final String TAG = "RVVM-MainActivity";
 
@@ -74,13 +73,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private static final int APP_CMD_STOP                 = 14;
     private static final int APP_CMD_DESTROY              = 15;
 
-    private SensorManager sensorManager;
-    private Sensor accelerometer;
-    private Sensor gyroscope;
-    private Sensor light;
-
     private TextView statusText;
-    private TextView sensorDataText;
     private SurfaceView surfaceView;
     private SurfaceHolder surfaceHolder;
     private TextureView ttyView;          // Console tab render target
@@ -439,7 +432,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
         // Find views
         statusText = findViewById(R.id.statusText);
-        sensorDataText = findViewById(R.id.sensorDataText);
         surfaceView = findViewById(R.id.surfaceView);
         logOverlayScroll = findViewById(R.id.logOverlayScroll);
         logOverlayVScroll = findViewById(R.id.logOverlayVScroll);
@@ -509,12 +501,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         ttyView = findViewById(R.id.ttyView);
         ttyView.setSurfaceTextureListener(ttyTextureListener);
 
-        // Initialize sensor manager
-        sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
-        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
-        gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
-        light = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT);
-
         // Setup buttons
         runButton.setOnClickListener(v -> runGuestElf());
         suspendButton.setOnClickListener(v -> toggleSuspendGuest());
@@ -577,20 +563,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
             // Push the real screen metrics (the AConfiguration source of truth)
             pushDisplayConfig();
-
-            // Enable sensors
-            if (accelerometer != null) {
-                RvvmNative.nativeEnableSensor(Sensor.TYPE_ACCELEROMETER);
-                sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_NORMAL);
-            }
-            if (gyroscope != null) {
-                RvvmNative.nativeEnableSensor(Sensor.TYPE_GYROSCOPE);
-                sensorManager.registerListener(this, gyroscope, SensorManager.SENSOR_DELAY_NORMAL);
-            }
-            if (light != null) {
-                RvvmNative.nativeEnableSensor(Sensor.TYPE_LIGHT);
-                sensorManager.registerListener(this, light, SensorManager.SENSOR_DELAY_NORMAL);
-            }
 
             statusText.setText("RVVM initialized\nVersion: " + RvvmNative.nativeGetVersion());
             Log.i(TAG, "RVVM initialized");
@@ -983,33 +955,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         postLifecycleCmd(APP_CMD_WINDOW_REDRAW_NEEDED);
     }
 
-    @Override
-    public void onSensorChanged(SensorEvent event) {
-        if (!isInitialized) {
-            return;
-        }
-
-        // Push sensor data to native ring buffer
-        RvvmNative.nativePushSensorData(
-            event.values[0],
-            event.values[1],
-            event.values[2],
-            event.sensor.getType(),
-            event.timestamp
-        );
-
-        // Update UI
-        String sensorName = getSensorName(event.sensor.getType());
-        String data = String.format("%s: %.2f, %.2f, %.2f",
-            sensorName, event.values[0], event.values[1], event.values[2]);
-        sensorDataText.setText(data);
-    }
-
-    @Override
-    public void onAccuracyChanged(Sensor sensor, int accuracy) {
-        // Not used
-    }
-
     // --- Guest console overlay ------------------------------------------------
     //
     // Three states, driven by two signals:
@@ -1169,19 +1114,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 Toast.LENGTH_SHORT).show();
     }
 
-    private String getSensorName(int type) {
-        switch (type) {
-            case Sensor.TYPE_ACCELEROMETER:
-                return "Accel";
-            case Sensor.TYPE_GYROSCOPE:
-                return "Gyro";
-            case Sensor.TYPE_LIGHT:
-                return "Light";
-            default:
-                return "Unknown";
-        }
-    }
-
     // --- Activity lifecycle --------------------------------------------------
     // The whole Activity lifecycle is mirrored to the guest, at the same points
     // the framework runs it, so the guest game loop can drive itself from
@@ -1202,24 +1134,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     @Override
     protected void onResume() {
         super.onResume();
-        // Re-register sensors
-        if (accelerometer != null) {
-            sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_NORMAL);
-        }
-        if (gyroscope != null) {
-            sensorManager.registerListener(this, gyroscope, SensorManager.SENSOR_DELAY_NORMAL);
-        }
-        if (light != null) {
-            sensorManager.registerListener(this, light, SensorManager.SENSOR_DELAY_NORMAL);
-        }
         postLifecycleCmd(APP_CMD_RESUME);
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-        // Unregister sensors
-        sensorManager.unregisterListener(this);
         postLifecycleCmd(APP_CMD_PAUSE);
     }
 

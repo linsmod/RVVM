@@ -24,9 +24,6 @@
 #define CMDLOG(fmt, ...) printf(fmt "\n", ##__VA_ARGS__)
 #endif
 
-/* Ring buffer for sensor events */
-#include "virtpass/vp_sensor_ringbuf.h"
-
 /* Shared API header (queue functions, event ABI structs) */
 #include "vp_cmdpost.h"
 
@@ -51,36 +48,17 @@
 #include "virtpass/vp_syscall.h"
 
 /* ============================================================
- * Sensor types (must match vp_ndk_stub)
- * ============================================================ */
-#define ASENSOR_TYPE_ACCELEROMETER       1
-#define ASENSOR_TYPE_MAGNETIC_FIELD      2
-#define ASENSOR_TYPE_GYROSCOPE           4
-#define ASENSOR_TYPE_LIGHT               5
-#define ASENSOR_TYPE_PRESSURE            6
-#define ASENSOR_TYPE_PROXIMITY           8
-
-/* ============================================================
  * Internal state
  * ============================================================ */
 
 static bool g_initialized = false;
-static bool g_sensor_initialized = false;
 static bool g_window_initialized = false;
 static bool g_input_initialized = false;
 static bool g_looper_initialized = false;
 
-/* Sensor state */
-static bool g_sensors_enabled[8] = { false };
-static sensor_ringbuf_t* g_sensor_ringbuf = NULL;
-
 /* ============================================================
  * Callback function pointers (set by host via JNI)
  * ============================================================ */
-
-typedef void (*sensor_init_callback)(void);
-typedef void (*sensor_enable_callback)(int handle, bool enable);
-typedef void (*sensor_data_callback)(sensor_event_t* event);
 
 /* Window callbacks */
 typedef int32_t (*window_lock_callback)(void* window, void* outBuffer, void* dirtyBounds);
@@ -96,10 +74,6 @@ typedef int32_t (*window_set_buf_callback)(int32_t width, int32_t height, int32_
 
 /* Configuration callback: host resolves one AConfiguration field. */
 typedef int32_t (*config_get_callback)(int32_t field, int32_t* outValue);
-
-static sensor_init_callback g_sensor_init_cb = NULL;
-static sensor_enable_callback g_sensor_enable_cb = NULL;
-static sensor_data_callback g_sensor_data_cb = NULL;
 
 static window_lock_callback g_window_lock_cb = NULL;
 static window_unlock_callback g_window_unlock_cb = NULL;
@@ -171,15 +145,6 @@ void cmdpost_clear_key_events(void)
 /* ============================================================
  * Public API for setting callbacks (called from JNI/Android)
  * ============================================================ */
-
-void cmdpost_set_sensor_callbacks(sensor_init_callback init,
-                                   sensor_enable_callback enable,
-                                   sensor_data_callback data)
-{
-    g_sensor_init_cb = init;
-    g_sensor_enable_cb = enable;
-    g_sensor_data_cb = data;
-}
 
 void cmdpost_set_window_callbacks(window_lock_callback lock,
                                    window_unlock_callback unlock)
@@ -329,27 +294,6 @@ static void cmdpost_audio_refresh_state(cmdpost_audio_stream_t* stream)
     }
 }
 
-/*
- * Initialize the sensor ring buffer.
- * Must be called before any sensor operations.
- */
-void cmdpost_init_sensor_ringbuf(sensor_ringbuf_t* ringbuf)
-{
-    g_sensor_ringbuf = ringbuf;
-    sensor_ringbuf_init(ringbuf);
-}
-
-/*
- * Push a sensor event from the host side.
- * This is called by the Android sensor listener.
- */
-void cmdpost_push_sensor_event(const sensor_event_t* event)
-{
-    if (g_sensor_ringbuf) {
-        sensor_ringbuf_push(g_sensor_ringbuf, event);
-    }
-}
-
 /* ============================================================
  * Command dispatch (called from rvvm-user syscall handler)
  * ============================================================ */
@@ -377,50 +321,20 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
         case SYS_ANDROID_CALL: {
             /* Sub-command passed in a0 */
             switch (a0) {
-                case SYS_ANDROID_SENSOR_INIT: {
-                    int mode = (int)a1;
-                    if (mode == 0) {
-                        /* Initialize sensor manager */
-                        if (!g_sensor_initialized) {
-                            if (g_sensor_init_cb) {
-                                g_sensor_init_cb();
-                            }
-                            g_sensor_initialized = true;
-                        }
-                    } else if (mode == 1) {
-                        /* Create event queue */
-                        // TODO: Create actual sensor event queue
-                    }
-                    return 0;
-                }
-
-                case SYS_ANDROID_SENSOR_GET: {
-                    /* Get sensor info */
-                    // TODO: Return actual sensor info from host
-                    return 0;
-                }
-
-                case SYS_ANDROID_SENSOR_ENABLE: {
-                    int handle = (int)a1;
-                    bool enable = (bool)a2;
-                    if (handle >= 0 && handle < 8) {
-                        g_sensors_enabled[handle] = enable;
-                        if (g_sensor_enable_cb) {
-                            g_sensor_enable_cb(handle, enable);
-                        }
-                    }
-                    return 0;
-                }
-
-                case SYS_ANDROID_SENSOR_READ: {
-                    /* Read sensor events from ring buffer */
-                    // TODO: Copy events from ring buffer to guest memory
-                    // For now, return number of events available
-                    if (g_sensor_ringbuf) {
-                        return sensor_ringbuf_count(g_sensor_ringbuf);
-                    }
-                    return 0;
-                }
+                /* ---------- Phase 6: sensors ----------
+                 * The whole sensor proxy lives in vp_sensor.c; here we only
+                 * forward the sub-command, so the dispatcher stays a table. */
+                case VP_SENSOR_MANAGER_INIT:
+                case VP_SENSOR_LIST:
+                case VP_SENSOR_DEFAULT:
+                case VP_SENSOR_QUEUE_CREATE:
+                case VP_SENSOR_QUEUE_DESTROY:
+                case VP_SENSOR_QUEUE_ENABLE:
+                case VP_SENSOR_QUEUE_DISABLE:
+                case VP_SENSOR_QUEUE_SET_RATE:
+                case VP_SENSOR_QUEUE_HAS:
+                case VP_SENSOR_QUEUE_READ:
+                    return vp_sensor_dispatch(a0, a1, a2, a3, a4);
 
                 case SYS_ANDROID_WINDOW_INIT: {
                     /* Initialize window */
@@ -841,15 +755,9 @@ void cmdpost_cleanup(void)
     if (g_initialized) {
         printf("vp_cmdpost: Cleaning up\n");
         g_initialized = false;
-        g_sensor_initialized = false;
         g_window_initialized = false;
         g_input_initialized = false;
         g_looper_initialized = false;
-        memset(g_sensors_enabled, 0, sizeof(g_sensors_enabled));
-        g_sensor_ringbuf = NULL;
-        g_sensor_init_cb = NULL;
-        g_sensor_enable_cb = NULL;
-        g_sensor_data_cb = NULL;
         g_window_lock_cb = NULL;
         g_window_unlock_cb = NULL;
         g_window_size_cb = NULL;
@@ -863,6 +771,12 @@ void cmdpost_cleanup(void)
         g_choreographer_fd = -1;
         g_vsync_armed = false;
         g_vsync_source_lost = false;
+
+        /* Sensor queues, the staging FIFO and the platform sources armed by
+         * the guest all belong to the guest that just exited. vp_sensor_reset()
+         * drops them and detaches the backend; a relaunched guest installs its
+         * own ops through vp_sensor_set_ops() before it starts. */
+        vp_sensor_reset();
 
         /* The guest that owned these queues is gone, so nothing will ever
          * drain them. A host that reuses the process (launcher: Run after

@@ -3,16 +3,17 @@
  *
  * This file provides the JNI interface between Java (Android) and
  * the native rvvm library. It allows the Android side to:
- * - Initialize the sensor system
- * - Push sensor events to the ring buffer
  * - Handle lifecycle events
  * - Handle window operations (lock/unlock)
  * - Run RISC-V Guest ELF programs via rvvm-user
+ *
+ * Sensors are not part of this surface: the platform ASensorManager backs the
+ * Virtpass sensor ABI through vp_sensor_android.c, so the guest's sensor data
+ * never crosses Java.
  */
 
 #include <jni.h>
 #include <android/log.h>
-#include <android/sensor.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <android/configuration.h>  /* ACONFIGURATION_* constants */
@@ -31,6 +32,9 @@
 /* System EGL/GLES backend (marshalled GL dispatch) */
 #include "android_gl_host.h"
 
+/* Sensor backend (platform ASensorManager / ASensorEventQueue) */
+#include "vp_sensor_android.h"
+
 /* Include rvvm-user API */
 #include "rvvm_user.h"
 
@@ -44,18 +48,6 @@
 /* Global references to Java objects */
 static JavaVM* g_jvm = NULL;
 static JNIEnv* g_env = NULL;
-static jobject g_sensor_manager_obj = NULL;
-static jobject g_sensor_listener_obj = NULL;
-
-/* Sensor manager from Android */
-static ASensorManager* g_sensor_manager = NULL;
-static const ASensor* g_accelerometer = NULL;
-static const ASensor* g_gyroscope = NULL;
-static const ASensor* g_light = NULL;
-
-/* Event queue */
-static ASensorEventQueue* g_event_queue = NULL;
-static ALooper* g_looper = NULL;
 
 /* Window from Android (Layer 2: the viewport) */
 static ANativeWindow* g_native_window = NULL;
@@ -645,21 +637,6 @@ static void* guest_thread_func(void* arg)
     return NULL;
 }
 
-/* Sensor data callback (called from Java) */
-static void on_sensor_data(float x, float y, float z, int type, int64_t timestamp)
-{
-    sensor_event_t event = {0};
-    event.version = 0;
-    event.sensor = type;
-    event.type = type;
-    event.timestamp = timestamp;
-    event.vector.x = x;
-    event.vector.y = y;
-    event.vector.z = z;
-
-    cmdpost_push_sensor_event(&event);
-}
-
 /* Locked window buffer info (kept between lock and unlock) */
 static ANativeWindow_Buffer g_locked_buffer;
 
@@ -1200,6 +1177,11 @@ static void jni_register_cmdpost_callbacks(void)
      * guest's SPSC ring to AAudioStream. */
     cmdpost_set_audio_callbacks(android_aaudio_ops());
 
+    /* Real sensor backend: vp_sensor_android.c owns the platform
+     * ASensorEventQueue and feeds the subsystem through vp_sensor_ingest(). */
+    android_sensor_start();
+    vp_sensor_set_ops(android_sensor_ops());
+
     /* System EGL/GLES backend for the marshalled GL calls. Loads the system
      * libraries on first use and re-installs the dispatch callbacks; on
      * failure the guest falls back to CPU rendering like on win32. */
@@ -1223,30 +1205,6 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
      * before every later guest - see jni_register_cmdpost_callbacks(). */
     jni_register_cmdpost_callbacks();
 
-    /* Get Android sensor manager (per-package singleton, API 26+) */
-    g_sensor_manager = ASensorManager_getInstanceForPackage(NULL);
-    if (g_sensor_manager) {
-        LOGI("Sensor manager initialized");
-
-        /* Get default sensors */
-        g_accelerometer = ASensorManager_getDefaultSensor(g_sensor_manager, ASENSOR_TYPE_ACCELEROMETER);
-        g_gyroscope = ASensorManager_getDefaultSensor(g_sensor_manager, ASENSOR_TYPE_GYROSCOPE);
-        g_light = ASensorManager_getDefaultSensor(g_sensor_manager, ASENSOR_TYPE_LIGHT);
-
-        LOGI("Accelerometer: %s", g_accelerometer ? "found" : "not found");
-        LOGI("Gyroscope: %s", g_gyroscope ? "found" : "not found");
-        LOGI("Light: %s", g_light ? "found" : "not found");
-    } else {
-        LOGE("Failed to get sensor manager");
-    }
-
-    /* Create looper and event queue */
-    g_looper = ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
-    if (g_looper) {
-        g_event_queue = ASensorManager_createEventQueue(g_sensor_manager, g_looper, 0, NULL, NULL);
-        LOGI("Event queue created");
-    }
-
     LOGI("Native init complete");
 }
 
@@ -1256,21 +1214,8 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
     (void)env;
     (void)thiz;
 
-    /* Disable sensors */
-    if (g_event_queue && g_accelerometer) {
-        ASensorEventQueue_disableSensor(g_event_queue, g_accelerometer);
-    }
-    if (g_event_queue && g_gyroscope) {
-        ASensorEventQueue_disableSensor(g_event_queue, g_gyroscope);
-    }
-    if (g_event_queue && g_light) {
-        ASensorEventQueue_disableSensor(g_event_queue, g_light);
-    }
-
-    /* Destroy event queue */
-    if (g_sensor_manager && g_event_queue) {
-        ASensorManager_destroyEventQueue(g_sensor_manager, g_event_queue);
-    }
+    /* Stops the platform sensor thread and destroys its event queue. */
+    android_sensor_shutdown();
 
     /* A suspended guest is parked and would never poll again; wake it before
      * the teardown below so it is not left parked against a torn-down bridge. */
@@ -1290,125 +1235,6 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
     cmdpost_cleanup();
 
     LOGI("Native destroy complete");
-}
-
-JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativeEnableSensor(JNIEnv* env, jobject thiz, jint sensorType)
-{
-    (void)env;
-    (void)thiz;
-
-    if (!g_event_queue) {
-        LOGE("Event queue not initialized");
-        return;
-    }
-
-    const ASensor* sensor = NULL;
-    switch (sensorType) {
-        case ASENSOR_TYPE_ACCELEROMETER:
-            sensor = g_accelerometer;
-            break;
-        case ASENSOR_TYPE_GYROSCOPE:
-            sensor = g_gyroscope;
-            break;
-        case ASENSOR_TYPE_LIGHT:
-            sensor = g_light;
-            break;
-        default:
-            LOGE("Unknown sensor type: %d", sensorType);
-            return;
-    }
-
-    if (sensor) {
-        int result = ASensorEventQueue_enableSensor(g_event_queue, sensor);
-        if (result == 0) {
-            LOGI("Sensor %d enabled", sensorType);
-        } else {
-            LOGE("Failed to enable sensor %d", sensorType);
-        }
-    }
-}
-
-JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativeDisableSensor(JNIEnv* env, jobject thiz, jint sensorType)
-{
-    (void)env;
-    (void)thiz;
-
-    if (!g_event_queue) {
-        return;
-    }
-
-    const ASensor* sensor = NULL;
-    switch (sensorType) {
-        case ASENSOR_TYPE_ACCELEROMETER:
-            sensor = g_accelerometer;
-            break;
-        case ASENSOR_TYPE_GYROSCOPE:
-            sensor = g_gyroscope;
-            break;
-        case ASENSOR_TYPE_LIGHT:
-            sensor = g_light;
-            break;
-        default:
-            return;
-    }
-
-    if (sensor) {
-        ASensorEventQueue_disableSensor(g_event_queue, sensor);
-        LOGI("Sensor %d disabled", sensorType);
-    }
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_rvvm_android_RvvmNative_nativePollEvents(JNIEnv* env, jobject thiz)
-{
-    (void)env;
-    (void)thiz;
-
-    if (!g_event_queue) {
-        return JNI_FALSE;
-    }
-
-    /* Poll for events: (timeoutMillis, outFd, outEvents, outData) */
-    int events;
-    void* data;
-    int result = ALooper_pollOnce(0, NULL, &events, &data);
-
-    if (result >= 0) {
-        /* Read sensor events */
-        ASensorEvent event[16];
-        ssize_t count = ASensorEventQueue_getEvents(g_event_queue, event, 16);
-
-        if (count > 0) {
-            LOGI("Polled %zd sensor events", count);
-
-            /* Push events to ring buffer */
-            for (ssize_t i = 0; i < count; i++) {
-                on_sensor_data(
-                    event[i].acceleration.x,
-                    event[i].acceleration.y,
-                    event[i].acceleration.z,
-                    event[i].type,
-                    event[i].timestamp
-                );
-            }
-            return JNI_TRUE;
-        }
-    }
-
-    return JNI_FALSE;
-}
-
-JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativePushSensorData(
-    JNIEnv* env, jobject thiz,
-    jfloat x, jfloat y, jfloat z,
-    jint sensorType, jlong timestamp)
-{
-    (void)env;
-    (void)thiz;
-    on_sensor_data(x, y, z, sensorType, timestamp);
 }
 
 JNIEXPORT jstring JNICALL

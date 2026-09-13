@@ -13,9 +13,10 @@
  *  - Lifecycle:     queued via cmdpost_queue_lifecycle_cmd(), consumed by the
  *                   guest through SYS_ANDROID_GAME_POLL_CMD.
  *  - Motion events: queued via cmdpost_queue_motion_event(), same polling path.
- *  - Sensors:       stub accelerometer/gyroscope/light pushed every 100 ms
- *                   while the guest has them enabled (handle table matches
- *                   g_sensors[] in vp_ndk_stub.c).
+ *  - Sensors:       virtual accelerometer/gyroscope/light supplied by
+ *                   win32_sensor_stub.c and injected from WM_TIMER while the
+ *                   guest has them enabled. The subsystem (vp_sensor.c) owns
+ *                   the wire identity and the per-queue fan-out.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -36,12 +37,16 @@
 #include "win32_gl_dispatch.h" /* on_egl_dispatch, on_gl_dispatch, g_gl_active */
 #include "win32_gl_backend.h"  /* win32_gl_backend_load/ready/name/unload, w32gl_arg_f */
 #include "win32_aaudio_wasapi.h" /* win32_aaudio_ops, win32_aaudio_shutdown */
+#include "win32_sensor_stub.h"   /* win32_sensor_stub_ops, win32_sensor_stub_tick */
 #include <vterm.h>               /* guest virtual TTY parser (libvterm) */
 
 #define WM_APP_GUEST_EXIT (WM_APP + 1)
 #define WM_APP_RESIZE_TO_SURFACE (WM_APP + 2)
+/* Base tick for the virtual sensors. Each sensor emits at the rate the guest
+ * asked for through ASensorEventQueue_setEventRate(); this is only the
+ * granularity of the host-side scheduler. */
 #define SENSOR_TIMER_ID   1
-#define SENSOR_TIMER_MS   100
+#define SENSOR_TIMER_MS   10
 /* Stop watchdog: armed together with the cooperative teardown, fires when the
  * guest is still alive at the end of the grace period. */
 #define STOP_TIMER_ID     2
@@ -155,11 +160,6 @@ static int32_t g_win_h    = 768;
 static int32_t g_virt_w   = 1024;
 static int32_t g_virt_h   = 768;
 static int32_t g_virt_ppi = ACONFIGURATION_DENSITY_MEDIUM;
-
-/* Stub sensor enable state (handle table: vp_ndk_stub.c g_sensors[]) */
-static bool g_accel_on = false;  /* handle 0 */
-static bool g_gyro_on  = false;  /* handle 2 */
-static bool g_light_on = false;  /* handle 3 */
 
 /* Guest thread */
 static HANDLE g_guest_thread = NULL;
@@ -892,28 +892,6 @@ static int32_t on_config_get(int32_t field, int32_t* outValue)
     }
 }
 
-static void on_sensor_init(void)
-{
-    winhost_log("sensor system initialized (stub sensors)");
-}
-
-/* Handle values match g_sensors[] in vp_ndk_stub.c */
-static void on_sensor_enable(int handle, bool enable)
-{
-    switch (handle) {
-    case 0: g_accel_on = enable; break; /* ASENSOR_TYPE_ACCELEROMETER */
-    case 2: g_gyro_on  = enable; break; /* ASENSOR_TYPE_GYROSCOPE     */
-    case 3: g_light_on = enable; break; /* ASENSOR_TYPE_LIGHT         */
-    default: break;                     /* others: accepted, stubbed no-op */
-    }
-    winhost_log("sensor enable: handle=%d enable=%d", handle, enable ? 1 : 0);
-}
-
-static void on_sensor_data(sensor_event_t* event)
-{
-    (void)event; /* host does not consume sensor data */
-}
-
 static void on_game_lifecycle(int32_t cmd)
 {
     /* Mirrors jni_bridge.c: log only; real path is the queued commands */
@@ -924,30 +902,6 @@ static void on_game_input(void* motionEvent)
 {
     (void)motionEvent;
     winhost_log("guest input callback");
-}
-
-/* ------------------------------------------------------------------ */
-/* Stub sensor feeding                                                 */
-/* ------------------------------------------------------------------ */
-
-static void push_stub_sensor(int32_t type, float x, float y, float z)
-{
-    sensor_event_t ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.version   = 1;
-    ev.type      = type;
-    ev.timestamp = (int64_t)GetTickCount64() * 1000000LL;
-    ev.vector.x  = x;
-    ev.vector.y  = y;
-    ev.vector.z  = z;
-    cmdpost_push_sensor_event(&ev);
-}
-
-static void feed_stub_sensors(void)
-{
-    if (g_accel_on) push_stub_sensor(ASENSOR_TYPE_ACCELEROMETER, 0.0f, 0.0f, 9.81f);
-    if (g_gyro_on)  push_stub_sensor(ASENSOR_TYPE_GYROSCOPE, 0.0f, 0.0f, 0.0f);
-    if (g_light_on) push_stub_sensor(ASENSOR_TYPE_LIGHT, 0.0f, 0.0f, 0.0f);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1366,7 +1320,7 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     case WM_TIMER:
         if (wParam == SENSOR_TIMER_ID) {
-            feed_stub_sensors();
+            win32_sensor_stub_tick();
         } else if (wParam == STOP_TIMER_ID) {
             /* The guest sat through the whole cooperative teardown without
              * exiting: it never polls its lifecycle commands (e.g.
@@ -2239,7 +2193,7 @@ static void launcher_toggle_suspend(void)
  * there is no race with in-flight guest dispatches. */
 static void win32_cmdpost_register_callbacks(void)
 {
-    cmdpost_set_sensor_callbacks(on_sensor_init, on_sensor_enable, on_sensor_data);
+    vp_sensor_set_ops(win32_sensor_stub_ops());
     cmdpost_set_window_callbacks(on_window_lock, on_window_unlock);
     cmdpost_set_window_size_callback(on_window_size);
     cmdpost_set_window_set_buf_callback(on_window_set_buf);

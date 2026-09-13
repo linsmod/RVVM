@@ -93,6 +93,7 @@ add_library(rvvm_core STATIC
 
     # VirtPass host side
     ${RVVM_SRC}/virtpass/vp_cmdpost.c
+    ${RVVM_SRC}/virtpass/vp_sensor.c
 )
 
 target_include_directories(rvvm_core PUBLIC
@@ -127,6 +128,7 @@ target_link_options(rvvm_core PRIVATE -Wl,-z,max-page-size=16384)
 add_library(rvvm_jni SHARED
     jni_bridge.c
     vp_aaudio_android.c
+    vp_sensor_android.c
     android_gl_host.c
 )
 

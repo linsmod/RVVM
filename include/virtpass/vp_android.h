@@ -30,6 +30,11 @@
  * virtpass/vp_audio_ringbuf.h, which is pulled in through vp_aaudio.h below;
  * it holds both the SYS_ANDROID_AAUDIO_* numbers and the shared PCM ring. */
 
+/* Sensors (Phase 6). The BASE + 60..69 window and the event/descriptor wire
+ * structs live in virtpass/vp_sensor_abi.h; ASensorEvent below is that ABI's
+ * vp_sensor_event_t, so the guest can hand its own array to the host. */
+#include "virtpass/vp_sensor_abi.h"
+
 /* ============================================================
  * Lifecycle Commands (NativeAppGlueAppCmd)
  * ============================================================ */
@@ -205,6 +210,11 @@ typedef struct ANativeWindow_Buffer {
 
 /* ============================================================
  * Sensor API (android/sensor.h)
+ *
+ * ABI note: this surface follows the NDK signatures verbatim; nothing
+ * Virtpass-specific is added. The event buffer is caller-owned (the host
+ * copies out into it), so there is no ring buffer or shared memory in this
+ * ABI - see virtpass/vp_sensor_abi.h for the transport behind it.
  * ============================================================ */
 
 /* Sensor types */
@@ -235,31 +245,18 @@ typedef struct ANativeWindow_Buffer {
 #define AREPORTING_MODE_ONE_SHOT      2
 #define AREPORTING_MODE_SPECIAL_TRIGGER 3
 
-/* Sensor event (packed for ABI stability) */
-typedef struct {
-    int32_t version;
-    int32_t sensor;
-    int32_t type;
-    int32_t reserved0;
-    int64_t timestamp;
-    union {
-        float data[16];
-        struct {
-            float x;
-            float y;
-            float z;
-            float pad[13];
-        } vector;
-        struct {
-            float azimuth;
-            float pitch;
-            float roll;
-            float pad[13];
-        } orientation;
-    };
-    uint32_t flags;
-    int32_t reserved1[3];
-} __attribute__((packed)) ASensorEvent;
+/* Highest direct report rate level, as returned by
+ * ASensor_getHighestDirectReportRateLevel(). Virtpass implements no Direct
+ * Channel, so this is always STOP. */
+#define ASENSOR_DIRECT_RATE_STOP 0
+
+/* Set in ASensorEvent.flags for a wake-up sensor's events. */
+#define ASENSOR_FLAG_WAKE_UP 0x1u
+
+/* Sensor event: the NDK struct, with the layout pinned by vp_sensor_abi.h.
+ * Not packed - the NDK's is not either - and the compile-time asserts there
+ * hold the size/offsets on both the guest and the host side. */
+typedef vp_sensor_event_t ASensorEvent;
 
 /* Opaque types */
 typedef struct ASensorManager ASensorManager;
@@ -267,17 +264,26 @@ typedef struct ASensorEventQueue ASensorEventQueue;
 typedef struct ASensor ASensor;
 typedef struct ALooper ALooper;
 
+/* ALooper_callbackFunc is declared with the rest of the Looper API below, but
+ * ASensorManager_createEventQueue() needs it here. */
+typedef int (*ALooper_callbackFunc)(int fd, int events, void* data);
+
+/* Sensor list types, mirroring <android/sensor.h>:
+ * an ASensorList is an array of ASensorRef owned by the sensor manager. */
+typedef ASensor const* ASensorRef;
+typedef ASensorRef const* ASensorList;
+
 /* Sensor Manager */
 ASensorManager* ASensorManager_getInstanceForPackage(const char* packageName);
 ASensorManager* ASensorManager_getInstance(void);
-int ASensorManager_getSensorList(ASensorManager* manager, ASensor const** list);
-int ASensorManager_getDynamicSensorList(ASensorManager* manager, ASensor const** list);
+int ASensorManager_getSensorList(ASensorManager* manager, ASensorList* list);
+int ASensorManager_getDynamicSensorList(ASensorManager* manager, ASensorList* list);
 ASensor const* ASensorManager_getDefaultSensor(ASensorManager* manager, int type);
 ASensor const* ASensorManager_getDefaultSensorEx(ASensorManager* manager, int type, bool wakeUp);
 
 /* Event Queue */
 ASensorEventQueue* ASensorManager_createEventQueue(ASensorManager* manager,
-        ALooper* looper, int ident, void* callback, void* data);
+        ALooper* looper, int ident, ALooper_callbackFunc callback, void* data);
 int ASensorManager_destroyEventQueue(ASensorManager* manager, ASensorEventQueue* queue);
 int ASensorEventQueue_enableSensor(ASensorEventQueue* queue, ASensor const* sensor);
 int ASensorEventQueue_disableSensor(ASensorEventQueue* queue, ASensor const* sensor);
@@ -288,7 +294,11 @@ int ASensorEventQueue_registerSensor(ASensorEventQueue* queue, ASensor const* se
         int32_t samplingPeriodUs, int64_t maxBatchReportLatencyUs);
 int ASensorEventQueue_requestAdditionalInfoEvents(ASensorEventQueue* queue, bool enable);
 
-/* Sensor Info */
+/* Sensor Info.
+ *
+ * This is the whole ASensor accessor set the NDK exposes - do not add to it:
+ * there is no ASensor_getMaxDelay/getMaxRange/getPower in <android/sensor.h>,
+ * so inventing them would put the guest on a surface that does not exist. */
 const char* ASensor_getName(ASensor const* sensor);
 const char* ASensor_getVendor(ASensor const* sensor);
 int ASensor_getType(ASensor const* sensor);
@@ -299,6 +309,9 @@ int ASensor_getFifoReservedEventCount(ASensor const* sensor);
 const char* ASensor_getStringType(ASensor const* sensor);
 int ASensor_getReportingMode(ASensor const* sensor);
 bool ASensor_isWakeUpSensor(ASensor const* sensor);
+/* ASensor_getHandle() is __INTRODUCED_IN(29) in the real NDK. It is part of
+ * this guest surface (the stub can always answer it), but no host backend may
+ * call the platform one under a lower minSdk. */
 int ASensor_getHandle(ASensor const* sensor);
 bool ASensor_isDirectChannelTypeSupported(ASensor const* sensor, int channelType);
 int ASensor_getHighestDirectReportRateLevel(ASensor const* sensor);
@@ -469,9 +482,10 @@ float GameActivityPointerAxes_getAxisValue(const GameActivityPointerAxes* pointe
 
 #define ALOOPER_PREPARE_ALLOW_NON_CALLBACKS (1 << 0)
 
-/* Invoked when a fd registered with ident == ALOOPER_POLL_CALLBACK becomes
- * ready. Returning 0 removes the fd from the looper (NDK contract). */
-typedef int (*ALooper_callbackFunc)(int fd, int events, void* data);
+/* ALooper_callbackFunc: invoked when a fd registered with ident ==
+ * ALOOPER_POLL_CALLBACK becomes ready. Returning 0 removes the fd from the
+ * looper (NDK contract). Declared with the sensor API above, which needs it
+ * for ASensorManager_createEventQueue(). */
 
 ALooper* ALooper_prepare(int opts);
 int ALooper_pollAll(int timeoutMillis, int* events, void** data, void** source);

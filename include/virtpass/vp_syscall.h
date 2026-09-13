@@ -13,7 +13,10 @@
  *
  * The AAudio numbers (BASE + 40..51) intentionally stay in
  * virtpass/vp_audio_ringbuf.h: they are published together with the shared
- * PCM ring layout they describe.
+ * PCM ring layout they describe. The sensor numbers (BASE + 60..69) follow
+ * the same rule and live in virtpass/vp_sensor_abi.h - which, unlike the old
+ * sensor ring buffer header, is a pure wire protocol: the event data path is
+ * a copy-out into the caller's ASensorEvent array.
  */
 #ifndef VIRTPASS_SYSCALL_H
 #define VIRTPASS_SYSCALL_H
@@ -23,11 +26,11 @@
 #define SYS_ANDROID_BASE          0x10000
 #define SYS_ANDROID_CALL          0x10022
 
-/* Sub-commands passed in a0 for SYS_ANDROID_CALL. */
-#define SYS_ANDROID_SENSOR_INIT   (SYS_ANDROID_BASE + 1)
-#define SYS_ANDROID_SENSOR_GET    (SYS_ANDROID_BASE + 2)
-#define SYS_ANDROID_SENSOR_ENABLE (SYS_ANDROID_BASE + 3)
-#define SYS_ANDROID_SENSOR_READ   (SYS_ANDROID_BASE + 4)
+/* Sub-commands passed in a0 for SYS_ANDROID_CALL.
+ *
+ * BASE + 1..4 are retired: the sensor proxy used to live there and now owns
+ * the BASE + 60..69 block in virtpass/vp_sensor_abi.h, published together
+ * with the event/descriptor wire structs it carries. */
 #define SYS_ANDROID_WINDOW_INIT   (SYS_ANDROID_BASE + 5)
 #define SYS_ANDROID_INPUT_INIT    (SYS_ANDROID_BASE + 6)
 #define SYS_ANDROID_LIFECYCLE     (SYS_ANDROID_BASE + 7)
