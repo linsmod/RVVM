@@ -76,7 +76,10 @@ backend behind each callback differs.
   frame times; guests consume them via Looper fd wakeup or a blocking wait.
 - Diagnostics: guest stdout/stderr (write and writev) land in logcat under the
   `RVVM-GUEST` tag; GL calls trace under `RVVM-GL` with `RVVM_GL_TRACE`.
-  A guest can be launched directly with
+  The guest console is also parsed into the virtual TTY layer (the console
+  tab), and keeps flowing to logcat / the Java console log file - the TTY and
+  the io_callback are complementary sinks, not alternatives. A guest can be
+  launched directly with
   `am start -n com.rvvm.android/.MainActivity --es guest <name>.exe`.
 
 ## Test knobs (guest side, `guest-samples/test_render_gles.c`)

@@ -43,28 +43,33 @@ void rvvm_user_set_exit_callback(rvvm_machine_t* machine, rvvm_user_exit_callbac
 
 // --- Guest virtual TTY (libvterm-backed) ---
 //
-// When a host registers a TTY callback, guest writes to fd 1/2 are fed through
-// a libvterm instance instead of being written straight to the host terminal.
-// libvterm parses the raw byte stream (CR, ANSI escapes, scrolling, ...) and
-// the host renders the resulting screen state itself. This is what makes
-// in-place updates (e.g. progress counters using '\r') work consistently across
-// hosts, instead of depending on a real tty being attached (which only happens
-// on the win32 host today).
+// When a host injects a VTerm (rvvm_user_set_tty0) and/or registers a TTY
+// callback, guest writes to fd 1/2 are fed through the libvterm instance as
+// well: the bytes are parsed into a screen matrix (CR, ANSI escapes,
+// scrolling, ...) that the host renders itself. This is what makes in-place
+// updates (e.g. progress counters using '\r') work consistently across hosts,
+// instead of depending on a real tty being attached.
+//
+// The TTY is not an alternative sink: the same bytes also continue to the
+// host's io_callback (rvvm_user_set_io_callback) or, without one, to the host
+// fd. That is what keeps the guest console in the host log - logcat under the
+// RVVM-GUEST tag plus the Java console bridge on Android, host stdout on
+// win32. A host that wants the TTY to be the only sink can consume fd 1/2 in
+// its own io_callback.
 //
 // The opaque `tty` pointer passed to the callback is a libvterm `VTerm*`; cast
-// it back after including <vterm.h>. Registering NULL disables TTY parsing and
-// restores the default behaviour (raw write to the host fd).
+// it back after including <vterm.h>. Registering NULL disables TTY parsing.
 typedef void (*rvvm_user_tty_callback)(void* userdata, int fd, void* tty);
 
 void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback callback, void* userdata);
 
 // Attach a host-owned virtual TTY (a libvterm `VTerm*`, opaque here) to the
-// machine. Guest fd 1/2 output is fed into it (with ONLCR emulation) instead
-// of the host fd; pair with rvvm_user_set_tty_callback() so the host gets
-// repaint notifications. Ownership stays with the host: the VTerm survives
-// guest exit (keeping the last screen renderable) and rvvm_user never frees
-// it. Without this call rvvm_user creates and owns an internal VTerm, freed
-// with the machine. Must be called before rvvm_user_linux_ex().
+// machine. Guest fd 1/2 output is fed into it (with ONLCR emulation) in
+// addition to the host fd / io_callback path. Ownership stays with the host:
+// the VTerm survives guest exit (keeping the last screen renderable) and
+// rvvm_user never frees it. Without this call rvvm_user creates and owns an
+// internal VTerm, freed with the machine. Must be called before
+// rvvm_user_linux_ex().
 void rvvm_user_set_tty0(rvvm_machine_t* machine, void* tty);
 
 // Create a userland machine instance without starting it.

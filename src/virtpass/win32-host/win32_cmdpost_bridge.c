@@ -1369,6 +1369,19 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             set_title(title);
         }
         winhost_log("guest exited with code %d", g_guest_rc);
+        /* Optional dump of the frozen screen matrix to stdout. Guest output
+         * already reaches stdout verbatim through the host fd path; this shows
+         * the parsed screen instead (escapes resolved, in-place updates
+         * applied), which is what makes it useful from a batch run. */
+        if (g_tty_vt && getenv("RVVM_TTY_DUMP")) {
+            VTermScreen* scr = vterm_obtain_screen(g_tty_vt);
+            VTermRect    rect = { 0, TTY_ROWS, 0, TTY_COLS };
+            char         buf[TTY_ROWS * TTY_COLS + 1];
+            size_t       n = vterm_screen_get_text(scr, buf, sizeof(buf) - 1, rect);
+            buf[n] = 0;
+            printf("---- guest tty ----\n%s\n---- end guest tty ----\n", buf);
+            fflush(stdout);
+        }
         /* Guest is gone: nobody polls lifecycle cmds / input anymore, and the
          * guest thread already ran cmdpost_cleanup(). Queuing the Android
          * teardown here (as WM_CLOSE does) would only leave PAUSE/STOP/DESTROY

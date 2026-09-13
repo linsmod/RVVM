@@ -574,8 +574,9 @@ static void user_tty_init(rvvm_userland_t* ctx)
 
 // Feed guest output on fd 1/2 through libvterm. No-op unless a virtual TTY
 // exists - either injected by the host via rvvm_user_set_tty0() or created
-// on demand when a host registered a tty callback (so platforms that simply
-// write to a real tty are unaffected).
+// on demand when a host registered a tty callback. This only mirrors the bytes
+// into the screen matrix; the caller still forwards them to the host's
+// io_callback / host fd, so both sinks stay live.
 static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t count)
 {
     if (!ctx->tty_vt && !ctx->tty_cb) {
@@ -1920,15 +1921,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 64: { // write
                     void* wbuf = to_ptr(a1);
                     if (a0 == 1 || a0 == 2) {
-                        // fd 1/2: feed the virtual TTY parser (no-op unless a host
-                        // registered a tty callback). When it did, the host renders
-                        // the screen itself, so don't also write raw bytes to the
-                        // host fd (that would double the output).
+                        // fd 1/2: feed the virtual TTY parser first (no-op unless a
+                        // host injected a VTerm or registered a tty callback). The
+                        // bytes then continue to the host's io_callback / the host
+                        // fd as usual, so the guest console also reaches whatever
+                        // sink the host installed - logcat + the Java console on
+                        // Android, stdout on win32. A host that wants the virtual
+                        // TTY to be the only sink consumes the bytes in its own
+                        // io_callback instead of leaning on this path.
                         user_tty_write(uctx(), a0, wbuf, a2);
-                        if (uctx()->tty_vt) {
-                            a0 = (ssize_t)a2;
-                            break;
-                        }
                     }
                     if (uctx()->io_callback) {
                         ssize_t ret = uctx()->io_callback(a0, wbuf, a2);
@@ -1950,16 +1951,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                     if (a7 == 65) {
                         a0 = errno_ret(readv(a0, hiov, a2));
                     } else if (a0 == 1 || a0 == 2) {
-                        /* stdout/stderr */
+                        /* stdout/stderr: mirror every segment into the virtual
+                         * TTY parser (when one exists) and forward the same
+                         * bytes to the host's io_callback / host fd, exactly
+                         * like the write() path above - the TTY must not
+                         * swallow the guest console. */
                         ssize_t total = 0;
                         for (int i = 0; i < (int)a2; i++) {
-                            // Feed each segment to the virtual TTY parser.
                             user_tty_write(uctx(), a0, hiov[i].iov_base, hiov[i].iov_len);
-                            if (uctx()->tty_vt) {
-                                total += (ssize_t)hiov[i].iov_len;
-                                continue;
-                            }
-                            // No tty host: fall back to the raw write path.
                             ssize_t r = uctx()->io_callback
                                         ? uctx()->io_callback(a0, hiov[i].iov_base, hiov[i].iov_len)
                                         : writev(a0, &hiov[i], 1);

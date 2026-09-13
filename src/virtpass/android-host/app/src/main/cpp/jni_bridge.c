@@ -364,41 +364,6 @@ static void jni_tty_init(void)
     LOGI("Guest TTY initialized (%dx%d)", TTY_ROWS, TTY_COLS);
 }
 
-/* TEMP DIAG: dump the whole screen matrix to logcat whenever it changes, so
- * "the guest produced this" and "the renderer drew this" can be told apart.
- * Remove once the console redraw issue is resolved. */
-static void jni_tty_dump(VTermScreen* scr)
-{
-    static char prev[TTY_ROWS * (TTY_COLS + 1)];
-    static char curr[TTY_ROWS * (TTY_COLS + 1)];
-
-    for (int r = 0; r < TTY_ROWS; r++) {
-        char* line = curr + r * (TTY_COLS + 1);
-        int n = 0;
-        for (int c = 0; c < TTY_COLS; c++) {
-            VTermPos pos = { r, c };
-            VTermScreenCell cell;
-            uint32_t cp = 0;
-            if (vterm_screen_get_cell(scr, pos, &cell) && cell.chars[0] &&
-                cell.chars[0] != (uint32_t)-1) {
-                cp = cell.chars[0];
-            }
-            line[n++] = (char)((cp >= 0x20 && cp <= 0x7e) ? (char)cp : (cp ? '?' : ' '));
-        }
-        while (n > 0 && line[n - 1] == ' ') {
-            n--;
-        }
-        line[n] = '\0';
-    }
-    if (memcmp(prev, curr, sizeof(curr)) == 0) {
-        return;
-    }
-    memcpy(prev, curr, sizeof(curr));
-    for (int r = 0; r < TTY_ROWS; r++) {
-        LOGI("TTY[%02d]|%s", r, curr + r * (TTY_COLS + 1));
-    }
-}
-
 /* Cell snapshot for the Java renderer: rows*cols cells, each 4 uint32:
  * [0] codepoint (UCS-4), [1] fg ARGB, [2] bg ARGB, [3] flags (bit0 bold,
  * bit1 underline, bit2 reverse already swapped into fg/bg, bit3 CJK-wide).
@@ -425,7 +390,6 @@ Java_com_rvvm_android_RvvmNative_nativeTtySnapshot(JNIEnv* env, jobject thiz, ji
      * calls this before reading cells (tty_layer_render); without it the cells
      * read back below can be a stale generation of the screen. */
     vterm_screen_flush_damage(scr);
-    jni_tty_dump(scr); /* TEMP DIAG */
     for (int r = 0; r < TTY_ROWS; r++) {
         for (int c = 0; c < TTY_COLS; c++) {
             VTermPos pos = { r, c };

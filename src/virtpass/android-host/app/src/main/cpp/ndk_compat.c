@@ -1,5 +1,4 @@
 /* ndk_compat.c - Definitions for syscalls missing below Android API 30 */
-#define _GNU_SOURCE
 #include <unistd.h>
 #include <sys/syscall.h>
 

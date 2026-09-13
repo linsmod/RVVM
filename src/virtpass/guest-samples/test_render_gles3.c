@@ -170,7 +170,13 @@ static void prog_make(Prog* p, const char* vs_src, const char* fs_src)
     p->prog = 0;
     GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
     GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fs_src);
-    if (!vs || !fs) return;
+    if (!vs || !fs) {
+        /* Counted as a failure here: the stages bail out via `goto done`, so a
+         * shader that fails to build would otherwise let the run report success
+         * with the remaining stages silently skipped. */
+        check(0, "stage shaders compiled");
+        return;
+    }
 
     p->prog = glCreateProgram();
     glAttachShader(p->prog, vs);
@@ -191,7 +197,10 @@ static void prog_make(Prog* p, const char* vs_src, const char* fs_src)
     /* The shaders are owned by the program once linked. */
     glDeleteShader(vs);
     glDeleteShader(fs);
-    if (!p->prog) return;
+    if (!p->prog) {
+        check(0, "stage program linked");
+        return;
+    }
 
     p->l_pos        = glGetAttribLocation(p->prog, "a_pos");
     p->l_cell       = glGetAttribLocation(p->prog, "a_cell");
@@ -324,10 +333,13 @@ static GLuint make_vert_vbo(const Vert* v, int n)
     "out vec4 o_color;\n"                                                     \
     "void main() { o_color = texture(u_tex2d, v_uv); }\n"
 
+/* The fragment language predeclares default precisions for float, int,
+ * sampler2D and samplerCube only - sampler3D has none, so leaving the qualifier
+ * off is a compile error ("No precision specified (sampler)"), not a warning. */
 #define FS_TEX3D                                                              \
     "#version 300 es\n"                                                       \
     "precision mediump float;\n"                                              \
-    "uniform sampler3D u_tex3d;\n"                                            \
+    "uniform mediump sampler3D u_tex3d;\n"                                    \
     "uniform float u_slice;\n"                                                \
     "in vec2 v_uv;\n"                                                         \
     "out vec4 o_color;\n"                                                     \
@@ -750,11 +762,13 @@ int main(void)
         if (!p.prog) goto done;
 
         enum { T3_W = 4, T3_H = 4, T3_D = 2 };
-        static unsigned char layer_red[T3_W * T3_H * 4];
+        /* Sub-image for layer 1: opaque blue. The alpha byte must be written
+         * too - leaving it zero makes the sample read back (0,0,255,0) and the
+         * opaque-blue check below fails on every driver. */
         static unsigned char layer_blue[T3_W * T3_H * 4];
         for (int i = 0; i < T3_W * T3_H; i++) {
-            layer_red[i * 4 + 0] = 255;  layer_red[i * 4 + 1] = 0;  layer_red[i * 4 + 2] = 0;
-            layer_blue[i * 4 + 0] = 0;   layer_blue[i * 4 + 1] = 0; layer_blue[i * 4 + 2] = 255;
+            layer_blue[i * 4 + 0] = 0;   layer_blue[i * 4 + 1] = 0;
+            layer_blue[i * 4 + 2] = 255; layer_blue[i * 4 + 3] = 255;
         }
         /* Allocate both layers red, then overwrite layer 1 with blue through
          * glTexSubImage3D - the widest call the ABI has, and the reason
@@ -892,7 +906,15 @@ int main(void)
         GLuint q = 0;
         glGenQueries(1, &q);
         check(q != 0, "glGenQueries");
-        check(glIsQuery(q) == GL_TRUE, "glIsQuery");
+        /* Negative control: zero is never the name of a query object. */
+        check(glIsQuery(0) == GL_FALSE, "glIsQuery(0)");
+
+        /* glIsQuery on a *fresh* name is deliberately not asserted: the spec
+         * calls that GL_TRUE, but ANGLE/D3D11 only materialises the query
+         * object at glBeginQuery and answers GL_FALSE until then. Report what
+         * the driver said; the portable assertions follow below. */
+        printf("    glIsQuery after glGenQueries: %s (driver-dependent)\n",
+               glIsQuery(q) == GL_TRUE ? "GL_TRUE" : "GL_FALSE (lazy object)");
 
         glUseProgram(p.prog);
         glUniform1i(p.u_cell_scale, 0);
@@ -906,12 +928,27 @@ int main(void)
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         glBeginQuery(GL_ANY_SAMPLES_PASSED, q);
+        /* From glBeginQuery on, the name really is a query object on every
+         * driver - this is the positive form the stage asserts. */
+        check(glIsQuery(q) == GL_TRUE, "glIsQuery while the query is active");
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glEndQuery(GL_ANY_SAMPLES_PASSED);
 
+        /* Availability straight after glEndQuery is NOT guaranteed: the result
+         * is only required to be there once the query's commands have
+         * completed. A desktop driver that has already retired the tiny draw
+         * answers GL_TRUE, but a phone's tiled/deferred GPU has not even
+         * submitted it yet and answers GL_FALSE - legal, and not a failure.
+         * Report that value, then assert the portable form: glFinish()
+         * completes every command, so the result must be available after it. */
         GLuint avail = 0;
         glGetQueryObjectuiv(q, GL_QUERY_RESULT_AVAILABLE, &avail);
-        check(avail == GL_TRUE, "GL_QUERY_RESULT_AVAILABLE");
+        printf("    available straight after glEndQuery: %s\n",
+               avail == GL_TRUE ? "yes" : "no (deferred, tolerated)");
+
+        glFinish();
+        glGetQueryObjectuiv(q, GL_QUERY_RESULT_AVAILABLE, &avail);
+        check(avail == GL_TRUE, "GL_QUERY_RESULT_AVAILABLE after glFinish");
 
         GLuint samples = 0;
         glGetQueryObjectuiv(q, GL_QUERY_RESULT, &samples);
@@ -920,6 +957,7 @@ int main(void)
 
         expect_pixel(g_fb_w / 2, g_fb_h / 2, 255, 0, 255, 255, "frame is magenta");
         glDeleteQueries(1, &q);
+        check(glIsQuery(q) == GL_FALSE, "glIsQuery after glDeleteQueries");
         prog_free(&p);
     }
     gl_error_clear("query stage");
