@@ -49,22 +49,12 @@
 
 /* ============================================================
  * Callback function pointers (set by host via JNI)
+ *
+ * The callback typedefs live in vp_cmdpost.h - they are part of the host
+ * surface. Do NOT redefine them here: the signatures carry the instance as
+ * their first argument now, and a local copy silently reverted to the old
+ * shape (the compiler caught the mismatch in the struct's field types).
  * ============================================================ */
-
-/* Window callbacks */
-typedef int32_t (*window_lock_callback)(void* window, void* outBuffer, void* dirtyBounds);
-typedef int32_t (*window_unlock_callback)(void* window, void* guestPixels);
-
-/* GameActivity callbacks */
-typedef void (*game_lifecycle_callback)(int32_t cmd);
-typedef void (*game_input_callback)(void* motionEvent);
-
-/* Window callbacks */
-typedef void (*window_size_callback)(int64_t* width, int64_t* height);
-typedef int32_t (*window_set_buf_callback)(int32_t width, int32_t height, int32_t format);
-
-/* Configuration callback: host resolves one AConfiguration field. */
-typedef int32_t (*config_get_callback)(int32_t field, int32_t* outValue);
 
 /* ============================================================
  * Phase 5: AAudio proxy
@@ -492,7 +482,7 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
                     /* Get one device configuration field (a1 = VP_ACONFIG_QUERY_*) */
                     int32_t field = (int32_t)a1;
                     int32_t value = 0;
-                    if (inst->config_get_cb && inst->config_get_cb(field, &value) == 0) {
+                    if (inst->config_get_cb && inst->config_get_cb(inst, field, &value) == 0) {
                         return (int64_t)value;
                     }
                     return -1; /* host provided no configuration */
@@ -524,7 +514,7 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
                     }
                     /* window (a1) is a guest static, outBuffer (a2) and
                      * dirtyBounds (a3) are guest buffers; a3 may be NULL */
-                    int32_t lock_rc = inst->window_lock_cb(rvvm_user_guest_ptr((uint64_t)a1),
+                    int32_t lock_rc = inst->window_lock_cb(inst, rvvm_user_guest_ptr((uint64_t)a1),
                                                        rvvm_user_guest_ptr((uint64_t)a2),
                                                        rvvm_user_guest_ptr((uint64_t)a3));
                     if (lock_rc != 0) {
@@ -536,7 +526,7 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
                 case SYS_ANDROID_WINDOW_UNLOCK: {
                     /* Unlock window and post buffer; a2 = guest pixel buffer */
                     if (inst->window_unlock_cb) {
-                        return inst->window_unlock_cb(rvvm_user_guest_ptr((uint64_t)a1),
+                        return inst->window_unlock_cb(inst, rvvm_user_guest_ptr((uint64_t)a1),
                                                   rvvm_user_guest_ptr((uint64_t)a2));
                     }
                     return -1;
@@ -546,7 +536,7 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
                     /* Get window size: pack (height << 32) | width into a0 */
                     int64_t w = 0, h = 0;
                     if (inst->window_size_cb) {
-                        inst->window_size_cb(&w, &h);
+                        inst->window_size_cb(inst, &w, &h);
                     }
                     CMDLOG("Host window get size: %" PRId64 "x%" PRId64, w, h);
                     return (int64_t)(((uint64_t)w & 0xFFFFFFFFu) |
@@ -556,7 +546,7 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
                 case SYS_ANDROID_WINDOW_SET_BUF: {
                     /* Guest requested buffer geometry change (width, height, format) */
                     if (inst->window_set_buf_cb) {
-                        int32_t result = inst->window_set_buf_cb((int32_t)a1, (int32_t)a2, (int32_t)a3);
+                        int32_t result = inst->window_set_buf_cb(inst, (int32_t)a1, (int32_t)a2, (int32_t)a3);
                         CMDLOG("Host window set buf: %dx%d fmt=%d -> %d",
                                (int32_t)a1, (int32_t)a2, (int32_t)a3, result);
                         return result;
@@ -846,14 +836,14 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
             if (!c) return -1;
             /* args[] carries guest addresses, which the GL backend is expected
              * to translate via rvvm_user_guest_ptr() before dereferencing */
-            if (inst->egl_dispatch_cb) inst->egl_dispatch_cb((uint32_t)c->fn_id, c->args, &c->ret);
+            if (inst->egl_dispatch_cb) inst->egl_dispatch_cb(inst, (uint32_t)c->fn_id, c->args, &c->ret);
             else c->ret = 0;
             return 0;
         }
         case SYS_GL_CALL: {
             gl_call* c = rvvm_user_guest_ptr((uint64_t)a0);
             if (!c) return -1;
-            if (inst->gl_dispatch_cb) inst->gl_dispatch_cb((uint32_t)c->fn_id, c->args, &c->ret);
+            if (inst->gl_dispatch_cb) inst->gl_dispatch_cb(inst, (uint32_t)c->fn_id, c->args, &c->ret);
             else c->ret = 0;
             return 0;
         }

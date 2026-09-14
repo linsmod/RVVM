@@ -732,9 +732,10 @@ void present_gl_frame(void)
     present_frame_impl(rb, w, h, WINDOW_FORMAT_RGBA_8888, 4, true);
 }
 
-static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
+static int32_t on_window_lock(vp_cmdpost_t* inst, void* window, void* outBuffer, void* dirtyBounds)
 {
     cmdpost_ANativeWindow_Buffer* buf = (cmdpost_ANativeWindow_Buffer*)outBuffer;
+    (void)inst;   /* single-run host: the instance carries no extra state */
     (void)window;
     (void)dirtyBounds;
     if (!buf) {
@@ -769,9 +770,10 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
     return 0;
 }
 
-static int32_t on_window_unlock(void* window, void* guestPixels)
+static int32_t on_window_unlock(vp_cmdpost_t* inst, void* window, void* guestPixels)
 {
     int32_t w = 0, h = 0, fmt = 0;
+    (void)inst;   /* single-run host: the instance carries no extra state */
     (void)window;
     if (!guestPixels) {
         /* UNLOCK with a null pixel pointer is the fingerprint of the guest
@@ -804,10 +806,11 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
     return 0;
 }
 
-static void on_window_size(int64_t* width, int64_t* height)
+static void on_window_size(vp_cmdpost_t* inst, int64_t* width, int64_t* height)
 {
     int32_t w = 0, h = 0;
 
+    (void)inst;   /* single-run host: the instance carries no extra state */
     if (!width || !height) return;
     EnterCriticalSection(&g_surf_cs);
     /* The guest's window is its own surface (L1), never the panel: being asked
@@ -819,10 +822,11 @@ static void on_window_size(int64_t* width, int64_t* height)
     *height = (int64_t)h;
 }
 
-static int32_t on_window_set_buf(int32_t width, int32_t height, int32_t format)
+static int32_t on_window_set_buf(vp_cmdpost_t* inst, int32_t width, int32_t height, int32_t format)
 {
     /* The guest ABI validation stays here: these are the NDK's formats, and a
      * size or format outside them is a guest error it should hear about. */
+    (void)inst;   /* single-run host: the instance carries no extra state */
     if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return -1;
     if (format != WINDOW_FORMAT_RGBA_8888 &&
         format != WINDOW_FORMAT_RGBX_8888 &&
@@ -873,8 +877,9 @@ static int32_t density_bucket_for_ppi(int32_t ppi)
     return buckets[best];
 }
 
-static int32_t on_config_get(int32_t field, int32_t* outValue)
+static int32_t on_config_get(vp_cmdpost_t* inst, int32_t field, int32_t* outValue)
 {
+    (void)inst;   /* single-run host: the instance carries no extra state */
     int32_t w, h, ppi, width_dp, height_dp, long_dp, short_dp;
 
     if (!outValue) return -1;

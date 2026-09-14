@@ -35,13 +35,21 @@ typedef struct {
 
 /* ============================================================
  * Callback function types
+ *
+ * Every guest-facing callback carries the instance it was dispatched
+ * through as its first argument. A host that runs several guests keeps a
+ * cmdpost instance per guest, and the callback is the only place where
+ * "which guest is calling" is knowable - the instance IS that identity,
+ * the host maps it back to its own run record. Single-guest hosts (the
+ * win32 launcher today) simply ignore the argument.
  * ============================================================ */
+typedef struct vp_cmdpost vp_cmdpost_t;
 
 /* Window callbacks */
-typedef int32_t (*window_lock_callback)(void* window, void* outBuffer, void* dirtyBounds);
-typedef int32_t (*window_unlock_callback)(void* window, void* guestPixels);
-typedef void (*window_size_callback)(int64_t* width, int64_t* height);
-typedef int32_t (*window_set_buf_callback)(int32_t width, int32_t height, int32_t format);
+typedef int32_t (*window_lock_callback)(vp_cmdpost_t* inst, void* window, void* outBuffer, void* dirtyBounds);
+typedef int32_t (*window_unlock_callback)(vp_cmdpost_t* inst, void* window, void* guestPixels);
+typedef void (*window_size_callback)(vp_cmdpost_t* inst, int64_t* width, int64_t* height);
+typedef int32_t (*window_set_buf_callback)(vp_cmdpost_t* inst, int32_t width, int32_t height, int32_t format);
 
 /* Field selectors for SYS_ANDROID_CONFIG (passed in a1).
  * Internal transport encoding; mirrored in virtpass/vp_android.h. */
@@ -57,7 +65,7 @@ typedef int32_t (*window_set_buf_callback)(int32_t width, int32_t height, int32_
 
 /* Configuration callback: host fills *outValue for the requested field
  * (VP_ACONFIG_QUERY_* selector) and returns 0 on success. */
-typedef int32_t (*config_get_callback)(int32_t field, int32_t* outValue);
+typedef int32_t (*config_get_callback)(vp_cmdpost_t* inst, int32_t field, int32_t* outValue);
 
 /* GameActivity callbacks */
 typedef void (*game_lifecycle_callback)(int32_t cmd);
@@ -65,8 +73,8 @@ typedef void (*game_input_callback)(void* motionEvent);
 
 /* Phase 3: GL dispatch callbacks. host 在回调内填 *ret.
  * 0x2000+ 扩展函数时 args[0] = 函数名字符串的 guest 地址. */
-typedef void (*egl_dispatch_callback)(uint32_t fn_id, const int64_t* args, int64_t* ret);
-typedef void (*gl_dispatch_callback) (uint32_t fn_id, const int64_t* args, int64_t* ret);
+typedef void (*egl_dispatch_callback)(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, int64_t* ret);
+typedef void (*gl_dispatch_callback) (vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, int64_t* ret);
 
 /* ============================================================
  * Per-instance state
@@ -79,8 +87,6 @@ typedef void (*gl_dispatch_callback) (uint32_t fn_id, const int64_t* args, int64
  * rvvm_user_set_host_ctx() so a guest's ecall path can find the instance its
  * syscalls belong to, and destroys it at teardown.
  * ============================================================ */
-typedef struct vp_cmdpost vp_cmdpost_t;
-
 vp_cmdpost_t* cmdpost_create(void);
 void cmdpost_destroy(vp_cmdpost_t* inst);
 

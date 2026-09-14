@@ -50,10 +50,13 @@ public class RvvmNative {
     public static native void nativeDestroy();
 
     /**
-     * Set the native window for rendering.
-     * @param surface The Surface to render to
+     * Set the native window for rendering, bound to the given guest: each run
+     * owns its own surface (its floating card), so CPU locks and EGL window
+     * surfaces for that guest work on this window only.
+     * @param surface The Surface to render to, or null when it goes away
+     * @param guestId guest the surface belongs to, or -1 for the active one
      */
-    public static native void nativeSetWindow(Surface surface);
+    public static native void nativeSetWindow(Surface surface, int guestId);
 
     /**
      * Push the real device configuration (AConfiguration values) to native.
@@ -117,6 +120,7 @@ public class RvvmNative {
      * Post a motion event to the guest-facing input queue.
      * All pointers of the MotionEvent are forwarded so the guest sees true
      * multi-touch input.
+     * @param guestId guest to deliver to, or -1 for the active one
      * @param xs Pointer X coordinates, indexed by pointer index
      * @param ys Pointer Y coordinates, indexed by pointer index
      * @param ids Pointer IDs (MotionEvent.getPointerId)
@@ -126,7 +130,7 @@ public class RvvmNative {
      *               the upper bits, matching the GameActivity ABI.
      * @param eventTime Event timestamp in nanoseconds
      */
-    public static native void nativePostMotionEvent(float[] xs, float[] ys, int[] ids,
+    public static native void nativePostMotionEvent(int guestId, float[] xs, float[] ys, int[] ids,
                                                     int pointerCount, int action, long eventTime);
 
     /**
@@ -138,37 +142,42 @@ public class RvvmNative {
     public static native boolean nativeRunElf(String elfPath, String[] args);
 
     /**
-     * Check if the guest is currently running.
+     * Check if the given guest is currently running.
+     * @param guestId guest to query, or -1 for the active one
      * @return true if guest is running
      */
-    public static native boolean nativeIsGuestRunning();
+    public static native boolean nativeIsGuestRunning(int guestId);
 
     /**
-      * Stop the running guest.
+      * Stop the given guest (it unwinds like a normal exit).
+      * @param guestId guest to stop, or -1 for the active one
       */
-    public static native void nativeStopGuest();
+    public static native void nativeStopGuest(int guestId);
 
     /**
-     * Suspend the running guest: park its vCPUs and the frame clock.
+     * Suspend the given guest: park its vCPUs and the frame clock.
      * No-op when no guest is running or it is already suspended.
+     * @param guestId guest to suspend, or -1 for the active one
      */
-    public static native void nativeSuspendGuest();
+    public static native void nativeSuspendGuest(int guestId);
 
     /**
-     * Resume a guest suspended by {@link #nativeSuspendGuest()}.
+     * Resume a guest suspended by {@link #nativeSuspendGuest(int)}.
      * No-op when no guest is running or it is not suspended.
+     * @param guestId guest to resume, or -1 for the active one
      */
-    public static native void nativeResumeGuest();
+    public static native void nativeResumeGuest(int guestId);
 
     /**
-     * Check whether the running guest is suspended.
+     * Check whether the given guest is suspended.
+     * @param guestId guest to query, or -1 for the active one
      * @return true if the guest is currently suspended
      */
-    public static native boolean nativeIsGuestSuspended();
+    public static native boolean nativeIsGuestSuspended(int guestId);
 
     /**
-      * Set a callback invoked when the guest exits.
-      * Called on the guest thread after rvvm_user_linux returns.
+      * Set a callback invoked when a guest exits.
+      * Called on the guest's vCPU thread while the run is winding down.
       * @param callback Listener for guest exit events, or null to clear
       */
     public static native void nativeSetExitCallback(ExitListener callback);
@@ -177,7 +186,7 @@ public class RvvmNative {
       * Listener interface for guest exit events.
       */
     public interface ExitListener {
-        void onExit(int exitCode);
+        void onExit(int guestId, int exitCode);
     }
 
     /**
@@ -255,19 +264,22 @@ public class RvvmNative {
      * {@link #nativeTtySnapshot(int[], int[])} just like guest output. No-op when no
      * guest is running or no TTY is attached.
      *
+     * @param guestId guest to type into, or -1 for the active one
      * @param bytes Terminal input bytes, already encoded
      */
-    public static native void nativeTtyInput(byte[] bytes);
+    public static native void nativeTtyInput(int guestId, byte[] bytes);
 
     /**
       * Listener for the guest's console I/O. onOutput receives one line per
       * call (line breaks normalized); onFirstFrame fires once per guest run
       * when the first frame has actually reached the screen - either through
       * the CPU unlock path or a successful eglSwapBuffers - which is the UI's
-      * cue to hand the surface over to the rendered content.
+      * cue to reveal that guest's card. The id names the run that drew the
+      * frame, which is what keeps one guest's frame from revealing another
+      * guest's window.
       */
     public interface ConsoleListener {
         void onOutput(String line);
-        void onFirstFrame();
+        void onFirstFrame(int guestId);
     }
 }

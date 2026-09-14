@@ -25,6 +25,7 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.TextureView;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.ViewConfiguration;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
@@ -55,7 +56,7 @@ import java.util.HashMap;
  * owns the platform ASensorManager and feeds the guest directly, so no sensor
  * data crosses Java.
  */
-public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
+public class MainActivity extends Activity {
 
     private static final String TAG = "RVVM-MainActivity";
 
@@ -78,8 +79,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
      * The card is only a viewport onto the panel, which is why touches are
      * mapped from card pixels into panel pixels before they are forwarded.
      */
-    private static final int PANEL_W = 1280;
-    private static final int PANEL_H = 720;
+    // Package-visible: GlWindowCard sizes its letterbox to the panel's ratio.
+    static final int PANEL_W = 1280;
+    static final int PANEL_H = 720;
 
     // Lifecycle commands forwarded to the guest. These are the APP_CMD_* values
     // from include/virtpass/vp_android.h - they are the wire format of the
@@ -100,8 +102,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     private static final int APP_CMD_DESTROY              = 15;
 
     private TextView statusText;
-    private SurfaceView surfaceView;
-    private SurfaceHolder surfaceHolder;
     private TextureView ttyView;          // Console render target
     private FrameLayout ttyViewport;      // Console viewport (holds ttyView)
     private TtyEditText ttyInput;         // Console keyboard/IME focus target
@@ -110,51 +110,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     private Button stopButton;
     private Spinner guestAppSpinner;
 
-    // ---- Floating graphics window ----
-    // The guest renders into a SurfaceView card that floats above the console
-    // (setZOrderMediaOverlay), pinned to the top-right corner with a margin. It
-    // is a window in the Windows sense: a title bar that drags, and the usual
-    // three buttons - minimize (to the chip in the corner), maximize / restore,
-    // and close (stops the guest and takes the window down with it). Everything
-    // except the title bar belongs to the guest: a touch on the video area is
-    // forwarded to it, which is also why the video cannot host a gesture of
-    // ours.
+    // ---- Floating graphics windows ----
+    // Each run gets its own floating card (GlWindowCard): a SurfaceView that
+    // composites above the console (setZOrderMediaOverlay), a caption bar that
+    // drags, and the Windows three-button set. Everything except the title bar
+    // belongs to the guest: a touch on a card's video area is forwarded to that
+    // card's run, which is also why the video cannot host a gesture of ours.
     //
-    // There is one window, reused by every run, so its state is split by owner:
-    //
-    //   * the USER's arrangement - where the window is, whether it fills the
-    //     workspace - is kept across runs, because it is the workspace's layout
-    //     and not the guest's;
-    //   * a RUN owns whether the window has content yet and whether its start is
-    //     held back for a surface. Those are reset for every run
-    //     (resetGlWindowForRun) and every signal that can arrive late carries
-    //     the runGeneration it was born with, so it cannot land on the run that
-    //     replaced it - a distinction window state alone cannot make.
-    //
-    // Three owners, then, and the window only knows about the first two on its
-    // own: the guest owns the pixels in the surface, the user owns the layout,
-    // and the run owns the lifetime.
+    // The cards live in a map by guest id; the run and its card share a
+    // lifetime (a closed card stops its run, an exited run takes its card
+    // down). First-frame and exit signals still carry the runGeneration so a
+    // late signal cannot land on the run that replaced this one.
     private View workspace;
-    private View glWindow;                // the card: title bar + SurfaceView
-    private FitFrameLayout glVideoArea;   // fits the picture (letterbox)
-    private View glCaptionBar;            // the title bar
-    private TextView glCaption;           // the drag handle
-    private TextView glBtnMin, glBtnMax, glBtnClose;
     private LinearLayout glTaskbar;       // one entry per minimized guest window
-    // The name of the guest this window belongs to, as shown in its title bar
-    // and in its taskbar entry. Set when a run starts (the window outlives the
-    // guest, so the name stays until the next run), empty before the first one.
-    private String glGuestName = "";
-    // Whether the window is minimized - on the taskbar - rather than on screen
-    // or closed. Not readable from the card's visibility: a closed window is
-    // just as gone, and leaves nothing behind.
-    private boolean glMinimized = false;
-    // Floating geometry as inflated from the XML: the size and the gravity the
-    // floating state is laid out with. Everything else about the position is a
-    // margin, not a translation - see moveGlWindow() for why.
-    private int glFloatW, glFloatH, glFloatGravity;
-    private float glRestoreLeft, glRestoreTop;
-    private boolean glMaximized = false;  // user's arrangement, kept across runs
+    private final java.util.HashMap<Integer, GlWindowCard> glCards =
+            new java.util.HashMap<>();
+    // A run whose card is waiting for its surface: picked up by the card's
+    // surfaceCreated (see runGuestElf). The ELF it will run is kept alongside.
+    private int glRunPendingId = -1;
+    private String pendingElfName = null;
+    private String pendingElfPath = null;
 
     // ---- Run identity ----
     // Bumped by every run that actually starts, and read by the signals a run
@@ -165,22 +140,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     // the UI thread, read from the guest thread and the exit monitor.
     private volatile int runGeneration = 0;
 
-    // ---- Content-driven visibility ----
-    // The window is not shown until the guest has a frame for it, so a guest
-    // that never draws (a plain console program) never puts an empty black
-    // rectangle on screen. The catch is that the *surface* cannot be hidden
-    // while waiting: an EGL guest builds its window surface from the window
-    // handle the moment it starts, and a GameActivity guest only draws after
-    // INIT_WINDOW - a window that appeared later would leave both of them stuck
-    // waiting. So the surface stays alive the whole time and only the card's
-    // footprint is taken away: it is laid out 1x1 px with no frame, no title
-    // bar and no shadow, and grows back into place on the first frame
-    // (revealGlWindow).
-    private boolean glRevealed = false;
-    // Card decorations as inflated, put back on the first frame.
-    private int glFramePadding;
-    private float glFloatElevation;
-    private Drawable glBackground;
+    // Content-driven visibility (the 1x1 waiting state, the first-frame reveal)
+    // is per-card now - see GlWindowCard. The rule it implements is unchanged:
+    // the surface must exist from the start (an EGL guest builds its window
+    // surface the moment it starts), but the card takes no room on screen
+    // until the guest has a frame for it.
 
     // The run's log file. Opened in runGuestElf (UI thread), written from the
     // guest thread (onOutput), closed when the guest exits - hence the lock.
@@ -204,12 +168,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     private final int[] motionId = new int[MAX_POINTERS];
 
     private boolean isInitialized = false;
-    private boolean isSurfaceReady = false;
     private boolean hasAutoStarted = false;
-    // A run that asked to start before the window's surface was back: the guest
-    // is held back until surfaceCreated() has handed native a window, see
-    // runGuestElf().
-    private boolean glRunPending = false;
 
     // ---- TTY console (TextureView tab) ----
     // One cell = 4 ints from nativeTtySnapshot: [0] UCS-4 cp, [1] fg ARGB,
@@ -765,7 +724,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     }
 
     /* ============================================================
-     * Floating graphics window
+     * Floating graphics windows (one card per run)
      *
      * The guest renders into a SurfaceView card that floats over the console.
      * z-order is the whole trick: a SurfaceView is normally composited *below*
@@ -775,377 +734,142 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
      * card sits over the console and can be dragged or expanded anywhere on
      * the screen.
      *
-     * The price is the mirror image of that rule: nothing drawn in this window
-     * can cover the surface either, so the card is laid out as a title bar
-     * *above* the video area rather than over it, and the bar is the only place
-     * a host gesture can live. Touches on the video area are forwarded to the
-     * guest, which is why the window's controls are the title bar's buttons and
-     * not, say, a tap anywhere on the card: the console the card covers would
-     * otherwise be unreachable, with no graphics tab left to switch back to.
+     * Each run owns one card (GlWindowCard): its own surface, its own
+     * geometry, its own three-button set. The host side - everything that
+     * crosses runs - lives here: the card table, the taskbar strip, touch
+     * forwarding to the right guest, and the close button ending that card's
+     * run. A card's surface lifecycle is bound to its run's native window
+     * with the card's guest id (nativeSetWindow).
      *
      * The three buttons are the Windows set and mean what they mean there.
      * Minimize takes the window off the workspace and leaves a chip in its
      * place; maximize fills the workspace and restore puts the window back at
-     * its floating corner; close stops the guest and takes the window down with
-     * it. Minimize leaves the guest running and close is the only one that ends
-     * it, which is the same split a desktop draws between a minimized window
+     * its floating corner; close stops the guest and takes the window down
+     * with it. Minimize leaves the guest running and close is the only one
+     * that ends it, the same split a desktop draws between a minimized window
      * and a closed one.
      * ============================================================ */
 
-    private void initGlWindow() {
-        workspace = findViewById(R.id.workspace);
-        glWindow = findViewById(R.id.glWindow);
-        glCaptionBar = findViewById(R.id.glCaptionBar);
-        glCaption = findViewById(R.id.glCaption);
-        glBtnMin = findViewById(R.id.glBtnMin);
-        glBtnMax = findViewById(R.id.glBtnMax);
-        glBtnClose = findViewById(R.id.glBtnClose);
-        glTaskbar = findViewById(R.id.glTaskbar);
-
-        // The picture is fitted to the panel's ratio, never stretched: a
-        // SurfaceView can only be scaled by the rectangle it is given, so the
-        // ratio goes on the video area and the bars around the frame are what
-        // shows through it. Set here, before the first layout, so the surface
-        // is created at its final size.
-        glVideoArea = findViewById(R.id.glVideoArea);
-        glVideoArea.setAspectRatio((float) PANEL_W / PANEL_H);
-
-        // Has to be set before the surface is created to take effect.
-        surfaceView.setZOrderMediaOverlay(true);
-
-        // Remember the floating geometry as inflated: the maximized state is
-        // entered and left by re-laying the card out, so the way back has to
-        // be written down first.
-        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) glWindow.getLayoutParams();
-        glFloatW = lp.width;
-        glFloatH = lp.height;
-        glFloatGravity = lp.gravity;
-
-        // Nothing to show yet: the card waits for the guest's first frame
-        // (see the content-driven visibility note above).
-        glFramePadding = glWindow.getPaddingLeft();
-        glFloatElevation = glWindow.getElevation();
-        glBackground = glWindow.getBackground();
-        hideGlWindow();
-        applyGlWindowLayout();
-        rebuildTaskbar();
-
-        glBtnMin.setOnClickListener(v -> minimizeGlWindow());
-        glBtnMax.setOnClickListener(v -> toggleGlWindowMaximized());
-        glBtnClose.setOnClickListener(v -> closeGlWindow());
-
-        final int slop = ViewConfiguration.get(this).getScaledTouchSlop();
-        glCaption.setOnTouchListener(new View.OnTouchListener() {
-            private float fromX, fromY, baseLeft, baseTop;
-            private boolean dragging;
-
-            @Override
-            public boolean onTouch(View v, MotionEvent event) {
-                switch (event.getActionMasked()) {
-                    case MotionEvent.ACTION_DOWN:
-                        // Raw coordinates: the view moves under the finger.
-                        fromX = event.getRawX();
-                        fromY = event.getRawY();
-                        baseLeft = glWindow.getLeft();
-                        baseTop = glWindow.getTop();
-                        dragging = false;
-                        return true;
-                    case MotionEvent.ACTION_MOVE: {
-                        if (glMaximized) {
-                            return true;    // fills the workspace; nowhere to go
-                        }
-                        float dx = event.getRawX() - fromX;
-                        float dy = event.getRawY() - fromY;
-                        if (!dragging) {
-                            if (Math.hypot(dx, dy) < slop) {
-                                return true;    // still a tap candidate
-                            }
-                            dragging = true;
-                        }
-                        moveGlWindow(baseLeft + dx, baseTop + dy);
-                        return true;
-                    }
-                    case MotionEvent.ACTION_UP:
-                    case MotionEvent.ACTION_CANCEL:
-                        dragging = false;
-                        return true;
-                    default:
-                        return false;
-                }
+    private final GlWindowCard.Host glCardHost = new GlWindowCard.Host() {
+        @Override public void onCardSurfaceCreated(GlWindowCard card, SurfaceHolder holder) {
+            if (!isInitialized) {
+                return;
             }
-        });
-
-        // The workspace shrinks under the window when the soft keyboard comes
-        // up: pull the card back inside so it cannot end up half off-screen.
-        workspace.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) ->
-                clampGlWindow());
-    }
-
-    /**
-     * Put the card's top-left corner at (left, top) in workspace coordinates,
-     * clamped so it always stays inside the workspace.
-     *
-     * The move is a re-layout (a margin), never a translation. A SurfaceView
-     * composites its own surface and follows the *layout* position, so a
-     * translated card would slide the caption bar out from under the video it
-     * is supposed to be a window around. Positioning by margin keeps the two
-     * together, at the price of a layout pass per motion event - which this
-     * hierarchy (a card with two children) is not going to notice.
-     *
-     * The card is laid out with horizontal gravity END, so the margin that
-     * places it on the X axis is the right one: right = width - w - left.
-     */
-    private void moveGlWindow(float left, float top) {
-        if (glMaximized) {
-            return;
+            RvvmNative.nativeSetWindow(holder.getSurface(), card.getGuestId());
+            postLifecycleCmd(APP_CMD_INIT_WINDOW);
+            if (card.getGuestId() == glRunPendingId) {
+                // A run held back for exactly this surface (runGuestElf). The
+                // window is in native hands now - that is the line above - so
+                // the guest can go ahead.
+                Log.i(TAG, "Window up: starting the held-back run " + card.getGuestId());
+                glRunPendingId = -1;
+                startRun(card.getGuestId(), pendingElfName, pendingElfPath);
+            }
         }
-        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) glWindow.getLayoutParams();
-        // Explicit sizes are what the floating state uses; the card still
-        // reports the maximized one until the next layout runs.
-        float w = lp.width > 0 ? lp.width : glWindow.getWidth();
-        float h = lp.height > 0 ? lp.height : glWindow.getHeight();
-        float maxLeft = Math.max(0f, workspace.getWidth() - w);
-        float maxTop = Math.max(0f, workspace.getHeight() - h);
-        left = clamp(left, 0f, maxLeft);
-        top = clamp(top, 0f, maxTop);
-        lp.rightMargin = (int) Math.max(0f, workspace.getWidth() - w - left);
-        lp.topMargin = (int) top;
-        glWindow.setLayoutParams(lp);
-    }
 
-    /** Re-apply the current position against a workspace that may have changed
-     *  size (soft keyboard, rotation). Only the clamps can move the card. */
-    private void clampGlWindow() {
-        if (glMaximized) {
-            return;
+        @Override public void onCardSurfaceChanged(GlWindowCard card, SurfaceHolder holder,
+                                                  int format, int width, int height) {
+            Log.i(TAG, "Card " + card.getGuestId() + " surface changed: " + width + "x" + height);
+            if (isInitialized) {
+                RvvmNative.nativeSetWindow(holder.getSurface(), card.getGuestId());
+                postLifecycleCmd(APP_CMD_WINDOW_RESIZED);
+            }
         }
-        moveGlWindow(glWindow.getLeft(), glWindow.getTop());
-    }
 
-    private static float clamp(float value, float lo, float hi) {
-        return value < lo ? lo : (value > hi ? hi : value);
-    }
-
-    /**
-     * Lay the card out for its current state: waiting for a frame, maximized
-     * (fills the workspace) or floating (its own size). The position is not
-     * this method's business - that is a margin, see moveGlWindow(), which the
-     * callers re-apply when the card comes back from the maximized layout (it
-     * is laid out with its margins cleared).
-     *
-     * Until the guest has a frame, the card is 1x1 px: the surface inside it
-     * has to exist (see the content-driven visibility note above) but must not
-     * be given any room on screen.
-     */
-    private void applyGlWindowLayout() {
-        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) glWindow.getLayoutParams();
-        if (!glRevealed) {
-            // Waiting for a frame: the surface gets the smallest box that keeps
-            // it alive, parked where the window will grow from.
-            lp.width = 1;
-            lp.height = 1;
-            lp.gravity = glFloatGravity;
-            glWindow.setLayoutParams(lp);
-            return;
+        @Override public void onCardSurfaceDestroyed(GlWindowCard card, SurfaceHolder holder) {
+            if (isInitialized) {
+                RvvmNative.nativeSetWindow(null, card.getGuestId());
+                postLifecycleCmd(APP_CMD_TERM_WINDOW);
+            }
         }
-        if (glMaximized) {
-            lp.width = FrameLayout.LayoutParams.MATCH_PARENT;
-            lp.height = FrameLayout.LayoutParams.MATCH_PARENT;
-            lp.gravity = Gravity.TOP | Gravity.START;
-            lp.leftMargin = lp.topMargin = lp.rightMargin = lp.bottomMargin = 0;
-        } else {
-            lp.width = glFloatW;
-            lp.height = glFloatH;
-            lp.gravity = glFloatGravity;
+
+        @Override public void onCardRedrawNeeded(GlWindowCard card, SurfaceHolder holder) {
+            postLifecycleCmd(APP_CMD_WINDOW_REDRAW_NEEDED);
         }
-        glWindow.setLayoutParams(lp);
-    }
 
-    /**
-     * Take the card's footprint away without taking its surface away.
-     *
-     * Every part of this matters, because a SurfaceView only has a surface
-     * while its content area is non-zero: at 1x1 px, the 1dp frame and the 32dp
-     * title bar would eat the whole box and the SurfaceView would be measured
-     * to nothing - and a zero-sized SurfaceView has no surface, which is
-     * exactly the state that strands a guest waiting for INIT_WINDOW.
-     */
-    private void hideGlWindow() {
-        glCaptionBar.setVisibility(View.GONE);
-        glWindow.setPadding(0, 0, 0, 0);
-        glWindow.setBackground(null);
-        glWindow.setElevation(0f);
-    }
-
-    /**
-     * The guest has a frame for the window (or the user asked for it back):
-     * put the card's frame, title bar, shadow and size back.
-     *
-     * Nothing is recreated under the guest: the card only grows over the
-     * surface that has been there all along, so the frame it already holds is
-     * what appears - no new surface, no INIT_WINDOW, and at most the resize the
-     * guest would see if the card had been dragged to that size by hand.
-     */
-    private void revealGlWindow() {
-        if (glRevealed) {
-            return;
+        @Override public void onCardTouch(GlWindowCard card, MotionEvent event) {
+            // The card is a viewport: the guest's input space is the panel, and
+            // the frame buffer fills the whole card, so the mapping is a plain
+            // linear scale from card pixels to panel pixels.
+            if (!isInitialized) {
+                return;
+            }
+            float viewW = card.surfaceView.getWidth(), viewH = card.surfaceView.getHeight();
+            if (viewW <= 0f || viewH <= 0f) {
+                return;
+            }
+            float sx = PANEL_W / viewW, sy = PANEL_H / viewH;
+            int count = event.getPointerCount();
+            if (count > MAX_POINTERS) {
+                count = MAX_POINTERS;
+            }
+            for (int i = 0; i < count; i++) {
+                motionX[i] = event.getX(i) * sx;
+                motionY[i] = event.getY(i) * sy;
+                motionId[i] = event.getPointerId(i);
+            }
+            // Use the raw action: ACTION_POINTER_DOWN/UP encode the pointer
+            // index in the upper bits, which the guest's GameActivity expects.
+            RvvmNative.nativePostMotionEvent(card.getGuestId(), motionX, motionY, motionId, count,
+                    event.getAction(), event.getEventTime() * 1000000L);
         }
-        glRevealed = true;
-        glWindow.setBackground(glBackground);
-        glWindow.setElevation(glFloatElevation);
-        glWindow.setPadding(glFramePadding, glFramePadding, glFramePadding, glFramePadding);
-        glCaptionBar.setVisibility(View.VISIBLE);
-        applyGlWindowLayout();
-    }
 
-    /**
-     * Maximize button: fill the workspace with the guest's window, or put it
-     * back at the corner and size it was floating at.
-     */
-    private void toggleGlWindowMaximized() {
-        if (glMaximized) {
-            glMaximized = false;
-            applyGlWindowLayout();
-            // Not restored from the margins, which the maximized layout
-            // cleared: the position is re-derived from the corner it had, and
-            // clamped again on the way back.
-            moveGlWindow(glRestoreLeft, glRestoreTop);
-        } else {
-            glRestoreLeft = glWindow.getLeft();
-            glRestoreTop = glWindow.getTop();
-            glMaximized = true;
-            applyGlWindowLayout();
+        @Override public void onCardClosed(GlWindowCard card) {
+            // Close button: stop the guest, and take the window down with it -
+            // the Stop button's action plus the card's dismissal.
+            stopGuestElf(card.getGuestId());
+            dismissCard(card);
+        }
+
+        @Override public void onCardMaximized() {
             // The console the card just covered is also where the keyboard
             // would have gone.
             hideTtyKeyboard();
         }
-        updateGlWindowButtons();
-    }
 
-    /**
-     * Minimize button: take the window off the workspace and leave it in the
-     * corner as a chip - the taskbar, in one widget.
-     *
-     * The guest is not touched. What changes on its side is the window: hiding
-     * the card takes the surface with it, so the guest gets the same
-     * TERM_WINDOW a minimized window gives it on a desktop and stops
-     * presenting, and the restore hands it a fresh surface and INIT_WINDOW to
-     * repaint into.
-     */
-    private void minimizeGlWindow() {
-        setGlWindowShown(false);
-    }
-
-    /** The chip: bring the minimized window back. */
-    private void restoreMinimizedGlWindow() {
-        setGlWindowShown(true);
-    }
-
-    /**
-     * The card on screen, or the chip in its place. Revealing here covers the
-     * window that was minimized before it ever had a frame (nothing to show, so
-     * nothing was shown): without it, the chip would hand back the 1x1 waiting
-     * state and the window would look like it was still minimized.
-     */
-    private void setGlWindowShown(boolean shown) {
-        glMinimized = !shown;
-        glWindow.setVisibility(shown ? View.VISIBLE : View.GONE);
-        if (shown) {
-            revealGlWindow();
+        @Override public void onCardMinimized(GlWindowCard card) {
+            rebuildTaskbar();
         }
-        rebuildTaskbar();
-    }
 
-    /**
-     * Rebuild the taskbar from the guest windows that are not on screen.
-     *
-     * One entry today - the host runs a guest at a time - but the strip belongs
-     * to the taskbar, not to the window: what it lists is every window that is
-     * minimized, and each entry carries the name of the guest it stands for. A
-     * second guest window adds a second entry here and nothing else.
-     */
+        @Override public void onCardRestored(GlWindowCard card) {
+            rebuildTaskbar();
+        }
+    };
+
+    /** The taskbar strip: one entry per card that is minimized. */
     private void rebuildTaskbar() {
         glTaskbar.removeAllViews();
-        if (glMinimized) {
-            addTaskbarEntry();
+        for (GlWindowCard card : glCards.values()) {
+            if (card.isMinimized()) {
+                addTaskbarEntry(card);
+            }
         }
         glTaskbar.setVisibility(glTaskbar.getChildCount() > 0 ? View.VISIBLE : View.GONE);
     }
 
     /** One entry: the guest's name, and the way back to its window. */
-    private void addTaskbarEntry() {
-        String name = glGuestName.isEmpty() ? getString(R.string.gl_title) : glGuestName;
+    private void addTaskbarEntry(final GlWindowCard card) {
+        String name = card.getTitle().isEmpty() ? getString(R.string.gl_title) : card.getTitle();
         TextView entry = (TextView) getLayoutInflater().inflate(
                 R.layout.gl_taskbar_entry, glTaskbar, false);
         entry.setText(getString(R.string.gl_taskbar_entry, name));
-        entry.setOnClickListener(v -> restoreMinimizedGlWindow());
+        entry.setOnClickListener(v -> card.restore());
         glTaskbar.addView(entry);
     }
 
-    /**
-     * Close button: stop the guest, and take the window down with it.
-     *
-     * This is the Stop button's action - the same asynchronous unwind, the same
-     * exit report in the status line - plus closing the window, because a
-     * window whose guest is gone has nothing left to show. No chip is left
-     * behind either: the window belongs to the run that just ended, and the way
-     * back is the Run button, which gives the next guest a window that appears
-     * with its first frame (resetGlWindowForRun). The guest's own exit does the
-     * same thing, so a window does not outlive the run it belongs to.
-     */
-    private void closeGlWindow() {
-        stopGuestElf();
-        dismissGlWindow();
-    }
-
-    /**
-     * Take the window down for good: no card, and no chip to restore it from
-     * either - there is no guest left for it to belong to.
-     *
-     * A card that never got its first frame is deliberately left alone. It is
-     * invisible anyway (the 1x1 waiting state), and hiding it would destroy the
-     * surface, which the next run would then have to wait for and the guest's
-     * window would have to be rebuilt around - all for a card nobody could see.
-     */
-    private void dismissGlWindow() {
-        // Closed, not minimized: no taskbar entry - there is no guest left for
-        // one to belong to.
-        glMinimized = false;
-        rebuildTaskbar();
-        if (glRevealed) {
-            glWindow.setVisibility(View.GONE);
-        }
-    }
-
-    /**
-     * Back to the state a run starts in: the card on screen, waiting at 1x1 px
-     * for the first frame, with no chip.
-     *
-     * This also takes back a window the user minimized or closed by hand: both
-     * belong to the run that just ended, and a new guest gets its own window as
-     * soon as it has a frame for it. The window's geometry - its corner, and
-     * whether it was maximized - is deliberately kept: that is the user's
-     * arrangement of the workspace, not the guest's.
-     */
-    private void resetGlWindowForRun(String guestName) {
-        // This window now belongs to a named guest: its title bar and its
-        // taskbar entry say which one, and it is on screen rather than
-        // minimized (a window the user minimized or closed by hand belongs to
-        // the run that just ended).
-        glGuestName = guestName != null ? guestName : "";
-        glCaption.setText(glGuestName.isEmpty() ? getString(R.string.gl_title) : glGuestName);
-        glMinimized = false;
-        glWindow.setVisibility(View.VISIBLE);
-        glRevealed = false;
-        hideGlWindow();
-        applyGlWindowLayout();
+    /** Take a card down for good: off the workspace and out of the table. */
+    private void dismissCard(GlWindowCard card) {
+        glCards.remove(card.getGuestId());
+        card.dismiss();
         rebuildTaskbar();
     }
 
-    /** The maximize button's glyph: Windows' pair, a box for "fill the screen"
-     *  and the same box doubled for "put it back". */
-    private void updateGlWindowButtons() {
-        glBtnMax.setText(glMaximized ? R.string.gl_btn_restore : R.string.gl_btn_max);
+    /** Create the card for a run: added to the workspace at 1x1, waiting for
+     *  its surface (which the run is then held back for, see runGuestElf). */
+    private GlWindowCard createCard(int guestId, String guestName) {
+        GlWindowCard card = new GlWindowCard(this, (ViewGroup) workspace, guestId, guestName, glCardHost);
+        glCards.put(guestId, card);
+        return card;
     }
 
     // Whether a soft keyboard is on screen, and the tallest the window has been
@@ -1214,15 +938,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     }
 
     /** Forward text to the guest as UTF-8. */
-    private static void sendTtyText(CharSequence text) {
+    private void sendTtyText(CharSequence text) {
         if (text == null || text.length() == 0) return;
         sendTtyBytes(text.toString().getBytes(StandardCharsets.UTF_8));
     }
 
-    private static void sendTtyBytes(byte[] bytes) {
+    private void sendTtyBytes(byte[] bytes) {
         if (bytes == null || bytes.length == 0) return;
-        if (!RvvmNative.nativeIsGuestRunning()) return;
-        RvvmNative.nativeTtyInput(bytes);
+        if (!RvvmNative.nativeIsGuestRunning(activeGuestId)) return;
+        RvvmNative.nativeTtyInput(activeGuestId, bytes);
     }
 
     /**
@@ -1396,6 +1120,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     // thread publishes it to the UI once nativeIsGuestRunning() has cleared.
     private volatile int lastExitCode = -1;
 
+    // The guest the UI drives (Run/Stop/Suspend, touch, console input). Set
+    // when a run is created, cleared when it exits. All run-scoped native
+    // calls take an id; -1 means "the active one" on the native side too.
+    private volatile int activeGuestId = -1;
+
     // Assets file name of the guest currently launched, or null when none runs.
     // Remembered so an Intent asking for the same guest is not torn down.
     private String currentGuestApp;
@@ -1407,7 +1136,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
 
         // Find views
         statusText = findViewById(R.id.statusText);
-        surfaceView = findViewById(R.id.surfaceView);
         runButton = findViewById(R.id.runButton);
         suspendButton = findViewById(R.id.suspendButton);
         stopButton = findViewById(R.id.stopButton);
@@ -1432,57 +1160,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
 
         // Honor an explicit "which guest to run" Intent before the auto-start
         // path picks its default. The launch itself happens in
-        // maybeAutoStartGuest() once the surface is ready, so only the
-        // selection is applied here.
+        // maybeAutoStartGuest(), so only the selection is applied here.
         applyGuestSelectionFromIntent(getIntent());
 
-        // Setup surface holder
-        surfaceHolder = surfaceView.getHolder();
-        surfaceHolder.addCallback(this);
-
         // The console owns the workspace; the guest's graphics output lives in
-        // the floating window above it.
+        // floating windows above it (one per run, created with the run).
+        workspace = findViewById(R.id.workspace);
         ttyViewport = findViewById(R.id.ttyViewport);
         ttyView = findViewById(R.id.ttyView);
         ttyView.setSurfaceTextureListener(ttyTextureListener);
         initTtyInput();
         initTtyScrolling();
 
-        initGlWindow();
+        glTaskbar = findViewById(R.id.glTaskbar);
+
+        // The workspace shrinks under the windows when the soft keyboard comes
+        // up: pull every card back inside so none ends up half off-screen.
+        workspace.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            for (GlWindowCard card : glCards.values()) {
+                card.clampToWorkspace();
+            }
+        });
 
         // Setup buttons
         runButton.setOnClickListener(v -> runGuestElf());
         suspendButton.setOnClickListener(v -> toggleSuspendGuest());
         stopButton.setOnClickListener(v -> stopGuestElf());
         updateButtonStates();
-
-        // Forward touches on the surface to the guest (all pointers). The card
-        // is a viewport: the guest's input space is the panel, and the frame
-        // buffer fills the whole card, so the mapping is a plain linear scale.
-        surfaceView.setOnTouchListener((v, event) -> {
-            if (!isInitialized) {
-                return false;
-            }
-            float viewW = surfaceView.getWidth(), viewH = surfaceView.getHeight();
-            if (viewW <= 0f || viewH <= 0f) {
-                return false;
-            }
-            float sx = PANEL_W / viewW, sy = PANEL_H / viewH;
-            int count = event.getPointerCount();
-            if (count > MAX_POINTERS) {
-                count = MAX_POINTERS;
-            }
-            for (int i = 0; i < count; i++) {
-                motionX[i] = event.getX(i) * sx;
-                motionY[i] = event.getY(i) * sy;
-                motionId[i] = event.getPointerId(i);
-            }
-            // Use the raw action: ACTION_POINTER_DOWN/UP encode the pointer
-            // index in the upper bits, which the guest's GameActivity expects.
-            RvvmNative.nativePostMotionEvent(motionX, motionY, motionId, count,
-                    event.getAction(), event.getEventTime() * 1000000L);
-            return true;
-        });
 
         // Initialize native RVVM
         initializeRvvm();
@@ -1502,9 +1206,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
             // Record the guest's exit code as it fires (guest thread). The UI
             // is updated by the guest-exit-monitor, not here: the callback
             // runs while the guest thread has not finished unwinding yet.
-            RvvmNative.nativeSetExitCallback(code -> {
-                lastExitCode = code;
-                Log.i(TAG, "Guest exit callback: code " + code);
+            RvvmNative.nativeSetExitCallback((guestId, code) -> {
+                // Only the guest the UI drives updates the status line; a
+                // background run's exit is visible through its own monitor.
+                if (guestId == activeGuestId) {
+                    lastExitCode = code;
+                }
+                Log.i(TAG, "Guest exit callback: guest " + guestId + " code " + code);
             });
 
             // Guest console I/O: rendered in the overlay and persisted to a
@@ -1517,8 +1225,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
                 }
 
                 @Override
-                public void onFirstFrame() {
-                    handleFirstFrame();
+                public void onFirstFrame(int guestId) {
+                    handleFirstFrame(guestId);
                 }
             });
 
@@ -1590,7 +1298,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     }
 
     private void maybeAutoStartGuest() {
-        if (!isInitialized || !isSurfaceReady || hasAutoStarted) {
+        if (!isInitialized || hasAutoStarted) {
             return;
         }
         hasAutoStarted = true;
@@ -1601,11 +1309,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     private void runGuestElf() {
         if (!isInitialized) {
             statusText.setText("RVVM not initialized");
-            return;
-        }
-
-        if (RvvmNative.nativeIsGuestRunning()) {
-            statusText.setText("Guest already running");
             return;
         }
 
@@ -1626,35 +1329,45 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
             return;
         }
 
-        // Run the ELF
-        String elfPath = elfFile.getAbsolutePath();
-        statusText.setText("Running: " + elfName + "\nPath: " + elfPath);
-
-        // The window first: it goes back to waiting for content, and comes back
-        // if the previous run's was minimized or closed. Doing this before the
-        // guest starts is what (re)creates the surface a guest needs.
-        resetGlWindowForRun(elfName);
-
-        /* ...but that surface is not there yet. Closing or minimizing the
-         * window destroyed it, and the framework only creates the new one on
-         * the next traversal - a UI pass after this method returns. A guest
-         * started in between has no window at all: an EGL guest asks for one in
-         * its very first statements and gives up with EGL_NO_SURFACE when it
-         * does not get it (test_render_gles does exactly that, which is how a
-         * run right after a closed one ends in "eglCreateWindowSurface
-         * FAILED"), and a CPU guest has every lock refused until the window is
-         * back. So the run is held here and picked up by surfaceCreated(),
-         * which hands native the window before calling back in.
-         *
-         * A guest that needs no window at all is held back for a few
-         * milliseconds by this too, which is the price of not having to know
-         * which kind of guest this is. */
-        if (!isSurfaceReady) {
-            glRunPending = true;
-            statusText.setText("Waiting for the graphics window...");
-            Log.i(TAG, "Run held back until the window's surface is up");
+        // This run's guest handle: created before its card, because the card is
+        // keyed by the guest id. The slot only feeds the table; the machine is
+        // not created until startRun() below (nativeRunElf).
+        final int guestId = RvvmNative.nativeCreateGuest();
+        if (guestId < 0) {
+            statusText.setText("No guest slot left");
+            Log.i(TAG, "No guest slot left");
             return;
         }
+        RvvmNative.nativeSetActiveGuest(guestId);
+        activeGuestId = guestId;
+
+        // The card first: a run gets its own window, created waiting at 1x1
+        // with its surface coming up on the next UI pass (the framework creates
+        // it after this method returns). A guest needing the window - an EGL
+        // guest asks for one in its very first statements, a GameActivity guest
+        // draws only after INIT_WINDOW - is held back here and picked up by the
+        // card's surfaceCreated (glCardHost), which hands native the window
+        // before calling startRun.
+        GlWindowCard card = createCard(guestId, elfName);
+        updateButtonStates();
+
+        if (!card.isSurfaceReady()) {
+            glRunPendingId = guestId;
+            pendingElfName = elfName;
+            pendingElfPath = elfFile.getAbsolutePath();
+            statusText.setText("Waiting for the graphics window...");
+            Log.i(TAG, "Run " + guestId + " held back until the card's surface is up");
+            return;
+        }
+
+        startRun(guestId, elfName, elfFile.getAbsolutePath());
+    }
+
+    /** A run whose card now has its surface: seed the lifecycle state and hand
+     *  the ELF to the core. Called straight through when the card's surface was
+     *  already up, from onCardSurfaceCreated otherwise. */
+    private void startRun(int guestId, String elfName, String elfPath) {
+        statusText.setText("Running: " + elfName + "\nPath: " + elfPath);
 
         // From here on this is a run of its own: it gets a generation, and the
         // signals it will leave behind (a first frame, an exit) are stamped
@@ -1666,14 +1379,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         // TTY, which keeps the previous run's last screen until new output
         // arrives, so there is nothing to reset here.
         openGuestLogFile(elfName);
-
-        // This run's guest handle: created here - after the hold-back check, so
-        // a run that never starts does not consume a slot - and made the one the
-        // native surface addresses. Its id is what the taskbar entry will name.
-        int guestId = RvvmNative.nativeCreateGuest();
-        if (guestId >= 0) {
-            RvvmNative.nativeSetActiveGuest(guestId);
-        }
 
         replayGuestStartupState();
 
@@ -1695,36 +1400,37 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         // because nativeIsGuestRunning() only clears after the guest thread
         // has fully unwound - flipping buttons in onExit would be premature.
         new Thread(() -> {
-            while (RvvmNative.nativeIsGuestRunning()) {
+            while (RvvmNative.nativeIsGuestRunning(guestId)) {
                 try { Thread.sleep(100); } catch (InterruptedException e) { return; }
             }
             int code = lastExitCode;
             runOnUiThread(() -> {
-                /* Everything here belongs to the run that just ended, and the
-                 * window, the log file and the status line are all shared with
-                 * whatever runs next. A run can start in between - the
+                /* Everything here belongs to the run that just ended, and its
+                 * card goes with it. A run can start in between - the
                  * launcher Activity is singleTask, so "am start --es guest ..."
                  * goes through onNewIntent and can launch a new guest while
                  * this callback is still on its way to the UI thread - and
-                 * applying a dead run's exit to it would close its window,
-                 * close its log file and overwrite its status line. The
-                 * generation is what tells the two apart. */
+                 * applying a dead run's exit to it would close ITS card and
+                 * overwrite the status line. The generation is what tells the
+                 * two apart. */
                 if (gen != runGeneration) {
-                    Log.i(TAG, "Exit of run " + gen + " ignored: run " + runGeneration + " owns the window now");
-                    return;
+                    Log.i(TAG, "Exit of run " + gen + " ignored: run " + runGeneration + " owns the foreground now");
+                } else {
+                    currentGuestApp = null;
+                    closeGuestLogFile();
+                    statusText.setText("Guest exited: " + elfName + " (exit " + code + ")");
+                    Log.i(TAG, "Guest exited: " + elfName + " (exit " + code + ")");
+                    // Nothing left to type into; the frozen last screen stays as
+                    // it is, but the keyboard should not sit over it.
+                    hideTtyKeyboard();
                 }
-                currentGuestApp = null;
-                closeGuestLogFile();
-                // The guest is gone: its window goes with it, the way closing
-                // an application takes its window with it. The next run brings
-                // a new one up - with whatever frame that guest produces
-                // (resetGlWindowForRun).
-                dismissGlWindow();
-                statusText.setText("Guest exited: " + elfName + " (exit " + code + ")");
-                Log.i(TAG, "Guest exited: " + elfName + " (exit " + code + ")");
-                // Nothing left to type into; the frozen last screen stays as it
-                // is, but the keyboard should not sit over it.
-                hideTtyKeyboard();
+                // The guest is gone: its card goes with it, the way closing an
+                // application takes its window with it. The next run brings a
+                // new one up - with whatever frame that guest produces.
+                GlWindowCard card = glCards.get(guestId);
+                if (card != null) {
+                    dismissCard(card);
+                }
                 updateButtonStates();
             });
         }, "guest-exit-monitor").start();
@@ -1751,21 +1457,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         RvvmNative.nativeClearLifecycleCmds();
         postLifecycleCmd(APP_CMD_START);
         postLifecycleCmd(APP_CMD_RESUME);
-        if (isSurfaceReady) {
-            postLifecycleCmd(APP_CMD_INIT_WINDOW);
-            if (hasWindowFocus()) {
-                postLifecycleCmd(APP_CMD_GAINED_FOCUS);
-            }
+        // INIT_WINDOW: the card's surface is handed to native by
+        // onCardSurfaceCreated, which queues the window command there - the
+        // seed here only carries the state the guest would have seen before
+        // its surface existed.
+        if (hasWindowFocus()) {
+            postLifecycleCmd(APP_CMD_GAINED_FOCUS);
         }
     }
 
     private void stopGuestElf() {
-        if (!isInitialized || !RvvmNative.nativeIsGuestRunning()) {
+        stopGuestElf(activeGuestId);
+    }
+
+    private void stopGuestElf(int guestId) {
+        if (!isInitialized || !RvvmNative.nativeIsGuestRunning(guestId)) {
             return;
         }
-        Log.i(TAG, "Stopping guest");
-        RvvmNative.nativeStopGuest();
-        currentGuestApp = null;
+        Log.i(TAG, "Stopping guest " + guestId);
+        RvvmNative.nativeStopGuest(guestId);
+        if (guestId == activeGuestId) {
+            currentGuestApp = null;
+        }
         // Provisional: the stop is asynchronous (the guest unwinds like a
         // normal exit), so the guest-exit-monitor lands the final state with
         // the actual exit code in a moment.
@@ -1814,32 +1527,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     }
 
     /**
-     * Launch the selected guest unless that exact guest is already running.
-     * Stopping is asynchronous (the guest thread clears the running flag only
-     * after it unwinds), so switching targets waits for the old guest to retire
-     * before launching the new one.
+     * Launch the selected guest. With one card per run there is nothing to
+     * switch: a repeated "am start --es guest ..." simply starts another run
+     * beside the running ones - which is the whole point of the multi-run
+     * host. Stopping a guest is the close button's or the Stop button's job.
      */
     private void startSelectedGuestIfNeeded() {
         if (!isInitialized || selectedGuestApp == null || selectedGuestApp.isEmpty()) {
             return;
         }
-        if (!RvvmNative.nativeIsGuestRunning()) {
-            runGuestElf();
-            return;
-        }
-        if (selectedGuestApp.equals(currentGuestApp)) {
-            Log.i(TAG, "Guest already running: " + currentGuestApp);
-            return;
-        }
-        Log.i(TAG, "Switching guest: " + currentGuestApp + " -> " + selectedGuestApp);
-        RvvmNative.nativeStopGuest();
-        currentGuestApp = null;
-        new Thread(() -> {
-            while (RvvmNative.nativeIsGuestRunning()) {
-                try { Thread.sleep(50); } catch (InterruptedException e) { return; }
-            }
-            runOnUiThread(this::runGuestElf);
-        }, "guest-switch").start();
+        runGuestElf();
     }
 
     /**
@@ -1848,15 +1545,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
      * and continues exactly where it left off on resume.
      */
     private void toggleSuspendGuest() {
-        if (!isInitialized || !RvvmNative.nativeIsGuestRunning()) {
+        if (!isInitialized || !RvvmNative.nativeIsGuestRunning(activeGuestId)) {
             return;
         }
-        if (RvvmNative.nativeIsGuestSuspended()) {
-            RvvmNative.nativeResumeGuest();
+        if (RvvmNative.nativeIsGuestSuspended(activeGuestId)) {
+            RvvmNative.nativeResumeGuest(activeGuestId);
             statusText.setText("Guest resumed");
             Log.i(TAG, "Guest resumed");
         } else {
-            RvvmNative.nativeSuspendGuest();
+            RvvmNative.nativeSuspendGuest(activeGuestId);
             statusText.setText("Guest suspended");
             Log.i(TAG, "Guest suspended");
         }
@@ -1864,11 +1561,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     }
 
     private void updateButtonStates() {
-        boolean running = RvvmNative.nativeIsGuestRunning();
+        boolean running = RvvmNative.nativeIsGuestRunning(activeGuestId);
         // nativeIsGuestSuspended() is only meaningful while a guest runs; it
         // reports the requested state, so the label flips immediately even when
         // a vCPU is still unwinding a blocking host syscall.
-        boolean suspended = running && RvvmNative.nativeIsGuestSuspended();
+        boolean suspended = running && RvvmNative.nativeIsGuestSuspended(activeGuestId);
         runButton.setEnabled(!running);
         suspendButton.setEnabled(running);
         suspendButton.setText(suspended ? R.string.resume_guest : R.string.suspend_guest);
@@ -1915,72 +1612,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         
         out.close();
         in.close();
-    }
-
-    @Override
-    public void surfaceCreated(SurfaceHolder holder) {
-        Log.i(TAG, "Surface created");
-        isSurfaceReady = true;
-
-        // Set the native window
-        if (isInitialized) {
-            RvvmNative.nativeSetWindow(holder.getSurface());
-            postLifecycleCmd(APP_CMD_INIT_WINDOW);
-            if (glRunPending) {
-                // A run held back for exactly this surface (runGuestElf). The
-                // window is in native hands now - that is the line above - so
-                // the guest can go ahead. The automatic first start is marked
-                // as done in its place: the guest it would have picked is the
-                // one about to launch.
-                Log.i(TAG, "Window up: starting the held-back run");
-                glRunPending = false;
-                hasAutoStarted = true;
-                runGuestElf();
-            } else {
-                maybeAutoStartGuest();
-            }
-        }
-    }
-
-    @Override
-    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        Log.i(TAG, "Surface changed: " + width + "x" + height);
-        isSurfaceReady = true;
-
-        // Update the native window; the guest gets a resize notification too so
-        // it can re-query the panel geometry.
-        if (isInitialized) {
-            RvvmNative.nativeSetWindow(holder.getSurface());
-            postLifecycleCmd(APP_CMD_WINDOW_RESIZED);
-        }
-    }
-
-    @Override
-    public void surfaceDestroyed(SurfaceHolder holder) {
-        Log.i(TAG, "Surface destroyed");
-        isSurfaceReady = false;
-
-        // Clear the native window
-        if (isInitialized) {
-            RvvmNative.nativeSetWindow(null);
-            postLifecycleCmd(APP_CMD_TERM_WINDOW);
-        }
-    }
-
-    /**
-     * Called by the framework right before the surface is shown again (and
-     * after every surfaceCreated/surfaceChanged) to ask the view to redraw its
-     * content. Forwarding it lets the guest repaint immediately instead of
-     * waiting for the next vsync.
-     *
-     * Implementing SurfaceHolder.Callback2 rather than Callback is what makes
-     * SurfaceView deliver this callback; the async variant has a default
-     * implementation that calls this one, so only the synchronous form is
-     * needed here.
-     */
-    @Override
-    public void surfaceRedrawNeeded(SurfaceHolder holder) {
-        postLifecycleCmd(APP_CMD_WINDOW_REDRAW_NEEDED);
     }
 
     // --- Guest console output -------------------------------------------------
@@ -2076,25 +1707,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
      * so it never puts a window on screen at all; a guest that does gets its
      * window at the moment it has something to put in it.
      */
-    private void handleFirstFrame() {
-        Log.i(TAG, "First frame presented");
-        /* Stamped here, on the guest thread, where the frame still belongs to a
-         * known run: by the time the UI thread gets to it, a later run may own
-         * the window, and a frame of the previous one must not bring it up for
-         * the guest that replaced it (which would show that guest an empty
-         * window before it has drawn anything). */
-        final int gen = runGeneration;
+    private void handleFirstFrame(final int guestId) {
+        Log.i(TAG, "First frame presented by guest " + guestId);
+        /* The frame carries the id of the run that drew it (native resolves it
+         * through the calling cmdpost), so attribution is exact: one guest's
+         * frame can never reveal another guest's card - which matters, because
+         * revealing a card resizes its surface and tears down the 1x1 window
+         * the guest may still be bringing EGL up on. The run's own card, and
+         * only it, is revealed by the run's own frame. */
         runOnUiThread(() -> {
-            if (gen != runGeneration) {
-                Log.i(TAG, "First frame of run " + gen + " ignored: run "
-                        + runGeneration + " owns the window now");
-                return;
-            }
-            /* Same run, but its guest may already be gone: the exit path closes
-             * the window a moment later, and revealing first would flash a
-             * window for a guest that has exited. */
-            if (RvvmNative.nativeIsGuestRunning()) {
-                revealGlWindow();
+            GlWindowCard card = glCards.get(guestId);
+            if (card != null && RvvmNative.nativeIsGuestRunning(guestId)) {
+                card.revealOnFirstFrame();
             }
         });
     }
@@ -2157,8 +1781,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         super.onDestroy();
         postLifecycleCmd(APP_CMD_DESTROY);
         // Stop guest if running
-        if (RvvmNative.nativeIsGuestRunning()) {
-            RvvmNative.nativeStopGuest();
+        if (RvvmNative.nativeIsGuestRunning(activeGuestId)) {
+            RvvmNative.nativeStopGuest(activeGuestId);
         }
         // Stop the console bridge before the native side goes away, so no
         // callback can reach this half-torn-down Activity.

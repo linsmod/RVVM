@@ -42,8 +42,8 @@
 
 /* on_egl_dispatch / on_gl_dispatch are defined below; cmdpost_set_gl_callbacks
  * in android_gl_host_init() takes their addresses. */
-void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret);
-void on_gl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret);
+void on_egl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, int64_t* ret);
+void on_gl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, int64_t* ret);
 
 #define LOG_TAG "RVVM-GL"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -269,7 +269,7 @@ static void gl_trace(const char* kind, uint32_t fn_id, const int64_t* a, int64_t
     LOGI("[gl] %s %-28s ret=%lld", kind, name ? name : "?", (long long)ret);
 }
 
-void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
+void on_egl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, int64_t* ret)
 {
     *ret = 0;
     switch (fn_id) {
@@ -294,8 +294,8 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
          * has resized the card. It is also given a moment to appear, for a card
          * that is on its way back. */
         {
-            extern struct ANativeWindow* jni_wait_surface(int wait_ms);
-            win = jni_wait_surface(EGL_WINDOW_WAIT_MS);
+            extern struct ANativeWindow* jni_wait_surface(vp_cmdpost_t* inst, int wait_ms);
+            win = jni_wait_surface(inst, EGL_WINDOW_WAIT_MS);
         }
         if (!win) {
             /* No window, and none arrived. Fail the call (the guest sees
@@ -312,8 +312,8 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
          * glViewport(0, 0, panelW, panelH) would map onto the bottom-left
          * corner of a viewport-sized surface. */
         {
-            extern void jni_apply_surface_geometry(struct ANativeWindow* w);
-            jni_apply_surface_geometry(win);
+            extern void jni_apply_surface_geometry(vp_cmdpost_t* inst, struct ANativeWindow* w);
+            jni_apply_surface_geometry(inst, win);
         }
 
         *ret = (int64_t)(intptr_t)p_eglCreateWindowSurface(
@@ -334,8 +334,8 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
         /* The GL present path: a successful swap means a frame is on the
          * surface, the same cue the CPU unlock path gives the UI. */
         if (*ret == 1) {
-            extern void jni_guest_first_frame(void);
-            jni_guest_first_frame();
+            extern void jni_guest_first_frame(vp_cmdpost_t* inst);
+            jni_guest_first_frame(inst);
         }
         break;
     }
@@ -346,8 +346,9 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
     gl_trace("egl", fn_id, args, *ret);
 }
 
-void on_gl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
+void on_gl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, int64_t* ret)
 {
+    (void)inst;   /* plain GL calls carry no per-run state on this host */
     *ret = 0;
     vpgl_dispatch_gl_generic(fn_id, args, ret);
     gl_trace("gl", fn_id, args, *ret);

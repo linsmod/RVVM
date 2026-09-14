@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "virtpass/vp_cmdpost.h"  /* vp_cmdpost_t: callback instance */
+
 /* GLES2 enum constants (avoid including gl2.h on Win32) */
 #define GL_RGBA         0x1908
 #define GL_UNSIGNED_BYTE 0x1401
@@ -18,7 +20,7 @@ extern bool g_gl_active;
 extern const char* g_gl_inflight;
 
 /* Dispatch callbacks — registered with vp_cmdpost in win32_host_init. */
-void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret);
-void on_gl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret);
+void on_egl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, int64_t* ret);
+void on_gl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, int64_t* ret);
 
 #endif /* WIN32_GL_DISPATCH_H */

@@ -25,6 +25,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/system_properties.h>  /* rvvm.max_guests capacity knob */
 
 /* Include vp_cmdpost API */
 #include "virtpass/vp_cmdpost.h"
@@ -86,6 +87,17 @@ struct android_run {
     /* The guest itself. Created in nativeRunElf(), freed by
      * rvvm_user_linux_ex() on the guest thread. */
     rvvm_machine_t* machine;
+    /* The run's own window (Layer 2: the viewport). Installed by
+     * nativeSetWindow() with this run's id, holding a reference until the
+     * window goes away; a reference is taken again for the duration of every
+     * lock()/EGL call that works on it. NULL between surfaces - while the
+     * card is being recreated, minimized or closed. */
+    ANativeWindow*  window;
+    /* The outstanding ANativeWindow_lock() pair on this run's window: the
+     * reference taken at lock time and released at unlock, and the buffer
+     * lock() handed back. Per run, because each run owns its own surface. */
+    ANativeWindow*        locked_window;
+    ANativeWindow_Buffer  locked_buffer;
     pthread_t       thread;
     volatile int    running;
     /* Host-side mirror of the suspend request. rvvm_user_is_suspended() would
@@ -96,8 +108,6 @@ struct android_run {
     char            elf_path[512];
     int             argc;
     char*           argv[16];
-    /* Guest exit callback (Java object reference, held by global ref). */
-    jobject         exit_listener;
     /* Host-side mirror of the lifecycle commands. vp_cmdpost holds the
      * guest-facing queue; this copy is what the JNI poller answers from. */
     int32_t         lifecycle_queue[32];
@@ -113,12 +123,71 @@ struct android_run {
  * threads never go through this indirection: their callbacks arrive on the
  * cmdpost instance their own run was bound to. */
 #define VP_ANDROID_MAX_GUESTS 4
-static struct android_run* g_runs[VP_ANDROID_MAX_GUESTS];
+/* Compile-time ceiling of the run table; the effective capacity is the
+ * rvvm.max_guests system property clamped to [1, ceiling] (see
+ * android_max_guests). */
+#define VP_ANDROID_MAX_GUESTS_CEILING 8
+static struct android_run* g_runs[VP_ANDROID_MAX_GUESTS_CEILING];
 static struct android_run* g_active_run = NULL;
 
-/* Make a run and take a slot for it. The slot index is the id Java holds.
- * Returns NULL when the table is full or out of memory. */
-static struct android_run* android_run_create(void)
+/* Guards the run's display geometry and the window. Held for short reads/writes
+ * only, never across an ANativeWindow_lock()/unlockAndPost() pair. */
+static pthread_mutex_t g_surf_cs = PTHREAD_MUTEX_INITIALIZER;
+
+/* ------------------------------------------------------------------
+ * Host-level display configuration.
+ *
+ * The panel pin and the density belong to the HOST, not to a run: Java pins
+ * the panel once at init (nativeSetPanelSize) and every run created after
+ * that must observe the same geometry. A run whose session started empty
+ * would otherwise latch its panel from whatever surface happened to be
+ * showing when it became active - the 1x1 "waiting for the first frame"
+ * card - and both present paths would then render into a 1x1 guest buffer.
+ * The values are recorded here and applied to every run at creation.
+ * ------------------------------------------------------------------ */
+static int32_t g_host_panel_w = 0, g_host_panel_h = 0;
+static int32_t g_host_density = 0;
+
+/* The guest exit listener is host state too: it belongs to the Activity,
+ * which registers it once, and must stay reachable no matter which run is
+ * active (or alive) when the guest exits. */
+static jobject g_exit_listener = NULL;
+
+/* Guards the run table itself (g_runs / g_active_run): slot allocation,
+ * teardown and the lookups (by id, by cmdpost) that other threads now make.
+ * Short critical sections only - never held across cmdpost_destroy(), which
+ * joins nothing but may take the sensor/vsync paths. */
+static pthread_mutex_t g_runs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Table capacity. The static ceiling is the compile-time shape (the Java
+ * surface documents it); the effective capacity is the rvvm.max_guests system
+ * property when it is set, clamped to [1, ceiling] - so a launcher can trade
+ * memory (each run is one machine with its own RAM) for parallelism without a
+ * rebuild. Read once, on first use. */
+static int android_max_guests(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        char buf[PROP_VALUE_MAX] = {0};
+        int value = 0;
+        __system_property_get("rvvm.max_guests", buf);
+        value = atoi(buf);
+        if (value <= 0) {
+            cached = VP_ANDROID_MAX_GUESTS;
+        } else if (value > VP_ANDROID_MAX_GUESTS_CEILING) {
+            cached = VP_ANDROID_MAX_GUESTS_CEILING;
+        } else {
+            cached = value;
+        }
+    }
+    return cached;
+}
+
+/* Slot allocation. Caller holds g_runs_lock. The session is initialized and
+ * given the host's display config before the run is published, so no other
+ * thread can observe a half-seeded run (and the session work needs no run
+ * lock, avoiding lock-order questions between the two mutexes). */
+static struct android_run* android_run_create_locked(void)
 {
     struct android_run* run = calloc(1, sizeof(*run));
     int i;
@@ -126,22 +195,50 @@ static struct android_run* android_run_create(void)
     if (!run) {
         return NULL;
     }
-    for (i = 0; i < VP_ANDROID_MAX_GUESTS; i++) {
+    /* Fresh runs start from a properly initialized session and inherit the
+     * host's display config (see the globals above); without this a run
+     * created after the first one has an empty session and latches its panel
+     * from the first surface it sees. */
+    pthread_mutex_lock(&g_surf_cs);
+    vp_session_init(&run->session);
+    if (g_host_panel_w > 0 && g_host_panel_h > 0) {
+        vp_session_set_panel(&run->session, g_host_panel_w, g_host_panel_h);
+    }
+    if (g_host_density > 0) {
+        vp_session_set_density(&run->session, g_host_density);
+    }
+    pthread_mutex_unlock(&g_surf_cs);
+
+    for (i = 0; i < android_max_guests(); i++) {
         if (!g_runs[i]) {
             g_runs[i] = run;
             run->id = i;
             return run;
         }
     }
-    LOGI("No guest slot left (max %d)", VP_ANDROID_MAX_GUESTS);
+    LOGI("No guest slot left (max %d)", android_max_guests());
     free(run);
     return NULL;
+}
+
+/* Make a run and take a slot for it. The slot index is the id Java holds.
+ * Returns NULL when the table is full or out of memory. */
+static struct android_run* android_run_create(void)
+{
+    struct android_run* run;
+
+    pthread_mutex_lock(&g_runs_lock);
+    run = android_run_create_locked();
+    pthread_mutex_unlock(&g_runs_lock);
+    return run;
 }
 
 /* End a run: off the table, its bridge instance torn down with it (which also
  * frees the sensor subscriber hanging off that instance). Refuses nothing - the
  * caller must not destroy a run whose guest thread is still alive; the thread
- * destroys its own run as it ends. */
+ * destroys its own run as it ends. The run is unpublished before its cmdpost
+ * dies, so a callback racing the teardown resolves to "no such run" rather
+ * than into a freed instance. */
 static void android_run_destroy(struct android_run* run)
 {
     int i;
@@ -149,7 +246,8 @@ static void android_run_destroy(struct android_run* run)
     if (!run) {
         return;
     }
-    for (i = 0; i < VP_ANDROID_MAX_GUESTS; i++) {
+    pthread_mutex_lock(&g_runs_lock);
+    for (i = 0; i < android_max_guests(); i++) {
         if (g_runs[i] == run) {
             g_runs[i] = NULL;
         }
@@ -157,44 +255,126 @@ static void android_run_destroy(struct android_run* run)
     if (g_active_run == run) {
         g_active_run = NULL;
     }
+    pthread_mutex_unlock(&g_runs_lock);
+
     cmdpost_destroy(run->cmdpost);
     free(run);
 }
 
 static struct android_run* android_run_by_id(int id)
 {
-    if (id < 0 || id >= VP_ANDROID_MAX_GUESTS) {
-        return NULL;
+    struct android_run* run = NULL;
+
+    if (id >= 0) {
+        pthread_mutex_lock(&g_runs_lock);
+        if (id < android_max_guests()) {
+            run = g_runs[id];
+        }
+        pthread_mutex_unlock(&g_runs_lock);
     }
-    return g_runs[id];
+    return run;
+}
+
+/* The run the JNI surface addresses. Made on first use, so a host that only
+ * ever runs one guest keeps exactly the behaviour it has always had. */
+static struct android_run* android_run_active(void);
+
+/* The run a cmdpost instance belongs to - the inverse of
+ * rvvm_user_set_host_ctx(). Guest-driven callbacks carry the instance they
+ * were dispatched through (see vp_cmdpost.h), and this maps that identity
+ * back to the run record, so a callback always lands in the state of the
+ * guest that triggered it - even when "the active run" is somebody else.
+ * Falls back to the active run when the instance is unknown, which keeps a
+ * mis-registered callback behaving the way it did before multi-run. */
+static struct android_run* android_run_by_cmdpost(vp_cmdpost_t* inst)
+{
+    struct android_run* found = NULL;
+    int i;
+
+    if (inst) {
+        pthread_mutex_lock(&g_runs_lock);
+        for (i = 0; i < android_max_guests(); i++) {
+            if (g_runs[i] && g_runs[i]->cmdpost == inst) {
+                found = g_runs[i];
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_runs_lock);
+        if (found) {
+            return found;
+        }
+        LOGW("cmdpost instance %p belongs to no run; using the active one", (void*)inst);
+    }
+    return android_run_active();
+}
+
+/* The run a JNI call addresses: an explicit id when given, the active one
+ * otherwise (the "activate, then act" contract the UI thread drives). */
+static struct android_run* android_run_for_call(int guestId)
+{
+    if (guestId >= 0) {
+        struct android_run* run = android_run_by_id(guestId);
+        if (run) {
+            return run;
+        }
+        LOGW("No guest %d in the table; using the active run", guestId);
+    }
+    return android_run_active();
+}
+
+/* The run whose machine the calling vCPU belongs to. The exit callback fires
+ * on a guest vCPU thread with no other identity available, so the machine is
+ * looked up through the core's thread-local hart. */
+static struct android_run* android_run_by_machine(rvvm_machine_t* machine)
+{
+    struct android_run* found = NULL;
+    int i;
+
+    if (machine) {
+        pthread_mutex_lock(&g_runs_lock);
+        for (i = 0; i < android_max_guests(); i++) {
+            if (g_runs[i] && g_runs[i]->machine == machine) {
+                found = g_runs[i];
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_runs_lock);
+    }
+    return found;
 }
 
 /* Whether any run still holds a machine: the console session is closed only
  * when the last one is gone (it outlives guests on purpose). */
 static bool android_run_any_machine(void)
 {
+    bool any = false;
     int i;
 
-    for (i = 0; i < VP_ANDROID_MAX_GUESTS; i++) {
+    pthread_mutex_lock(&g_runs_lock);
+    for (i = 0; i < android_max_guests(); i++) {
         if (g_runs[i] && g_runs[i]->machine) {
-            return true;
+            any = true;
+            break;
         }
     }
-    return false;
+    pthread_mutex_unlock(&g_runs_lock);
+    return any;
 }
 
 /* The run the JNI surface addresses. Made on first use, so a host that only
  * ever runs one guest keeps exactly the behaviour it has always had. */
 static struct android_run* android_run_active(void)
 {
-    if (!g_active_run) {
-        g_active_run = android_run_create();
-    }
-    return g_active_run;
-}
+    struct android_run* run;
 
-/* Window from Android (Layer 2: the viewport) */
-static ANativeWindow* g_native_window = NULL;
+    pthread_mutex_lock(&g_runs_lock);
+    if (!g_active_run) {
+        g_active_run = android_run_create_locked();
+    }
+    run = g_active_run;
+    pthread_mutex_unlock(&g_runs_lock);
+    return run;
+}
 
 /* ------------------------------------------------------------------
  * Two-layer display model (mirrors the win32 host).
@@ -214,10 +394,6 @@ static ANativeWindow* g_native_window = NULL;
  * locks and the Java callbacks - driving that session (android_run_active()->session) under
  * g_surf_cs.
  * ------------------------------------------------------------------ */
-
-/* Guards the run's display geometry and the window. Held for short reads/writes
- * only, never across an ANativeWindow_lock()/unlockAndPost() pair. */
-static pthread_mutex_t g_surf_cs = PTHREAD_MUTEX_INITIALIZER;
 
 /* ============================================================
  * Choreographer (Phase 4): display vsync source
@@ -248,6 +424,7 @@ static int             g_vsync_warned = 0;
 static void on_vsync_frame(long frame_time_nanos, void* data)
 {
     (void)data;
+    int i;
 
     pthread_mutex_lock(&g_vsync_mutex);
     g_vsync_frame_time = frame_time_nanos;
@@ -255,9 +432,15 @@ static void on_vsync_frame(long frame_time_nanos, void* data)
     pthread_cond_broadcast(&g_vsync_cond);
     pthread_mutex_unlock(&g_vsync_mutex);
 
-    /* fd path: hand the frame time to the guest's Looper pipe if it asked for
-     * this vsync. Cheap no-op while nothing is armed. */
-    vp_cmdpost_vsync_tick(android_run_active()->cmdpost, (int64_t)frame_time_nanos);
+    /* fd path: hand the frame time to every guest's Looper pipe that asked
+     * for this vsync. The tick is fanned out over the whole run table - a
+     * background guest keeps its frame clock even while another run owns the
+     * UI - and a no-op while nothing is armed. */
+    for (i = 0; i < VP_ANDROID_MAX_GUESTS; i++) {
+        if (g_runs[i] && g_runs[i]->cmdpost) {
+            vp_cmdpost_vsync_tick(g_runs[i]->cmdpost, (int64_t)frame_time_nanos);
+        }
+    }
 
     /* Keep the tick continuous: re-arm immediately from inside the callback. */
     if (g_vsync_running) {
@@ -366,8 +549,15 @@ static void jni_vsync_stop(void)
 
     g_vsync_running = 0;
 
-    /* Release a guest blocked in poll() on the vsync fd. */
-    vp_cmdpost_vsync_source_lost(android_run_active()->cmdpost);
+    /* Release every guest blocked in poll() on its vsync fd. */
+    {
+        int i;
+        for (i = 0; i < VP_ANDROID_MAX_GUESTS; i++) {
+            if (g_runs[i] && g_runs[i]->cmdpost) {
+                vp_cmdpost_vsync_source_lost(g_runs[i]->cmdpost);
+            }
+        }
+    }
 
     /* Wake a thread parked in ALooper_pollOnce(-1) ... */
     if (g_vsync_looper) {
@@ -613,9 +803,9 @@ Java_com_rvvm_android_RvvmNative_nativeTtyScrollBy(JNIEnv* env, jobject thiz, ji
  * a view parked in history home before echoing, so the console cannot end up
  * looking dead while the user types. */
 JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativeTtyInput(JNIEnv* env, jobject thiz, jbyteArray in)
+Java_com_rvvm_android_RvvmNative_nativeTtyInput(JNIEnv* env, jobject thiz, jint guestId, jbyteArray in)
 {
-    rvvm_machine_t* machine = android_run_active()->machine;
+    rvvm_machine_t* machine = android_run_for_call(guestId)->machine;
     jsize len;
     jbyte* buf;
 
@@ -693,18 +883,24 @@ void jni_guest_output(const char* data, size_t count)
 }
 
 /* Mark the first presented frame. Called from both present paths: the CPU
- * unlock here in jni_bridge.c and eglSwapBuffers in android_gl_host.c. */
-void jni_guest_first_frame(void)
+ * unlock here in jni_bridge.c and eglSwapBuffers in android_gl_host.c. The
+ * instance names the calling run, so the note lands in that run's session and
+ * the first-frame signal reaches Java once - carrying that run's id, so Java
+ * reveals THIS guest's card and never the foreground one's. */
+void jni_guest_first_frame(vp_cmdpost_t* inst)
 {
+    struct android_run* run = android_run_by_cmdpost(inst);
     JNIEnv* env;
     int attached;
     int first;
 
+    if (!run) return;
+
     pthread_mutex_lock(&g_console_mutex);
-    first = vp_session_note_first_frame(&android_run_active()->session);
+    first = vp_session_note_first_frame(&run->session);
     if (first) {
         /* Flush whatever output precedes the frame. */
-        vp_session_console_flush(&android_run_active()->session);
+        vp_session_console_flush(&run->session);
     }
     pthread_mutex_unlock(&g_console_mutex);
 
@@ -712,7 +908,7 @@ void jni_guest_first_frame(void)
     if (!g_console_listener || !g_console_first_frame_mid) return;
     env = console_env(&attached);
     if (!env) return;
-    (*env)->CallVoidMethod(env, g_console_listener, g_console_first_frame_mid);
+    (*env)->CallVoidMethod(env, g_console_listener, g_console_first_frame_mid, (jint)run->id);
     if (attached) {
         (*g_jvm)->DetachCurrentThread(g_jvm);
     }
@@ -728,7 +924,7 @@ static void console_reset(void)
 
 /* Defined with the window callbacks below; called from the guest thread once
  * the guest is gone. */
-static void surf_finish_pending_lock(void);
+static void surf_finish_pending_lock(struct android_run* run);
 
 /* Guest thread function */
 static void* guest_thread_func(void* arg)
@@ -746,28 +942,28 @@ static void* guest_thread_func(void* arg)
      * (nothing ever pthread_join()s it). */
     pthread_detach(pthread_self());
 
-    LOGI("Guest thread started, ELF: %s", android_run_active()->elf_path);
-    
+    LOGI("Guest thread started, ELF: %s", run->elf_path);
+
     /* Build argc/argv for rvvm_user_linux_ex() */
     /* argv[0] = ELF path, argv[1..] = guest args */
-    android_run_active()->argv[0] = android_run_active()->elf_path;
+    run->argv[0] = run->elf_path;
     
     /* On non-riscv hosts rvvm_user.c defaults prefix_path to a hardcoded
      * Debian userland path. Disable it so host paths pass through unchanged. */
     putenv("RVVM_USER_PREFIX=");
     
-    int result = rvvm_user_linux_ex(machine, android_run_active()->argc, android_run_active()->argv, NULL);
-    
+    int result = rvvm_user_linux_ex(machine, run->argc, run->argv, NULL);
+
     LOGI("Guest thread finished with code: %d", result);
 
     /* The guest is gone: if it died between ANativeWindow_lock() and
      * ANativeWindow_unlockAndPost() (a Stop landing mid-frame), the surface is
      * still locked and would refuse every lock from the next guest. Release it
      * here, where no guest code can run anymore. */
-    surf_finish_pending_lock();
+    surf_finish_pending_lock(run);
 
     /* rvvm_user_linux_ex() owns and has just freed the machine */
-    android_run_active()->machine = NULL;
+    run->machine = NULL;
 
     /* This run is over, so it goes now - its cmdpost instance and the sensor
      * state hanging off it with it. It goes *before* "not running" becomes
@@ -780,31 +976,19 @@ static void* guest_thread_func(void* arg)
     return NULL;
 }
 
-/* Locked window buffer info (kept between lock and unlock) */
-static ANativeWindow_Buffer g_locked_buffer;
-
-/* The surface the buffer above came from, holding a reference taken at lock
- * time and dropped at unlock time. The Java thread can destroy the Surface at
- * any moment (surfaceDestroyed / surface replaced), and touching a released
- * Surface aborts inside libgui:
- *   FATAL: 'FORTIFY: pthread_mutex_lock called on a destroyed mutex'
- *   #04 android::Surface::lock()
- *   #05 android::Surface::hook_perform()
- * so a lock()/unlockAndPost() pair must own the object it is working on for
- * its whole duration. g_native_window itself is only ever touched under
- * g_surf_cs. */
-static ANativeWindow* g_locked_window = NULL;
-
-/* Take a reference to the current surface, or NULL if there is none. The
- * caller owns the reference and must ANativeWindow_release() it. This is how
- * the guest-driven callbacks obtain the window: they must never use
- * g_native_window directly, since it can be swapped out underneath them. */
-static ANativeWindow* surf_acquire(void)
+/* Take a reference to the run's window, or NULL if there is none. The caller
+ * owns the reference and must ANativeWindow_release() it. This is how the
+ * guest-driven callbacks obtain the window: they must never read
+ * run->window unlocked, since nativeSetWindow swaps it underneath them. */
+static ANativeWindow* surf_acquire_for(struct android_run* run)
 {
-    ANativeWindow* w;
+    ANativeWindow* w = NULL;
 
+    if (!run) {
+        return NULL;
+    }
     pthread_mutex_lock(&g_surf_cs);
-    w = g_native_window;
+    w = run->window;
     if (w) {
         ANativeWindow_acquire(w);
     }
@@ -816,8 +1000,9 @@ static ANativeWindow* surf_acquire(void)
 /* Broadcast when a window is installed, under g_surf_cs (nativeSetWindow). */
 static pthread_cond_t g_window_cond = PTHREAD_COND_INITIALIZER;
 
-/* The window to bind, with a reference held for the caller - release it with
- * ANativeWindow_release(). NULL when there is none.
+/* The window to bind for the run `inst` belongs to, with a reference held for
+ * the caller - release it with ANativeWindow_release(). NULL when there is
+ * none.
  *
  * The GL path has to go through this instead of keeping its own copy of the
  * pointer: the host swaps windows from the UI thread (every surfaceCreated /
@@ -843,17 +1028,18 @@ static pthread_cond_t g_window_cond = PTHREAD_COND_INITIALIZER;
  * what to do about it. Called from the guest thread, inside a graphics entry
  * point; the lock is released while waiting, so the UI thread can hand the
  * window over. */
-struct ANativeWindow* jni_wait_surface(int wait_ms)
+struct ANativeWindow* jni_wait_surface(vp_cmdpost_t* inst, int wait_ms)
 {
+    struct android_run* run = android_run_by_cmdpost(inst);
     struct timespec deadline;
     ANativeWindow* w = NULL;
 
-    w = surf_acquire();
-    if (w || wait_ms <= 0) {
+    w = surf_acquire_for(run);
+    if (w || wait_ms <= 0 || !run) {
         return w;
     }
 
-    LOGI("No window yet: waiting up to %d ms for one", wait_ms);
+    LOGI("Guest %d: no window yet, waiting up to %d ms for one", run->id, wait_ms);
 
     /* Clock: the same one pthread_cond_timedwait() defaults to. */
     clock_gettime(CLOCK_REALTIME, &deadline);
@@ -865,7 +1051,7 @@ struct ANativeWindow* jni_wait_surface(int wait_ms)
     }
 
     pthread_mutex_lock(&g_surf_cs);
-    while (!g_native_window) {
+    while (!run->window) {
         /* 0 is a wake-up call, from nativeSetWindow's broadcast or a spurious
          * one - the predicate is re-tested either way. Anything else ends the
          * wait: ETIMEDOUT in the normal case, and a bad clock or timespec must
@@ -874,7 +1060,7 @@ struct ANativeWindow* jni_wait_surface(int wait_ms)
             break;
         }
     }
-    w = g_native_window;
+    w = run->window;
     if (w) {
         ANativeWindow_acquire(w);
     }
@@ -919,13 +1105,13 @@ static void log_frame_geometry(int32_t gw, int32_t gh, int32_t gf,
 }
 
 /* Drop the reference kept between lock and unlock. Safe to call when idle. */
-static void surf_drop_locked(void)
+static void surf_drop_locked(struct android_run* run)
 {
     ANativeWindow* w;
 
     pthread_mutex_lock(&g_surf_cs);
-    w = g_locked_window;
-    g_locked_window = NULL;
+    w = run->locked_window;
+    run->locked_window = NULL;
     pthread_mutex_unlock(&g_surf_cs);
 
     if (w) {
@@ -952,21 +1138,24 @@ static void surf_drop_locked(void)
  *
  * Must be called when no guest can touch the lock anymore (guest thread wound
  * down), so nothing is posting behind our back. */
-static void surf_finish_pending_lock(void)
+static void surf_finish_pending_lock(struct android_run* run)
 {
     ANativeWindow* w;
 
+    if (!run) {
+        return;
+    }
     pthread_mutex_lock(&g_surf_cs);
-    w = g_locked_window;
-    g_locked_window = NULL;
-    memset(&g_locked_buffer, 0, sizeof(g_locked_buffer));
+    w = run->locked_window;
+    run->locked_window = NULL;
+    memset(&run->locked_buffer, 0, sizeof(run->locked_buffer));
     pthread_mutex_unlock(&g_surf_cs);
 
     if (!w) {
         return;
     }
 
-    LOGW("Guest died holding the window lock; posting the abandoned buffer to release it");
+    LOGW("Guest %d died holding the window lock; posting the abandoned buffer to release it", run->id);
     ANativeWindow_unlockAndPost(w);
     ANativeWindow_release(w);
 }
@@ -986,27 +1175,28 @@ static void surf_finish_pending_lock(void)
  * desynchronise the guest buffer from the bytes we copy on unlock - the rule
  * the win32 host follows too, where the virtual panel defaults to the window
  * size and then stays put across resizes. What is Android's here is the
- * reading of the window. */
-static void panel_latch_locked(void)
+ * reading of the window; with one window per run, each run latches from its
+ * own. */
+static void panel_latch_locked(vp_session_t* session, ANativeWindow* win)
 {
-    ANativeWindow* win = g_native_window;
     int32_t w, h;
 
-    if (!win) return;
+    if (!win || !session) return;
 
     w = ANativeWindow_getWidth(win);
     h = ANativeWindow_getHeight(win);
-    if (vp_session_latch_panel(&android_run_active()->session, w, h)) {
+    if (vp_session_latch_panel(session, w, h)) {
         LOGI("Virtual panel latched: %dx%d", w, h);
     }
 }
 
 /* Effective guest geometry. Caller holds g_surf_cs. */
-static void guest_geometry_locked(int32_t* w, int32_t* h, int32_t* fmt)
+static void guest_geometry_locked(vp_session_t* session, int32_t* w, int32_t* h, int32_t* fmt)
 {
-    if (vp_session_guest_geometry(&android_run_active()->session, w, h, fmt)) {
+    if (!session) return;
+    if (vp_session_guest_geometry(session, w, h, fmt)) {
         LOGI("Guest surface latched to panel: %dx%d",
-             android_run_active()->session.gfx_w, android_run_active()->session.gfx_h);
+             session->gfx_w, session->gfx_h);
     }
 }
 
@@ -1022,21 +1212,24 @@ static void guest_geometry_locked(int32_t* w, int32_t* h, int32_t* fmt)
  * guest's glViewport(0, 0, panelW, panelH) would only cover the bottom-left
  * corner of a viewport-sized surface.
  *
- * Called with g_surf_cs NOT held. */
-void jni_apply_surface_geometry(struct ANativeWindow* w)
+ * `inst` names the run whose geometry is pushed; the session always comes from
+ * that run, never from "the active one". Called with g_surf_cs NOT held. */
+void jni_apply_surface_geometry(vp_cmdpost_t* inst, struct ANativeWindow* w)
 {
+    struct android_run* run;
     int32_t gw, gh, gf;
 
     if (!w) {
         return;
     }
+    run = android_run_by_cmdpost(inst);
 
     pthread_mutex_lock(&g_surf_cs);
-    panel_latch_locked();
-    guest_geometry_locked(&gw, &gh, &gf);
-    if (vp_session_geometry_dirty(&android_run_active()->session, gw, gh, gf)) {
+    panel_latch_locked(run ? &run->session : NULL, w);
+    guest_geometry_locked(run ? &run->session : NULL, &gw, &gh, &gf);
+    if (run && vp_session_geometry_dirty(&run->session, gw, gh, gf)) {
         if (ANativeWindow_setBuffersGeometry(w, gw, gh, gf) == 0) {
-            vp_session_geometry_pushed(&android_run_active()->session, gw, gh, gf);
+            vp_session_geometry_pushed(&run->session, gw, gh, gf);
         }
     }
     pthread_mutex_unlock(&g_surf_cs);
@@ -1048,19 +1241,26 @@ void jni_apply_surface_geometry(struct ANativeWindow* w)
  * geometry handed to the guest is the virtual panel, never the live viewport,
  * so a surface resize cannot move the buffer the guest is mid-frame on.
  *
+ * `inst` names the calling run: the session (panel latch, guest geometry) is
+ * always that run's. While the host still shows ONE window shared by every
+ * run, the outstanding lock is exclusive: a second run asking to lock while
+ * the first holds it is refused (its frame is dropped, it retries next frame)
+ * instead of both runs corrupting each other's lock/unlock pairs.
+ *
  * outBuffer is already a HOST pointer: cmdpost translates the guest address
  * before calling in, since guest memory is the userland machine's own buffer
  * and is not mapped into the host. */
-static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
+static int32_t on_window_lock(vp_cmdpost_t* inst, void* window, void* outBuffer, void* dirtyBounds)
 {
+    struct android_run* run = android_run_by_cmdpost(inst);
     (void)window;
     (void)dirtyBounds;
 
     int32_t gw, gh, gf;
 
     /* Own the surface for the whole lock() ... unlockAndPost() pair; the Java
-     * thread may drop it right now (see g_locked_window). */
-    ANativeWindow* w = surf_acquire();
+     * thread may drop it right now (see run->locked_window). */
+    ANativeWindow* w = surf_acquire_for(run);
     if (!w) {
         /* Normal while the surface is being recreated: the host cleared the
          * window and the guest has not drained APP_CMD_TERM_WINDOW yet. Log it
@@ -1073,13 +1273,13 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
     }
 
     pthread_mutex_lock(&g_surf_cs);
-    panel_latch_locked();
-    guest_geometry_locked(&gw, &gh, &gf);
+    panel_latch_locked(run ? &run->session : NULL, w);
+    guest_geometry_locked(run ? &run->session : NULL, &gw, &gh, &gf);
     pthread_mutex_unlock(&g_surf_cs);
 
     /* Push the panel geometry onto the real surface so lock() hands back a
      * buffer we can copy the guest frame into one-for-one. */
-    jni_apply_surface_geometry(w);
+    jni_apply_surface_geometry(inst, w);
 
     ANativeWindow_Buffer buffer;
     ARect dirty;
@@ -1105,8 +1305,8 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
 
     /* Hand the reference over to on_window_unlock(). */
     pthread_mutex_lock(&g_surf_cs);
-    g_locked_window = w;
-    g_locked_buffer = buffer;
+    run->locked_window = w;
+    run->locked_buffer = buffer;
     pthread_mutex_unlock(&g_surf_cs);
 
     if (outBuffer) {
@@ -1127,8 +1327,9 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
 
 /* Window unlock callback (called from vp_cmdpost)
  * Copies the guest-rendered pixels into the real surface buffer, then posts. */
-static int32_t on_window_unlock(void* window, void* guestPixels)
+static int32_t on_window_unlock(vp_cmdpost_t* inst, void* window, void* guestPixels)
 {
+    struct android_run* run = android_run_by_cmdpost(inst);
     (void)window;
 
     int32_t gw, gh, gf;
@@ -1136,9 +1337,12 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
     ANativeWindow* w;
 
     pthread_mutex_lock(&g_surf_cs);
-    guest_geometry_locked(&gw, &gh, &gf);
-    w = g_locked_window;
-    lbuf = g_locked_buffer;
+    guest_geometry_locked(run ? &run->session : NULL, &gw, &gh, &gf);
+    w = run ? run->locked_window : NULL;
+    memset(&lbuf, 0, sizeof(lbuf));
+    if (run) {
+        lbuf = run->locked_buffer;
+    }
     pthread_mutex_unlock(&g_surf_cs);
 
     if (!w) {
@@ -1197,12 +1401,12 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
     int32_t result = ANativeWindow_unlockAndPost(w);
 
     /* Drop the reference taken in on_window_lock(). */
-    surf_drop_locked();
+    surf_drop_locked(run);
 
     /* The CPU present path: once a frame is actually on the surface the
      * rendered content takes over from the console overlay. */
     if (result == 0) {
-        jni_guest_first_frame();
+        jni_guest_first_frame(inst);
     }
 
     return result;
@@ -1211,13 +1415,14 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
 /* Window size callback (called from vp_cmdpost).
  * Reports the virtual panel, not the viewport: this is the number the guest
  * caches, so it must not move when the surface is resized. */
-static void on_window_size(int64_t* width, int64_t* height)
+static void on_window_size(vp_cmdpost_t* inst, int64_t* width, int64_t* height)
 {
+    struct android_run* run = android_run_by_cmdpost(inst);
     int32_t gw = 0, gh = 0;
 
     pthread_mutex_lock(&g_surf_cs);
-    panel_latch_locked();
-    guest_geometry_locked(&gw, &gh, NULL);
+    panel_latch_locked(run ? &run->session : NULL, run ? run->window : NULL);
+    guest_geometry_locked(run ? &run->session : NULL, &gw, &gh, NULL);
     pthread_mutex_unlock(&g_surf_cs);
 
     *width  = (int64_t)gw;
@@ -1230,13 +1435,17 @@ static void on_window_size(int64_t* width, int64_t* height)
  * the guest moves its own geometry, exactly like win32 - while the usual
  * (0, 0, format) call only selects the pixel format and leaves the panel
  * untouched. The real surface is re-applied lazily at the next lock. */
-static int32_t on_window_set_buf(int32_t width, int32_t height, int32_t format)
+static int32_t on_window_set_buf(vp_cmdpost_t* inst, int32_t width, int32_t height, int32_t format)
 {
+    struct android_run* run = android_run_by_cmdpost(inst);
+
     pthread_mutex_lock(&g_surf_cs);
     /* The session applies the guest's rule - a concrete size redefines the
      * surface, a bare format select leaves it alone - and retires the cached
      * push, so the real surface is re-applied at the next lock. */
-    vp_session_set_guest_geometry(&android_run_active()->session, width, height, format);
+    if (run) {
+        vp_session_set_guest_geometry(&run->session, width, height, format);
+    }
     pthread_mutex_unlock(&g_surf_cs);
 
     LOGI("Window geometry set: %dx%d format=%d (guest geometry %s)",
@@ -1277,16 +1486,17 @@ static int32_t density_bucket_for_ppi(int32_t ppi)
  * Everything is derived from the virtual panel, never from the real device:
  * the guest must observe a stable host-owned display, the same way the win32
  * host synthesises it from its surface size and virtual PPI. */
-static int32_t on_config_get(int32_t field, int32_t* outValue)
+static int32_t on_config_get(vp_cmdpost_t* inst, int32_t field, int32_t* outValue)
 {
+    struct android_run* run = android_run_by_cmdpost(inst);
     int32_t w, h, ppi, width_dp, height_dp, long_dp, short_dp;
 
     if (!outValue) return -1;
 
     pthread_mutex_lock(&g_surf_cs);
-    panel_latch_locked();
-    guest_geometry_locked(&w, &h, NULL);
-    ppi = (android_run_active()->session.panel_ppi > 0) ? android_run_active()->session.panel_ppi
+    panel_latch_locked(run ? &run->session : NULL, run ? run->window : NULL);
+    guest_geometry_locked(run ? &run->session : NULL, &w, &h, NULL);
+    ppi = (run && run->session.panel_ppi > 0) ? run->session.panel_ppi
                                     : ACONFIGURATION_DENSITY_MEDIUM;
     pthread_mutex_unlock(&g_surf_cs);
 
@@ -1491,7 +1701,7 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
      * run that was prepared and never started. */
     {
         int i;
-        for (i = 0; i < VP_ANDROID_MAX_GUESTS; i++) {
+        for (i = 0; i < VP_ANDROID_MAX_GUESTS_CEILING; i++) {
             android_run_destroy(g_runs[i]);
         }
     }
@@ -1584,6 +1794,8 @@ Java_com_rvvm_android_RvvmNative_nativeSetDisplayConfig(
     (void)screenRound;
 
     pthread_mutex_lock(&g_surf_cs);
+    /* Recorded beyond the active run: every later run inherits it at creation. */
+    g_host_density = (int32_t)densityDpi;
     vp_session_set_density(&android_run_active()->session, (int32_t)densityDpi);
     pthread_mutex_unlock(&g_surf_cs);
 
@@ -1614,6 +1826,10 @@ Java_com_rvvm_android_RvvmNative_nativeSetPanelSize(JNIEnv* env, jobject thiz,
      * that, an already-latched panel is overwritten - it was latched from a
      * viewport size nobody has rendered into yet. */
     pthread_mutex_lock(&g_surf_cs);
+    /* Recorded beyond the active run: every later run inherits this pin at
+     * creation (see android_run_create). */
+    g_host_panel_w = width;
+    g_host_panel_h = height;
     if (vp_session_set_panel(&android_run_active()->session, width, height)) {
         LOGI("Virtual panel pinned: %dx%d", width, height);
     } else {
@@ -1624,8 +1840,10 @@ Java_com_rvvm_android_RvvmNative_nativeSetPanelSize(JNIEnv* env, jobject thiz,
 }
 
 JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobject surface)
+Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz,
+                                                 jobject surface, jint guestId)
 {
+    struct android_run* run = android_run_for_call(guestId);
     (void)thiz;
 
     /* SurfaceCreated and SurfaceChanged both hand us a surface. Acquire it
@@ -1641,26 +1859,26 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
 
     int32_t pw, ph;
 
-    /* Swap the tracked window while holding g_surf_cs. The guest-driven
+    /* Swap the run's tracked window while holding g_surf_cs. The guest-driven
      * callbacks take their own reference under the same mutex, so the Surface
      * is never released while a lock()/unlockAndPost() pair is using it (that
      * race is what aborted in Surface::lock). The old reference is dropped
      * only after the swap, outside the critical section. */
     pthread_mutex_lock(&g_surf_cs);
-    ANativeWindow* old_window = g_native_window;
-    g_native_window = new_window;
+    ANativeWindow* old_window = run->window;
+    run->window = new_window;
 
     if (new_window) {
         /* Freeze the virtual panel at the first surface size we ever see. From
          * here on the surface is only a viewport: later resizes repaint, they
          * do not move the geometry the guest renders into. */
-        panel_latch_locked();
+        panel_latch_locked(&run->session, new_window);
         g_no_window_logged = 0;
     }
     if (old_window != new_window) {
         /* A brand new Surface starts with the platform's default geometry:
          * forget what we pushed so the next lock re-applies the panel size. */
-        vp_session_forget_geometry(&android_run_active()->session);
+        vp_session_forget_geometry(&run->session);
     }
 
     /* Tells the GL backend a window came or went - a log line only: the pointer
@@ -1673,8 +1891,8 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
      * waiter sleeps on. */
     pthread_cond_broadcast(&g_window_cond);
 
-    pw = android_run_active()->session.panel_w;
-    ph = android_run_active()->session.panel_h;
+    pw = run->session.panel_w;
+    ph = run->session.panel_h;
     pthread_mutex_unlock(&g_surf_cs);
 
     if (old_window == new_window) {
@@ -1682,7 +1900,7 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
          * it, just drop the extra reference we took. */
         if (new_window) {
             ANativeWindow_release(new_window);
-            LOGI("Native window unchanged, keeping existing window");
+            LOGI("Guest %d: native window unchanged, keeping existing window", run->id);
         }
         return;
     }
@@ -1692,11 +1910,11 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
     }
 
     if (new_window) {
-        LOGI("Native window set: %dx%d (panel %dx%d)",
-             ANativeWindow_getWidth(new_window),
+        LOGI("Guest %d: native window set: %dx%d (panel %dx%d)",
+             run->id, ANativeWindow_getWidth(new_window),
              ANativeWindow_getHeight(new_window), pw, ph);
     } else {
-        LOGI("Native window cleared");
+        LOGI("Guest %d: native window cleared", run->id);
     }
 }
 
@@ -1760,13 +1978,15 @@ Java_com_rvvm_android_RvvmNative_nativePostLifecycleCmd(JNIEnv* env, jobject thi
 
 JNIEXPORT void JNICALL
 Java_com_rvvm_android_RvvmNative_nativePostMotionEvent(JNIEnv* env, jobject thiz,
+                                                       jint guestId,
                                                        jfloatArray xs, jfloatArray ys,
                                                        jintArray ids, jint pointerCount,
                                                        jint action, jlong eventTime)
 {
+    vp_cmdpost_t* cmdpost = android_run_for_call(guestId)->cmdpost;
     (void)thiz;
 
-    if (!xs || !ys) {
+    if (!xs || !ys || !cmdpost) {
         return;
     }
 
@@ -1817,7 +2037,7 @@ Java_com_rvvm_android_RvvmNative_nativePostMotionEvent(JNIEnv* env, jobject thiz
         ev.pointers[i].toolType = 1; /* AMOTION_EVENT_TOOL_TYPE_FINGER */
     }
 
-    cmdpost_queue_motion_event(android_run_active()->cmdpost, &ev);
+    cmdpost_queue_motion_event(cmdpost, &ev);
     LOGI("Motion event queued: pointers=%d action=0x%x first=(%.0f,%.0f)",
          (int)count, (unsigned)action, xbuf[0], ybuf[0]);
 }
@@ -1886,16 +2106,14 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
      * starting a guest with the surface still locked would let it render
      * nothing at all. Normally a no-op - the previous guest's thread already
      * released the lock on its way out. */
-    surf_finish_pending_lock();
-    
-    /* Fresh userland instance per guest, so nothing leaks between runs. */
+    surf_finish_pending_lock(android_run_active());
     android_run_active()->machine = rvvm_user_create();
     if (!android_run_active()->machine) {
         LOGE("Failed to create userland machine");
         return JNI_FALSE;
     }
-    /* on_guest_exit re-reads android_run_active()->exit_listener when it fires, so registering it
-     * once per run covers a listener set before or after this point. */
+    /* on_guest_exit re-reads g_exit_listener (host-level state) when it fires,
+     * so there is nothing per-run to wire up here. */
     rvvm_user_set_exit_callback(android_run_active()->machine, on_guest_exit);
 
     /* This run's cmdpost instance is normally made by nativeClearLifecycleCmds()
@@ -1941,52 +2159,60 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_rvvm_android_RvvmNative_nativeIsGuestRunning(JNIEnv* env, jobject thiz)
+Java_com_rvvm_android_RvvmNative_nativeIsGuestRunning(JNIEnv* env, jobject thiz, jint guestId)
 {
+    struct android_run* run;
     (void)env;
     (void)thiz;
-    return android_run_active()->running ? JNI_TRUE : JNI_FALSE;
+    /* A poll names its run and gets that run's answer - never the active
+     * one's. A destroyed run (its slot already freed by its own guest thread)
+     * answers "not running": falling back here would let a run's exit monitor
+     * poll the NEXT guest's flag and spin forever. */
+    run = (guestId >= 0) ? android_run_by_id(guestId) : android_run_active();
+    return (run && run->running) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativeStopGuest(JNIEnv* env, jobject thiz)
+Java_com_rvvm_android_RvvmNative_nativeStopGuest(JNIEnv* env, jobject thiz, jint guestId)
 {
+    struct android_run* run = android_run_for_call(guestId);
     (void)env;
     (void)thiz;
-    
-    if (android_run_active()->running) {
-        LOGI("Stopping guest...");
+
+    if (run->running) {
+        LOGI("Stopping guest %d...", run->id);
         /* A suspended guest is parked and cannot poll for the stop; resume it
          * first so it unwinds the normal way instead of being forced down. The
          * frame clock stays off: the guest degrades to its own clock while it
          * tears down, so there is no point restarting a source we are about to
          * retire. */
-        if (android_run_active()->suspended && android_run_active()->machine) {
-            rvvm_user_resume(android_run_active()->machine);
-            android_run_active()->suspended = 0;
+        if (run->suspended && run->machine) {
+            rvvm_user_resume(run->machine);
+            run->suspended = 0;
             LOGI("Stop: resumed the suspended guest first");
         }
         /* Kick every guest vCPU out of its run loop; the guest unwinds like a
          * sys_exit_group(0), so on_guest_exit fires and guest_thread_func
-         * clears android_run_active()->running once rvvm_user_linux_ex() returns. */
-        if (android_run_active()->machine) {
-            rvvm_user_stop(android_run_active()->machine, 0);
+         * clears run->running once rvvm_user_linux_ex() returns. */
+        if (run->machine) {
+            rvvm_user_stop(run->machine, 0);
         }
     }
 }
 
 JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativeSuspendGuest(JNIEnv* env, jobject thiz)
+Java_com_rvvm_android_RvvmNative_nativeSuspendGuest(JNIEnv* env, jobject thiz, jint guestId)
 {
+    struct android_run* run = android_run_for_call(guestId);
     (void)env;
     (void)thiz;
 
-    if (!android_run_active()->running || !android_run_active()->machine || android_run_active()->suspended) {
+    if (!run->running || !run->machine || run->suspended) {
         return;
     }
 
-    bool parked = rvvm_user_suspend(android_run_active()->machine);
-    android_run_active()->suspended = 1;
+    bool parked = rvvm_user_suspend(run->machine);
+    run->suspended = 1;
 
     /* Park the frame clock too: a parked guest polls neither frames nor
      * lifecycle commands, so a running clock would only pile up vsync ticks
@@ -1998,12 +2224,13 @@ Java_com_rvvm_android_RvvmNative_nativeSuspendGuest(JNIEnv* env, jobject thiz)
 }
 
 JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativeResumeGuest(JNIEnv* env, jobject thiz)
+Java_com_rvvm_android_RvvmNative_nativeResumeGuest(JNIEnv* env, jobject thiz, jint guestId)
 {
+    struct android_run* run = android_run_for_call(guestId);
     (void)env;
     (void)thiz;
 
-    if (!android_run_active()->running || !android_run_active()->machine || !android_run_active()->suspended) {
+    if (!run->running || !run->machine || !run->suspended) {
         return;
     }
 
@@ -2013,18 +2240,21 @@ Java_com_rvvm_android_RvvmNative_nativeResumeGuest(JNIEnv* env, jobject thiz)
     jni_vsync_start();
     jni_register_cmdpost_callbacks();
 
-    android_run_active()->suspended = 0;
-    rvvm_user_resume(android_run_active()->machine);
+    run->suspended = 0;
+    rvvm_user_resume(run->machine);
     LOGI("Suspend: guest resumed");
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_rvvm_android_RvvmNative_nativeIsGuestSuspended(JNIEnv* env, jobject thiz)
+Java_com_rvvm_android_RvvmNative_nativeIsGuestSuspended(JNIEnv* env, jobject thiz, jint guestId)
 {
+    struct android_run* run;
     (void)env;
     (void)thiz;
-    /* Reported from the host-side flag, not the machine: see android_run_active()->suspended. */
-    return android_run_active()->suspended ? JNI_TRUE : JNI_FALSE;
+    /* Same no-fallback rule as nativeIsGuestRunning: a destroyed run reports
+     * "not suspended" rather than borrowing the active run's state. */
+    run = (guestId >= 0) ? android_run_by_id(guestId) : android_run_active();
+    return (run && run->suspended) ? JNI_TRUE : JNI_FALSE;
 }
 
 /* C callback invoked by rvvm_user when the guest exits.
@@ -2035,19 +2265,29 @@ Java_com_rvvm_android_RvvmNative_nativeIsGuestSuspended(JNIEnv* env, jobject thi
  * a second userland over the existing one. */
 static void on_guest_exit(int exit_code)
 {
+    struct android_run* run;
+    int guest_id = -1;
+
     LOGI("Guest exited with code: %d", exit_code);
 
-    if (android_run_active()->exit_listener) {
+    /* The exit fires on one of the machine's vCPU threads: the machine names
+     * the run, and the run's id is what the listener is told. */
+    run = android_run_by_machine(rvvm_user_current_machine());
+    if (run) {
+        guest_id = run->id;
+    }
+
+    if (g_exit_listener) {
         JNIEnv* env = NULL;
         int attached = (*g_jvm)->GetEnv(g_jvm, (void**)&env, JNI_VERSION_1_6);
         if (attached == JNI_EDETACHED) {
             (*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL);
         }
         if (env) {
-            jclass clazz = (*env)->GetObjectClass(env, android_run_active()->exit_listener);
-            jmethodID mid = (*env)->GetMethodID(env, clazz, "onExit", "(I)V");
+            jclass clazz = (*env)->GetObjectClass(env, g_exit_listener);
+            jmethodID mid = (*env)->GetMethodID(env, clazz, "onExit", "(II)V");
             if (mid) {
-                (*env)->CallVoidMethod(env, android_run_active()->exit_listener, mid, (jint)exit_code);
+                (*env)->CallVoidMethod(env, g_exit_listener, mid, (jint)guest_id, (jint)exit_code);
             }
             (*env)->DeleteLocalRef(env, clazz);
         }
@@ -2073,7 +2313,7 @@ Java_com_rvvm_android_RvvmNative_nativeSetConsoleListener(JNIEnv* env, jobject t
         jclass clazz = (*env)->GetObjectClass(env, listener);
         g_console_listener = (*env)->NewGlobalRef(env, listener);
         g_console_output_mid = (*env)->GetMethodID(env, clazz, "onOutput", "(Ljava/lang/String;)V");
-        g_console_first_frame_mid = (*env)->GetMethodID(env, clazz, "onFirstFrame", "()V");
+        g_console_first_frame_mid = (*env)->GetMethodID(env, clazz, "onFirstFrame", "(I)V");
         (*env)->DeleteLocalRef(env, clazz);
         if (!g_console_output_mid || !g_console_first_frame_mid) {
             LOGE("ConsoleListener method lookup failed");
@@ -2090,15 +2330,15 @@ Java_com_rvvm_android_RvvmNative_nativeSetExitCallback(JNIEnv* env, jobject thiz
 {
     (void)thiz;
 
-    if (android_run_active()->exit_listener) {
-        (*env)->DeleteGlobalRef(env, android_run_active()->exit_listener);
-        android_run_active()->exit_listener = NULL;
+    if (g_exit_listener) {
+        (*env)->DeleteGlobalRef(env, g_exit_listener);
+        g_exit_listener = NULL;
     }
 
     if (listener) {
-        android_run_active()->exit_listener = (*env)->NewGlobalRef(env, listener);
-        /* The per-run machine is not alive yet (or already gone); on_guest_exit
-         * is registered on it in nativeRunElf() and re-reads android_run_active()->exit_listener
-         * when it fires, so there is nothing to wire up here. */
+        g_exit_listener = (*env)->NewGlobalRef(env, listener);
+        /* Host-level state (see the globals at the top of this file): the
+         * listener belongs to the Activity and must reach on_guest_exit()
+         * no matter which run is active - or alive - when the guest exits. */
     }
 }

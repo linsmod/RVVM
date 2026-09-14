@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  One guest window: the floating card that a run's graphics output lives in.
+
+  Extracted from activity_main.xml so MainActivity can inflate one card per
+  run (each with its own SurfaceView and surface) instead of the single card
+  every run used to share. Element ids are kept identical to the old inline
+  card; per-card views are resolved through cardView.findViewById(), so the
+  ids repeating across cards are harmless.
+
+  Layer 1 of the two-layer display model: the card is the window the guest's
+  output is shown in - a caption bar over a SurfaceView. MainActivity lifts
+  the surface above its window (setZOrderMediaOverlay), so the card can be
+  dragged anywhere over the console or expanded to fill the workspace, and
+  the console simply stays behind it.
+
+  The caption bar is the only host-owned part of the card. Nothing drawn in
+  this window can cover the surface itself, so the bar sits *above* the video
+  area rather than over it, and the bar is the only place a host gesture can
+  live.
+
+  The card can be any shape - a maximized window on a portrait phone
+  letterboxes the guest's frame instead of stretching it. The size below is
+  16:9 to match the panel, which is what the window wants to open at, not a
+  constraint on it.
+
+  The 1dp padding is the window's border: the surface composites above this
+  window, so the frame drawable is only visible in the ring the card keeps
+  free around its content. See gl_window_frame.xml.
+
+  The size below is the window's *shown* state. Until the guest has a frame
+  to put in it, GlWindowCard lays the card out at 1x1 px with this frame, the
+  title bar and the shadow taken away, so a guest that never draws never puts
+  an empty window on screen - while its surface, which has to exist from the
+  start, stays alive.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/glWindow"
+    android:layout_width="320dp"
+    android:layout_height="213dp"
+    android:layout_gravity="top|end"
+    android:layout_margin="12dp"
+    android:background="@drawable/gl_window_frame"
+    android:elevation="8dp"
+    android:orientation="vertical"
+    android:padding="1dp">
+
+    <!-- Title bar: the title area is the drag handle, the three buttons on
+         its right are the Windows set (minimize / maximize-restore / close).
+         The buttons are siblings of the drag handle on purpose - a touch
+         that lands on one of them has to reach its click listener instead of
+         starting a drag. -->
+    <LinearLayout
+        android:id="@+id/glCaptionBar"
+        android:layout_width="match_parent"
+        android:layout_height="32dp"
+        android:background="#FF303030"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/glCaption"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:gravity="center_vertical"
+            android:paddingStart="10dp"
+            android:paddingEnd="6dp"
+            android:singleLine="true"
+            android:text="@string/gl_title"
+            android:textColor="#FFE0E0E0"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/glBtnMin"
+            android:layout_width="36dp"
+            android:layout_height="match_parent"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="@string/gl_btn_min_desc"
+            android:gravity="center"
+            android:text="@string/gl_btn_min"
+            android:textColor="#FFE0E0E0"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/glBtnMax"
+            android:layout_width="36dp"
+            android:layout_height="match_parent"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="@string/gl_btn_max_desc"
+            android:gravity="center"
+            android:text="@string/gl_btn_max"
+            android:textColor="#FFE0E0E0"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/glBtnClose"
+            android:layout_width="36dp"
+            android:layout_height="match_parent"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="@string/gl_btn_close_desc"
+            android:gravity="center"
+            android:text="@string/gl_btn_close"
+            android:textColor="#FFE0E0E0"
+            android:textSize="12sp" />
+
+    </LinearLayout>
+
+    <!-- Video area: the letterbox. The SurfaceView inside it is measured to
+         the panel's aspect ratio (FitFrameLayout, ratio fed from
+         MainActivity.PANEL_W/H) and centred, so the guest's frame is shown
+         whole and never stretched - the black around it is this container. -->
+    <com.rvvm.android.FitFrameLayout
+        android:id="@+id/glVideoArea"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="#FF000000">
+
+        <SurfaceView
+            android:id="@+id/surfaceView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center" />
+
+    </com.rvvm.android.FitFrameLayout>
+
+</LinearLayout>

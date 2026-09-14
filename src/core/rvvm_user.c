@@ -2373,6 +2373,12 @@ static THREAD_LOCAL rvvm_hart_t* current_user_hart = NULL;
  * dispatch still resolve this symbol. */
 const char* g_gl_inflight = NULL;
 
+PUBLIC rvvm_machine_t* rvvm_user_current_machine(void)
+{
+    rvvm_hart_t* hart = current_user_hart;
+    return hart ? hart->machine : NULL;
+}
+
 static void user_fault_hex(char** p, uint64_t val)
 {
     char tmp[17];
@@ -5079,6 +5085,11 @@ void rvvm_user_set_host_ctx(rvvm_machine_t* machine, void* host_ctx)
 void* rvvm_user_host_ctx(rvvm_machine_t* machine)
 {
     UNUSED(machine);
+    return NULL;
+}
+
+rvvm_machine_t* rvvm_user_current_machine(void)
+{
     return NULL;
 }
 

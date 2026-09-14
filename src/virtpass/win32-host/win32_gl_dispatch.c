@@ -163,8 +163,9 @@ static void gl_trace(const char* kind, uint32_t fn_id, const int64_t* a, int64_t
  * EGL dispatch: 3 special cases before the generic table
  * ============================================================ */
 
-void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
+void on_egl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, int64_t* ret)
 {
+    (void)inst;   /* single-run host: the instance carries no extra state */
     *ret = 0;
     g_gl_inflight = vpgl_egl_name(fn_id);
     gl_trace_args("egl", fn_id, args);
@@ -251,8 +252,9 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
  * Keep hook points for future specialization.
  * ============================================================ */
 
-void on_gl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
+void on_gl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, int64_t* ret)
 {
+    (void)inst;   /* single-run host: the instance carries no extra state */
     *ret = 0;
     g_gl_inflight = vpgl_gl_name(fn_id);
     gl_trace_args("gl", fn_id, args);

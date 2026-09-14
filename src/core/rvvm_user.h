@@ -41,6 +41,12 @@ void rvvm_user_set_io_callback(rvvm_machine_t* machine, rvvm_user_io_callback ca
 void  rvvm_user_set_host_ctx(rvvm_machine_t* machine, void* ctx);
 void* rvvm_user_host_ctx(rvvm_machine_t* machine);
 
+// The machine whose vCPU is running on the calling thread, or NULL when the
+// thread is not servicing a guest. What lets a host-side callback with no
+// context argument (e.g. the exit callback) find the run it belongs to when
+// several machines are alive.
+rvvm_machine_t* rvvm_user_current_machine(void);
+
 // Callback type for guest exit event
 // Called when the guest exits (sys_exit or sys_exit_group)
 typedef void (*rvvm_user_exit_callback)(int exit_code);
