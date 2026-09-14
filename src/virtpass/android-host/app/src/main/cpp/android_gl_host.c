@@ -262,6 +262,15 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
             *ret = 0;
             break;
         }
+        /* The EGL surface sizes its buffers from the window's geometry, and
+         * the window is the floating card's viewport, not the panel the guest
+         * renders. Push the pinned panel size first, or the guest's
+         * glViewport(0, 0, panelW, panelH) would map onto the bottom-left
+         * corner of a viewport-sized surface. */
+        {
+            extern void jni_apply_surface_geometry(struct ANativeWindow* w);
+            jni_apply_surface_geometry(g_window);
+        }
         *ret = (int64_t)(intptr_t)p_eglCreateWindowSurface(
             (vpgl_EGLDisplay)(uintptr_t)args[0],
             (vpgl_EGLConfig)(uintptr_t)args[1],

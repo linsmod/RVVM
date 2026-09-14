@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Frame of the floating graphics window: a 1dp border around the dark card.
+
+  The border has to be a ring of *padding*, not a line drawn under the video.
+  The guest's surface is composited above this window (setZOrderMediaOverlay),
+  so anything the window draws in the video area is hidden by it; only the ring
+  the card keeps free around its content is left visible. The card therefore
+  carries 1dp of padding and this drawable, whose outer item is the border
+  colour showing through it and whose inset item is the card's own fill.
+
+  This is also where a rounded corner would go (a <corners> on both shapes): it
+  would clip the window's ring, but not the surface above it.
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#FF7A7A7A" />
+        </shape>
+    </item>
+
+    <item
+        android:bottom="1dp"
+        android:left="1dp"
+        android:right="1dp"
+        android:top="1dp">
+        <shape android:shape="rectangle">
+            <solid android:color="#F0181818" />
+        </shape>
+    </item>
+
+</layer-list>

@@ -16,7 +16,7 @@ import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
 import android.util.Log;
-import android.view.GestureDetector;
+import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
@@ -25,7 +25,6 @@ import android.view.SurfaceView;
 import android.view.TextureView;
 import android.view.View;
 import android.view.ViewConfiguration;
-import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputConnectionWrapper;
@@ -35,12 +34,8 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
-import android.widget.HorizontalScrollView;
-import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
-import android.widget.Toast;
-import android.widget.ViewFlipper;
 
 import java.io.BufferedWriter;
 import java.io.File;
@@ -70,6 +65,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
      */
     public static final String EXTRA_GUEST_APP = "guest";
 
+    /**
+     * The virtual panel: the pixel geometry the guest renders into and the
+     * space its input is expressed in.
+     *
+     * Pinned here rather than latched from the floating window's surface (see
+     * RvvmNative.nativeSetPanelSize), because that surface is the size of a
+     * card the user drags around. 720p landscape, so a guest that lays out for
+     * a desktop screen gets one regardless of this device's own orientation.
+     * The card is only a viewport onto the panel, which is why touches are
+     * mapped from card pixels into panel pixels before they are forwarded.
+     */
+    private static final int PANEL_W = 1280;
+    private static final int PANEL_H = 720;
+
     // Lifecycle commands forwarded to the guest. These are the APP_CMD_* values
     // from include/virtpass/vp_android.h - they are the wire format of the
     // host -> guest lifecycle channel and must stay in sync with that enum.
@@ -91,32 +100,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     private TextView statusText;
     private SurfaceView surfaceView;
     private SurfaceHolder surfaceHolder;
-    private TextureView ttyView;          // Console tab render target
-    private FrameLayout ttyViewport;      // Console tab viewport (holds ttyView)
+    private TextureView ttyView;          // Console render target
+    private FrameLayout ttyViewport;      // Console viewport (holds ttyView)
     private TtyEditText ttyInput;         // Console keyboard/IME focus target
-    private ViewFlipper viewFlipper;
     private Button runButton;
     private Button suspendButton;
     private Button stopButton;
     private Spinner guestAppSpinner;
 
-    // Guest console overlay, drawn on top of the SurfaceView. Visible before
-    // the guest renders its first frame and again after it exits; hidden once
-    // a frame has actually reached the surface.
-    private HorizontalScrollView logOverlayScroll;  // X axis + tap-to-toggle
-    private ScrollView logOverlayVScroll;           // Y axis
-    private TextView logOverlayText;
-    private final StringBuilder logBuffer = new StringBuilder();
-
-    // Overlay text mode. Monospace always; tap toggles wrapping.
-    private boolean logWrapText = true;
-
-    // True from Run until the next cold start: while set, the console overlay
-    // is shown whenever the guest is not actively rendering frames. Keeping
-    // the overlay up even with no output yet (a placeholder line shows) is
-    // what gives the tap-to-toggle-wrap gesture a stable target - a guest
-    // that prints nothing would otherwise leave nothing to tap.
-    private boolean consoleActive = false;
+    // ---- Floating graphics window ----
+    // The guest renders into a SurfaceView card that floats above the console
+    // (setZOrderMediaOverlay), pinned to the top-right corner with a margin. It
+    // is a window in the Windows sense: a title bar that drags, and the usual
+    // three buttons - minimize (rolls the card up to its title bar), maximize /
+    // restore, and close (hides it, leaving the console the whole screen).
+    // Everything except the title bar belongs to the guest: a touch on the
+    // video area is forwarded to it, which is also why the video cannot host a
+    // gesture of ours.
+    private View workspace;
+    private View glWindow;                // the card: title bar + SurfaceView
+    private View glCaptionBar;            // the title bar (measured when rolled up)
+    private TextView glCaption;           // the drag handle
+    private TextView glBtnMin, glBtnMax, glBtnClose;
+    private TextView glShowChip;          // shown while the window is closed
+    // Floating geometry as inflated from the XML: the size and the gravity the
+    // floating state is laid out with. Everything else about the position is a
+    // margin, not a translation - see moveGlWindow() for why.
+    private int glFloatW, glFloatH, glFloatGravity;
+    private float glRestoreLeft, glRestoreTop;
+    private boolean glMaximized = false;
+    private boolean glCollapsed = false;
+    // What the window was before it was rolled up, so minimizing can be undone.
+    private boolean glMaximizedBeforeCollapse = false;
 
     // The run's log file. Opened in runGuestElf (UI thread), written from the
     // guest thread (onOutput), closed when the guest exits - hence the lock.
@@ -124,14 +139,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     private BufferedWriter logWriter;
     private File logFile;
 
-    // Set once the first presented frame arrived (CPU unlock or GL swap).
-    private boolean guestRendering = false;
-
-    // Tail kept in the overlay text, so an endless guest cannot grow it
-    // without bound.
-    private static final int LOG_MAX_CHARS = 64 * 1024;
+    // Guest runs kept under files/logs/, oldest pruned first.
     private static final int LOG_MAX_FILES = 20;
-    private static final String LOG_PLACEHOLDER = "[console] waiting for guest output...\n";
 
     // Guest app list: .exe files from assets
     private String[] guestApps;
@@ -630,8 +639,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         });
 
         // Tap the terminal to summon the soft keyboard. It is not popped up
-        // automatically with the tab: the tab is often opened just to read the
-        // last screen, and a keyboard over it would be in the way.
+        // automatically with the console: it is often looked at just to read
+        // the last screen, and a keyboard over it would be in the way.
         ttyView.setOnClickListener(v -> toggleTtyKeyboard());
         watchTtyKeyboard();
 
@@ -642,6 +651,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         bindTtyKey(R.id.ttyKeyUp, TTY_UP);
         bindTtyKey(R.id.ttyKeyDown, TTY_DOWN);
         bindTtyKey(R.id.ttyKeyRight, TTY_RIGHT);
+
+        // The console is the only full-screen pane and is on screen from the
+        // start, so it takes focus right away: a hardware keyboard types
+        // straight into the guest. Focus alone does not raise the soft
+        // keyboard - that still only happens on a tap.
+        ttyInput.requestFocus();
     }
 
     private void bindTtyKey(int id, final byte[] bytes) {
@@ -696,17 +711,278 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         });
     }
 
-    /** Switch between the graphics tab (0) and the console tab (1). */
-    private void showTab(int index) {
-        viewFlipper.setDisplayedChild(index);
-        if (index == 1) {
-            // Move focus to the console so a hardware keyboard types straight
-            // into the guest; the soft keyboard still only appears on a tap.
-            ttyInput.requestFocus();
+    /* ============================================================
+     * Floating graphics window
+     *
+     * The guest renders into a SurfaceView card that floats over the console.
+     * z-order is the whole trick: a SurfaceView is normally composited *below*
+     * its window, which is what lets ordinary views draw on top of it - and
+     * what would otherwise let the console paint over the graphics. Calling
+     * setZOrderMediaOverlay(true) lifts the surface above the window, so the
+     * card sits over the console and can be dragged or expanded anywhere on
+     * the screen.
+     *
+     * The price is the mirror image of that rule: nothing drawn in this window
+     * can cover the surface either, so the card is laid out as a title bar
+     * *above* the video area rather than over it, and the bar is the only place
+     * a host gesture can live. Touches on the video area are forwarded to the
+     * guest, which is why the window's controls are the title bar's buttons and
+     * not, say, a tap anywhere on the card: the console the card covers would
+     * otherwise be unreachable, with no graphics tab left to switch back to.
+     *
+     * The three buttons are the Windows set and mean what they mean there.
+     * Minimize rolls the card up to its title bar and back; maximize fills the
+     * workspace and restore puts it back at its floating corner; close hides it
+     * and leaves the console the whole screen. None of them touches the guest -
+     * even close only takes its window away, which is the same
+     * TERM_WINDOW/INIT_WINDOW cycle a backgrounded Activity causes.
+     * ============================================================ */
+
+    private void initGlWindow() {
+        workspace = findViewById(R.id.workspace);
+        glWindow = findViewById(R.id.glWindow);
+        glCaptionBar = findViewById(R.id.glCaptionBar);
+        glCaption = findViewById(R.id.glCaption);
+        glBtnMin = findViewById(R.id.glBtnMin);
+        glBtnMax = findViewById(R.id.glBtnMax);
+        glBtnClose = findViewById(R.id.glBtnClose);
+        glShowChip = findViewById(R.id.glShowChip);
+
+        // Has to be set before the surface is created to take effect.
+        surfaceView.setZOrderMediaOverlay(true);
+
+        // Remember the floating geometry as inflated: the maximized state is
+        // entered and left by re-laying the card out, so the way back has to
+        // be written down first.
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) glWindow.getLayoutParams();
+        glFloatW = lp.width;
+        glFloatH = lp.height;
+        glFloatGravity = lp.gravity;
+
+        glBtnMin.setOnClickListener(v -> setGlWindowCollapsed(!glCollapsed));
+        glBtnMax.setOnClickListener(v -> toggleGlWindowMaximized());
+        glBtnClose.setOnClickListener(v -> setGlWindowClosed(true));
+        glShowChip.setOnClickListener(v -> setGlWindowClosed(false));
+
+        final int slop = ViewConfiguration.get(this).getScaledTouchSlop();
+        glCaption.setOnTouchListener(new View.OnTouchListener() {
+            private float fromX, fromY, baseLeft, baseTop;
+            private boolean dragging;
+
+            @Override
+            public boolean onTouch(View v, MotionEvent event) {
+                switch (event.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        // Raw coordinates: the view moves under the finger.
+                        fromX = event.getRawX();
+                        fromY = event.getRawY();
+                        baseLeft = glWindow.getLeft();
+                        baseTop = glWindow.getTop();
+                        dragging = false;
+                        return true;
+                    case MotionEvent.ACTION_MOVE: {
+                        if (glMaximized) {
+                            return true;    // fills the workspace; nowhere to go
+                        }
+                        float dx = event.getRawX() - fromX;
+                        float dy = event.getRawY() - fromY;
+                        if (!dragging) {
+                            if (Math.hypot(dx, dy) < slop) {
+                                return true;    // still a tap candidate
+                            }
+                            dragging = true;
+                        }
+                        moveGlWindow(baseLeft + dx, baseTop + dy);
+                        return true;
+                    }
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        dragging = false;
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+        });
+
+        // The workspace shrinks under the window when the soft keyboard comes
+        // up: pull the card back inside so it cannot end up half off-screen.
+        workspace.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) ->
+                clampGlWindow());
+    }
+
+    /**
+     * Put the card's top-left corner at (left, top) in workspace coordinates,
+     * clamped so it always stays inside the workspace.
+     *
+     * The move is a re-layout (a margin), never a translation. A SurfaceView
+     * composites its own surface and follows the *layout* position, so a
+     * translated card would slide the caption bar out from under the video it
+     * is supposed to be a window around. Positioning by margin keeps the two
+     * together, at the price of a layout pass per motion event - which this
+     * hierarchy (a card with two children) is not going to notice.
+     *
+     * The card is laid out with horizontal gravity END, so the margin that
+     * places it on the X axis is the right one: right = width - w - left.
+     */
+    private void moveGlWindow(float left, float top) {
+        if (glMaximized) {
+            return;
+        }
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) glWindow.getLayoutParams();
+        // Explicit sizes are what the floating state uses; the card still
+        // reports the maximized one until the next layout runs.
+        float w = lp.width > 0 ? lp.width : glWindow.getWidth();
+        float h = lp.height > 0 ? lp.height : glWindow.getHeight();
+        float maxLeft = Math.max(0f, workspace.getWidth() - w);
+        float maxTop = Math.max(0f, workspace.getHeight() - h);
+        left = clamp(left, 0f, maxLeft);
+        top = clamp(top, 0f, maxTop);
+        lp.rightMargin = (int) Math.max(0f, workspace.getWidth() - w - left);
+        lp.topMargin = (int) top;
+        glWindow.setLayoutParams(lp);
+    }
+
+    /** Re-apply the current position against a workspace that may have changed
+     *  size (soft keyboard, rotation). Only the clamps can move the card. */
+    private void clampGlWindow() {
+        if (glMaximized) {
+            return;
+        }
+        moveGlWindow(glWindow.getLeft(), glWindow.getTop());
+    }
+
+    private static float clamp(float value, float lo, float hi) {
+        return value < lo ? lo : (value > hi ? hi : value);
+    }
+
+    /**
+     * Lay the card out for its current state: maximized (fills the workspace),
+     * rolled up (title bar only) or floating (its own size). The position is
+     * not this method's business - that is a margin, see moveGlWindow(), which
+     * the callers re-apply when the card comes back from the maximized layout
+     * (it is laid out with its margins cleared).
+     */
+    private void applyGlWindowLayout() {
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) glWindow.getLayoutParams();
+        if (glMaximized) {
+            lp.width = FrameLayout.LayoutParams.MATCH_PARENT;
+            lp.height = FrameLayout.LayoutParams.MATCH_PARENT;
+            lp.gravity = Gravity.TOP | Gravity.START;
+            lp.leftMargin = lp.topMargin = lp.rightMargin = lp.bottomMargin = 0;
         } else {
-            ttyInput.clearFocus();
+            lp.width = glFloatW;
+            lp.height = glCollapsed ? glCollapsedHeight() : glFloatH;
+            lp.gravity = glFloatGravity;
+        }
+        glWindow.setLayoutParams(lp);
+    }
+
+    /** Height of the rolled-up window: the title bar plus the frame the card
+     *  keeps around it. Measured, not hardcoded, so the title bar can change
+     *  size (a taller bar, a thicker border) without this following it. */
+    private int glCollapsedHeight() {
+        return glCaptionBar.getHeight()
+             + glWindow.getPaddingTop() + glWindow.getPaddingBottom();
+    }
+
+    /**
+     * Maximize button: fill the workspace with the guest's window, or put it
+     * back at the corner and size it was floating at.
+     *
+     * Pressed while rolled up it unrolls the window too, straight to full size
+     * - the two title bar buttons differ only in the size they come back at,
+     * which is the one thing that makes either of them a safe way out of the
+     * rolled-up state.
+     */
+    private void toggleGlWindowMaximized() {
+        if (glCollapsed) {
+            // Unroll it into the floating state first, so the toggle below has
+            // a corner to remember and lands on "maximized".
+            glMaximizedBeforeCollapse = false;
+            setGlWindowCollapsed(false);
+        }
+        if (glMaximized) {
+            glMaximized = false;
+            applyGlWindowLayout();
+            // Not restored from the margins, which the maximized layout
+            // cleared: the position is re-derived from the corner it had, and
+            // clamped again on the way back.
+            moveGlWindow(glRestoreLeft, glRestoreTop);
+        } else {
+            glRestoreLeft = glWindow.getLeft();
+            glRestoreTop = glWindow.getTop();
+            glMaximized = true;
+            applyGlWindowLayout();
+            // The console the card just covered is also where the keyboard
+            // would have gone.
             hideTtyKeyboard();
         }
+        updateGlWindowButtons();
+    }
+
+    /**
+     * Minimize button: roll the card up to its title bar, and unroll it again.
+     *
+     * Two things make this more than a size change. The video area carries the
+     * surface, so rolling it up hides the SurfaceView and costs the guest the
+     * TERM_WINDOW / INIT_WINDOW cycle any hidden surface does - the guest keeps
+     * running throughout. And a rolled-up *maximized* window would be a title
+     * bar across the whole screen, which is why it comes down to the corner it
+     * was floating in and goes back up on the way out.
+     */
+    private void setGlWindowCollapsed(boolean collapsed) {
+        if (collapsed == glCollapsed) {
+            return;
+        }
+        if (collapsed) {
+            glMaximizedBeforeCollapse = glMaximized;
+            glMaximized = false;
+            glCollapsed = true;
+            surfaceView.setVisibility(View.GONE);
+            applyGlWindowLayout();
+            if (glMaximizedBeforeCollapse) {
+                moveGlWindow(glRestoreLeft, glRestoreTop);
+            }
+        } else {
+            glCollapsed = false;
+            glMaximized = glMaximizedBeforeCollapse;
+            if (glMaximized) {
+                // On its way back up: the corner it is leaving becomes the one
+                // "restore" returns it to.
+                glRestoreLeft = glWindow.getLeft();
+                glRestoreTop = glWindow.getTop();
+            }
+            surfaceView.setVisibility(View.VISIBLE);
+            applyGlWindowLayout();
+            if (!glMaximized) {
+                // The card just grew: a strip dragged along the bottom edge
+                // would otherwise hang off the workspace as a full window.
+                moveGlWindow(glWindow.getLeft(), glWindow.getTop());
+            }
+        }
+        updateGlWindowButtons();
+    }
+
+    /**
+     * Close button, and the chip that reopens: hide the window, leaving the
+     * console the whole screen.
+     *
+     * The guest is deliberately left alone - closing a window is not stopping a
+     * guest, and it simply loses its window the way it does when the Activity
+     * is backgrounded. The chip in the corner is then the way back, and the
+     * only one: there is no launcher or taskbar here, so a close without it
+     * would be a dead end with the guest still running.
+     */
+    private void setGlWindowClosed(boolean closed) {
+        glWindow.setVisibility(closed ? View.GONE : View.VISIBLE);
+        glShowChip.setVisibility(closed ? View.VISIBLE : View.GONE);
+    }
+
+    /** The maximize button's glyph: Windows' pair, a box for "fill the screen"
+     *  and the same box doubled for "put it back". */
+    private void updateGlWindowButtons() {
+        glBtnMax.setText(glMaximized ? R.string.gl_btn_restore : R.string.gl_btn_max);
     }
 
     // Whether a soft keyboard is on screen, and the tallest the window has been
@@ -719,7 +995,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
      *
      * InputMethodManager.isActive() is not an answer to "is a keyboard up": it
      * reports whether the view is the one the IME serves, which is already true
-     * from the moment the console tab takes focus. The tap toggle used to ask
+     * from the moment the console takes focus. The tap toggle used to ask
      * it that question, so it picked its hide branch on the very tap that
      * should have raised the keyboard - a keyboard only appeared in the rare
      * interleaving where the tab's focus request had not been served yet, which
@@ -969,33 +1245,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         // Find views
         statusText = findViewById(R.id.statusText);
         surfaceView = findViewById(R.id.surfaceView);
-        logOverlayScroll = findViewById(R.id.logOverlayScroll);
-        logOverlayVScroll = findViewById(R.id.logOverlayVScroll);
-        logOverlayText = findViewById(R.id.logOverlayText);
-        // The XML monospace attribute has the same OEM problem as the TTY
-        // canvas did; the resolved terminal font is used for both.
-        logOverlayText.setTypeface(ttyFont());
-
-        // Tap the overlay (a tap, not a scroll) to toggle word wrap; the
-        // current mode is confirmed with a toast. Monospace is always on.
-        //
-        // The tap is detected on the inner ScrollView: it is the view that
-        // actually owns the touch stream (a scrolling view consumes every
-        // gesture in onTouchEvent), so an OnClickListener on either scroller
-        // never fires. The listener returns false so the normal drag/fling
-        // handling of both scrollers is left untouched.
-        final GestureDetector logTapDetector = new GestureDetector(this,
-                new GestureDetector.SimpleOnGestureListener() {
-                    @Override
-                    public boolean onSingleTapUp(MotionEvent e) {
-                        toggleLogWrap();
-                        return true;
-                    }
-                });
-        logOverlayVScroll.setOnTouchListener((v, event) -> {
-            logTapDetector.onTouchEvent(event);
-            return false;
-        });
         runButton = findViewById(R.id.runButton);
         suspendButton = findViewById(R.id.suspendButton);
         stopButton = findViewById(R.id.stopButton);
@@ -1028,17 +1277,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         surfaceHolder = surfaceView.getHolder();
         surfaceHolder.addCallback(this);
 
-        // Tab switcher: graphics (SurfaceView) vs TTY console (TextureView)
-        viewFlipper = findViewById(R.id.viewFlipper);
-        Button tabGraphics = findViewById(R.id.tabGraphicsButton);
-        Button tabConsole = findViewById(R.id.tabConsoleButton);
-        tabGraphics.setOnClickListener(v -> showTab(0));
-        tabConsole.setOnClickListener(v -> showTab(1));
+        // The console owns the workspace; the guest's graphics output lives in
+        // the floating window above it.
         ttyViewport = findViewById(R.id.ttyViewport);
         ttyView = findViewById(R.id.ttyView);
         ttyView.setSurfaceTextureListener(ttyTextureListener);
         initTtyInput();
         initTtyScrolling();
+
+        initGlWindow();
 
         // Setup buttons
         runButton.setOnClickListener(v -> runGuestElf());
@@ -1046,18 +1293,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         stopButton.setOnClickListener(v -> stopGuestElf());
         updateButtonStates();
 
-        // Forward touches on the surface to the guest (all pointers)
+        // Forward touches on the surface to the guest (all pointers). The card
+        // is a viewport: the guest's input space is the panel, and the frame
+        // buffer fills the whole card, so the mapping is a plain linear scale.
         surfaceView.setOnTouchListener((v, event) -> {
             if (!isInitialized) {
                 return false;
             }
+            float viewW = surfaceView.getWidth(), viewH = surfaceView.getHeight();
+            if (viewW <= 0f || viewH <= 0f) {
+                return false;
+            }
+            float sx = PANEL_W / viewW, sy = PANEL_H / viewH;
             int count = event.getPointerCount();
             if (count > MAX_POINTERS) {
                 count = MAX_POINTERS;
             }
             for (int i = 0; i < count; i++) {
-                motionX[i] = event.getX(i);
-                motionY[i] = event.getY(i);
+                motionX[i] = event.getX(i) * sx;
+                motionY[i] = event.getY(i) * sy;
                 motionId[i] = event.getPointerId(i);
             }
             // Use the raw action: ACTION_POINTER_DOWN/UP encode the pointer
@@ -1076,6 +1330,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
             // Initialize native library
             RvvmNative.nativeInit();
             isInitialized = true;
+
+            // Pin the virtual panel before any guest can observe a geometry:
+            // after that the call is refused, by design (the buffer is what the
+            // guest is mid-frame on).
+            RvvmNative.nativeSetPanelSize(PANEL_W, PANEL_H);
 
             // Record the guest's exit code as it fires (guest thread). The UI
             // is updated by the guest-exit-monitor, not here: the callback
@@ -1208,10 +1467,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         String elfPath = elfFile.getAbsolutePath();
         statusText.setText("Running: " + elfName + "\nPath: " + elfPath);
 
-        // New run: clear the console overlay and start a fresh log file. The
-        // overlay stays visible (showing the guest's early output) until the
-        // first presented frame arrives, then hides; on exit it comes back.
-        clearGuestConsole();
+        // New run: a fresh log file. The console on screen is the guest's own
+        // TTY, which keeps the previous run's last screen until new output
+        // arrives, so there is nothing to reset here.
         openGuestLogFile(elfName);
 
         replayGuestStartupState();
@@ -1241,11 +1499,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
             runOnUiThread(() -> {
                 currentGuestApp = null;
                 closeGuestLogFile();
-                // The guest is gone: bring the console overlay back over the
-                // last frame (or the black surface), showing the tail of its
-                // output next to the exit status.
-                guestRendering = false;
-                updateLogOverlay();
                 statusText.setText("Guest exited: " + elfName + " (exit " + code + ")");
                 Log.i(TAG, "Guest exited: " + elfName + " (exit " + code + ")");
                 // Nothing left to type into; the frozen last screen stays as it
@@ -1497,26 +1750,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         postLifecycleCmd(APP_CMD_WINDOW_REDRAW_NEEDED);
     }
 
-    // --- Guest console overlay ------------------------------------------------
+    // --- Guest console output -------------------------------------------------
     //
-    // Three states, driven by two signals:
-    //   running, no frame yet  -> overlay visible, showing guest output
-    //   first frame arrived    -> overlay hidden, the surface shows the render
-    //   guest exited           -> overlay visible again over the last frame
+    // The console on screen is the guest's own TTY: fd 1/2 is parsed into a
+    // libvterm screen by the core and read back through nativeTtySnapshot(),
+    // so guest output and host keyboard echo arrive by the same path. That is
+    // the only console now - the text overlay this Activity used to paint over
+    // the SurfaceView duplicated it, and only existed because the tab that hid
+    // the console needed a console of its own.
     //
-    // Output is also appended to a per-run log file under files/logs/.
-
-    /** Clears the overlay text (guest (re)start). UI thread only. */
-    private void clearGuestConsole() {
-        logBuffer.setLength(0);
-        // Placeholder keeps the overlay renderable (and tappable) from the
-        // first moment; real output lines replace it as they arrive.
-        logBuffer.append(LOG_PLACEHOLDER);
-        logOverlayText.setText(logBuffer);
-        consoleActive = true;
-        guestRendering = false;
-        updateLogOverlay();
-    }
+    // The raw line stream is still appended to a per-run log file under
+    // files/logs/, which is what makes a run readable after the guest is gone.
 
     /** Opens a fresh log file for this run: logs/<guest>-<timestamp>.log. */
     private void openGuestLogFile(String guestName) {
@@ -1574,7 +1818,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         }
     }
 
-    /** One console line from the guest. Guest thread. */
+    /** One line of guest output, for the log file. Guest thread. */
     private void handleGuestOutput(String line) {
         synchronized (logFileLock) {
             if (logWriter != null) {
@@ -1588,72 +1832,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
                 }
             }
         }
-
-        // Overlay text is a tail; the actual history lives in the file.
-        runOnUiThread(() -> {
-            // First real line replaces the placeholder.
-            if (LOG_PLACEHOLDER.contentEquals(logBuffer)) {
-                logBuffer.setLength(0);
-            }
-            logBuffer.append(line).append('\n');
-            int over = logBuffer.length() - LOG_MAX_CHARS;
-            if (over > 0) {
-                int cut = logBuffer.indexOf("\n", over);
-                logBuffer.delete(0, (cut >= 0) ? cut + 1 : over);
-            }
-            logOverlayText.setText(logBuffer);
-            updateLogOverlay();
-            logOverlayVScroll.post(() ->
-                    logOverlayVScroll.fullScroll(View.FOCUS_DOWN));
-        });
-    }
-
-    /** The first presented frame is on the surface. Guest thread. */
-    private void handleFirstFrame() {
-        runOnUiThread(() -> {
-            guestRendering = true;
-            updateLogOverlay();
-        });
-    }
-
-    /** Show the overlay while a console session is live and no frame has
-     *  taken over the surface. */
-    private void updateLogOverlay() {
-        boolean show = consoleActive && !guestRendering;
-        logOverlayScroll.setVisibility(show ? View.VISIBLE : View.GONE);
-    }
-
-    /** Tap on the overlay: toggle word wrap, confirm with a toast. */
-    private void toggleLogWrap() {
-        logWrapText = !logWrapText;
-        Log.i(TAG, "Log wrap toggled: " + (logWrapText ? "on" : "off"));
-        applyLogWrapMode();
     }
 
     /**
-     * Apply the wrap mode. Wrapping needs the text view to fill the overlay
-     * width; single-line mode lets it extend past the surface width, with the
-     * outer HorizontalScrollView providing the sideways scroll.
+     * The first presented frame is on the surface. Guest thread.
+     *
+     * Nothing on screen depends on it any more (that is what the text overlay
+     * used to wait for), so it is only a marker in the log: the guest's window
+     * is up and the floating card is showing the guest's own frames.
      */
-    private void applyLogWrapMode() {
-        logOverlayText.setHorizontallyScrolling(!logWrapText);
-
-        ViewGroup.LayoutParams tvLp = logOverlayText.getLayoutParams();
-        ViewGroup.LayoutParams svLp = logOverlayVScroll.getLayoutParams();
-        int width = logWrapText ? ViewGroup.LayoutParams.MATCH_PARENT
-                                : ViewGroup.LayoutParams.WRAP_CONTENT;
-        tvLp.width = width;
-        svLp.width = width;
-        logOverlayText.setLayoutParams(tvLp);
-        logOverlayVScroll.setLayoutParams(svLp);
-
-        // Keep the tail in view after the re-layout.
-        logOverlayVScroll.post(() ->
-                logOverlayVScroll.fullScroll(View.FOCUS_DOWN));
-
-        Toast.makeText(this,
-                logWrapText ? R.string.log_wrap_on : R.string.log_wrap_off,
-                Toast.LENGTH_SHORT).show();
+    private void handleFirstFrame() {
+        Log.i(TAG, "First frame presented");
     }
 
     // --- Activity lifecycle --------------------------------------------------

@@ -850,6 +850,40 @@ static void guest_geometry_locked(int32_t* w, int32_t* h, int32_t* fmt)
     if (fmt) *fmt = g_surf_fmt;
 }
 
+/* Push the latched panel geometry onto a real surface.
+ *
+ * Both present paths have to do this before handing a surface to the platform,
+ * and for the same reason: a surface's own geometry is the *viewport's* (the
+ * floating graphics card is much smaller than the panel), while the guest
+ * renders a buffer laid out for the panel. The CPU path needs lock() to hand
+ * back a buffer of exactly the guest's size, because the frame is copied into
+ * it one-for-one; the GL path needs it before eglCreateWindowSurface, which
+ * takes its buffer size from the window's current geometry - without it the
+ * guest's glViewport(0, 0, panelW, panelH) would only cover the bottom-left
+ * corner of a viewport-sized surface.
+ *
+ * Called with g_surf_cs NOT held. */
+void jni_apply_surface_geometry(struct ANativeWindow* w)
+{
+    int32_t gw, gh, gf;
+
+    if (!w) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_surf_cs);
+    panel_latch_locked();
+    guest_geometry_locked(&gw, &gh, &gf);
+    if (g_applied_w != gw || g_applied_h != gh || g_applied_fmt != gf) {
+        if (ANativeWindow_setBuffersGeometry(w, gw, gh, gf) == 0) {
+            g_applied_w   = gw;
+            g_applied_h   = gh;
+            g_applied_fmt = gf;
+        }
+    }
+    pthread_mutex_unlock(&g_surf_cs);
+}
+
 /* Window lock callback (called from vp_cmdpost)
  * Fills geometry only; the guest renders into its own buffer and we copy
  * pixels on unlock. Never expose the host surface pointer to the guest. The
@@ -883,16 +917,11 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
     pthread_mutex_lock(&g_surf_cs);
     panel_latch_locked();
     guest_geometry_locked(&gw, &gh, &gf);
+    pthread_mutex_unlock(&g_surf_cs);
+
     /* Push the panel geometry onto the real surface so lock() hands back a
      * buffer we can copy the guest frame into one-for-one. */
-    if (g_applied_w != gw || g_applied_h != gh || g_applied_fmt != gf) {
-        if (ANativeWindow_setBuffersGeometry(w, gw, gh, gf) == 0) {
-            g_applied_w   = gw;
-            g_applied_h   = gh;
-            g_applied_fmt = gf;
-        }
-    }
-    pthread_mutex_unlock(&g_surf_cs);
+    jni_apply_surface_geometry(w);
 
     ANativeWindow_Buffer buffer;
     ARect dirty;
@@ -1328,6 +1357,42 @@ Java_com_rvvm_android_RvvmNative_nativeSetDisplayConfig(
 
     LOGI("Display config: density=%d (real %dx%d dp ignored; panel-owned)",
          densityDpi, widthDp, heightDp);
+}
+
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeSetPanelSize(JNIEnv* env, jobject thiz,
+                                                    jint width, jint height)
+{
+    (void)env;
+    (void)thiz;
+
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    /* The panel is normally latched from the first surface size this side ever
+     * sees (panel_latch_locked), which ties the guest's resolution to the size
+     * of the floating graphics window - and that window is draggable. The host
+     * pins it here instead (720p landscape), leaving the window as a viewport
+     * onto a fixed geometry.
+     *
+     * Ignored once the guest has observed a geometry (g_surf_* latched): that
+     * is the buffer it may be mid-frame on, and moving it under a running
+     * guest is exactly the desync this panel/surface split exists to prevent.
+     * Before that, an already-latched panel is overwritten - it was latched
+     * from a viewport size nobody has rendered into yet. */
+    pthread_mutex_lock(&g_surf_cs);
+    if (g_surf_w <= 0 && g_surf_h <= 0) {
+        g_virt_w = width;
+        g_virt_h = height;
+        g_init_w = width;
+        g_init_h = height;
+        LOGI("Virtual panel pinned: %dx%d", width, height);
+    } else {
+        LOGI("Virtual panel already in use (%dx%d), ignoring %dx%d",
+             g_surf_w, g_surf_h, width, height);
+    }
+    pthread_mutex_unlock(&g_surf_cs);
 }
 
 JNIEXPORT void JNICALL

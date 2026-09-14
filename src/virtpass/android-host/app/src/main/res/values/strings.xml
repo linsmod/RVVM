@@ -4,12 +4,24 @@
     <string name="guest_app_label">Guest App:</string>
     <string name="run_guest">Run</string>
     <string name="stop_guest">Stop</string>
-    <string name="log_wrap_on">Log: word wrap on</string>
-    <string name="log_wrap_off">Log: single line (scroll sideways)</string>
     <string name="suspend_guest">Suspend</string>
     <string name="resume_guest">Resume</string>
-    <string name="tab_graphics">Graphics</string>
-    <string name="tab_console">Console</string>
+
+    <!-- Floating graphics window: its title bar. The window buttons are the
+         Windows set and keep Windows' glyphs, written as escapes so the file
+         stays ASCII-only: an en dash to minimize, a box to maximize and - once
+         the window already fills the screen - the same box doubled to put it
+         back, and a multiplication cross to close. -->
+    <string name="gl_title">Guest</string>
+    <string name="gl_btn_min">\u2013</string>
+    <string name="gl_btn_max">\u25A1</string>
+    <string name="gl_btn_restore">\u2750</string>
+    <string name="gl_btn_close">\u2715</string>
+    <string name="gl_btn_min_desc">Minimize window</string>
+    <string name="gl_btn_max_desc">Maximize or restore window</string>
+    <string name="gl_btn_close_desc">Close window</string>
+    <!-- Shown in the corner only while the window is closed: the way back. -->
+    <string name="gl_show_window">\u2750 Guest</string>
 
     <!-- Console keyboard bar: the terminal keys a soft keyboard cannot produce.
          The arrows are written as escapes so the file stays ASCII-only. -->

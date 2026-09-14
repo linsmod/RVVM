@@ -1,267 +1,312 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!--
+  Two layers in one window:
+
+    layer 0 - the console: the TTY the guest's fd 1/2 and the keyboard are
+              parsed into, plus the terminal key bar and the run controls.
+              It owns the whole workspace and is never hidden.
+    layer 1 - the guest's graphics output: a floating card in the top-right
+              corner, a caption bar over a SurfaceView. MainActivity lifts the
+              surface above the window (setZOrderMediaOverlay), so the card can
+              be dragged anywhere over the console or expanded to fill the
+              workspace, and the console simply stays behind it.
+
+  The caption bar is the only host-owned part of the card. Nothing drawn in
+  this window can cover the surface itself, so the bar sits *above* the video
+  area instead of over it, and a touch on the video area is forwarded to the
+  guest like before.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/workspace"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:orientation="vertical">
+    android:layout_height="match_parent">
 
-    <!-- Two tabs: the guest's render target (SurfaceView + console overlay)
-         and the persistent TTY console (TextureView). The flipper swaps
-         between them; both stay alive, so the TTY keeps its screen while
-         graphics run in the other tab. -->
-    <ViewFlipper
-        android:id="@+id/viewFlipper"
+    <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1">
+        android:layout_height="match_parent"
+        android:orientation="vertical">
 
-        <!-- Tab 1: graphics -->
+        <!-- Console render target: a TextureView painted by MainActivity.drawTty().
+             An invisible 1x1 EditText is added to ttyViewport in code: it is the
+             keyboard/IME focus target, see MainActivity.initTtyInput(). -->
         <FrameLayout
+            android:id="@+id/ttyViewport"
             android:layout_width="match_parent"
-            android:layout_height="match_parent">
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:background="#FF000000">
 
-            <SurfaceView
-                android:id="@+id/surfaceView"
+            <TextureView
+                android:id="@+id/ttyView"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent" />
 
-            <!-- Tap toggles word wrap. Two nested scrollers so the unwrapped
-                 (single-line) mode can extend horizontally: the outer view
-                 scrolls X, the inner one Y. -->
-            <HorizontalScrollView
-                android:id="@+id/logOverlayScroll"
-                android:layout_width="match_parent"
-                android:layout_height="match_parent"
-                android:background="#C0000000"
-                android:fillViewport="true"
-                android:scrollbars="none"
-                android:visibility="gone">
-
-                <ScrollView
-                    android:id="@+id/logOverlayVScroll"
-                    android:layout_width="match_parent"
-                    android:layout_height="match_parent"
-                    android:fillViewport="true"
-                    android:scrollbars="none">
-
-                    <TextView
-                        android:id="@+id/logOverlayText"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:padding="6dp"
-                        android:textColor="#E0E0E0"
-                        android:textSize="12sp"
-                        android:typeface="monospace" />
-
-                </ScrollView>
-
-            </HorizontalScrollView>
-
         </FrameLayout>
 
-        <!-- Tab 2: TTY console, rendered by a TextureView + Canvas.
-             An invisible 1x1 EditText is added to ttyViewport in code: it is the
-             keyboard/IME focus target, see MainActivity.initTtyInput(). -->
+        <!-- Keys a soft keyboard cannot produce. Text, Enter and Backspace
+             come from the keyboard/app bar; these are what a shell needs for
+             line editing (arrows) and interrupting (^C), and they are the
+             only way to reach them on a touch-only device.
+             blocksDescendants: the buttons must never take keyboard focus
+             away from the console's input field. -->
+        <LinearLayout
+            android:id="@+id/ttyKeyBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#FF1C1C1C"
+            android:descendantFocusability="blocksDescendants"
+            android:orientation="horizontal"
+            android:padding="2dp">
+
+            <Button
+                android:id="@+id/ttyKeyEsc"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="@string/tty_key_esc"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/ttyKeyTab"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="@string/tty_key_tab"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/ttyKeyCtrlC"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="@string/tty_key_ctrl_c"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/ttyKeyLeft"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="@string/tty_key_left"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/ttyKeyUp"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="@string/tty_key_up"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/ttyKeyDown"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="@string/tty_key_down"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/ttyKeyRight"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="@string/tty_key_right"
+                android:textSize="12sp" />
+
+        </LinearLayout>
+
         <LinearLayout
             android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:background="#FF000000"
-            android:orientation="vertical">
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="8dp">
 
-            <FrameLayout
-                android:id="@+id/ttyViewport"
-                android:layout_width="match_parent"
-                android:layout_height="0dp"
-                android:layout_weight="1">
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/guest_app_label"
+                android:textSize="12sp"
+                android:layout_marginBottom="2dp" />
 
-                <TextureView
-                    android:id="@+id/ttyView"
-                    android:layout_width="match_parent"
-                    android:layout_height="match_parent" />
-
-            </FrameLayout>
-
-            <!-- Keys a soft keyboard cannot produce. Text, Enter and Backspace
-                 come from the keyboard/app bar; these are what a shell needs for
-                 line editing (arrows) and interrupting (^C), and they are the
-                 only way to reach them on a touch-only device.
-                 blocksDescendants: the buttons must never take keyboard focus
-                 away from the console's input field. -->
-            <LinearLayout
-                android:id="@+id/ttyKeyBar"
+            <Spinner
+                android:id="@+id/guestAppSpinner"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:background="#FF1C1C1C"
-                android:descendantFocusability="blocksDescendants"
+                android:layout_marginBottom="4dp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
                 android:orientation="horizontal"
-                android:padding="2dp">
+                android:layout_marginBottom="4dp">
 
                 <Button
-                    android:id="@+id/ttyKeyEsc"
+                    android:id="@+id/runButton"
                     android:layout_width="0dp"
-                    android:layout_height="40dp"
+                    android:layout_height="wrap_content"
                     android:layout_weight="1"
-                    android:minWidth="0dp"
-                    android:minHeight="0dp"
-                    android:padding="0dp"
-                    android:text="@string/tty_key_esc"
-                    android:textSize="12sp" />
+                    android:text="@string/run_guest"
+                    android:layout_marginEnd="4dp" />
 
                 <Button
-                    android:id="@+id/ttyKeyTab"
+                    android:id="@+id/suspendButton"
                     android:layout_width="0dp"
-                    android:layout_height="40dp"
+                    android:layout_height="wrap_content"
                     android:layout_weight="1"
-                    android:minWidth="0dp"
-                    android:minHeight="0dp"
-                    android:padding="0dp"
-                    android:text="@string/tty_key_tab"
-                    android:textSize="12sp" />
+                    android:text="@string/suspend_guest"
+                    android:enabled="false"
+                    android:layout_marginEnd="4dp" />
 
                 <Button
-                    android:id="@+id/ttyKeyCtrlC"
+                    android:id="@+id/stopButton"
                     android:layout_width="0dp"
-                    android:layout_height="40dp"
+                    android:layout_height="wrap_content"
                     android:layout_weight="1"
-                    android:minWidth="0dp"
-                    android:minHeight="0dp"
-                    android:padding="0dp"
-                    android:text="@string/tty_key_ctrl_c"
-                    android:textSize="12sp" />
-
-                <Button
-                    android:id="@+id/ttyKeyLeft"
-                    android:layout_width="0dp"
-                    android:layout_height="40dp"
-                    android:layout_weight="1"
-                    android:minWidth="0dp"
-                    android:minHeight="0dp"
-                    android:padding="0dp"
-                    android:text="@string/tty_key_left"
-                    android:textSize="12sp" />
-
-                <Button
-                    android:id="@+id/ttyKeyUp"
-                    android:layout_width="0dp"
-                    android:layout_height="40dp"
-                    android:layout_weight="1"
-                    android:minWidth="0dp"
-                    android:minHeight="0dp"
-                    android:padding="0dp"
-                    android:text="@string/tty_key_up"
-                    android:textSize="12sp" />
-
-                <Button
-                    android:id="@+id/ttyKeyDown"
-                    android:layout_width="0dp"
-                    android:layout_height="40dp"
-                    android:layout_weight="1"
-                    android:minWidth="0dp"
-                    android:minHeight="0dp"
-                    android:padding="0dp"
-                    android:text="@string/tty_key_down"
-                    android:textSize="12sp" />
-
-                <Button
-                    android:id="@+id/ttyKeyRight"
-                    android:layout_width="0dp"
-                    android:layout_height="40dp"
-                    android:layout_weight="1"
-                    android:minWidth="0dp"
-                    android:minHeight="0dp"
-                    android:padding="0dp"
-                    android:text="@string/tty_key_right"
-                    android:textSize="12sp" />
+                    android:text="@string/stop_guest"
+                    android:enabled="false" />
 
             </LinearLayout>
 
+            <TextView
+                android:id="@+id/statusText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Initializing..."
+                android:textSize="12sp"
+                android:background="#E0E0E0"
+                android:padding="4dp"
+                android:layout_marginBottom="4dp" />
+
         </LinearLayout>
-
-    </ViewFlipper>
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal">
-
-        <Button
-            android:id="@+id/tabGraphicsButton"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="@string/tab_graphics"
-            android:layout_marginEnd="4dp" />
-
-        <Button
-            android:id="@+id/tabConsoleButton"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="@string/tab_console" />
 
     </LinearLayout>
 
+    <!-- The floating graphics window. It is a viewport onto the pinned 720p
+         panel (see MainActivity.PANEL_W/H), not the panel itself, so its size
+         only decides how big the guest's screen is shown - the video area is
+         16:9 (318x179dp inside the 1dp frame, under the 32dp caption) to match
+         1280x720 and keep the guest's frame undistorted.
+
+         The 1dp padding is the window's border: the surface composites above
+         this window, so the frame drawable is only visible in the ring the
+         card keeps free around its content. See gl_window_frame.xml. -->
     <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:id="@+id/glWindow"
+        android:layout_width="320dp"
+        android:layout_height="213dp"
+        android:layout_gravity="top|end"
+        android:layout_margin="12dp"
+        android:background="@drawable/gl_window_frame"
+        android:elevation="8dp"
         android:orientation="vertical"
-        android:padding="8dp">
+        android:padding="1dp">
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/guest_app_label"
-            android:textSize="12sp"
-            android:layout_marginBottom="2dp" />
-
-        <Spinner
-            android:id="@+id/guestAppSpinner"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginBottom="4dp" />
-
+        <!-- Title bar: the title area is the drag handle, the three buttons on
+             its right are the Windows set (minimize / maximize-restore /
+             close). The buttons are siblings of the drag handle on purpose -
+             a touch that lands on one of them has to reach its click listener
+             instead of starting a drag. -->
         <LinearLayout
+            android:id="@+id/glCaptionBar"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:layout_marginBottom="4dp">
+            android:layout_height="32dp"
+            android:background="#FF303030"
+            android:orientation="horizontal">
 
-            <Button
-                android:id="@+id/runButton"
+            <TextView
+                android:id="@+id/glCaption"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
+                android:layout_height="match_parent"
                 android:layout_weight="1"
-                android:text="@string/run_guest"
-                android:layout_marginEnd="4dp" />
+                android:gravity="center_vertical"
+                android:paddingStart="10dp"
+                android:paddingEnd="6dp"
+                android:singleLine="true"
+                android:text="@string/gl_title"
+                android:textColor="#FFE0E0E0"
+                android:textSize="12sp" />
 
-            <Button
-                android:id="@+id/suspendButton"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="@string/suspend_guest"
-                android:enabled="false"
-                android:layout_marginEnd="4dp" />
+            <TextView
+                android:id="@+id/glBtnMin"
+                android:layout_width="36dp"
+                android:layout_height="match_parent"
+                android:background="?android:attr/selectableItemBackground"
+                android:contentDescription="@string/gl_btn_min_desc"
+                android:gravity="center"
+                android:text="@string/gl_btn_min"
+                android:textColor="#FFE0E0E0"
+                android:textSize="12sp" />
 
-            <Button
-                android:id="@+id/stopButton"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="@string/stop_guest"
-                android:enabled="false" />
+            <TextView
+                android:id="@+id/glBtnMax"
+                android:layout_width="36dp"
+                android:layout_height="match_parent"
+                android:background="?android:attr/selectableItemBackground"
+                android:contentDescription="@string/gl_btn_max_desc"
+                android:gravity="center"
+                android:text="@string/gl_btn_max"
+                android:textColor="#FFE0E0E0"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/glBtnClose"
+                android:layout_width="36dp"
+                android:layout_height="match_parent"
+                android:background="?android:attr/selectableItemBackground"
+                android:contentDescription="@string/gl_btn_close_desc"
+                android:gravity="center"
+                android:text="@string/gl_btn_close"
+                android:textColor="#FFE0E0E0"
+                android:textSize="12sp" />
 
         </LinearLayout>
 
-        <TextView
-            android:id="@+id/statusText"
+        <SurfaceView
+            android:id="@+id/surfaceView"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Initializing..."
-            android:textSize="12sp"
-            android:background="#E0E0E0"
-            android:padding="4dp"
-            android:layout_marginBottom="4dp" />
+            android:layout_height="0dp"
+            android:layout_weight="1" />
 
     </LinearLayout>
 
-</LinearLayout>
+    <!-- Stand-in for the taskbar: the window has no launcher to come back from,
+         so while it is closed this chip in the corner is the way to it. The
+         guest itself keeps running - closing a window is not stopping a guest. -->
+    <TextView
+        android:id="@+id/glShowChip"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_margin="12dp"
+        android:background="@drawable/gl_window_frame"
+        android:elevation="8dp"
+        android:padding="8dp"
+        android:singleLine="true"
+        android:text="@string/gl_show_window"
+        android:textColor="#FFE0E0E0"
+        android:textSize="12sp"
+        android:visibility="gone" />
+
+</FrameLayout>

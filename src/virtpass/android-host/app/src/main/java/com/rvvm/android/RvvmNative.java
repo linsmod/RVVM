@@ -48,6 +48,24 @@ public class RvvmNative {
                                                      int screenLong, int screenRound);
 
     /**
+     * Pin the virtual panel: the pixel geometry the guest renders into and
+     * which {@link #nativePostMotionEvent} coordinates are expressed in.
+     *
+     * Without this the panel is latched from the first surface size the native
+     * side sees, which ties the guest's resolution to the size of the floating
+     * graphics window - and that window moves. Pinning it keeps the guest on a
+     * fixed geometry (720p landscape by default) with the window acting purely
+     * as a viewport onto it.
+     *
+     * Must be called before the guest observes a window geometry (i.e. before
+     * starting it); once a guest has a buffer, the call is ignored.
+     *
+     * @param width  Panel width in pixels
+     * @param height Panel height in pixels
+     */
+    public static native void nativeSetPanelSize(int width, int height);
+
+    /**
      * Get the library version.
      * @return Version string
      */
