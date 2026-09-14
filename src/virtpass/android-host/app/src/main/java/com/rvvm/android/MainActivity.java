@@ -1667,6 +1667,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         // arrives, so there is nothing to reset here.
         openGuestLogFile(elfName);
 
+        // This run's guest handle: created here - after the hold-back check, so
+        // a run that never starts does not consume a slot - and made the one the
+        // native surface addresses. Its id is what the taskbar entry will name.
+        int guestId = RvvmNative.nativeCreateGuest();
+        if (guestId >= 0) {
+            RvvmNative.nativeSetActiveGuest(guestId);
+        }
+
         replayGuestStartupState();
 
         boolean started = RvvmNative.nativeRunElf(elfPath, null);

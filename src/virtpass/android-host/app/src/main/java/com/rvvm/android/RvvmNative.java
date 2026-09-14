@@ -19,6 +19,31 @@ public class RvvmNative {
     public static native void nativeInit();
 
     /**
+     * Create a guest run and return its id (or -1 when the run table is full).
+     *
+     * The rest of this class's run-scoped calls address "the" active guest
+     * rather than taking an id on every signature: they are driven from the UI
+     * thread, which serializes its own calls, so {@link #nativeSetActiveGuest}
+     * followed by the calls that seed and start that guest is the whole
+     * contract. A host that only ever runs one guest never needs these - the
+     * active guest is created on demand.
+     */
+    public static native int nativeCreateGuest();
+
+    /**
+     * End a guest that never started. A guest that did start ends itself in its
+     * own thread, and this call refuses to free a run that thread is standing
+     * in.
+     */
+    public static native void nativeDestroyGuest(int guestId);
+
+    /**
+     * Make the given guest the one the run-scoped calls address. Returns false
+     * when there is no guest with that id.
+     */
+    public static native boolean nativeSetActiveGuest(int guestId);
+
+    /**
      * Clean up native resources.
      * Must be called when the app is destroyed.
      */
