@@ -148,6 +148,13 @@ struct vp_cmdpost {
     /* ---- Audio streams ---- */
     const vp_audio_ops_t*  audio_ops;
     cmdpost_audio_stream_t audio_streams[CMDPOST_MAX_AUDIO_STREAMS];
+
+    /* ---- Sensors ----
+     * The sensor subsystem's per-guest state (its descriptor table and its
+     * queues) is over there; its device-level half (the backend, the aggregate
+     * it is driven with, the fan-out) is process-wide. Owned here so a host
+     * cannot end up with one of the two and not the other. */
+    vp_sensor_t*           sensor;
 };
 
 /*
@@ -180,6 +187,11 @@ vp_cmdpost_t* cmdpost_create(void)
      * valid fd, so it cannot be left to the calloc zeroing. Every other field is
      * fine as zero (callbacks unregistered, queues empty). */
     inst->choreographer_fd = -1;
+
+    /* This guest's sensor state. NULL when the sensor subsystem is out of
+     * instance slots: the guest then sees no sensors, exactly like a host with
+     * no backend. */
+    inst->sensor = vp_sensor_create();
     return inst;
 }
 
@@ -191,6 +203,13 @@ void cmdpost_destroy(vp_cmdpost_t* inst)
         return;
     }
     cmdpost_cleanup(inst);
+
+    /* The sensor state goes last: cleanup() already ended this instance's run,
+     * which is what drops its queues, so nothing can dispatch into it any more
+     * (and the guest that owned them is gone). */
+    vp_sensor_destroy(inst->sensor);
+    inst->sensor = NULL;
+
     free(inst);
 }
 
@@ -441,7 +460,7 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
                 case VP_SENSOR_QUEUE_SET_RATE:
                 case VP_SENSOR_QUEUE_HAS:
                 case VP_SENSOR_QUEUE_READ:
-                    return vp_sensor_dispatch(a0, a1, a2, a3, a4);
+                    return vp_sensor_dispatch(inst->sensor, a0, a1, a2, a3, a4);
 
                 case SYS_ANDROID_WINDOW_INIT: {
                     /* Initialize window */
@@ -916,15 +935,12 @@ static void cmdpost_drop_run_state(vp_cmdpost_t* inst)
     inst->vsync_armed        = false;
     inst->vsync_source_lost  = false;
 
-    /* Sensor queues, the staging FIFO and the platform sources armed by the
-     * guest all belong to the guest that just exited. vp_sensor_reset() drops
-     * them and detaches the backend; a relaunched guest installs its own ops
-     * through vp_sensor_set_ops() before it starts.
-     *
-     * vp_sensor is still process-wide state: two guests running at once share
-     * it (and would clear each other's queues here). Instance-ising it is the
-     * same treatment this file just got, and is not done yet. */
-    vp_sensor_reset();
+    /* Sensor queues, the staging FIFO and the descriptor table this guest
+     * enumerated all belong to the guest that just exited, and only to it:
+     * vp_sensor_reset() drops this instance's queues and recomputes the device
+     * aggregate, which switches off any sensor this guest was the last
+     * subscriber of. The backend registration is the device's and stays. */
+    vp_sensor_reset(inst->sensor);
 
     /* The guest that owned these queues is gone, so nothing will ever drain
      * them. A host that reuses the process (launcher: Run after Run) must not

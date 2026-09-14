@@ -2275,6 +2275,10 @@ static void launcher_toggle_suspend(void)
  * with in-flight guest dispatches. */
 static void win32_cmdpost_register_callbacks(void)
 {
+    /* Device-level, so it outlives the run: the per-guest half (descriptor
+     * table, queues) is the cmdpost instance's and is dropped by
+     * vp_sensor_reset() when that guest exits. Re-registering per launch is an
+     * idempotent restatement. */
     vp_sensor_set_ops(win32_sensor_stub_ops());
     cmdpost_set_window_callbacks(g_cmdpost, on_window_lock, on_window_unlock);
     cmdpost_set_window_size_callback(g_cmdpost, on_window_size);

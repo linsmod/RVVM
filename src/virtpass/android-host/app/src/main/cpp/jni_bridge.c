@@ -1279,7 +1279,11 @@ static void jni_register_cmdpost_callbacks(void)
     cmdpost_set_audio_callbacks(g_cmdpost, android_aaudio_ops());
 
     /* Real sensor backend: vp_sensor_android.c owns the platform
-     * ASensorEventQueue and feeds the subsystem through vp_sensor_ingest(). */
+     * ASensorEventQueue and feeds the subsystem through vp_sensor_ingest().
+     * The registration is device-level and survives a run (the per-guest half
+     * - descriptor table, queues - is the cmdpost instance's, and is dropped by
+     * vp_sensor_reset() when that guest exits), so re-running this per guest is
+     * just an idempotent restatement of "the platform source is still ours". */
     android_sensor_start();
     vp_sensor_set_ops(android_sensor_ops());
 

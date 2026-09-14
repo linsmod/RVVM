@@ -10,9 +10,16 @@
  *   - every guest consultation of a queue (QUEUE_READ / QUEUE_HAS) clears the
  *     armed flag, and the guest stub drains the pipe before consulting, so at
  *     most one byte is ever outstanding and write() cannot fill the pipe.
+ *
+ * The split between the device and an instance is what makes a second guest
+ * possible: descriptors, queues and FIFOs live per instance (one guest cannot
+ * name another's queue, and ending a run clears only its own), while the
+ * backend, the aggregate it is driven with and the fan-out stay process-wide -
+ * there is one accelerometer, and it serves every subscriber.
  */
 
 #include <stdio.h>
+#include <stdlib.h>  /* calloc/free: one instance per guest, made on demand */
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -33,6 +40,12 @@
 #define SENSLOG(fmt, ...) printf("[sensor] " fmt "\n", ##__VA_ARGS__)
 #endif
 
+/* How many guests can have sensors at once in one process. Each host runs one
+ * guest at a time today; this is the ceiling for the day one wants more, and
+ * vp_sensor_create() fails (a guest without sensors) beyond it rather than
+ * silently dropping a guest's events. */
+#define VP_SENSOR_MAX_INSTANCES 8
+
 /* ============================================================
  * State
  * ============================================================ */
@@ -51,39 +64,60 @@ typedef struct {
     vp_sensor_event_t fifo[VP_SENSOR_FIFO_MAX_EVENTS];
 } vp_sensor_queue_t;
 
-static vp_sensor_queue_t      g_queues[VP_SENSOR_MAX_QUEUES];
-static vp_sensor_info_t       g_desc[VP_SENSOR_MAX_HANDLES];
-static int32_t                g_desc_count = 0;
-static uint32_t               g_caps = 0;
-static bool                   g_ready = false;
+/* One guest's subscriber state. Zero-initialized storage is a valid starting
+ * point (an empty queue table, an empty descriptor table, a quiescent lock). */
+struct vp_sensor {
+    vp_sensor_queue_t queues[VP_SENSOR_MAX_QUEUES];
+    vp_sensor_info_t  desc[VP_SENSOR_MAX_HANDLES];
+    int32_t           desc_count;
+    uint32_t          caps;
+    bool              ready;
+
+    /* Guards this instance's descriptor table and queues. */
+    rvvm_lock_t       lock;
+};
+
+/* ---- Device level ----
+ *
+ * Shared by every instance: the backend, the aggregate last pushed to it, and
+ * the list of instances to fan events out to. Zero-initialized static storage
+ * is a valid quiescent rvvm_lock_t. */
 static const vp_sensor_ops_t* g_ops = NULL;
-
-/* Zero-initialized static storage is a valid quiescent rvvm_lock_t. */
-static rvvm_lock_t            g_lock;
-
-/* Aggregate per-handle state last pushed to the backend, so a queue change
- * only produces a platform call when the aggregate actually changes. Only the
- * guest thread (and teardown) touches these. */
 static bool                   g_backend_on[VP_SENSOR_MAX_HANDLES];
 static int32_t                g_backend_rate[VP_SENSOR_MAX_HANDLES];
+static rvvm_lock_t            g_dev_lock;
+static vp_sensor_t*           g_instances[VP_SENSOR_MAX_INSTANCES];
 
-static void sensor_lock(void)   { rvvm_lock_slow(&g_lock); }
-static void sensor_unlock(void) { rvvm_unlock(&g_lock); }
+static void sensor_lock(vp_sensor_t* self)   { rvvm_lock_slow(&self->lock); }
+static void sensor_unlock(vp_sensor_t* self) { rvvm_unlock(&self->lock); }
 
-static vp_sensor_queue_t* sensor_queue(int64_t id)
+/* The registered backend, read under the device lock. The pointer stays valid
+ * until the host detaches it, and a caller must not hold this lock while using
+ * it (the backend can be slow, and must never be called under a lock). */
+static const vp_sensor_ops_t* sensor_ops(void)
 {
-    if (id < 0 || id >= VP_SENSOR_MAX_QUEUES || !g_queues[id].used) {
-        return NULL;
-    }
-    return &g_queues[id];
+    const vp_sensor_ops_t* ops;
+
+    rvvm_lock_slow(&g_dev_lock);
+    ops = g_ops;
+    rvvm_unlock(&g_dev_lock);
+    return ops;
 }
 
-static vp_sensor_info_t* sensor_desc(int32_t handle)
+static vp_sensor_queue_t* sensor_queue(vp_sensor_t* self, int64_t id)
 {
-    if (handle < 0 || handle >= g_desc_count) {
+    if (id < 0 || id >= VP_SENSOR_MAX_QUEUES || !self->queues[id].used) {
         return NULL;
     }
-    return &g_desc[handle];
+    return &self->queues[id];
+}
+
+static vp_sensor_info_t* sensor_desc(vp_sensor_t* self, int32_t handle)
+{
+    if (handle < 0 || handle >= self->desc_count) {
+        return NULL;
+    }
+    return &self->desc[handle];
 }
 
 /* ============================================================
@@ -122,7 +156,7 @@ static void sensor_wake(vp_sensor_queue_t* q)
 }
 
 /* ============================================================
- * Producer entry point
+ * Producer entry point (device level)
  * ============================================================ */
 
 void vp_sensor_ingest(int32_t handle, const vp_sensor_event_t* ev)
@@ -131,65 +165,91 @@ void vp_sensor_ingest(int32_t handle, const vp_sensor_event_t* ev)
         return;
     }
 
-    sensor_lock();
-    const vp_sensor_info_t* desc = g_ops ? sensor_desc(handle) : NULL;
-    if (desc) {
-        /* The wire identity is ours, not the backend's: fill it from the same
-         * descriptor the guest enumerated, so ev.sensor/ev.type can never
-         * disagree with ASensor_getHandle()/ASensor_getType(). */
-        vp_sensor_event_t wire = *ev;
-        wire.version = VP_SENSOR_EVENT_VERSION;
-        wire.sensor = desc->handle;
-        wire.type = desc->type;
-        wire.flags = desc->wake_up ? VP_SENSOR_FLAG_WAKE_UP : 0;
+    if (handle < 0 || handle >= VP_SENSOR_MAX_HANDLES) {
+        return;
+    }
 
-        for (int32_t i = 0; i < VP_SENSOR_MAX_QUEUES; i++) {
-            vp_sensor_queue_t* q = &g_queues[i];
-            if (q->used && q->enabled[handle]) {
-                sensor_fifo_push(q, &wire);
-                sensor_wake(q);
+    /* One device event, every subscriber. Each instance gets its own copy of
+     * the wire identity, taken from *its* descriptor table, so the fields can
+     * never disagree with the list that instance was handed. */
+    rvvm_lock_slow(&g_dev_lock);
+    for (int32_t i = 0; i < VP_SENSOR_MAX_INSTANCES; i++) {
+        vp_sensor_t* self = g_instances[i];
+        if (!self) {
+            continue;
+        }
+
+        sensor_lock(self);
+        const vp_sensor_info_t* desc = sensor_desc(self, handle);
+        if (desc) {
+            /* The wire identity is ours, not the backend's: fill it from the
+             * same descriptor the guest enumerated, so ev.sensor/ev.type can
+             * never disagree with ASensor_getHandle()/ASensor_getType(). */
+            vp_sensor_event_t wire = *ev;
+            wire.version = VP_SENSOR_EVENT_VERSION;
+            wire.sensor = desc->handle;
+            wire.type = desc->type;
+            wire.flags = desc->wake_up ? VP_SENSOR_FLAG_WAKE_UP : 0;
+
+            for (int32_t q = 0; q < VP_SENSOR_MAX_QUEUES; q++) {
+                vp_sensor_queue_t* qu = &self->queues[q];
+                if (qu->used && qu->enabled[handle]) {
+                    sensor_fifo_push(qu, &wire);
+                    sensor_wake(qu);
+                }
             }
         }
+        sensor_unlock(self);
     }
-    sensor_unlock();
+    rvvm_unlock(&g_dev_lock);
 }
 
 /* ============================================================
- * Backend aggregation
+ * Backend aggregation (device level)
  * ============================================================ */
 
 /* Push the aggregate state of one handle to the backend: the platform source
- * runs while at least one queue has the sensor enabled, at the fastest rate
- * anybody asked for. This is what keeps a backend free of queue knowledge. */
+ * runs while at least one queue *of any instance* has the sensor enabled, at
+ * the fastest rate anybody asked for. This is what keeps a backend free of
+ * queue - and guest - knowledge. */
 static void sensor_sync_handle(int32_t handle)
 {
     bool any = false;
     int32_t period = 0;
     int32_t batch = 0;
-    const vp_sensor_ops_t* ops = NULL;
+    const vp_sensor_ops_t* ops;
 
     if (handle < 0 || handle >= VP_SENSOR_MAX_HANDLES) {
         return;
     }
 
-    sensor_lock();
-    for (int32_t i = 0; i < VP_SENSOR_MAX_QUEUES; i++) {
-        const vp_sensor_queue_t* q = &g_queues[i];
-        if (!q->used || !q->enabled[handle]) {
+    rvvm_lock_slow(&g_dev_lock);
+    for (int32_t i = 0; i < VP_SENSOR_MAX_INSTANCES; i++) {
+        vp_sensor_t* self = g_instances[i];
+        if (!self) {
             continue;
         }
-        any = true;
-        int32_t r = q->rate_us[handle];
-        if (r > 0 && (period == 0 || r < period)) {
-            period = r;
+
+        sensor_lock(self);
+        for (int32_t q = 0; q < VP_SENSOR_MAX_QUEUES; q++) {
+            const vp_sensor_queue_t* qu = &self->queues[q];
+            if (!qu->used || !qu->enabled[handle]) {
+                continue;
+            }
+            any = true;
+            int32_t r = qu->rate_us[handle];
+            if (r > 0 && (period == 0 || r < period)) {
+                period = r;
+            }
+            int32_t b = qu->batch_us[handle];
+            if (b > 0 && (batch == 0 || b < batch)) {
+                batch = b;
+            }
         }
-        int32_t b = q->batch_us[handle];
-        if (b > 0 && (batch == 0 || b < batch)) {
-            batch = b;
-        }
+        sensor_unlock(self);
     }
     ops = g_ops;
-    sensor_unlock();
+    rvvm_unlock(&g_dev_lock);
 
     if (!ops) {
         return;
@@ -209,56 +269,116 @@ static void sensor_sync_handle(int32_t handle)
 }
 
 /* ============================================================
+ * Instance lifetime
+ * ============================================================ */
+
+vp_sensor_t* vp_sensor_create(void)
+{
+    vp_sensor_t* self = calloc(1, sizeof(*self));
+    bool added = false;
+
+    if (!self) {
+        return NULL;
+    }
+    /* rvvm_lock_t is a single flag whose zero is the quiescent state, so the
+     * calloc'd lock is already valid. */
+
+    rvvm_lock_slow(&g_dev_lock);
+    for (int32_t i = 0; i < VP_SENSOR_MAX_INSTANCES; i++) {
+        if (!g_instances[i]) {
+            g_instances[i] = self;
+            added = true;
+            break;
+        }
+    }
+    rvvm_unlock(&g_dev_lock);
+
+    if (!added) {
+        /* Out of instance slots: refuse rather than hand back one that would
+         * never receive an event (its queues would look alive to the guest). */
+        SENSLOG("no instance slot left (max %d)", VP_SENSOR_MAX_INSTANCES);
+        free(self);
+        return NULL;
+    }
+    return self;
+}
+
+void vp_sensor_destroy(vp_sensor_t* self)
+{
+    if (!self) {
+        return;
+    }
+
+    /* Off the device's aggregate first, so the sensors this guest was keeping
+     * alive are switched off before its queues disappear. */
+    vp_sensor_reset(self);
+
+    rvvm_lock_slow(&g_dev_lock);
+    for (int32_t i = 0; i < VP_SENSOR_MAX_INSTANCES; i++) {
+        if (g_instances[i] == self) {
+            g_instances[i] = NULL;
+        }
+    }
+    rvvm_unlock(&g_dev_lock);
+
+    free(self);
+}
+
+/* ============================================================
  * Manager init
  * ============================================================ */
 
-static int64_t sensor_manager_init(void)
+static int64_t sensor_manager_init(vp_sensor_t* self)
 {
     int64_t rc;
+    const vp_sensor_ops_t* ops = sensor_ops();
 
-    sensor_lock();
-    if (!g_ready) {
-        g_ready = true;
-        g_caps = 0;
+    /* The instance lock is held across the backend calls below: enumerate()
+     * and query() are documented as "must not call back into this subsystem",
+     * so there is no path back through the device lock from here. */
+    sensor_lock(self);
+    if (!self->ready) {
+        self->ready = true;
+        self->caps = 0;
 
-        if (g_ops) {
-            if (g_ops->query) {
-                g_caps = g_ops->query();
+        if (ops) {
+            if (ops->query) {
+                self->caps = ops->query();
             }
-            if ((g_caps & VP_SENSOR_CAP_LIST) && g_ops->enumerate) {
-                int32_t n = g_ops->enumerate(g_desc, VP_SENSOR_MAX_HANDLES);
-                g_desc_count = (n > 0 && n <= VP_SENSOR_MAX_HANDLES) ? n : 0;
+            if ((self->caps & VP_SENSOR_CAP_LIST) && ops->enumerate) {
+                int32_t n = ops->enumerate(self->desc, VP_SENSOR_MAX_HANDLES);
+                self->desc_count = (n > 0 && n <= VP_SENSOR_MAX_HANDLES) ? n : 0;
             }
-            for (int32_t i = 0; i < g_desc_count; i++) {
+            for (int32_t i = 0; i < self->desc_count; i++) {
                 /* The handle IS the descriptor index: a backend cannot hand out
                  * a handle the guest could not look up in the list it got. */
-                g_desc[i].handle = i;
+                self->desc[i].handle = i;
                 /* Advertise only what the staging FIFO can actually hold. */
-                if (g_desc[i].fifo_max_events <= 0 ||
-                    g_desc[i].fifo_max_events > VP_SENSOR_FIFO_MAX_EVENTS) {
-                    g_desc[i].fifo_max_events = VP_SENSOR_FIFO_MAX_EVENTS;
+                if (self->desc[i].fifo_max_events <= 0 ||
+                    self->desc[i].fifo_max_events > VP_SENSOR_FIFO_MAX_EVENTS) {
+                    self->desc[i].fifo_max_events = VP_SENSOR_FIFO_MAX_EVENTS;
                 }
             }
-            if (g_desc_count == 0) {
-                g_caps = 0;
+            if (self->desc_count == 0) {
+                self->caps = 0;
             } else {
                 bool wake_up = false;
-                for (int32_t i = 0; i < g_desc_count; i++) {
-                    if (g_desc[i].wake_up) {
+                for (int32_t i = 0; i < self->desc_count; i++) {
+                    if (self->desc[i].wake_up) {
                         wake_up = true;
                         break;
                     }
                 }
                 if (wake_up) {
-                    g_caps |= VP_SENSOR_CAP_WAKEUP;
+                    self->caps |= VP_SENSOR_CAP_WAKEUP;
                 } else {
-                    g_caps &= ~VP_SENSOR_CAP_WAKEUP;
+                    self->caps &= ~VP_SENSOR_CAP_WAKEUP;
                 }
             }
         }
     }
-    rc = (int64_t)g_caps;
-    sensor_unlock();
+    rc = (int64_t)self->caps;
+    sensor_unlock(self);
     return rc;
 }
 
@@ -266,64 +386,64 @@ static int64_t sensor_manager_init(void)
  * Sub-command dispatch
  * ============================================================ */
 
-static int64_t sensor_queue_create(int64_t wake_fd)
+static int64_t sensor_queue_create(vp_sensor_t* self, int64_t wake_fd)
 {
     int64_t rc = VP_SENSOR_ERROR_UNSUPPORTED;
 
-    sensor_lock();
-    if (g_ops) {
+    sensor_lock(self);
+    if (sensor_ops()) {
         rc = VP_SENSOR_ERROR_NO_MEMORY;
         for (int32_t i = 0; i < VP_SENSOR_MAX_QUEUES; i++) {
-            if (g_queues[i].used) {
+            if (self->queues[i].used) {
                 continue;
             }
-            memset(&g_queues[i], 0, sizeof(g_queues[i]));
-            g_queues[i].used = true;
-            if (wake_fd >= 0 && (g_caps & VP_SENSOR_CAP_FD_WAKEUP)) {
-                g_queues[i].wake_fd = (int32_t)wake_fd;
+            memset(&self->queues[i], 0, sizeof(self->queues[i]));
+            self->queues[i].used = true;
+            if (wake_fd >= 0 && (self->caps & VP_SENSOR_CAP_FD_WAKEUP)) {
+                self->queues[i].wake_fd = (int32_t)wake_fd;
             } else {
-                g_queues[i].wake_fd = -1;
+                self->queues[i].wake_fd = -1;
             }
             rc = i;
             break;
         }
     }
-    sensor_unlock();
+    sensor_unlock(self);
     return rc;
 }
 
-static int64_t sensor_queue_destroy(int64_t id)
+static int64_t sensor_queue_destroy(vp_sensor_t* self, int64_t id)
 {
     int64_t rc = VP_SENSOR_ERROR_INVALID_ARG;
 
-    sensor_lock();
-    vp_sensor_queue_t* q = sensor_queue(id);
+    sensor_lock(self);
+    vp_sensor_queue_t* q = sensor_queue(self, id);
     if (q) {
         memset(q, 0, sizeof(*q));
         rc = VP_SENSOR_OK;
     }
-    sensor_unlock();
+    sensor_unlock(self);
 
     if (rc == VP_SENSOR_OK) {
         /* A handle can lose its last subscriber here. */
-        for (int32_t h = 0; h < g_desc_count; h++) {
+        for (int32_t h = 0; h < self->desc_count; h++) {
             sensor_sync_handle(h);
         }
     }
     return rc;
 }
 
-static int64_t sensor_queue_enable(int64_t id, int64_t handle, bool enable)
+static int64_t sensor_queue_enable(vp_sensor_t* self, int64_t id, int64_t handle, bool enable)
 {
     int64_t rc = VP_SENSOR_ERROR_INVALID_ARG;
 
-    sensor_lock();
-    vp_sensor_queue_t* q = sensor_queue(id);
-    if (q && sensor_desc((int32_t)handle)) {
+    sensor_lock(self);
+    vp_sensor_queue_t* q = sensor_queue(self, id);
+    if (q && sensor_desc(self, (int32_t)handle)) {
         q->enabled[handle] = enable;
         rc = VP_SENSOR_OK;
     }
-    sensor_unlock();
+    sensor_unlock(self);
 
     if (rc == VP_SENSOR_OK) {
         sensor_sync_handle((int32_t)handle);
@@ -331,20 +451,20 @@ static int64_t sensor_queue_enable(int64_t id, int64_t handle, bool enable)
     return rc;
 }
 
-static int64_t sensor_queue_set_rate(int64_t id, int64_t handle,
+static int64_t sensor_queue_set_rate(vp_sensor_t* self, int64_t id, int64_t handle,
                                     int64_t period_us, int64_t batch_us)
 {
     int64_t rc = VP_SENSOR_ERROR_INVALID_ARG;
 
-    sensor_lock();
-    vp_sensor_queue_t* q = sensor_queue(id);
-    if (q && sensor_desc((int32_t)handle)) {
+    sensor_lock(self);
+    vp_sensor_queue_t* q = sensor_queue(self, id);
+    if (q && sensor_desc(self, (int32_t)handle)) {
         /* 0 keeps the NDK meaning of "use the backend default". */
         q->rate_us[handle] = (int32_t)(period_us > 0 ? period_us : 0);
         q->batch_us[handle] = (int32_t)(batch_us > 0 ? batch_us : 0);
         rc = VP_SENSOR_OK;
     }
-    sensor_unlock();
+    sensor_unlock(self);
 
     if (rc == VP_SENSOR_OK) {
         sensor_sync_handle((int32_t)handle);
@@ -352,7 +472,7 @@ static int64_t sensor_queue_set_rate(int64_t id, int64_t handle,
     return rc;
 }
 
-static int64_t sensor_queue_read(int64_t id, int64_t guest_events, int64_t want)
+static int64_t sensor_queue_read(vp_sensor_t* self, int64_t id, int64_t guest_events, int64_t want)
 {
     vp_sensor_event_t* dst = guest_events ? rvvm_user_guest_ptr((uint64_t)guest_events) : NULL;
     int64_t rc = 0;
@@ -361,8 +481,8 @@ static int64_t sensor_queue_read(int64_t id, int64_t guest_events, int64_t want)
         return VP_SENSOR_ERROR_INVALID_ARG;
     }
 
-    sensor_lock();
-    vp_sensor_queue_t* q = sensor_queue(id);
+    sensor_lock(self);
+    vp_sensor_queue_t* q = sensor_queue(self, id);
     if (q) {
         int32_t n = 0;
         while (n < (int32_t)want && q->count > 0) {
@@ -375,15 +495,22 @@ static int64_t sensor_queue_read(int64_t id, int64_t guest_events, int64_t want)
         q->wake_armed = false;
         rc = n;
     }
-    sensor_unlock();
+    sensor_unlock(self);
     return rc;
 }
 
-int64_t vp_sensor_dispatch(int64_t sub, int64_t a1, int64_t a2, int64_t a3, int64_t a4)
+int64_t vp_sensor_dispatch(vp_sensor_t* self, int64_t sub, int64_t a1, int64_t a2, int64_t a3, int64_t a4)
 {
+    if (!self) {
+        /* No instance (out of slots, or a host that never created one): answer
+         * like a device with no sensors, which is what the guest stub expects
+         * from a host with no backend. */
+        return VP_SENSOR_ERROR_INVALID_ARG;
+    }
+
     switch (sub) {
         case VP_SENSOR_MANAGER_INIT:
-            return sensor_manager_init();
+            return sensor_manager_init(self);
 
         case VP_SENSOR_LIST: {
             vp_sensor_info_t* dst = a1 ? rvvm_user_guest_ptr((uint64_t)a1) : NULL;
@@ -393,13 +520,13 @@ int64_t vp_sensor_dispatch(int64_t sub, int64_t a1, int64_t a2, int64_t a3, int6
             if (!dst || max <= 0) {
                 return 0;
             }
-            sensor_lock();
-            int32_t n = max < g_desc_count ? max : g_desc_count;
+            sensor_lock(self);
+            int32_t n = max < self->desc_count ? max : self->desc_count;
             if (n > 0) {
-                memcpy(dst, g_desc, sizeof(g_desc[0]) * (size_t)n);
+                memcpy(dst, self->desc, sizeof(self->desc[0]) * (size_t)n);
             }
             rc = n;
-            sensor_unlock();
+            sensor_unlock(self);
             return rc;
         }
 
@@ -407,47 +534,47 @@ int64_t vp_sensor_dispatch(int64_t sub, int64_t a1, int64_t a2, int64_t a3, int6
             int32_t type = (int32_t)a1;
             int64_t rc = -1;
 
-            sensor_lock();
-            for (int32_t i = 0; i < g_desc_count; i++) {
-                if (g_desc[i].type == type) {
-                    rc = g_desc[i].handle;
+            sensor_lock(self);
+            for (int32_t i = 0; i < self->desc_count; i++) {
+                if (self->desc[i].type == type) {
+                    rc = self->desc[i].handle;
                     break;
                 }
             }
-            sensor_unlock();
+            sensor_unlock(self);
             return rc;
         }
 
         case VP_SENSOR_QUEUE_CREATE:
-            return sensor_queue_create(a1);
+            return sensor_queue_create(self, a1);
 
         case VP_SENSOR_QUEUE_DESTROY:
-            return sensor_queue_destroy(a1);
+            return sensor_queue_destroy(self, a1);
 
         case VP_SENSOR_QUEUE_ENABLE:
-            return sensor_queue_enable(a1, a2, true);
+            return sensor_queue_enable(self, a1, a2, true);
 
         case VP_SENSOR_QUEUE_DISABLE:
-            return sensor_queue_enable(a1, a2, false);
+            return sensor_queue_enable(self, a1, a2, false);
 
         case VP_SENSOR_QUEUE_SET_RATE:
-            return sensor_queue_set_rate(a1, a2, a3, a4);
+            return sensor_queue_set_rate(self, a1, a2, a3, a4);
 
         case VP_SENSOR_QUEUE_HAS: {
             int64_t rc = VP_SENSOR_ERROR_INVALID_ARG;
 
-            sensor_lock();
-            vp_sensor_queue_t* q = sensor_queue(a1);
+            sensor_lock(self);
+            vp_sensor_queue_t* q = sensor_queue(self, a1);
             if (q) {
                 q->wake_armed = false;
                 rc = q->count > 0 ? 1 : 0;
             }
-            sensor_unlock();
+            sensor_unlock(self);
             return rc;
         }
 
         case VP_SENSOR_QUEUE_READ:
-            return sensor_queue_read(a1, a2, a3);
+            return sensor_queue_read(self, a1, a2, a3);
 
         default:
             return VP_SENSOR_ERROR_INVALID_ARG;
@@ -455,40 +582,40 @@ int64_t vp_sensor_dispatch(int64_t sub, int64_t a1, int64_t a2, int64_t a3, int6
 }
 
 /* ============================================================
- * Backend registration / teardown
+ * Backend registration / instance reset
  * ============================================================ */
 
 void vp_sensor_set_ops(const vp_sensor_ops_t* ops)
 {
-    sensor_lock();
+    rvvm_lock_slow(&g_dev_lock);
     g_ops = ops;
-    sensor_unlock();
+    rvvm_unlock(&g_dev_lock);
 }
 
-void vp_sensor_reset(void)
+void vp_sensor_reset(vp_sensor_t* self)
 {
-    /* Nothing the guest handed us survives a teardown: drop the queues first
-     * so an in-flight ingest from the platform thread becomes a no-op. */
-    sensor_lock();
-    memset(g_queues, 0, sizeof(g_queues));
-    sensor_unlock();
-
-    /* The platform source is owned by the backend but armed by us: stop every
-     * sensor we turned on before dropping the table. */
-    if (g_ops && g_ops->set_enabled) {
-        for (int32_t h = 0; h < VP_SENSOR_MAX_HANDLES; h++) {
-            if (g_backend_on[h]) {
-                g_ops->set_enabled(h, false);
-            }
-        }
+    if (!self) {
+        return;
     }
-    memset(g_backend_on, 0, sizeof(g_backend_on));
-    memset(g_backend_rate, 0, sizeof(g_backend_rate));
 
-    sensor_lock();
-    g_desc_count = 0;
-    g_caps = 0;
-    g_ready = false;
-    g_ops = NULL;
-    sensor_unlock();
+    /* Nothing the guest handed us survives: drop the queues first so an
+     * in-flight ingest from the platform thread becomes a no-op. Only this
+     * instance's queues - another guest's are its own. */
+    sensor_lock(self);
+    memset(self->queues, 0, sizeof(self->queues));
+    sensor_unlock(self);
+
+    /* The platform source is owned by the backend but armed by us: recompute
+     * the aggregate for every handle, which turns one off when this guest was
+     * its last subscriber. The backend registration itself stays: it belongs to
+     * the device, not to the guest that is ending. */
+    for (int32_t h = 0; h < VP_SENSOR_MAX_HANDLES; h++) {
+        sensor_sync_handle(h);
+    }
+
+    sensor_lock(self);
+    self->desc_count = 0;
+    self->caps = 0;
+    self->ready = false;
+    sensor_unlock(self);
 }
