@@ -10,4 +10,14 @@
     <string name="resume_guest">Resume</string>
     <string name="tab_graphics">Graphics</string>
     <string name="tab_console">Console</string>
+
+    <!-- Console keyboard bar: the terminal keys a soft keyboard cannot produce.
+         The arrows are written as escapes so the file stays ASCII-only. -->
+    <string name="tty_key_esc">Esc</string>
+    <string name="tty_key_tab">Tab</string>
+    <string name="tty_key_ctrl_c">^C</string>
+    <string name="tty_key_left">\u2190</string>
+    <string name="tty_key_up">\u2191</string>
+    <string name="tty_key_down">\u2193</string>
+    <string name="tty_key_right">\u2192</string>
 </resources>

@@ -161,6 +161,26 @@ public class RvvmNative {
     public static native int nativeTtySerial();
 
     /**
+     * Send host keyboard input to the guest's virtual TTY - the input half of
+     * the console.
+     *
+     * {@code bytes} is the byte sequence a real terminal would receive from its
+     * keyboard: UTF-8 text for typed characters, '\r' for Enter, 0x7F for
+     * Backspace, "\u001b[A" (ESC [ A) and siblings for the arrow keys,
+     * 0x03/0x04 for Ctrl-C/Ctrl-D. Native runs them through the line discipline
+     * the guest's termios advertises (ICRNL, canonical line assembly with erase,
+     * ECHO) and queues the cooked result for the guest's read(0, ...).
+     *
+     * Because the guest never saw the keystroke, native echoes it into the
+     * libvterm screen itself - typed characters appear through
+     * {@link #nativeTtySnapshot(int[])} just like guest output. No-op when no
+     * guest is running or no TTY is attached.
+     *
+     * @param bytes Terminal input bytes, already encoded
+     */
+    public static native void nativeTtyInput(byte[] bytes);
+
+    /**
       * Listener for the guest's console I/O. onOutput receives one line per
       * call (line breaks normalized); onFirstFrame fires once per guest run
       * when the first frame has actually reached the screen - either through

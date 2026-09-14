@@ -58,18 +58,123 @@
 
         </FrameLayout>
 
-        <!-- Tab 2: TTY console, rendered by a TextureView + Canvas -->
-        <FrameLayout
+        <!-- Tab 2: TTY console, rendered by a TextureView + Canvas.
+             An invisible 1x1 EditText is added to ttyViewport in code: it is the
+             keyboard/IME focus target, see MainActivity.initTtyInput(). -->
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:background="#FF000000">
+            android:background="#FF000000"
+            android:orientation="vertical">
 
-            <TextureView
-                android:id="@+id/ttyView"
+            <FrameLayout
+                android:id="@+id/ttyViewport"
                 android:layout_width="match_parent"
-                android:layout_height="match_parent" />
+                android:layout_height="0dp"
+                android:layout_weight="1">
 
-        </FrameLayout>
+                <TextureView
+                    android:id="@+id/ttyView"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent" />
+
+            </FrameLayout>
+
+            <!-- Keys a soft keyboard cannot produce. Text, Enter and Backspace
+                 come from the keyboard/app bar; these are what a shell needs for
+                 line editing (arrows) and interrupting (^C), and they are the
+                 only way to reach them on a touch-only device.
+                 blocksDescendants: the buttons must never take keyboard focus
+                 away from the console's input field. -->
+            <LinearLayout
+                android:id="@+id/ttyKeyBar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="#FF1C1C1C"
+                android:descendantFocusability="blocksDescendants"
+                android:orientation="horizontal"
+                android:padding="2dp">
+
+                <Button
+                    android:id="@+id/ttyKeyEsc"
+                    android:layout_width="0dp"
+                    android:layout_height="40dp"
+                    android:layout_weight="1"
+                    android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:padding="0dp"
+                    android:text="@string/tty_key_esc"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/ttyKeyTab"
+                    android:layout_width="0dp"
+                    android:layout_height="40dp"
+                    android:layout_weight="1"
+                    android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:padding="0dp"
+                    android:text="@string/tty_key_tab"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/ttyKeyCtrlC"
+                    android:layout_width="0dp"
+                    android:layout_height="40dp"
+                    android:layout_weight="1"
+                    android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:padding="0dp"
+                    android:text="@string/tty_key_ctrl_c"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/ttyKeyLeft"
+                    android:layout_width="0dp"
+                    android:layout_height="40dp"
+                    android:layout_weight="1"
+                    android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:padding="0dp"
+                    android:text="@string/tty_key_left"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/ttyKeyUp"
+                    android:layout_width="0dp"
+                    android:layout_height="40dp"
+                    android:layout_weight="1"
+                    android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:padding="0dp"
+                    android:text="@string/tty_key_up"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/ttyKeyDown"
+                    android:layout_width="0dp"
+                    android:layout_height="40dp"
+                    android:layout_weight="1"
+                    android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:padding="0dp"
+                    android:text="@string/tty_key_down"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/ttyKeyRight"
+                    android:layout_width="0dp"
+                    android:layout_height="40dp"
+                    android:layout_weight="1"
+                    android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:padding="0dp"
+                    android:text="@string/tty_key_right"
+                    android:textSize="12sp" />
+
+            </LinearLayout>
+
+        </LinearLayout>
 
     </ViewFlipper>
 

@@ -340,6 +340,12 @@ static volatile int g_first_frame_sent = 0;
 
 static VTerm*         g_tty_vt     = NULL;
 static volatile int   g_tty_serial = 0; /* bumped on every output burst */
+/* Cursor visibility: libvterm's DECTCEM state (ESC [ ? 25 h / l), which the
+ * guest toggles to park or hide the cursor (a full-screen app does this on
+ * entry). Reported to us only through the screen callbacks below - libvterm
+ * has no termprop getter - and honoured so the renderer does not keep drawing
+ * the block after the guest asked for no cursor. */
+static volatile int   g_tty_cursor_visible = 1;
 
 /* Repaint hint: guest thread, on every fd 1/2 write. */
 static void jni_tty_cb(void* userdata, int fd, void* tty)
@@ -347,6 +353,33 @@ static void jni_tty_cb(void* userdata, int fd, void* tty)
     (void)userdata; (void)fd; (void)tty;
     g_tty_serial++;
 }
+
+/* Termprop notifications come from the guest thread (it parses the output that
+ * carries them), so this only records the value: a plain int store. */
+static int jni_tty_settermprop(VTermProp prop, VTermValue* val, void* userdata)
+{
+    (void)userdata;
+    if (prop == VTERM_PROP_CURSORVISIBLE && val) {
+        g_tty_cursor_visible = val->boolean;
+    }
+    return 1;
+}
+
+/* Only settermprop is hooked, and the rest must stay NULL: moverect_user()
+ * skips damagerect() when a moverect callback answers, so hooking it would
+ * lose the damage markings of every scrolled row and the host would stop
+ * repainting a scrolling screen. */
+static const VTermScreenCallbacks jni_tty_screen_cbs = {
+    .damage      = NULL,
+    .moverect    = NULL,
+    .movecursor  = NULL,
+    .settermprop = jni_tty_settermprop,
+    .bell        = NULL,
+    .resize      = NULL,
+    .sb_pushline = NULL,
+    .sb_popline  = NULL,
+    .sb_clear    = NULL,
+};
 
 /* Persistent VTerm for the process lifetime. */
 static void jni_tty_init(void)
@@ -360,13 +393,19 @@ static void jni_tty_init(void)
         return;
     }
     vterm_set_utf8(g_tty_vt, 1); /* UTF-8 is off by default in libvterm */
+    vterm_screen_set_callbacks(vterm_obtain_screen(g_tty_vt),
+                               &jni_tty_screen_cbs, NULL);
     vterm_screen_reset(vterm_obtain_screen(g_tty_vt), true);
     LOGI("Guest TTY initialized (%dx%d)", TTY_ROWS, TTY_COLS);
 }
 
 /* Cell snapshot for the Java renderer: rows*cols cells, each 4 uint32:
  * [0] codepoint (UCS-4), [1] fg ARGB, [2] bg ARGB, [3] flags (bit0 bold,
- * bit1 underline, bit2 reverse already swapped into fg/bg, bit3 CJK-wide).
+ * bit1 underline, bit2 reverse already swapped into fg/bg, bit3 CJK-wide,
+ * bit4 this is the cursor cell).
+ * The cursor is part of the snapshot rather than a second entry point so the
+ * position and the cells are read in one locked pass: separately they could
+ * disagree by a frame.
  * Returns 0 if there is no TTY yet. */
 JNIEXPORT jint JNICALL
 Java_com_rvvm_android_RvvmNative_nativeTtySnapshot(JNIEnv* env, jobject thiz, jintArray out)
@@ -385,11 +424,27 @@ Java_com_rvvm_android_RvvmNative_nativeTtySnapshot(JNIEnv* env, jobject thiz, ji
     }
 
     VTermScreen* scr = vterm_obtain_screen(g_tty_vt);
+    /* The guest thread parses its own fd 1/2 output into this same VTerm while
+     * we read cells out of it, and the core also echoes keystrokes into it from
+     * this (UI) thread via rvvm_user_tty_input(). Take the core's VTerm lock so
+     * a snapshot can never see a half-parsed escape sequence, and so the
+     * flush_damage() below cannot race input parsing on libvterm's internals. */
+    rvvm_machine_t* machine = g_guest_machine;
+    if (machine) {
+        rvvm_user_tty_lock(machine);
+    }
     /* libvterm defers part of its screen state to the damage queue: pending
      * scroll/damage is only folded into the matrix here. The win32 renderer
      * calls this before reading cells (tty_layer_render); without it the cells
      * read back below can be a stale generation of the screen. */
     vterm_screen_flush_damage(scr);
+    /* Where the guest's own cursor sits, read in the same locked pass as the
+     * cells. -1/-1 means "no cursor to draw": the guest hid it (DECTCEM), or
+     * the VTerm has none yet. */
+    VTermPos cursor = { -1, -1 };
+    if (g_tty_cursor_visible) {
+        vterm_state_get_cursorpos(vterm_obtain_state(g_tty_vt), &cursor);
+    }
     for (int r = 0; r < TTY_ROWS; r++) {
         for (int c = 0; c < TTY_COLS; c++) {
             VTermPos pos = { r, c };
@@ -430,9 +485,17 @@ Java_com_rvvm_android_RvvmNative_nativeTtySnapshot(JNIEnv* env, jobject thiz, ji
                 jint t = cellout[1]; cellout[1] = cellout[2]; cellout[2] = t;
                 flags |= 1 << 2;
             }
+            /* The cursor cell keeps its own colours: the renderer inverts them
+             * for the block, so it needs the cell as the guest drew it. */
+            if (r == cursor.row && c == cursor.col) {
+                flags |= 1 << 4;
+            }
             cellout[0] = (jint)cp;
             cellout[3] = flags;
         }
+    }
+    if (machine) {
+        rvvm_user_tty_unlock(machine);
     }
     (*env)->ReleaseIntArrayElements(env, out, buf, 0);
     return TTY_ROWS * TTY_COLS;
@@ -444,6 +507,37 @@ Java_com_rvvm_android_RvvmNative_nativeTtySerial(JNIEnv* env, jobject thiz)
 {
     (void)env; (void)thiz;
     return g_tty_serial;
+}
+
+/* Host keyboard -> guest console, the input half of the TTY.
+ *
+ * `bytes` is what a real terminal receives from its keyboard: UTF-8 text,
+ * '\r' for Enter, 0x7F for Backspace, "\x1b[A" and friends for the arrows,
+ * 0x03/0x04 for Ctrl-C/Ctrl-D. The core runs the line discipline the guest's
+ * termios advertises and queues the cooked bytes for the guest's read(0, ...);
+ * typing comes back to the screen through nativeTtySnapshot() because the core
+ * echoes it into the VTerm. */
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeTtyInput(JNIEnv* env, jobject thiz, jbyteArray in)
+{
+    rvvm_machine_t* machine = g_guest_machine;
+    jsize len;
+    jbyte* buf;
+
+    (void)thiz;
+    if (!machine || !in) {
+        return;
+    }
+    len = (*env)->GetArrayLength(env, in);
+    if (len <= 0) {
+        return;
+    }
+    buf = (*env)->GetByteArrayElements(env, in, NULL);
+    if (!buf) {
+        return;
+    }
+    rvvm_user_tty_input(machine, buf, (size_t)len);
+    (*env)->ReleaseByteArrayElements(env, in, buf, JNI_ABORT);
 }
 
 /* JNIEnv for the calling thread, attaching it first when needed. The caller
@@ -1506,6 +1600,11 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
      * the last screen) and register the repaint-hint callback. */
     jni_tty_init();
     if (g_tty_vt) {
+        /* The new guest starts with a visible cursor, and libvterm's screen
+         * reset does not re-announce the termprop (CURSORVISIBLE is only
+         * reported on DECTCEM and DECRC), so a guest that hid its cursor must
+         * not leave the next run without one. */
+        g_tty_cursor_visible = 1;
         vterm_screen_reset(vterm_obtain_screen(g_tty_vt), true);
         rvvm_user_set_tty0(g_guest_machine, g_tty_vt);
         rvvm_user_set_tty_callback(g_guest_machine, jni_tty_cb, NULL);

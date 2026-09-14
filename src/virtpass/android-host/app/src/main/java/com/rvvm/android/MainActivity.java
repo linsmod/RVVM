@@ -1,16 +1,23 @@
 package com.rvvm.android;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.res.AssetManager;
 import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.SurfaceTexture;
 import android.os.Bundle;
+import android.os.SystemClock;
+import android.text.Editable;
+import android.text.InputType;
+import android.text.TextWatcher;
 import android.util.Log;
 import android.view.GestureDetector;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
@@ -18,9 +25,15 @@ import android.view.SurfaceView;
 import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputConnectionWrapper;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.ScrollView;
 import android.widget.Spinner;
@@ -34,6 +47,7 @@ import java.io.FileWriter;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 
 /**
@@ -77,6 +91,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     private SurfaceView surfaceView;
     private SurfaceHolder surfaceHolder;
     private TextureView ttyView;          // Console tab render target
+    private FrameLayout ttyViewport;      // Console tab viewport (holds ttyView)
+    private TtyEditText ttyInput;         // Console keyboard/IME focus target
     private ViewFlipper viewFlipper;
     private Button runButton;
     private Button suspendButton;
@@ -141,12 +157,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     private static final int TTY_COLS = 80;
     private static final int TTY_CELL = 4;
     private static final float TTY_PAD = 8f;
+
+    // Cell flags, packed by native into ttyCells[i + 3].
+    private static final int TTY_FLAG_BOLD      = 1;
+    private static final int TTY_FLAG_UNDERLINE = 1 << 1;
+    private static final int TTY_FLAG_REVERSE   = 1 << 2;
+    private static final int TTY_FLAG_WIDE      = 1 << 3;
+    private static final int TTY_FLAG_CURSOR    = 1 << 4;
+
     private final int[] ttyCells = new int[TTY_ROWS * TTY_COLS * TTY_CELL];
     private int ttySerial = -1;
     private volatile boolean ttyRunning = false;
     private final Paint ttyTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint ttyBgPaint = new Paint();
+    private final Paint ttyCursorPaint = new Paint();
     private final Paint ttyUnderlinePaint = new Paint();
+
+    // Cursor blink. Its own clock is what makes the tick repaint even when the
+    // guest is silent, which is the point: a console waiting for input has to
+    // show where that input will land. A repaint is one canvas pass over the
+    // 24x80 grid, so 2 Hz of them costs less than the guest's own output does.
+    private static final long TTY_BLINK_MS = 500;
+    private boolean ttyCursorOn = true;
+    private long ttyBlinkNext = 0;
 
     // Terminal font. Typeface.MONOSPACE is only a generic family: on plenty of
     // devices it is mapped to a proportional face (or resolves per character
@@ -166,14 +199,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     private float ttyGlyphWidthSize = -1f;                  // size the cache is for
     private final char[] ttyGlyph = new char[2];            // one code point, no alloc
 
-    // 30 Hz poll: snapshot + redraw only when the native serial changed.
+    // 30 Hz poll: snapshot + redraw when the native serial changed, plus the
+    // cursor's own blink phase.
     private final Runnable ttyTick = new Runnable() {
         @Override public void run() {
             if (!ttyRunning) return;
             if (ttyView != null && ttyView.isAvailable()) {
                 int serial = RvvmNative.nativeTtySerial();
-                if (serial != ttySerial) {
+                long now = SystemClock.uptimeMillis();
+                boolean redraw = serial != ttySerial;
+                if (redraw) {
+                    // New output: the cursor is shown at once and the blink
+                    // restarts from there, the way a terminal behaves when
+                    // something is typed or printed.
                     ttySerial = serial;
+                    ttyCursorOn = true;
+                    ttyBlinkNext = now + TTY_BLINK_MS;
+                } else if (now >= ttyBlinkNext) {
+                    ttyCursorOn = !ttyCursorOn;
+                    ttyBlinkNext = now + TTY_BLINK_MS;
+                    redraw = true;
+                }
+                if (redraw) {
                     drawTty();
                 }
             }
@@ -208,6 +255,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         ttyTextPaint.setSubpixelText(false);
         ttyUnderlinePaint.setStyle(Paint.Style.STROKE);
         ttySerial = -1;
+        // A full blink period of grace, so the first repaint does not arrive
+        // with the cursor already in its off phase.
+        ttyCursorOn = true;
+        ttyBlinkNext = SystemClock.uptimeMillis() + TTY_BLINK_MS;
         ttyView.post(ttyTick);
     }
 
@@ -325,11 +376,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
             float ox = (float) Math.floor((w - gridW) / 2f);
             float oy = (float) Math.floor((h - gridH) / 2f);
 
+            // The cursor spans one cell and native flags it in the cell
+            // attributes; located up front so its block can be painted before
+            // the glyphs that sit on it.
+            int curRow = -1, curCol = -1;
+            for (int r = 0; r < TTY_ROWS && curRow < 0; r++) {
+                for (int c = 0; c < TTY_COLS; c++) {
+                    if ((ttyCells[(r * TTY_COLS + c) * TTY_CELL + 3] & TTY_FLAG_CURSOR) != 0) {
+                        curRow = r;
+                        curCol = c;
+                        break;
+                    }
+                }
+            }
+
             /* TEMP DIAG: one line per repaint, so the frame the renderer was
              * asked to draw can be matched against the native screen dump. */
             Log.i(TAG, "tty draw: canvas " + w + "x" + h + " size=" + size +
                     " cell=" + cellW + "x" + cellH + " origin=(" + ox + "," + oy +
-                    ") grid=" + gridW + "x" + gridH + " serial=" + ttySerial);
+                    ") grid=" + gridW + "x" + gridH + " serial=" + ttySerial +
+                    " cursor=" + curRow + "," + curCol + (ttyCursorOn ? " on" : " off"));
 
             Paint.FontMetrics fm = ttyTextPaint.getFontMetrics();
             float baselineOff = (float) Math.round((cellH - (fm.descent - fm.ascent)) / 2f - fm.ascent);
@@ -360,6 +426,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
                     }
                 }
 
+                // Cursor block: the cell filled with its own foreground colour,
+                // with the glyph (when there is one, see below) redrawn in the
+                // background colour on top of it - the reverse-video block a
+                // real terminal shows. Painted before the glyphs so it lies
+                // underneath them; on a blank cell it is simply a solid block.
+                if (r == curRow && ttyCursorOn) {
+                    int i = (curRow * TTY_COLS + curCol) * TTY_CELL;
+                    boolean cursorWide = (ttyCells[i + 3] & TTY_FLAG_WIDE) != 0
+                            && curCol + 1 < TTY_COLS;
+                    ttyCursorPaint.setColor(ttyCells[i + 1]);
+                    float cx = ox + curCol * cellW;
+                    canvas.drawRect(cx, y0, cx + (cursorWide ? 2f : 1f) * cellW,
+                            y0 + cellH, ttyCursorPaint);
+                }
+
                 // Glyphs: one draw per cell. A missing glyph still falls back
                 // to a proportional face, so each one is placed on the grid -
                 // centered when it fits, horizontally squeezed when it does not
@@ -372,7 +453,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
                         continue;   // blank cell or an unpaired surrogate
                     }
                     int flags = ttyCells[i + 3];
-                    boolean wide = (flags & 8) != 0 && c + 1 < TTY_COLS;
+                    boolean wide = (flags & TTY_FLAG_WIDE) != 0 && c + 1 < TTY_COLS;
+                    // Under the block the glyph has to trade colours with it.
+                    boolean onCursor = ttyCursorOn && r == curRow && c == curCol;
                     int len = Character.toChars(cp, ttyGlyph, 0);
 
                     float target = cellW * (wide ? 2 : 1);
@@ -386,13 +469,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
                         x += (target - gw) / 2f;   // zero-width: keep the origin
                     }
 
-                    ttyTextPaint.setColor(ttyCells[i + 1]);
-                    ttyTextPaint.setFakeBoldText((flags & 1) != 0);
+                    ttyTextPaint.setColor(onCursor ? ttyCells[i + 2] : ttyCells[i + 1]);
+                    ttyTextPaint.setFakeBoldText((flags & TTY_FLAG_BOLD) != 0);
                     canvas.drawText(ttyGlyph, 0, len, x, baseline, ttyTextPaint);
                     ttyTextPaint.setTextScaleX(1f);   // next measure must be unscaled
 
-                    if ((flags & 2) != 0) {
-                        ttyUnderlinePaint.setColor(ttyCells[i + 1]);
+                    if ((flags & TTY_FLAG_UNDERLINE) != 0) {
+                        ttyUnderlinePaint.setColor(onCursor ? ttyCells[i + 2] : ttyCells[i + 1]);
                         canvas.drawLine(x, y0 + cellH - 1f,
                                 x + target, y0 + cellH - 1f, ttyUnderlinePaint);
                     }
@@ -413,6 +496,351 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         float w = ttyTextPaint.measureText(ttyGlyph, 0, len);
         ttyGlyphWidths.put(cp, w);
         return w;
+    }
+
+    /* ============================================================
+     * Console keyboard input
+     *
+     * The console used to be read-only: guest fd 1/2 was parsed into the VTerm
+     * and rendered, but guest fd 0 was the *host* process's stdin, so nothing
+     * typed here could ever reach it. Keyboard input now travels
+     *
+     *     this field  ->  RvvmNative.nativeTtyInput()
+     *                 ->  rvvm_user_tty_input()      (core: line discipline)
+     *                 ->  guest read(0, ...)
+     *
+     * and returns to the screen through the core's VTerm echo, i.e. through the
+     * same nativeTtySnapshot() path as guest output. Everything is funnelled
+     * through one 1x1 invisible EditText because that is what Android routes
+     * IME text, paste and hardware key events to; the field is kept empty (its
+     * text is forwarded and cleared as it arrives) so the terminal never gets a
+     * local echo, a cursor or a selection competing with the guest's.
+     * ============================================================ */
+
+    // Byte sequences a real terminal sends for its non-printing keys.
+    private static final byte[] TTY_ENTER = { '\r' };
+    private static final byte[] TTY_TAB   = { '\t' };
+    private static final byte[] TTY_ESC   = { 0x1B };
+    private static final byte[] TTY_BS    = { 0x7F };                  // Backspace
+    private static final byte[] TTY_DEL   = { 0x1B, '[', '3', '~' };   // Delete
+    private static final byte[] TTY_UP    = { 0x1B, '[', 'A' };
+    private static final byte[] TTY_DOWN  = { 0x1B, '[', 'B' };
+    private static final byte[] TTY_RIGHT = { 0x1B, '[', 'C' };
+    private static final byte[] TTY_LEFT  = { 0x1B, '[', 'D' };
+    private static final byte[] TTY_HOME  = { 0x1B, '[', 'H' };
+    private static final byte[] TTY_END   = { 0x1B, '[', 'F' };
+    private static final byte[] TTY_PGUP  = { 0x1B, '[', '5', '~' };
+    private static final byte[] TTY_PGDN  = { 0x1B, '[', '6', '~' };
+
+    /** Create the console's keyboard target and wire it up to the guest. */
+    private void initTtyInput() {
+        ttyInput = new TtyEditText(this);
+        // 1x1 and fully transparent: a focus/IME target that is never drawn
+        // over the terminal grid.
+        ttyInput.setAlpha(0f);
+        ttyInput.setBackground(null);
+        ttyInput.setPadding(0, 0, 0, 0);
+        ttyInput.setCursorVisible(false);
+        ttyInput.setInputType(InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        // A terminal offers the IME nothing to navigate to, and the extract UI
+        // would cover the very console being typed into.
+        ttyInput.setImeOptions(EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                | EditorInfo.IME_FLAG_NO_FULLSCREEN
+                | EditorInfo.IME_ACTION_NONE);
+        ttyViewport.addView(ttyInput, new FrameLayout.LayoutParams(1, 1));
+
+        // The single text path. Whatever an IME commit, a hardware key or a
+        // paste puts in the field is forwarded to the guest and removed right
+        // away: the guest's line discipline owns the echo, so the field must
+        // keep no copy of it (and must not grow without bound).
+        ttyInput.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void afterTextChanged(Editable s) {
+                if (s.length() > 0) {
+                    sendTtyText(s);
+                    s.clear();
+                }
+            }
+        });
+
+        // Tap the terminal to summon the soft keyboard. It is not popped up
+        // automatically with the tab: the tab is often opened just to read the
+        // last screen, and a keyboard over it would be in the way.
+        ttyView.setOnClickListener(v -> toggleTtyKeyboard());
+        watchTtyKeyboard();
+
+        bindTtyKey(R.id.ttyKeyEsc, TTY_ESC);
+        bindTtyKey(R.id.ttyKeyTab, TTY_TAB);
+        bindTtyKey(R.id.ttyKeyCtrlC, new byte[] { 0x03 });
+        bindTtyKey(R.id.ttyKeyLeft, TTY_LEFT);
+        bindTtyKey(R.id.ttyKeyUp, TTY_UP);
+        bindTtyKey(R.id.ttyKeyDown, TTY_DOWN);
+        bindTtyKey(R.id.ttyKeyRight, TTY_RIGHT);
+    }
+
+    private void bindTtyKey(int id, final byte[] bytes) {
+        View key = findViewById(id);
+        if (key != null) {
+            key.setOnClickListener(v -> sendTtyBytes(bytes));
+        }
+    }
+
+    /** Switch between the graphics tab (0) and the console tab (1). */
+    private void showTab(int index) {
+        viewFlipper.setDisplayedChild(index);
+        if (index == 1) {
+            // Move focus to the console so a hardware keyboard types straight
+            // into the guest; the soft keyboard still only appears on a tap.
+            ttyInput.requestFocus();
+        } else {
+            ttyInput.clearFocus();
+            hideTtyKeyboard();
+        }
+    }
+
+    // Whether a soft keyboard is on screen, and the tallest the window has been
+    // (its keyboard-less height, see watchTtyKeyboard).
+    private boolean ttyKeyboardVisible = false;
+    private int ttyWindowHeight = 0;
+
+    /**
+     * Track the soft keyboard through the window's visible frame.
+     *
+     * InputMethodManager.isActive() is not an answer to "is a keyboard up": it
+     * reports whether the view is the one the IME serves, which is already true
+     * from the moment the console tab takes focus. The tap toggle used to ask
+     * it that question, so it picked its hide branch on the very tap that
+     * should have raised the keyboard - a keyboard only appeared in the rare
+     * interleaving where the tab's focus request had not been served yet, which
+     * is exactly the "almost never, and inexplicably sometimes" behaviour.
+     * The IME's own height cannot be wrong about this, and unlike a flag of our
+     * own it stays right when the keyboard is dismissed with Back.
+     */
+    private void watchTtyKeyboard() {
+        final View root = getWindow().getDecorView();
+        final int minKeyboardHeight = getResources().getDisplayMetrics().heightPixels / 4;
+        root.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
+            // adjustResize shrinks the window itself on some versions and only
+            // the content on others: the tallest height ever seen is the
+            // keyboard-less one either way, so the difference to the bottom of
+            // the visible frame is the keyboard's height.
+            if (root.getHeight() > ttyWindowHeight) {
+                ttyWindowHeight = root.getHeight();
+            }
+            Rect visible = new Rect();
+            root.getWindowVisibleDisplayFrame(visible);
+            ttyKeyboardVisible = ttyWindowHeight - visible.bottom > minKeyboardHeight;
+        });
+    }
+
+    /** Tap behaviour: raise the keyboard when it is down, drop it when it is up. */
+    private void toggleTtyKeyboard() {
+        if (ttyKeyboardVisible) {
+            hideTtyKeyboard();
+        } else {
+            showTtyKeyboard();
+        }
+    }
+
+    private void showTtyKeyboard() {
+        ttyInput.requestFocus();
+        InputMethodManager imm = getSystemService(InputMethodManager.class);
+        if (imm == null) {
+            return;
+        }
+        // Posted rather than called here: a showSoftInput() issued while the
+        // touch is still being dispatched - or while the focus change from a
+        // tab switch is still in flight, in which case requestFocus() above
+        // returns without dispatching anything at all - is dropped by the IME.
+        // That is the other half of why the keyboard came up so rarely.
+        ttyInput.post(() -> imm.showSoftInput(ttyInput, InputMethodManager.SHOW_IMPLICIT));
+    }
+
+    private void hideTtyKeyboard() {
+        InputMethodManager imm = getSystemService(InputMethodManager.class);
+        if (imm != null) {
+            imm.hideSoftInputFromWindow(ttyInput.getWindowToken(), 0);
+        }
+    }
+
+    /** Forward text to the guest as UTF-8. */
+    private static void sendTtyText(CharSequence text) {
+        if (text == null || text.length() == 0) return;
+        sendTtyBytes(text.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static void sendTtyBytes(byte[] bytes) {
+        if (bytes == null || bytes.length == 0) return;
+        if (!RvvmNative.nativeIsGuestRunning()) return;
+        RvvmNative.nativeTtyInput(bytes);
+    }
+
+    /**
+     * Terminal byte sequence for a hardware key, or null when the key has none.
+     * This is what gives a physical keyboard its arrows, Esc, Tab, Delete and
+     * Ctrl+&lt;letter&gt; - none of which a soft keyboard can produce.
+     */
+    private static byte[] ttyKeyBytes(KeyEvent event) {
+        switch (event.getKeyCode()) {
+            case KeyEvent.KEYCODE_ENTER:
+            case KeyEvent.KEYCODE_NUMPAD_ENTER: return TTY_ENTER;
+            case KeyEvent.KEYCODE_DEL:          return TTY_BS;
+            case KeyEvent.KEYCODE_FORWARD_DEL:  return TTY_DEL;
+            case KeyEvent.KEYCODE_TAB:          return TTY_TAB;
+            case KeyEvent.KEYCODE_ESCAPE:       return TTY_ESC;
+            case KeyEvent.KEYCODE_DPAD_UP:      return TTY_UP;
+            case KeyEvent.KEYCODE_DPAD_DOWN:    return TTY_DOWN;
+            case KeyEvent.KEYCODE_DPAD_RIGHT:   return TTY_RIGHT;
+            case KeyEvent.KEYCODE_DPAD_LEFT:    return TTY_LEFT;
+            case KeyEvent.KEYCODE_MOVE_HOME:    return TTY_HOME;
+            case KeyEvent.KEYCODE_MOVE_END:     return TTY_END;
+            case KeyEvent.KEYCODE_PAGE_UP:      return TTY_PGUP;
+            case KeyEvent.KEYCODE_PAGE_DOWN:    return TTY_PGDN;
+            default: break;
+        }
+        if (!event.isCtrlPressed()) {
+            return null;
+        }
+        // Ctrl+<key> is the control character at the key's position in the
+        // alphabet - ^C is 0x03, ^D is 0x04 and so on - which is how a terminal
+        // gets its line-editing and interrupt keys. Some keymaps hand over the
+        // control character directly and some the plain letter, so both are
+        // accepted.
+        int c = event.getUnicodeChar(0);
+        if (c > 0 && c < 0x20) {
+            return new byte[] { (byte)c };
+        }
+        if (c >= 'a' && c <= 'z') {
+            c -= 'a' - 'A';
+        }
+        if (c >= 'A' && c <= 'Z') {
+            return new byte[] { (byte)(c - 'A' + 1) };
+        }
+        switch (c) {
+            case ' ': case '@': return new byte[] { 0x00 };  // ^Space / ^@
+            case '[':           return TTY_ESC;              // ^[
+            case '\\':          return new byte[] { 0x1C };  // ^\
+            case ']':           return new byte[] { 0x1D };  // ^]
+            case '^':           return new byte[] { 0x1E };  // ^^
+            case '_':           return new byte[] { 0x1F };  // ^_
+            default: break;
+        }
+        return null;
+    }
+
+    /**
+     * The console's keyboard target.
+     *
+     * An EditText is used only because it is the one view Android routes IME
+     * text, paste and key events to; it must never behave like a text field.
+     * The two hooks below are what keep it out of the way:
+     *
+     *  - the input connection drops IME preedit (an intermediate pinyin or
+     *    gesture-typing string is not what the user typed - only the committed
+     *    text is) and turns the soft keyboard's Backspace into a real 0x7F,
+     *    which on an always-empty field would otherwise delete nothing and so
+     *    reach the guest as no input at all;
+     *  - key events are translated to terminal bytes instead of being handed to
+     *    the field, so a physical keyboard cannot edit the (invisible) text.
+     */
+    private final class TtyEditText extends EditText {
+
+        TtyEditText(Context context) {
+            super(context);
+        }
+
+        @Override
+        public boolean onKeyDown(int keyCode, KeyEvent event) {
+            byte[] bytes = ttyKeyBytes(event);
+            if (bytes != null) {
+                // Held keys repeat through onKeyMultiple on real hardware;
+                // sending from both would double every repeat.
+                if (event.getRepeatCount() == 0) {
+                    sendTtyBytes(bytes);
+                }
+                return true;
+            }
+            // Printable keys are deliberately left to the field: they land in
+            // the Editable and the TextWatcher forwards them.
+            return super.onKeyDown(keyCode, event);
+        }
+
+        @Override
+        public boolean onKeyMultiple(int keyCode, int repeatCount, KeyEvent event) {
+            byte[] bytes = ttyKeyBytes(event);
+            if (bytes != null) {
+                for (int i = 0; i < Math.max(repeatCount, 1); i++) {
+                    sendTtyBytes(bytes);
+                }
+                return true;
+            }
+            return super.onKeyMultiple(keyCode, repeatCount, event);
+        }
+
+        @Override
+        public boolean onKeyUp(int keyCode, KeyEvent event) {
+            // Swallowed so the field's own handling never sees half a key. A
+            // terminal acts on the press, so nothing is sent here.
+            if (ttyKeyBytes(event) != null) {
+                return true;
+            }
+            return super.onKeyUp(keyCode, event);
+        }
+
+        @Override
+        public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+            InputConnection base = super.onCreateInputConnection(outAttrs);
+            outAttrs.imeOptions |= EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                    | EditorInfo.IME_FLAG_NO_FULLSCREEN;
+            if (base == null) {
+                return null;
+            }
+            return new InputConnectionWrapper(base, false) {
+                @Override
+                public boolean setComposingText(CharSequence text, int newCursorPosition) {
+                    // Preedit is not forwarded and not put in the field either,
+                    // so no candidate string shows up on the guest's screen.
+                    return true;
+                }
+
+                @Override
+                public boolean finishComposingText() {
+                    // Nothing to finish: setComposingText() never inserted.
+                    return true;
+                }
+
+                @Override
+                public boolean deleteSurroundingText(int beforeLength, int afterLength) {
+                    // The soft keyboard's Backspace. On an empty field the base
+                    // implementation has nothing to delete, so it is translated
+                    // into the byte the guest expects instead.
+                    for (int i = 0; i < beforeLength; i++) {
+                        sendTtyBytes(TTY_BS);
+                    }
+                    for (int i = 0; i < afterLength; i++) {
+                        sendTtyBytes(TTY_DEL);
+                    }
+                    return true;
+                }
+
+                @Override
+                public boolean sendKeyEvent(KeyEvent event) {
+                    // IMEs that translate their keys themselves arrive here
+                    // rather than as key events on the view.
+                    byte[] bytes = ttyKeyBytes(event);
+                    if (bytes != null) {
+                        if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                            sendTtyBytes(bytes);
+                        }
+                        return true;
+                    }
+                    return super.sendKeyEvent(event);
+                }
+            };
+        }
     }
 
     // Exit code of the most recent guest, delivered by the native exit
@@ -493,13 +921,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         surfaceHolder.addCallback(this);
 
         // Tab switcher: graphics (SurfaceView) vs TTY console (TextureView)
-        ViewFlipper flipper = findViewById(R.id.viewFlipper);
+        viewFlipper = findViewById(R.id.viewFlipper);
         Button tabGraphics = findViewById(R.id.tabGraphicsButton);
         Button tabConsole = findViewById(R.id.tabConsoleButton);
-        tabGraphics.setOnClickListener(v -> flipper.setDisplayedChild(0));
-        tabConsole.setOnClickListener(v -> flipper.setDisplayedChild(1));
+        tabGraphics.setOnClickListener(v -> showTab(0));
+        tabConsole.setOnClickListener(v -> showTab(1));
+        ttyViewport = findViewById(R.id.ttyViewport);
         ttyView = findViewById(R.id.ttyView);
         ttyView.setSurfaceTextureListener(ttyTextureListener);
+        initTtyInput();
 
         // Setup buttons
         runButton.setOnClickListener(v -> runGuestElf());
@@ -709,6 +1139,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
                 updateLogOverlay();
                 statusText.setText("Guest exited: " + elfName + " (exit " + code + ")");
                 Log.i(TAG, "Guest exited: " + elfName + " (exit " + code + ")");
+                // Nothing left to type into; the frozen last screen stays as it
+                // is, but the keyboard should not sit over it.
+                hideTtyKeyboard();
                 updateButtonStates();
             });
         }, "guest-exit-monitor").start();

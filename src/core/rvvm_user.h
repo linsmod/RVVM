@@ -72,6 +72,37 @@ void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback 
 // rvvm_user_linux_ex().
 void rvvm_user_set_tty0(rvvm_machine_t* machine, void* tty);
 
+// Push host keyboard input toward the guest's virtual TTY - the input half of
+// the console described above.
+//
+// `buf`/`len` is the byte sequence a real terminal receives from the keyboard:
+// printable UTF-8, '\r' for Enter, 0x7F for Backspace, "\x1b[A"/"\x1b[B"/
+// "\x1b[C"/"\x1b[D" for the arrow keys, 0x03/0x04 for Ctrl-C/Ctrl-D. The bytes
+// run through the line discipline the guest's termios advertises:
+//
+//   - ICRNL      '\r' is translated to '\n'
+//   - ICANON     lines are assembled until Enter, Backspace erases and Ctrl-D
+//                ends the line / reports EOF; when the guest clears ICANON the
+//                bytes pass through raw, which is how a full-screen app gets
+//                individual key presses
+//   - ECHO/ECHOE typing is echoed into the VTerm, so the host's next snapshot
+//                shows it (the guest cannot echo: the input never came from it)
+//
+// The cooked result is what the guest's read(0, ...) / readv(0, ...) returns:
+// with a TTY attached, fd 0 is the console instead of the host process's own
+// stdin. Safe to call from any thread; a no-op when no TTY is attached.
+void rvvm_user_tty_input(rvvm_machine_t* machine, const void* buf, size_t len);
+
+// Serialize host access to the guest TTY's VTerm.
+//
+// The guest thread parses its own fd 1/2 output into the VTerm, so a host that
+// also touches it - reading the screen matrix for a snapshot, for instance -
+// must hold this lock for the duration of that access. Hold it briefly: it is
+// a spinlock the guest thread contends for on every write, so do not block,
+// allocate or render while holding it.
+void rvvm_user_tty_lock(rvvm_machine_t* machine);
+void rvvm_user_tty_unlock(rvvm_machine_t* machine);
+
 // Override the guest's filesystem prefix - the directory guest absolute paths
 // are resolved against.
 //

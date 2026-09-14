@@ -621,6 +621,12 @@ typedef struct {
  * no behaviour. Later steps move one group at a time into the context.
  * ============================================================ */
 
+// Virtual TTY input ring (cooked bytes waiting for the guest) and the
+// canonical line buffer under construction. Both are small: this is an
+// interactive console, not a pipe.
+#define TTY_IN_RING 4096
+#define TTY_IN_LINE 1024
+
 typedef struct rvvm_userland {
     // Machine this context belongs to; identical to rvvm_machine_t::userdata
     rvvm_machine_t* machine;
@@ -671,6 +677,23 @@ typedef struct rvvm_userland {
     bool                     tty_owned;     // internally created, free with the machine
     rvvm_user_tty_callback   tty_cb;
     void*                    tty_userdata;
+
+    // --- Guest virtual TTY input (group E) ---
+    // The keyboard side of the console. The host hands us the bytes a real
+    // terminal would receive (rvvm_user_tty_input); they run through the line
+    // discipline the guest's termios advertises (ICRNL, ICANON line assembly
+    // with erase, ECHO) and the cooked result is what read(0, ...) returns.
+    spinlock_t   tty_vt_lock;      // serializes every VTerm access
+    spinlock_t   tty_in_lock;      // guards the ring + pending line below
+    rvvm_event_t tty_in_event;     // wakes a read(0) blocked with nothing to read
+    uint8_t      tty_cooked[TTY_IN_RING];
+    size_t       tty_cooked_head;  // read cursor into the ring
+    size_t       tty_cooked_len;   // bytes waiting for the guest
+    uint8_t      tty_line[TTY_IN_LINE];
+    size_t       tty_line_len;     // canonical line under construction
+    uint32_t     tty_lflag;        // c_lflag from the last TCGETS/TCSETS
+    uint32_t     tty_eof_pending;  // Ctrl-D delivered: next read returns 0
+    bool         tty_in_eof;       // teardown: unblock reads that are waiting
 } rvvm_userland_t;
 
 // Context attached to a userland machine, NULL for a non-userland machine
@@ -696,6 +719,11 @@ static inline rvvm_userland_t* rvvm_userland_ctx(rvvm_machine_t* machine)
 static void user_tty_init(rvvm_userland_t* ctx)
 {
     if (ctx->tty_vt) {
+        /* A host-injected VTerm (rvvm_user_set_tty0) owns its screen; keep the
+         * pair consistent for the paths that read the matrix back. */
+        if (!ctx->tty_screen) {
+            ctx->tty_screen = vterm_obtain_screen((VTerm*)ctx->tty_vt);
+        }
         return;
     }
     VTerm* vt = vterm_new(VTERM_ROWS, VTERM_COLS);
@@ -731,6 +759,9 @@ static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t
      * libvterm's LF only moves down without returning the carriage. */
     const uint8_t* p = buf;
     size_t start = 0;
+    /* The VTerm is also touched by host keyboard echo and by the host's
+     * screen snapshot, so every access is serialized through tty_vt_lock. */
+    spin_lock(&ctx->tty_vt_lock);
     for (size_t i = 0; i < count; ++i) {
         if (p[i] != '\n') {
             continue;
@@ -742,8 +773,27 @@ static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t
     if (start < count) {
         vterm_input_write((VTerm*)ctx->tty_vt, (const char*)p + start, count - start);
     }
+    spin_unlock(&ctx->tty_vt_lock);
     // Notify the host; it decides when to flush/render (throttling is its job).
     ctx->tty_cb(ctx->tty_userdata, fd, ctx->tty_vt);
+}
+
+// Write raw bytes into the VTerm with no line-discipline translation,
+// serialized against the guest's own fd 1/2 output, then nudge the host
+// renderer. Used for keyboard echo, where the caller already passes the exact
+// screen content ("\r\n" for Enter, the back/blank/back sequence of
+// user_tty_erase_echo() for erase, ...).
+static void user_tty_vt_write(rvvm_userland_t* ctx, const char* buf, size_t len)
+{
+    if (!ctx->tty_vt || !buf || !len) {
+        return;
+    }
+    spin_lock(&ctx->tty_vt_lock);
+    vterm_input_write((VTerm*)ctx->tty_vt, buf, len);
+    spin_unlock(&ctx->tty_vt_lock);
+    if (ctx->tty_cb) {
+        ctx->tty_cb(ctx->tty_userdata, 1, ctx->tty_vt);
+    }
 }
 
 /*
@@ -759,6 +809,25 @@ static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t
 #define UAPI_TIOCGWINSZ 0x5413
 #define UAPI_TIOCSWINSZ 0x5414
 
+/*
+ * Termios bits the virtual TTY's input path acts on (asm-generic values, the
+ * guest ABI's, not the host's). TTY_LFLAG_DEFAULT is the state TCGETS reports
+ * before the guest changes anything and therefore what the line discipline
+ * starts in - it must stay in sync with the TCGETS answer in user_tty_ioctl().
+ */
+#define TTY_IFLAG_ICRNL    0x0100  // input CR -> NL
+#define TTY_LFLAG_ISIG     0x0001  // Ctrl-C: signal the foreground process
+#define TTY_LFLAG_ICANON   0x0002  // canonical: assemble lines, handle erase
+#define TTY_LFLAG_ECHO     0x0008  // echo typed characters
+#define TTY_LFLAG_ECHOE    0x0010  // erase echoes as "\b \b"
+#define TTY_LFLAG_ECHOK    0x0020  // kill echoes the line
+#define TTY_LFLAG_IEXTEN   0x8000
+#define TTY_LFLAG_DEFAULT  (TTY_LFLAG_ISIG | TTY_LFLAG_ICANON | TTY_LFLAG_ECHO | \
+                            TTY_LFLAG_ECHOE | TTY_LFLAG_ECHOK | TTY_LFLAG_IEXTEN)
+
+#define TTY_CC_ERASE  0x7F  // DEL, the default VERASE
+#define TTY_CC_VEOF   0x04  // Ctrl-D
+
 // asm-generic struct termios: 4 flag words + c_line + c_cc[32] + 2 speeds
 typedef struct __attribute__((packed)) {
     uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
@@ -771,16 +840,20 @@ typedef struct {
     uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel;
 } uapi_winsize_t;
 
+// Defined further down (it belongs with the TLS it reads); the TTY ioctl and the
+// line discipline need it before that.
+static inline rvvm_userland_t* uctx(void);
+
 static int64_t user_tty_ioctl(uint64_t cmd, void* arg)
 {
     switch (cmd) {
         case UAPI_TCGETS: {
             uapi_termios_t t;
             memset(&t, 0, sizeof(t));
-            t.c_iflag = 0x100 | 0x400;      // ICRNL | IXON
+            t.c_iflag = TTY_IFLAG_ICRNL | 0x400; // ICRNL | IXON
             t.c_oflag = 0x1 | 0x4;          // OPOST | ONLCR (matches user_tty_write LF->CRLF)
             t.c_cflag = 0x30 | 0x80 | 0xF;  // CS8 | CREAD | B38400
-            t.c_lflag = 0x1 | 0x2 | 0x8 | 0x10 | 0x20 | 0x8000; // ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN
+            t.c_lflag = uctx()->tty_lflag;
             t.c_cc[6] = 1;                  // VMIN
             t.c_ispeed = t.c_ospeed = 0xF;  // B38400
             memcpy(arg, &t, sizeof(t));
@@ -794,12 +867,331 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg)
         case UAPI_TCSETS:
         case UAPI_TCSETSW:
         case UAPI_TCSETSF:
+            // The guest's terminal modes are honoured for the flags that shape
+            // the input path (ICANON / ECHO / ECHOE): that is what lets a
+            // full-screen app turn off canonical mode and receive raw keys.
+            // The remaining words stay fixed, matching TCGETS above.
+            if (arg) {
+                const uapi_termios_t* t = arg;
+                uctx()->tty_lflag = t->c_lflag;
+            }
+            return 0;
         case UAPI_TIOCSWINSZ:
-            // Guest termios changes: accept and ignore, the virtual TTY
-            // keeps its fixed state.
+            // Window size changes: accepted and ignored, the virtual TTY keeps
+            // its fixed 24x80 grid.
             return 0;
     }
     return -UAPI_ENOTTY;
+}
+
+/* ============================================================
+ * Guest virtual TTY input
+ *
+ * The keyboard half of the console. The host hands us the byte sequence a
+ * real terminal receives (printable UTF-8, '\r' for Enter, 0x7F for
+ * Backspace, ESC sequences for the arrows, ...); we run the line discipline
+ * the guest's termios advertises and queue the cooked bytes for read(0).
+ *
+ * This lives here rather than in each host on purpose: the VTerm, the termios
+ * answers and the output line discipline are already in this file, so both
+ * the Android and the win32 host get identical console behaviour for free.
+ * ============================================================ */
+
+// Queue cooked bytes for the guest. Caller holds tty_in_lock. Returns the
+// number of bytes actually queued (the ring may be full).
+static size_t tty_cooked_push(rvvm_userland_t* ctx, const void* buf, size_t len)
+{
+    const uint8_t* p = buf;
+    size_t space = TTY_IN_RING - ctx->tty_cooked_len;
+    if (len > space) {
+        len = space;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        size_t idx = (ctx->tty_cooked_head + ctx->tty_cooked_len) % TTY_IN_RING;
+        ctx->tty_cooked[idx] = p[i];
+        ctx->tty_cooked_len++;
+    }
+    return len;
+}
+
+// Drain up to len bytes out of the ring. Caller holds tty_in_lock.
+static size_t tty_cooked_pop(rvvm_userland_t* ctx, void* buf, size_t len)
+{
+    uint8_t* p = buf;
+    if (len > ctx->tty_cooked_len) {
+        len = ctx->tty_cooked_len;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        p[i] = ctx->tty_cooked[ctx->tty_cooked_head];
+        ctx->tty_cooked_head = (ctx->tty_cooked_head + 1) % TTY_IN_RING;
+    }
+    ctx->tty_cooked_len -= len;
+    return len;
+}
+
+/*
+ * Columns of screen the character just echoed occupies.
+ *
+ * Read back from the VTerm rather than from a width table of our own: libvterm
+ * decides which cells a character fills (its wcwidth covers CJK and emoji, and
+ * is not part of its public API), and the host renderer draws exactly those
+ * cells, so a private table could disagree with both and leave half a
+ * character behind. The cursor sits one column past the character, where the
+ * cell under it answers the question; against the right margin libvterm parks
+ * it as a phantom *on* the character instead (see putglyph() in state.c), and
+ * there the start column gives the width away, a wide glyph being unable to
+ * start at the last column.
+ */
+static int user_tty_erased_cols(rvvm_userland_t* ctx)
+{
+    if (!ctx->tty_vt) {
+        return 1;
+    }
+    /* Ask the VTerm for its screen instead of trusting the cached pointer: a
+     * host-injected VTerm (rvvm_user_set_tty0) is set up by the host before
+     * tty_screen is filled in, and a NULL screen here would silently degrade
+     * every erase to a single column. vterm_obtain_screen() just returns the
+     * existing screen for a VTerm that has one. */
+    VTermScreen* scr = vterm_obtain_screen((VTerm*)ctx->tty_vt);
+    VTermState*  st  = vterm_obtain_state((VTerm*)ctx->tty_vt);
+    int cols = 1;
+
+    spin_lock(&ctx->tty_vt_lock);
+    /* Pending scrolls are only folded into the matrix here, and a cell read
+     * before that can still be the previous generation of the screen. */
+    vterm_screen_flush_damage(scr);
+    VTermPos cur;
+    vterm_state_get_cursorpos(st, &cur);
+
+    VTermScreenCell cell;
+    if (vterm_screen_get_cell(scr, cur, &cell) && cell.chars[0]
+        && cur.col + cell.width >= VTERM_COLS) {
+        cols = cell.width;              // right margin: cursor on the character
+    } else if (cur.col > 0
+        && vterm_screen_get_cell(scr, (VTermPos){ cur.row, cur.col - 1 }, &cell)) {
+        /* One column back is either the gap cell of a wide character - the
+         * chars[0] == -1 marker the host renderer keys on as well - or the
+         * character itself, when it was a narrow one. */
+        cols = cell.chars[0] == (uint32_t)-1 ? 2 : 1;
+    }
+    spin_unlock(&ctx->tty_vt_lock);
+    return cols;
+}
+
+// Echo an erase: back over the character's cells, blank them, and return the
+// cursor to where it was, so the next keystroke lands in the same place. With
+// ECHOE clear a real terminal only moves the cursor and leaves the character
+// visible.
+static void user_tty_erase_echo(rvvm_userland_t* ctx, int cols, bool echoe)
+{
+    char seq[3 * 8];
+    size_t n = 0;
+    if (cols < 1) {
+        cols = 1;
+    } else if (cols > 8) {
+        cols = 8;                       // no character is wider than this
+    }
+    for (int i = 0; i < cols; ++i) {
+        seq[n++] = '\b';
+    }
+    if (echoe) {
+        for (int i = 0; i < cols; ++i) {
+            seq[n++] = ' ';
+        }
+        for (int i = 0; i < cols; ++i) {
+            seq[n++] = '\b';
+        }
+    }
+    user_tty_vt_write(ctx, seq, n);
+}
+
+// How many bytes the lead byte of a UTF-8 sequence claims, 0 if it is not one.
+static int tty_utf8_seq_len(uint8_t b)
+{
+    if (b < 0x80)         return 1;
+    if ((b & 0xE0) == 0xC0) return 2;
+    if ((b & 0xF0) == 0xE0) return 3;
+    if ((b & 0xF8) == 0xF0) return 4;
+    return 0;                   // a continuation byte, or an invalid lead
+}
+
+/*
+ * Drop the last character from the pending line, and report how many bytes went
+ * away (0 when the line is already empty).
+ *
+ * A character, not a byte, which is the whole point of this function: the line
+ * holds UTF-8, so erasing one byte of a multi-byte character would hand the
+ * guest an invalid sequence and would take three Backspaces to remove one CJK
+ * character. The tail is walked back over the continuation bytes onto the lead
+ * byte, and the whole sequence is taken only when the lead byte claims exactly
+ * the bytes that are there: anything malformed (a stray continuation byte, a
+ * sequence truncated at the head of the line) is erased a byte at a time, so a
+ * broken burst cannot swallow the character before it.
+ *
+ * Note that this is one *codepoint*, the same unit a Linux tty's VERASE
+ * removes: a combining mark that got in as its own codepoint, or one emoji of a
+ * ZWJ sequence, still takes a press each.
+ */
+static size_t tty_line_erase(rvvm_userland_t* ctx)
+{
+    size_t len = ctx->tty_line_len;
+    if (!len) {
+        return 0;
+    }
+    size_t start = len - 1;
+    size_t nbytes = 1;
+    if (ctx->tty_line[start] & 0x80) {
+        while (start > 0 && (ctx->tty_line[start] & 0xC0) == 0x80) {
+            start--;
+        }
+        nbytes = len - start;
+        if ((ctx->tty_line[start] & 0xC0) == 0x80
+            || tty_utf8_seq_len(ctx->tty_line[start]) != (int)nbytes) {
+            start = len - 1;        // not a well-formed sequence: last byte only
+            nbytes = 1;
+        }
+    }
+    ctx->tty_line_len = start;
+    return nbytes;
+}
+
+// Run one host input burst through the line discipline.
+static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
+{
+    const uint8_t* p = buf;
+    bool wake = false;
+
+    spin_lock(&ctx->tty_in_lock);
+
+    uint32_t lflag = ctx->tty_lflag;
+    bool canon = (lflag & TTY_LFLAG_ICANON) != 0;
+    bool echo  = (lflag & TTY_LFLAG_ECHO)   != 0;
+    bool echoe = (lflag & TTY_LFLAG_ECHOE)  != 0;
+
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t c = p[i];
+
+        // ICRNL: the keyboard's Enter arrives as CR and reads back as NL.
+        if (c == '\r') {
+            c = '\n';
+        }
+
+        if (!canon) {
+            // Raw mode (guest cleared ICANON): hand the byte straight through
+            // and echo it verbatim - the guest owns its own line editing.
+            tty_cooked_push(ctx, &c, 1);
+            if (echo) {
+                user_tty_vt_write(ctx, (const char*)&c, 1);
+            }
+            wake = true;
+            continue;
+        }
+
+        // --- canonical mode ---
+        if (c == TTY_CC_ERASE) {
+            // Erase the last character, whole: one Backspace takes one
+            // character the user typed, however many bytes of UTF-8 that is,
+            // out of the line the guest will read and off the screen.
+            if (ctx->tty_line_len) {
+                int cols = user_tty_erased_cols(ctx);
+                tty_line_erase(ctx);
+                if (echo) {
+                    user_tty_erase_echo(ctx, cols, echoe);
+                }
+            }
+            continue;
+        }
+
+        if (c == TTY_CC_VEOF) {
+            // Ctrl-D: deliver the pending line as-is; on an empty line it is
+            // the classic end-of-file, which read(0) reports as 0.
+            if (ctx->tty_line_len) {
+                tty_cooked_push(ctx, ctx->tty_line, ctx->tty_line_len);
+                ctx->tty_line_len = 0;
+            } else {
+                ctx->tty_eof_pending = 1;
+            }
+            wake = true;
+            continue;
+        }
+
+        if (c == '\n') {
+            // Enter: flush the assembled line, newline included.
+            if (echo) {
+                user_tty_vt_write(ctx, "\r\n", 2);
+            }
+            if (ctx->tty_line_len) {
+                tty_cooked_push(ctx, ctx->tty_line, ctx->tty_line_len);
+                ctx->tty_line_len = 0;
+            }
+            tty_cooked_push(ctx, "\n", 1);
+            wake = true;
+            continue;
+        }
+
+        if (ctx->tty_line_len < sizeof(ctx->tty_line)) {
+            ctx->tty_line[ctx->tty_line_len++] = c;
+            if (echo) {
+                user_tty_vt_write(ctx, (const char*)&c, 1);
+            }
+        }
+    }
+
+    spin_unlock(&ctx->tty_in_lock);
+    if (wake) {
+        rvvm_event_wake(&ctx->tty_in_event);
+    }
+}
+
+// True while a cooked byte, a pending EOF, or a torn-down TTY is available.
+static bool user_tty_readable(rvvm_userland_t* ctx)
+{
+    return ctx->tty_cooked_len || ctx->tty_eof_pending || ctx->tty_in_eof;
+}
+
+/*
+ * Serve read(0, ...) from the virtual TTY.
+ *
+ * @block  when true and nothing is queued, wait for host input instead of
+ *         returning early. The first iovec of a readv() blocks, the rest do
+ *         not, so a multi-segment read returns as soon as the console drains.
+ *
+ * Returns the byte count, 0 for EOF, or a negative errno. A single reader is
+ * assumed (an interactive console is read by one thread at a time): the wake
+ * below rouses one waiter per queued burst.
+ */
+static int64_t user_tty_read(rvvm_userland_t* ctx, void* buf, size_t count, bool block)
+{
+    if (!buf) {
+        return -UAPI_EFAULT;
+    }
+    if (!count) {
+        return 0;
+    }
+
+    for (;;) {
+        spin_lock(&ctx->tty_in_lock);
+        if (ctx->tty_cooked_len) {
+            size_t n = tty_cooked_pop(ctx, buf, count);
+            spin_unlock(&ctx->tty_in_lock);
+            return (int64_t)n;
+        }
+        if (ctx->tty_eof_pending) {
+            ctx->tty_eof_pending = 0;
+            spin_unlock(&ctx->tty_in_lock);
+            return 0;
+        }
+        if (ctx->tty_in_eof) {
+            spin_unlock(&ctx->tty_in_lock);
+            return 0;
+        }
+        spin_unlock(&ctx->tty_in_lock);
+
+        if (!block) {
+            return 0;
+        }
+        rvvm_event_wait(&ctx->tty_in_event, RVVM_EVENT_INFINITE);
+    }
 }
 
 void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback callback, void* userdata)
@@ -822,8 +1214,65 @@ void rvvm_user_set_tty0(rvvm_machine_t* machine, void* tty)
     if (ctx->tty_vt && ctx->tty_owned) {
         vterm_free((VTerm*)ctx->tty_vt);
     }
-    ctx->tty_vt    = tty;
-    ctx->tty_owned = false;
+    ctx->tty_vt = tty;
+    /* The screen travels with the VTerm: the matrix readers (the erase echo)
+     * need both, and leaving this NULL here silently cost a wide character its
+     * second column. */
+    ctx->tty_screen = tty ? vterm_obtain_screen((VTerm*)tty) : NULL;
+    ctx->tty_owned  = false;
+}
+
+/*
+ * Push host keyboard input toward the guest's virtual TTY.
+ *
+ * `buf`/`len` is the byte sequence a real terminal would receive from the
+ * keyboard: printable UTF-8, '\r' for Enter, 0x7F for Backspace, "\x1b[A" and
+ * friends for the arrow keys, 0x03/0x04 for Ctrl-C/Ctrl-D. The bytes are run
+ * through the line discipline the guest's termios advertises (ICRNL, ICANON
+ * line assembly, ECHO) and the cooked result is what the guest's read(0, ...)
+ * / readv(0, ...) returns. Echo is written into the VTerm, so the host's next
+ * snapshot shows the typing.
+ *
+ * Safe to call from any thread, but the bytes are serialized against the
+ * guest's own fd 1/2 output through the VTerm lock. A no-op when no TTY is
+ * attached.
+ */
+void rvvm_user_tty_input(rvvm_machine_t* machine, const void* buf, size_t len)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (!ctx || !buf || !len) {
+        return;
+    }
+    if (!ctx->tty_vt && !ctx->tty_cb) {
+        return; // no virtual TTY attached: nowhere to echo and nothing to read
+    }
+    user_tty_init(ctx);
+    user_tty_input(ctx, buf, len);
+}
+
+/*
+ * Serialize host access to the guest TTY's VTerm.
+ *
+ * The guest thread parses its own fd 1/2 output into the VTerm; a host that
+ * also touches it - keyboard echo, or reading the screen matrix for a
+ * snapshot - must hold this lock for the duration of its access. Take it and
+ * release it promptly: it is a spinlock and the guest thread contends for it
+ * on every write, so do not block, allocate or render while holding it.
+ */
+void rvvm_user_tty_lock(rvvm_machine_t* machine)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (ctx) {
+        spin_lock(&ctx->tty_vt_lock);
+    }
+}
+
+void rvvm_user_tty_unlock(rvvm_machine_t* machine)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (ctx) {
+        spin_unlock(&ctx->tty_vt_lock);
+    }
 }
 
 /*
@@ -1634,6 +2083,14 @@ static void userland_process_exit(rvvm_userland_t* ctx, int code, rvvm_user_thre
     if (atomic_swap_uint32(&ctx->userland_suspend, 0)) {
         rvvm_futex_wake(&ctx->userland_suspend, UINT32_MAX);
     }
+
+    // Unblock any thread parked in read(0) on the virtual TTY. Its wait is on a
+    // host event, not on the interpreter, so the hart pause above cannot reach
+    // it; it returns EOF and unwinds like every other guest thread.
+    spin_lock(&ctx->tty_in_lock);
+    ctx->tty_in_eof = true;
+    spin_unlock(&ctx->tty_in_lock);
+    rvvm_event_wake(&ctx->tty_in_event);
 }
 
 /*
@@ -2388,10 +2845,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 29: // ioctl
                     // TODO: I sure hope not many ioctl() interfaces need struct conversion...
                     rvvm_info("sys_ioctl(%ld, %lx, %lx)", a0, a1, a2);
-                    if ((a0 == 1 || a0 == 2) && uctx()->tty_vt) {
+                    if ((a0 == 0 || a0 == 1 || a0 == 2) && uctx()->tty_vt) {
                         // Virtual TTY rendered by the host: answer the termios
                         // probes guest libc makes for isatty() itself instead
-                        // of forwarding them to the host fd.
+                        // of forwarding them to the host fd. fd 0 is included
+                        // because it is the same console, only the input half.
                         a0 = user_tty_ioctl(a1, a2 ? to_ptr(a2) : NULL);
                         break;
                     }
@@ -2532,7 +2990,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 63: { // read
                     void* buf = a2 ? to_ptr_sz(a1, a2) : NULL;
-                    a0 = (a2 && !buf) ? (rvvm_addr_t)-UAPI_EFAULT : errno_ret(read(a0, buf, a2));
+                    if (a2 && !buf) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    if (a0 == 0 && uctx()->tty_vt) {
+                        // fd 0 is the virtual TTY: the guest's stdin comes from
+                        // the host keyboard (rvvm_user_tty_input), not from the
+                        // host process's own stdin. Blocks until a line has been
+                        // assembled by the line discipline.
+                        a0 = (rvvm_addr_t)user_tty_read(uctx(), buf, a2, true);
+                        break;
+                    }
+                    a0 = errno_ret(read(a0, buf, a2));
                     break;
                 }
                 case 64: { // write
@@ -2575,7 +3045,35 @@ static void* rvvm_user_thread_wrap(void* arg)
                         break;
                     }
                     if (a7 == 65) {
-                        a0 = errno_ret(readv(a0, hiov, a2));
+                        if (a0 == 0 && uctx()->tty_vt) {
+                            // fd 0 is the virtual TTY: serve readv() from the
+                            // keyboard queue. The first non-empty segment blocks
+                            // until input arrives, the rest drain what is
+                            // already queued so the call returns as soon as the
+                            // console is empty instead of blocking twice.
+                            ssize_t total = 0;
+                            for (int i = 0; i < (int)a2; i++) {
+                                if (!hiov[i].iov_len) {
+                                    continue;
+                                }
+                                ssize_t r = user_tty_read(uctx(), hiov[i].iov_base,
+                                                          hiov[i].iov_len, total == 0);
+                                if (r < 0) {
+                                    total = total ? total : r;
+                                    break;
+                                }
+                                if (r == 0) {
+                                    break; // EOF, or the console drained
+                                }
+                                total += r;
+                                if (!user_tty_readable(uctx())) {
+                                    break;
+                                }
+                            }
+                            a0 = errno_ret(total);
+                        } else {
+                            a0 = errno_ret(readv(a0, hiov, a2));
+                        }
                     } else if (a0 == 1 || a0 == 2) {
                         /* stdout/stderr: mirror every segment into the virtual
                          * TTY parser (when one exists) and forward the same
@@ -3509,6 +4007,18 @@ static void jump_start(size_t entry, size_t stack_top)
     atomic_store_uint32(&ctx->userland_suspend, 0);
     atomic_store_uint32(&ctx->userland_parked, 0);
 
+    // ...and neither must the previous guest's console state: no type-ahead
+    // left in the ring, no half-typed line, and the terminal back to the
+    // default modes it reports through TCGETS.
+    spin_lock(&ctx->tty_in_lock);
+    ctx->tty_cooked_head = 0;
+    ctx->tty_cooked_len  = 0;
+    ctx->tty_line_len    = 0;
+    ctx->tty_eof_pending = 0;
+    ctx->tty_in_eof      = false;
+    ctx->tty_lflag       = TTY_LFLAG_DEFAULT;
+    spin_unlock(&ctx->tty_in_lock);
+
     rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
     thread->cpu = rvvm_create_user_thread(userland);
     ctx->userland_main_thread = thread;
@@ -3699,6 +4209,9 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
     ctx->machine      = machine;
     ctx->prefix_path  = USERLAND_DEFAULT_PREFIX;
     ctx->fake_root    = USERLAND_DEFAULT_FAKE_ROOT;
+    // Terminal state before the guest changes it - must match the TCGETS
+    // answer in user_tty_ioctl(): canonical, echoing, line editing.
+    ctx->tty_lflag    = TTY_LFLAG_DEFAULT;
     machine->userdata = ctx;
     return machine;
 }
