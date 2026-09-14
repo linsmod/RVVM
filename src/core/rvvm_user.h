@@ -43,7 +43,7 @@ void rvvm_user_set_exit_callback(rvvm_machine_t* machine, rvvm_user_exit_callbac
 
 // --- Guest virtual TTY (libvterm-backed) ---
 //
-// When a host injects a VTerm (rvvm_user_set_tty0) and/or registers a TTY
+// When a host attaches a session (rvvm_tty_attach) and/or registers a TTY
 // callback, guest writes to fd 1/2 are fed through the libvterm instance as
 // well: the bytes are parsed into a screen matrix (CR, ANSI escapes,
 // scrolling, ...) that the host renders itself. This is what makes in-place
@@ -63,19 +63,111 @@ typedef void (*rvvm_user_tty_callback)(void* userdata, int fd, void* tty);
 
 void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback callback, void* userdata);
 
-// Attach a host-owned virtual TTY (a libvterm `VTerm*`, opaque here) to the
-// machine. Guest fd 1/2 output is fed into it (with ONLCR emulation) in
-// addition to the host fd / io_callback path. Ownership stays with the host:
-// the VTerm survives guest exit (keeping the last screen renderable) and
-// rvvm_user never frees it. Without this call rvvm_user creates and owns an
-// internal VTerm, freed with the machine. Must be called before
-// rvvm_user_linux_ex().
+// --- Host-owned terminal session ---
 //
-// The grid size belongs to whoever owns the VTerm: a host may resize it (the
-// Android console derives its row count from its viewport, for example) and
-// the guest then observes the new size through TIOCGWINSZ. Only when no VTerm
-// is attached does rvvm_user report its built-in default grid.
-void rvvm_user_set_tty0(rvvm_machine_t* machine, void* tty);
+// A console is a session, not a property of a run. The session owns the screen
+// matrix and the lock that serializes every access to it, and it outlives the
+// guest - which is what lets a host keep showing, and scrolling through, the
+// last screen after the run ends (Ctrl-C included). Open one for the lifetime
+// of the host's console, attach it before each run, detach it once the guest
+// thread is gone:
+//
+//     rvvm_tty_t* tty = rvvm_tty_open(24, 80);
+//     rvvm_tty_attach(tty, machine);      // guest fd 1/2 parses into it
+//     ... rvvm_user_linux_ex() ...
+//     rvvm_tty_detach(tty, machine);      // screen, lock and size stay valid
+//     rvvm_tty_close(tty);
+//
+// Everything a renderer needs hangs off the session and needs no machine: it
+// owns the packed cells and the scrollback behind rvvm_tty_snapshot(), the view
+// position behind rvvm_tty_scroll(), and the repaint serial. A host that wants
+// to talk to libvterm itself (a diagnostic dump, say) can take the lock and go
+// through rvvm_tty_vterm(). The grid size belongs to whoever opened the session
+// (the Android console derives its row count from its viewport, for example)
+// and the guest observes it through TIOCGWINSZ. Only when no session is
+// attached does rvvm_user report its built-in default grid.
+//
+// Without an attached session rvvm_user creates and owns an internal one as
+// soon as a TTY callback is registered, and frees it with the machine.
+typedef struct rvvm_tty rvvm_tty_t;
+
+// One screen cell as the renderers consume it. The layout is fixed at 4 x
+// uint32 with no padding, which is exactly what the Android renderer reads out
+// of its int[] - so a host can pass its own array straight to
+// rvvm_tty_snapshot() without a conversion pass.
+typedef struct {
+    uint32_t cp;     // UCS-4 codepoint; 0 is a blank (or double-width gap) cell
+    uint32_t fg;     // ARGB
+    uint32_t bg;     // ARGB; the low 24 bits are 0 for the default background
+    uint32_t flags;  // RVT_TTY_*, below
+} rvvm_tty_cell_t;
+
+// Cell flags, packed by rvvm_tty_snapshot() into rvvm_tty_cell_t.flags.
+enum {
+    RVT_TTY_BOLD      = 1 << 0,
+    RVT_TTY_UNDERLINE = 1 << 1,
+    RVT_TTY_REVERSE   = 1 << 2,  // already swapped into fg/bg
+    RVT_TTY_WIDE      = 1 << 3,  // lead cell of a double-width glyph
+    RVT_TTY_CURSOR    = 1 << 4,  // this is the cursor cell
+};
+
+// Where a snapshot's cells came from, and where the view sits in history.
+typedef struct {
+    int32_t rows, cols;              // the grid the cells belong to
+    int32_t scroll;                  // lines the view sits above the live bottom
+    int32_t scrollback_lines;        // lines stored in history
+    int32_t cursor_row, cursor_col;  // -1/-1 when no cursor is drawn
+    int32_t serial;                  // the serial this snapshot was taken at
+} rvvm_tty_view_t;
+
+rvvm_tty_t* rvvm_tty_open(int rows, int cols);  // NULL on allocation failure
+void        rvvm_tty_close(rvvm_tty_t* tty);    // no guest may be attached
+void        rvvm_tty_attach(rvvm_tty_t* tty, rvvm_machine_t* machine);
+void        rvvm_tty_detach(rvvm_tty_t* tty, rvvm_machine_t* machine);
+void        rvvm_tty_reset(rvvm_tty_t* tty);    // wipe the screen for a new run
+void        rvvm_tty_resize(rvvm_tty_t* tty, int rows, int cols);
+void        rvvm_tty_get_size(rvvm_tty_t* tty, int* rows, int* cols);  // caller holds the lock
+
+// Serialize access to the session's VTerm. The guest thread parses its own
+// fd 1/2 output into it, so a host that reads the screen matrix (a snapshot,
+// say) must hold this lock for the duration of that access. Hold it briefly -
+// it is a spinlock the guest thread contends for on every write - so do not
+// block, allocate or render while holding it. rvvm_tty_resize() and
+// rvvm_tty_reset() take it themselves; the VTerm calls made through
+// rvvm_tty_vterm() require the caller to.
+void        rvvm_tty_lock(rvvm_tty_t* tty);
+void        rvvm_tty_unlock(rvvm_tty_t* tty);
+
+// The libvterm `VTerm*` behind the session, for the rendering calls (flush the
+// damage queue, read cells). Cast it after including <vterm.h>. Every use must
+// be inside rvvm_tty_lock()/rvvm_tty_unlock().
+void*       rvvm_tty_vterm(rvvm_tty_t* tty);
+
+// Snapshot the view for a renderer: fills up to out_cells cells (rows*cols of
+// the session's current grid, in view->rows/view->cols) plus the view they came
+// from, in one locked pass - so the cells and the cursor can never disagree by
+// a frame. Takes the lock itself; nothing needs to be held by the caller.
+//
+// The cells are already packed (colors resolved to ARGB, double-width gaps
+// zeroed, cursor cell flagged): a renderer walks that array, it does not touch
+// libvterm. A window scrolled into history is a copy out of the session's own
+// scrollback, which is why the result is the same whether the line is on screen
+// or has already scrolled off.
+//
+// Returns the number of cells written, or 0 when the session has no grid yet -
+// or when out_cells is too small, in which case view->rows/view->cols are still
+// filled so the caller can grow its buffer and call again.
+int         rvvm_tty_snapshot(rvvm_tty_t* tty, rvvm_tty_cell_t* out, int out_cells, rvvm_tty_view_t* view);
+
+// Drag the view through the scrollback, in whole rows: positive looks back into
+// history. Clamped to what the session stored, and dragging back past the live
+// bottom re-pins the view there. A view parked in history stays on the lines
+// being read while output keeps arriving; typing brings it home.
+void        rvvm_tty_scroll(rvvm_tty_t* tty, int lines);
+
+// Repaint hint: bumped on output, resize, reset and scroll. Read without the
+// lock (it is only ever compared), so a poller can call it at any rate.
+int         rvvm_tty_serial(rvvm_tty_t* tty);
 
 // Push host keyboard input toward the guest's virtual TTY - the input half of
 // the console described above.
@@ -101,16 +193,6 @@ void rvvm_user_set_tty0(rvvm_machine_t* machine, void* tty);
 // with a TTY attached, fd 0 is the console instead of the host process's own
 // stdin. Safe to call from any thread; a no-op when no TTY is attached.
 void rvvm_user_tty_input(rvvm_machine_t* machine, const void* buf, size_t len);
-
-// Serialize host access to the guest TTY's VTerm.
-//
-// The guest thread parses its own fd 1/2 output into the VTerm, so a host that
-// also touches it - reading the screen matrix for a snapshot, for instance -
-// must hold this lock for the duration of that access. Hold it briefly: it is
-// a spinlock the guest thread contends for on every write, so do not block,
-// allocate or render while holding it.
-void rvvm_user_tty_lock(rvvm_machine_t* machine);
-void rvvm_user_tty_unlock(rvvm_machine_t* machine);
 
 // Override the guest's filesystem prefix - the directory guest absolute paths
 // are resolved against.

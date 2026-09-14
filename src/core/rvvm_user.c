@@ -672,8 +672,15 @@ typedef struct rvvm_userland {
     // --- Guest virtual TTY (libvterm, optional) ---
     // When tty_cb is set, guest writes to fd 1/2 are parsed by libvterm and the
     // host renders the screen itself instead of writing raw bytes to a tty.
-    void*                    tty_vt;        // VTerm* (opaque here)
-    void*                    tty_screen;    // VTermScreen* (opaque here)
+    //
+    // The console is a host-owned *session* (rvvm_tty_t, defined below): the
+    // session holds the VTerm and the lock that serializes every access to it,
+    // and it outlives this machine - that is what lets the host keep rendering
+    // (and scrolling through) the last screen after the guest is gone.
+    // rvvm_tty_attach() installs the host's session here; when the host attaches
+    // none, the first write creates an internal one (tty_owned) so fd 1/2 still
+    // parses into a screen for a host that only registered a callback.
+    rvvm_tty_t*              tty;
     bool                     tty_owned;     // internally created, free with the machine
     rvvm_user_tty_callback   tty_cb;
     void*                    tty_userdata;
@@ -683,7 +690,6 @@ typedef struct rvvm_userland {
     // terminal would receive (rvvm_user_tty_input); they run through the line
     // discipline the guest's termios advertises (ICRNL, ICANON line assembly
     // with erase, ECHO) and the cooked result is what read(0, ...) returns.
-    spinlock_t   tty_vt_lock;      // serializes every VTerm access
     spinlock_t   tty_in_lock;      // guards the ring + pending line below
     rvvm_event_t tty_in_event;     // wakes a read(0) blocked with nothing to read
     uint8_t      tty_cooked[TTY_IN_RING];
@@ -713,50 +719,520 @@ static inline rvvm_userland_t* rvvm_userland_ctx(rvvm_machine_t* machine)
  */
 #include <vterm.h>
 
-/* Default grid of the internally-created VTerm (the one used when no host has
- * injected its own through rvvm_user_set_tty0). A host-injected VTerm owns its
- * size - the Android console, for instance, follows its viewport height - and
- * these two are then only the fallback TIOCGWINSZ answers when no VTerm is
- * attached yet. */
+/* Default grid of a terminal session whose opener did not pick one, and of the
+ * internal session created when no host attached one (see user_tty_init). The
+ * grid of an attached session belongs to whoever opened it - the Android
+ * console, for instance, follows its viewport height - so these two are then
+ * only the fallback answers for "no session attached". */
 #define VTERM_ROWS 24
 #define VTERM_COLS 80
 
-static void user_tty_init(rvvm_userland_t* ctx)
+/* ============================================================
+ * rvvm_tty - host-owned terminal session
+ * ============================================================
+ * The screen matrix and the lock that serializes every access to it live here,
+ * NOT on the machine, and that split is the point: a machine *is* the guest's
+ * lifetime (fd 1/2 parsing, the line discipline, the winsize ioctl all end with
+ * the run), while the console is the host's - it keeps rendering the frozen
+ * last screen, and scrolling through it, with no machine left to ask.
+ *
+ * A host opens one session for the lifetime of its console, attaches it before
+ * each run and detaches it once the guest thread is gone:
+ *
+ *     rvvm_tty_t* tty = rvvm_tty_open(24, 80);
+ *     rvvm_tty_attach(tty, machine);      // guest fd 1/2 now parses into it
+ *     ... rvvm_user_linux_ex() ...
+ *     rvvm_tty_detach(tty, machine);      // screen, lock and size stay valid
+ *
+ * The session also owns everything a renderer draws: the packed cell grid
+ * (rvvm_tty_snapshot), the scrollback ring behind it, the view position and the
+ * repaint hint - so a host is left with the actual drawing and nothing else.
+ * No machine pointer is involved in any of it, which is what lets a console be
+ * rendered and scrolled after the guest exited (Ctrl-C included): exactly when
+ * reading the output back matters most.
+ *
+ * Threading: the lock is the same one the core takes while parsing guest output
+ * (user_tty_write) and echoing host input, so a host snapshot can never see a
+ * half-parsed escape sequence. Attach/detach are not locked: they are the
+ * host's start- and end-of-run points, where no guest thread is running.
+ * ============================================================ */
+/* History rows kept per session. The ring is allocated with the session, which
+ * is the same budget the Android host used to keep in a static array of its
+ * own. */
+#define RVT_TTY_SB_LINES 1000
+
+struct rvvm_tty {
+    VTerm*       vt;
+    VTermScreen* screen;    /* the screen of vt, for the packing callbacks */
+    spinlock_t   lock;
+
+    /* Scrollback: libvterm's sb_pushline is a notification - the row is handed
+     * over and then forgotten - so a console that can be scrolled has to store
+     * the lines itself. They go in already packed, the very cells a snapshot
+     * hands out, which makes a window that reaches into history a copy rather
+     * than a second rendering path. Ring of RVT_TTY_SB_LINES rows, each `cols`
+     * cells wide; the oldest is at sb_count - 1. */
+    rvvm_tty_cell_t* sb;
+    int          cols;      /* grid width, fixed for the session's lifetime */
+    int          sb_count;
+    int          sb_next;
+
+    /* View: where the snapshot window sits. It follows the live screen until a
+     * host drags it back, and a view parked in history stays on the lines being
+     * read while output keeps arriving (see rvvm_tty_sb_pushline). */
+    int          scroll;
+    bool         follow;
+
+    /* Cursor visibility: libvterm's DECTCEM state (ESC [ ? 25 h / l), which a
+     * full-screen guest toggles to park or hide the cursor. libvterm reports it
+     * only through a screen callback, so it is recorded here. */
+    bool         cursor_visible;
+
+    /* Repaint hint. Written under the lock, read without it (a poller only ever
+     * compares two values), hence the volatile. */
+    volatile int serial;
+};
+
+/* The cell layout hosts read out of their own arrays (the Android renderer
+ * hands its int[] straight to rvvm_tty_snapshot) must stay exactly 4 x 32 bits:
+ * this fails to compile if it ever grows padding. */
+typedef char rvvm_tty_cell_layout_check[sizeof(rvvm_tty_cell_t) == 16 ? 1 : -1];
+
+/* One VTerm cell -> a packed rvvm_tty_cell_t. Both the live screen and the
+ * scrollback rows are packed here, so a line looks the same the moment it
+ * scrolls off the top and when it is later read back out of history. The cursor
+ * bit belongs to the snapshot and is deliberately left out here. */
+static void rvvm_tty_pack_cell(VTermScreen* scr, const VTermScreenCell* cell,
+                               rvvm_tty_cell_t* out)
 {
-    if (ctx->tty_vt) {
-        /* A host-injected VTerm (rvvm_user_set_tty0) owns its screen; keep the
-         * pair consistent for the paths that read the matrix back. */
-        if (!ctx->tty_screen) {
-            ctx->tty_screen = vterm_obtain_screen((VTerm*)ctx->tty_vt);
-        }
-        return;
+    uint32_t cp = cell->chars[0];
+    uint32_t flags = 0;
+    if (cp == (uint32_t)-1) {
+        cp = 0; /* double-width gap: lead char already drawn */
+    } else if (cp) {
+        if (cell->attrs.bold)      flags |= RVT_TTY_BOLD;
+        if (cell->attrs.underline) flags |= RVT_TTY_UNDERLINE;
+        /* libvterm's own wcwidth covers CJK *and* emoji (U+1F300+); a
+         * hand-rolled codepoint range list misses the latter and renders them
+         * overlapping the next cell. */
+        if (cell->width == 2)      flags |= RVT_TTY_WIDE;
     }
-    VTerm* vt = vterm_new(VTERM_ROWS, VTERM_COLS);
-    if (!vt) {
-        return;
+    /* Colors: resolve defaults and indexed palette to ARGB. */
+    VTermColor fg = cell->fg, bg = cell->bg;
+    if (VTERM_COLOR_IS_DEFAULT_FG(&fg)) {
+        out->fg = 0xFFDCDCDC; /* light gray on black */
+    } else {
+        vterm_screen_convert_color_to_rgb(scr, &fg);
+        out->fg = 0xFF000000u | ((uint32_t)fg.rgb.red << 16) |
+                  ((uint32_t)fg.rgb.green << 8) | (uint32_t)fg.rgb.blue;
     }
-    VTermScreen* screen = vterm_obtain_screen(vt);
-    // No screen callbacks needed: the host renders by calling
-    // vterm_screen_flush_damage() + vterm_screen_get_chars() on demand.
-    vterm_set_utf8(vt, 1); // UTF-8 off by default in libvterm
-    vterm_screen_reset(screen, true);
-    ctx->tty_vt     = vt;
-    ctx->tty_screen = screen;
-    ctx->tty_owned  = true;
+    if (VTERM_COLOR_IS_DEFAULT_BG(&bg)) {
+        out->bg = 0xFF000000; /* black */
+    } else {
+        vterm_screen_convert_color_to_rgb(scr, &bg);
+        out->bg = 0xFF000000u | ((uint32_t)bg.rgb.red << 16) |
+                  ((uint32_t)bg.rgb.green << 8) | (uint32_t)bg.rgb.blue;
+    }
+    if (cell->attrs.reverse) {
+        uint32_t t = out->fg; out->fg = out->bg; out->bg = t;
+        flags |= RVT_TTY_REVERSE;
+    }
+    out->cp    = cp;
+    out->flags = flags;
 }
 
-// Feed guest output on fd 1/2 through libvterm. No-op unless a virtual TTY
-// exists - either injected by the host via rvvm_user_set_tty0() or created
-// on demand when a host registered a tty callback. This only mirrors the bytes
-// into the screen matrix; the caller still forwards them to the host's
-// io_callback / host fd, so both sinks stay live.
+/* A blank cell of the session's shape: what a scrollback row is padded with
+ * when libvterm hands over fewer columns than the session is wide, and what a
+ * window reading past the stored history gets. */
+static void rvvm_tty_blank_cell(rvvm_tty_cell_t* out)
+{
+    out->cp    = 0;
+    out->fg    = 0xFFDCDCDC;
+    out->bg    = 0xFF000000;
+    out->flags = 0;
+}
+
+/* Reached from the guest thread while it parses its own output, with the
+ * session lock held (the core holds it across that write), never outside it. */
+static int rvvm_tty_sb_pushline(int cols, const VTermScreenCell* cells, void* user)
+{
+    rvvm_tty_t* tty = user;
+    rvvm_tty_cell_t* row = tty->sb + (size_t)tty->sb_next * tty->cols;
+    for (int c = 0; c < tty->cols; c++) {
+        if (c < cols) {
+            rvvm_tty_pack_cell(tty->screen, &cells[c], row + c);
+        } else {
+            rvvm_tty_blank_cell(row + c);
+        }
+    }
+    tty->sb_next = (tty->sb_next + 1) % RVT_TTY_SB_LINES;
+    if (tty->sb_count < RVT_TTY_SB_LINES) {
+        tty->sb_count++;
+    }
+    /* A view dragged back is anchored on the lines it is showing: one line
+     * pushed is one more line between it and the live bottom, otherwise the
+     * text would drift up under the reader on every output burst. */
+    if (!tty->follow && tty->scroll < tty->sb_count) {
+        tty->scroll++;
+    }
+    tty->serial++;
+    return 1;
+}
+
+/* The guest asked for the scrollback to go away (CSI 3 J, a reset). It is gone,
+ * so a view parked in it has nowhere to be but back on the live screen. */
+static int rvvm_tty_sb_clear(void* user)
+{
+    rvvm_tty_t* tty = user;
+    tty->sb_count = 0;
+    tty->sb_next  = 0;
+    tty->scroll   = 0;
+    tty->follow   = true;
+    tty->serial++;
+    return 1;
+}
+
+/* Termprop notifications come from the guest thread (it parses the output that
+ * carries them), so this only records the value. */
+static int rvvm_tty_settermprop(VTermProp prop, VTermValue* val, void* user)
+{
+    rvvm_tty_t* tty = user;
+    if (prop == VTERM_PROP_CURSORVISIBLE && val) {
+        tty->cursor_visible = val->boolean;
+    }
+    return 1;
+}
+
+/* settermprop records cursor visibility; sb_pushline / sb_clear keep the
+ * session's own scrollback. The rest must stay NULL: moverect_user() skips
+ * damagerect() when a moverect callback answers, so hooking it would lose the
+ * damage markings of every scrolled row and the host would stop repainting a
+ * scrolling screen - and sb_popline is only asked for when libvterm shrinks a
+ * screen, where this session drops the rows rather than storing them back. */
+static const VTermScreenCallbacks rvvm_tty_screen_cbs = {
+    .damage      = NULL,
+    .moverect    = NULL,
+    .movecursor  = NULL,
+    .settermprop = rvvm_tty_settermprop,
+    .bell        = NULL,
+    .resize      = NULL,
+    .sb_pushline = rvvm_tty_sb_pushline,
+    .sb_popline  = NULL,
+    .sb_clear    = rvvm_tty_sb_clear,
+};
+
+PUBLIC rvvm_tty_t* rvvm_tty_open(int rows, int cols)
+{
+    if (rows < 1) rows = VTERM_ROWS;
+    if (cols < 1) cols = VTERM_COLS;
+
+    rvvm_tty_t* tty = safe_new_obj(rvvm_tty_t);
+    tty->vt = vterm_new(rows, cols);
+    if (!tty->vt) {
+        safe_free(tty);
+        return NULL;
+    }
+    /* UTF-8 is OFF by default in libvterm; without it CJK/emoji get mangled
+     * into latin1 before reaching the cells. */
+    vterm_set_utf8(tty->vt, 1);
+
+    tty->cols           = cols;
+    tty->follow         = true;
+    tty->cursor_visible = true;
+    tty->sb             = safe_calloc((size_t)RVT_TTY_SB_LINES * cols,
+                                      sizeof(rvvm_tty_cell_t));
+
+    /* The screen carries the session as its callback data: sb_pushline and
+     * sb_clear keep the scrollback, settermprop the cursor visibility, and the
+     * serial is bumped from all of them. Installed before the first reset so
+     * the screen starts from a known state. */
+    tty->screen = vterm_obtain_screen(tty->vt);
+    vterm_screen_set_callbacks(tty->screen, &rvvm_tty_screen_cbs, tty);
+    vterm_screen_reset(tty->screen, true);
+    return tty;
+}
+
+PUBLIC void rvvm_tty_close(rvvm_tty_t* tty)
+{
+    if (!tty) {
+        return;
+    }
+    /* The lifetime rule belongs to the caller: close only once no guest is
+     * attached, since a running guest parses its own output into this VTerm. */
+    vterm_free(tty->vt);
+    safe_free(tty->sb);
+    safe_free(tty);
+}
+
+PUBLIC void rvvm_tty_lock(rvvm_tty_t* tty)
+{
+    if (tty) {
+        spin_lock(&tty->lock);
+    }
+}
+
+PUBLIC void rvvm_tty_unlock(rvvm_tty_t* tty)
+{
+    if (tty) {
+        spin_unlock(&tty->lock);
+    }
+}
+
+/* The libvterm instance behind the session. Every use has to be inside
+ * rvvm_tty_lock() ... rvvm_tty_unlock(), the same lock the guest's own output
+ * is parsed under. */
+PUBLIC void* rvvm_tty_vterm(rvvm_tty_t* tty)
+{
+    return tty ? tty->vt : NULL;
+}
+
+/* Wipe the screen for a fresh run: the cells, the scrollback, the view and the
+ * cursor state all belong to the run that just ended. Takes the lock itself;
+ * called between runs, from the host's UI thread. */
+PUBLIC void rvvm_tty_reset(rvvm_tty_t* tty)
+{
+    if (!tty) {
+        return;
+    }
+    rvvm_tty_lock(tty);
+    /* libvterm's screen reset does not re-announce the termprop (CURSORVISIBLE
+     * is only reported on DECTCEM and DECRC), so a guest that hid its cursor
+     * must not leave the next run without one. */
+    tty->cursor_visible = true;
+    tty->sb_count       = 0;
+    tty->sb_next        = 0;
+    tty->scroll         = 0;
+    tty->follow         = true;
+    vterm_screen_reset(tty->screen, true);
+    tty->serial++;
+    rvvm_tty_unlock(tty);
+}
+
+/* Resize the grid - the host viewport owns it. Takes the lock itself (the
+ * renderer calls this from its layout path, with no lock held), and the guest
+ * observes the new size through TIOCGWINSZ on its next query. */
+PUBLIC void rvvm_tty_resize(rvvm_tty_t* tty, int rows, int cols)
+{
+    if (!tty || rows < 1) {
+        return;
+    }
+    rvvm_tty_lock(tty);
+    /* The column count is part of the session: the scrollback is stored that
+     * wide, so a resize with a different cols is ignored rather than silently
+     * re-striding history. A host that wants another width opens the session
+     * with it. */
+    if (cols != tty->cols) {
+        cols = tty->cols;
+    }
+    vterm_set_size(tty->vt, rows, cols);
+    tty->serial++;
+    rvvm_tty_unlock(tty);
+}
+
+/* Grid size of the session. Caller holds the lock. */
+PUBLIC void rvvm_tty_get_size(rvvm_tty_t* tty, int* rows, int* cols)
+{
+    int r = VTERM_ROWS, c = VTERM_COLS;
+    if (tty) {
+        vterm_get_size(tty->vt, &r, &c);
+    }
+    if (rows) *rows = r;
+    if (cols) *cols = c;
+}
+
+/* Back to the live screen - anything that makes the lines being written the
+ * ones worth showing (typing, a new run). Caller holds the lock. */
+static void rvvm_tty_follow_locked(rvvm_tty_t* tty)
+{
+    if (!tty->follow || tty->scroll) {
+        tty->follow = true;
+        tty->scroll = 0;
+        tty->serial++;
+    }
+}
+
+PUBLIC void rvvm_tty_scroll(rvvm_tty_t* tty, int lines)
+{
+    if (!tty || !lines) {
+        return;
+    }
+    rvvm_tty_lock(tty);
+    int scroll = (tty->follow ? 0 : tty->scroll) + lines;
+    if (scroll <= 0) {
+        /* Dragged back past the live bottom: re-pin the view there. */
+        tty->follow = true;
+        scroll = 0;
+    } else {
+        if (scroll > tty->sb_count) {
+            scroll = tty->sb_count;
+        }
+        tty->follow = false;
+    }
+    tty->scroll = scroll;
+    tty->serial++;
+    rvvm_tty_unlock(tty);
+}
+
+PUBLIC int rvvm_tty_serial(rvvm_tty_t* tty)
+{
+    return tty ? tty->serial : 0;
+}
+
+PUBLIC int rvvm_tty_snapshot(rvvm_tty_t* tty, rvvm_tty_cell_t* out, int out_cells,
+                             rvvm_tty_view_t* view)
+{
+    if (!tty || !out || !view) {
+        return 0;
+    }
+
+    rvvm_tty_lock(tty);
+    int rows = 0, cols = 0;
+    vterm_get_size(tty->vt, &rows, &cols);
+    if (rows < 1 || cols < 1) {
+        rvvm_tty_unlock(tty);
+        return 0;
+    }
+    /* The view is filled even when the caller's buffer is too small, so it can
+     * size the buffer from it and call again. */
+    view->rows        = rows;
+    view->cols        = cols;
+    view->serial      = tty->serial;
+    view->scroll      = 0;
+    view->scrollback_lines = tty->sb_count;
+    view->cursor_row  = -1;
+    view->cursor_col  = -1;
+    if (out_cells < rows * cols) {
+        rvvm_tty_unlock(tty);
+        return 0;
+    }
+
+    /* libvterm defers part of its screen state to the damage queue: pending
+     * scroll/damage is only folded into the matrix here, and a cell read before
+     * that can still be the previous generation of the screen. */
+    vterm_screen_flush_damage(tty->screen);
+
+    /* The window: the last `rows` lines of "history + screen", shifted up by the
+     * scrollback offset, clamped to what is actually stored so a view parked in
+     * history cannot ask for lines that have been recycled. */
+    int scroll = tty->follow ? 0 : tty->scroll;
+    if (scroll > tty->sb_count) scroll = tty->sb_count;
+    if (scroll < 0) scroll = 0;
+    /* The scrollback is stored tty->cols cells wide, so a grid of another width
+     * cannot read it: only reachable if a host resized the VTerm behind the
+     * session's back (rvvm_tty_resize pins the column count). */
+    if (cols != tty->cols) {
+        scroll = 0;
+    }
+
+    /* Where the guest's own cursor sits, read in the same locked pass as the
+     * cells. -1/-1 means "no cursor to draw": the guest hid it (DECTCEM), the
+     * VTerm has none yet, or the view is scrolled away from the live screen,
+     * where the cursor is not on screen at all. */
+    VTermPos cursor = { -1, -1 };
+    if (!scroll && tty->cursor_visible) {
+        vterm_state_get_cursorpos(vterm_obtain_state(tty->vt), &cursor);
+    }
+
+    for (int r = 0; r < rows; r++) {
+        /* Output row r is line (r - scroll) counted from the live screen's top
+         * row; a negative line is that many rows above it, in history. */
+        int line = r - scroll;
+        rvvm_tty_cell_t* rowout = out + (size_t)r * cols;
+        if (line < 0) {
+            int idx = tty->sb_count + line; /* -1 = the newest stored row */
+            if (idx >= 0) {
+                int slot = (tty->sb_next - tty->sb_count + idx + RVT_TTY_SB_LINES)
+                           % RVT_TTY_SB_LINES;
+                memcpy(rowout, tty->sb + (size_t)slot * tty->cols,
+                       (size_t)cols * sizeof(*rowout));
+            } else {
+                for (int c = 0; c < cols; c++) {
+                    rvvm_tty_blank_cell(rowout + c); /* never drawn */
+                }
+            }
+            continue;
+        }
+        for (int c = 0; c < cols; c++) {
+            VTermPos pos = { line, c };
+            VTermScreenCell cell;
+            memset(&cell, 0, sizeof(cell));
+            vterm_screen_get_cell(tty->screen, pos, &cell);
+            rvvm_tty_pack_cell(tty->screen, &cell, rowout + c);
+            /* The cursor cell keeps its own colours: the renderer inverts them
+             * for the block, so it needs the cell as the guest drew it. */
+            if (line == cursor.row && c == cursor.col) {
+                rowout[c].flags |= RVT_TTY_CURSOR;
+            }
+        }
+    }
+
+    view->scroll     = scroll;
+    view->cursor_row = cursor.row;
+    view->cursor_col = cursor.col;
+    rvvm_tty_unlock(tty);
+    return rows * cols;
+}
+
+/* Make @tty the console of @machine - the modern spelling of the old
+ * rvvm_user_set_tty0(). Called before rvvm_user_linux_ex(). A session already
+ * attached is replaced; only an internal one is freed here, since a host
+ * session belongs to the host. */
+PUBLIC void rvvm_tty_attach(rvvm_tty_t* tty, rvvm_machine_t* machine)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (!ctx) {
+        return;
+    }
+    if (ctx->tty && ctx->tty_owned) {
+        rvvm_tty_close(ctx->tty);
+    }
+    ctx->tty       = tty;
+    ctx->tty_owned = false;
+}
+
+/* Unhook the console from @machine. Only the pointer goes: the session keeps
+ * its screen, its lock and its size, which is what keeps the last screen
+ * renderable - and scrollable - after the run, Ctrl-C included. Call once the
+ * guest thread has fully unwound; the core must not read the session after
+ * this. */
+PUBLIC void rvvm_tty_detach(rvvm_tty_t* tty, rvvm_machine_t* machine)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (!ctx || ctx->tty != tty) {
+        return;
+    }
+    ctx->tty       = NULL;
+    ctx->tty_owned = false;
+}
+
+static void user_tty_init(rvvm_userland_t* ctx)
+{
+    if (ctx->tty) {
+        /* A session is attached: it owns the screen, there is nothing to make. */
+        return;
+    }
+    /* No host session attached: build an internal one so fd 1/2 still parses
+     * into a screen for a host that only registered a tty callback. */
+    rvvm_tty_t* tty = rvvm_tty_open(VTERM_ROWS, VTERM_COLS);
+    if (!tty) {
+        return;
+    }
+    ctx->tty       = tty;
+    ctx->tty_owned = true;
+}
+
+// Feed guest output on fd 1/2 through libvterm. No-op unless a session exists -
+// either attached by the host via rvvm_tty_attach() or created on demand when a
+// host registered a tty callback. This only mirrors the bytes into the screen
+// matrix; the caller still forwards them to the host's io_callback / host fd,
+// so both sinks stay live.
 static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t count)
 {
-    if (!ctx->tty_vt && !ctx->tty_cb) {
+    if (!ctx->tty && !ctx->tty_cb) {
         return;
     }
     user_tty_init(ctx);
-    if (!ctx->tty_vt || !buf || !count) {
+    if (!ctx->tty || !buf || !count) {
         return;
     }
     /* ONLCR emulation: guest stdio emits bare LF, a real tty's line
@@ -764,23 +1240,27 @@ static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t
      * libvterm's LF only moves down without returning the carriage. */
     const uint8_t* p = buf;
     size_t start = 0;
-    /* The VTerm is also touched by host keyboard echo and by the host's
-     * screen snapshot, so every access is serialized through tty_vt_lock. */
-    spin_lock(&ctx->tty_vt_lock);
+    rvvm_tty_t* tty = ctx->tty;
+    /* The VTerm is also touched by host keyboard echo and by the host's screen
+     * snapshot, so every access goes through the session's own lock. */
+    spin_lock(&tty->lock);
     for (size_t i = 0; i < count; ++i) {
         if (p[i] != '\n') {
             continue;
         }
-        vterm_input_write((VTerm*)ctx->tty_vt, (const char*)p + start, i - start);
-        vterm_input_write((VTerm*)ctx->tty_vt, "\r\n", 2);
+        vterm_input_write(tty->vt, (const char*)p + start, i - start);
+        vterm_input_write(tty->vt, "\r\n", 2);
         start = i + 1;
     }
     if (start < count) {
-        vterm_input_write((VTerm*)ctx->tty_vt, (const char*)p + start, count - start);
+        vterm_input_write(tty->vt, (const char*)p + start, count - start);
     }
-    spin_unlock(&ctx->tty_vt_lock);
+    tty->serial++;  /* there is a newer screen than the last snapshot */
+    spin_unlock(&tty->lock);
     // Notify the host; it decides when to flush/render (throttling is its job).
-    ctx->tty_cb(ctx->tty_userdata, fd, ctx->tty_vt);
+    if (ctx->tty_cb) {
+        ctx->tty_cb(ctx->tty_userdata, fd, tty->vt);
+    }
 }
 
 // Write raw bytes into the VTerm with no line-discipline translation,
@@ -790,14 +1270,16 @@ static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t
 // user_tty_erase_echo() for erase, ...).
 static void user_tty_vt_write(rvvm_userland_t* ctx, const char* buf, size_t len)
 {
-    if (!ctx->tty_vt || !buf || !len) {
+    if (!ctx->tty || !buf || !len) {
         return;
     }
-    spin_lock(&ctx->tty_vt_lock);
-    vterm_input_write((VTerm*)ctx->tty_vt, buf, len);
-    spin_unlock(&ctx->tty_vt_lock);
+    rvvm_tty_t* tty = ctx->tty;
+    spin_lock(&tty->lock);
+    vterm_input_write(tty->vt, buf, len);
+    tty->serial++;  /* echo is screen output too */
+    spin_unlock(&tty->lock);
     if (ctx->tty_cb) {
-        ctx->tty_cb(ctx->tty_userdata, 1, ctx->tty_vt);
+        ctx->tty_cb(ctx->tty_userdata, 1, tty->vt);
     }
 }
 
@@ -866,21 +1348,20 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg)
             return 0;
         }
         case UAPI_TIOCGWINSZ: {
-            /* Report the VTerm's real grid rather than the compile-time
-             * default: the host may have resized it to match its viewport (the
-             * Android console derives its row count from the view height while
-             * keeping the column count fixed), and a full-screen guest lays
-             * itself out from this value - answering 24x80 while the host
-             * shows, say, 60 rows would leave most of them permanently blank.
-             * Without a VTerm attached (or before it is initialized) this stays
-             * the built-in 24x80. */
+            /* Report the attached session's real grid rather than the
+             * compile-time default: the host may have resized it to match its
+             * viewport (the Android console derives its row count from the view
+             * height while keeping the column count fixed), and a full-screen
+             * guest lays itself out from this value - answering 24x80 while the
+             * host shows, say, 60 rows would leave most of them permanently
+             * blank. With no session attached this stays the built-in 24x80. */
             rvvm_userland_t* ctx = uctx();
             uapi_winsize_t ws = { VTERM_ROWS, VTERM_COLS, 0, 0 };
-            if (ctx && ctx->tty_vt) {
+            if (ctx && ctx->tty) {
                 int rows = VTERM_ROWS, cols = VTERM_COLS;
-                spin_lock(&ctx->tty_vt_lock);
-                vterm_get_size((VTerm*)ctx->tty_vt, &rows, &cols);
-                spin_unlock(&ctx->tty_vt_lock);
+                rvvm_tty_lock(ctx->tty);
+                rvvm_tty_get_size(ctx->tty, &rows, &cols);
+                rvvm_tty_unlock(ctx->tty);
                 if (rows > 0 && rows <= 0xFFFF) ws.ws_row = (uint16_t)rows;
                 if (cols > 0 && cols <= 0xFFFF) ws.ws_col = (uint16_t)cols;
             }
@@ -968,24 +1449,26 @@ static size_t tty_cooked_pop(rvvm_userland_t* ctx, void* buf, size_t len)
  */
 static int user_tty_erased_cols(rvvm_userland_t* ctx)
 {
-    if (!ctx->tty_vt) {
+    if (!ctx->tty) {
         return 1;
     }
-    /* Ask the VTerm for its screen instead of trusting the cached pointer: a
-     * host-injected VTerm (rvvm_user_set_tty0) is set up by the host before
-     * tty_screen is filled in, and a NULL screen here would silently degrade
-     * every erase to a single column. vterm_obtain_screen() just returns the
-     * existing screen for a VTerm that has one. */
-    VTermScreen* scr = vterm_obtain_screen((VTerm*)ctx->tty_vt);
-    VTermState*  st  = vterm_obtain_state((VTerm*)ctx->tty_vt);
+    /* Take the screen from the session's VTerm instead of a cached pointer: the
+     * screen travels with the VTerm, and asking for it is what keeps the erase
+     * echo honest for a session the host attached moments ago - a NULL screen
+     * here would silently degrade every erase to a single column.
+     * vterm_obtain_screen() just returns the existing screen for a VTerm that
+     * has one. */
+    VTerm*       vt  = ctx->tty->vt;
+    VTermScreen* scr = vterm_obtain_screen(vt);
+    VTermState*  st  = vterm_obtain_state(vt);
     int cols = 1;
     int trows = VTERM_ROWS, tcols = VTERM_COLS;
 
-    spin_lock(&ctx->tty_vt_lock);
+    spin_lock(&ctx->tty->lock);
     /* The right margin is wherever the VTerm currently ends: the host may have
      * resized it to its viewport, so the compile-time default is only the
      * fallback. */
-    vterm_get_size((VTerm*)ctx->tty_vt, &trows, &tcols);
+    vterm_get_size(vt, &trows, &tcols);
     /* Pending scrolls are only folded into the matrix here, and a cell read
      * before that can still be the previous generation of the screen. */
     vterm_screen_flush_damage(scr);
@@ -1003,7 +1486,7 @@ static int user_tty_erased_cols(rvvm_userland_t* ctx)
          * character itself, when it was a narrow one. */
         cols = cell.chars[0] == (uint32_t)-1 ? 2 : 1;
     }
-    spin_unlock(&ctx->tty_vt_lock);
+    spin_unlock(&ctx->tty->lock);
     return cols;
 }
 
@@ -1250,24 +1733,6 @@ void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback 
     ctx->tty_userdata = userdata;
 }
 
-void rvvm_user_set_tty0(rvvm_machine_t* machine, void* tty)
-{
-    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
-    if (!ctx) {
-        return;
-    }
-    // Host-owned VTerm replaces (and must not leak) an internally created one
-    if (ctx->tty_vt && ctx->tty_owned) {
-        vterm_free((VTerm*)ctx->tty_vt);
-    }
-    ctx->tty_vt = tty;
-    /* The screen travels with the VTerm: the matrix readers (the erase echo)
-     * need both, and leaving this NULL here silently cost a wide character its
-     * second column. */
-    ctx->tty_screen = tty ? vterm_obtain_screen((VTerm*)tty) : NULL;
-    ctx->tty_owned  = false;
-}
-
 /*
  * Push host keyboard input toward the guest's virtual TTY.
  *
@@ -1280,7 +1745,7 @@ void rvvm_user_set_tty0(rvvm_machine_t* machine, void* tty)
  * snapshot shows the typing.
  *
  * Safe to call from any thread, but the bytes are serialized against the
- * guest's own fd 1/2 output through the VTerm lock. A no-op when no TTY is
+ * guest's own fd 1/2 output through the session lock. A no-op when no TTY is
  * attached.
  */
 void rvvm_user_tty_input(rvvm_machine_t* machine, const void* buf, size_t len)
@@ -1289,36 +1754,20 @@ void rvvm_user_tty_input(rvvm_machine_t* machine, const void* buf, size_t len)
     if (!ctx || !buf || !len) {
         return;
     }
-    if (!ctx->tty_vt && !ctx->tty_cb) {
+    if (!ctx->tty && !ctx->tty_cb) {
         return; // no virtual TTY attached: nowhere to echo and nothing to read
     }
     user_tty_init(ctx);
+    if (ctx->tty) {
+        /* Typing belongs to the live screen: a view parked in history comes
+         * home first, or the echo of what is being typed would land off screen
+         * and the console would look dead. The view is the session's state, so
+         * the reset belongs here rather than in every host. */
+        rvvm_tty_lock(ctx->tty);
+        rvvm_tty_follow_locked(ctx->tty);
+        rvvm_tty_unlock(ctx->tty);
+    }
     user_tty_input(ctx, buf, len);
-}
-
-/*
- * Serialize host access to the guest TTY's VTerm.
- *
- * The guest thread parses its own fd 1/2 output into the VTerm; a host that
- * also touches it - keyboard echo, or reading the screen matrix for a
- * snapshot - must hold this lock for the duration of its access. Take it and
- * release it promptly: it is a spinlock and the guest thread contends for it
- * on every write, so do not block, allocate or render while holding it.
- */
-void rvvm_user_tty_lock(rvvm_machine_t* machine)
-{
-    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
-    if (ctx) {
-        spin_lock(&ctx->tty_vt_lock);
-    }
-}
-
-void rvvm_user_tty_unlock(rvvm_machine_t* machine)
-{
-    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
-    if (ctx) {
-        spin_unlock(&ctx->tty_vt_lock);
-    }
 }
 
 /*
@@ -2891,7 +3340,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 29: // ioctl
                     // TODO: I sure hope not many ioctl() interfaces need struct conversion...
                     rvvm_info("sys_ioctl(%ld, %lx, %lx)", a0, a1, a2);
-                    if ((a0 == 0 || a0 == 1 || a0 == 2) && uctx()->tty_vt) {
+                    if ((a0 == 0 || a0 == 1 || a0 == 2) && uctx()->tty) {
                         // Virtual TTY rendered by the host: answer the termios
                         // probes guest libc makes for isatty() itself instead
                         // of forwarding them to the host fd. fd 0 is included
@@ -3040,7 +3489,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -UAPI_EFAULT;
                         break;
                     }
-                    if (a0 == 0 && uctx()->tty_vt) {
+                    if (a0 == 0 && uctx()->tty) {
                         // fd 0 is the virtual TTY: the guest's stdin comes from
                         // the host keyboard (rvvm_user_tty_input), not from the
                         // host process's own stdin. Blocks until a line has been
@@ -3091,7 +3540,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         break;
                     }
                     if (a7 == 65) {
-                        if (a0 == 0 && uctx()->tty_vt) {
+                        if (a0 == 0 && uctx()->tty) {
                             // fd 0 is the virtual TTY: serve readv() from the
                             // keyboard queue. The first non-empty segment blocks
                             // until input arrives, the rest drain what is
@@ -4272,8 +4721,10 @@ static void userland_destroy(rvvm_machine_t* machine)
     machine->userdata = NULL;
     safe_free(ctx->prefix_owned);
     vector_free(ctx->userland_threads);
-    if (ctx->tty_vt && ctx->tty_owned) {
-        vterm_free((VTerm*)ctx->tty_vt);
+    /* Only an internally created session is ours to free: a host-attached one
+     * outlives the machine by design (see rvvm_tty_detach). */
+    if (ctx->tty && ctx->tty_owned) {
+        rvvm_tty_close(ctx->tty);
     }
     rvvm_free_machine(machine);
     safe_free(ctx);

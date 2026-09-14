@@ -80,11 +80,18 @@
 
 static HWND            g_hwnd       = NULL;
 
-/* Guest virtual TTY (libvterm) rendering state. g_tty_vt is host-owned
- * (created on first launch, reset per launch) and injected into rvvm_user via
- * rvvm_user_set_tty0(); g_tty_dirty gates repainting the retained layer. */
+/* Guest virtual TTY (libvterm) rendering state. g_tty is the host-owned console
+ * session (rvvm_tty_open: it owns the VTerm, the lock that serializes access to
+ * it, the scrollback and the view state), created on first launch and attached
+ * to each run; g_tty_vt is the VTerm behind it, kept only for the diagnostic
+ * dump below; g_tty_dirty gates repainting the retained layer.
+ *
+ * The renderer takes the cells from rvvm_tty_snapshot() - a locked copy - and
+ * never reads the VTerm directly, so the UI thread and the guest thread (which
+ * parses its output into the same VTerm) cannot touch it at once. */
 #define TTY_ROWS 24
 #define TTY_COLS 80
+static rvvm_tty_t* g_tty   = NULL;
 static VTerm*   g_tty_vt    = NULL;
 static bool     g_tty_dirty = false;
 /* True once the guest has written anything to fd 1/2 this launch. The
@@ -95,6 +102,12 @@ static bool     g_tty_dirty = false;
 static bool     g_tty_seen  = false;
 /* Retained TTY layer: the cell grid is rendered here only on dirty, every
  * frame just blits the bitmap onto the composition surface. */
+/* Snapshot buffer for the cells. The guest thread parses its output into the
+ * same session this renderer reads, so the cells are copied out under the
+ * session lock first (rvvm_tty_snapshot) and everything below - the GDI calls
+ * included - runs on that copy with no lock held. Grown on demand. */
+static rvvm_tty_cell_t* g_tty_cells     = NULL;
+static size_t           g_tty_cells_cap = 0;
 static HDC      g_tty_layer_dc   = NULL;
 static HBITMAP  g_tty_layer_bmp  = NULL;
 static HBITMAP  g_tty_layer_def  = NULL; /* DC's stock 1x1 bitmap, to restore */
@@ -108,8 +121,8 @@ static bool  tty_fonts_ready = false;
 
 /* Helpers (defined near host_tty_cb) */
 static void     tty_init_fonts(void);
-static COLORREF tty_cell_fg(const VTermScreen* scr, const VTermScreenCell* cell);
-static bool     tty_cell_bg(const VTermScreen* scr, const VTermScreenCell* cell, COLORREF* out);
+static COLORREF tty_argb(uint32_t argb);
+static bool     tty_cell_bg_argb(uint32_t argb, COLORREF* out);
 static bool     tty_is_cjk(uint32_t cp);
 static int      tty_utf16(uint32_t cp, wchar_t* out);
 static void     tty_fill_rect_bg(HDC cdc, int x0, int y0, int x1, int y1, COLORREF col);
@@ -1377,7 +1390,11 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             VTermScreen* scr = vterm_obtain_screen(g_tty_vt);
             VTermRect    rect = { 0, TTY_ROWS, 0, TTY_COLS };
             char         buf[TTY_ROWS * TTY_COLS + 1];
-            size_t       n = vterm_screen_get_text(scr, buf, sizeof(buf) - 1, rect);
+            size_t       n;
+            /* The session lock, as for every other read of the VTerm. */
+            rvvm_tty_lock(g_tty);
+            n = vterm_screen_get_text(scr, buf, sizeof(buf) - 1, rect);
+            rvvm_tty_unlock(g_tty);
             buf[n] = 0;
             printf("---- guest tty ----\n%s\n---- end guest tty ----\n", buf);
             fflush(stdout);
@@ -1432,11 +1449,12 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             cmp_surface_release_locked();
             LeaveCriticalSection(&g_surf_cs);
         }
-        /* Host-owned VTerm: free it only when no guest can still be writing
-         * into it; otherwise rvvm_user's ctx holds a live pointer until the
-         * machine unwinds, and the process is going away anyway. */
-        if (!g_guest_machine && g_tty_vt) {
-            vterm_free(g_tty_vt);
+        /* Host-owned console session: close it only when no guest can still be
+         * writing into it; otherwise rvvm_user's ctx holds a live pointer until
+         * the machine unwinds, and the process is going away anyway. */
+        if (!g_guest_machine && g_tty) {
+            rvvm_tty_close(g_tty);
+            g_tty       = NULL;
             g_tty_vt    = NULL;
             g_tty_dirty = false;
             g_tty_seen  = false;
@@ -1502,13 +1520,13 @@ static void host_guest_exit_cb(int exit_code)
 }
 
 /* TTY callback: rvvm_user fires this on every guest fd 1/2 write after feeding
- * the bytes to libvterm. We only stash the VTerm pointer and flag a repaint; the
- * actual screen flush + draw happens in WM_PAINT (throttled to vsync), so a burst
- * of guest output collapses into one frame instead of one redraw per write. */
+ * the bytes to the session. It only flags a repaint; the snapshot + draw happen
+ * in WM_PAINT (throttled to vsync), so a burst of guest output collapses into
+ * one frame instead of one redraw per write. The session's own serial is the
+ * same signal for a poller; this host renders from the event instead. */
 static void host_tty_cb(void* userdata, int fd, void* tty)
 {
-    (void)userdata; (void)fd;
-    g_tty_vt    = (VTerm*)tty;
+    (void)userdata; (void)fd; (void)tty;
     g_tty_dirty = true;
     g_tty_seen  = true; /* guest produced TTY output this launch */
     if (g_hwnd) {
@@ -1518,11 +1536,12 @@ static void host_tty_cb(void* userdata, int fd, void* tty)
 
 /* --- TTY cell rendering helpers (color + Unicode) ---
  *
- * Each libvterm cell carries up to VTERM_MAX_CHARS_PER_CELL codepoints, a
- * single/double width flag, and indexed/RGB fg/bg colors. The renderer walks
- * the grid and merges runs of same-styled cells into one TextOutW call; run
- * origins are placed by column (col * cw) instead of relying on the GDI text
- * advance, so double-width cells and CJK fallback fonts cannot cause drift.
+ * The cells come from the session snapshot (rvvm_tty_cell_t): a codepoint, ARGB
+ * colors and flags, with colors already resolved and double-width gaps zeroed.
+ * The renderer walks that grid and merges runs of same-styled cells into one
+ * TextOutW call; run origins are placed by column (col * cw) instead of relying
+ * on the GDI text advance, so double-width cells and CJK fallback fonts cannot
+ * cause drift.
  */
 
 /* Fonts: [cjk][bold], created once (array lives next to the TTY state).
@@ -1551,26 +1570,21 @@ static void tty_init_fonts(void)
     tty_fonts_ready = true;
 }
 
-/* Resolve a cell color to a COLORREF. Default-color flags survive until
- * convert_color_to_rgb() resets them, so they must be tested first. */
-static COLORREF tty_cell_fg(const VTermScreen* scr, const VTermScreenCell* cell)
+/* A cell color out of the session snapshot (already ARGB) as a COLORREF. */
+static COLORREF tty_argb(uint32_t argb)
 {
-    VTermColor c = cell->fg;
-    if (!VTERM_COLOR_IS_DEFAULT_FG(&c)) {
-        vterm_screen_convert_color_to_rgb(scr, &c);
-        return RGB(c.rgb.red, c.rgb.green, c.rgb.blue);
-    }
-    return RGB(220, 220, 220);
+    return RGB((argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF);
 }
 
-static bool tty_cell_bg(const VTermScreen* scr, const VTermScreenCell* cell, COLORREF* out)
+/* Background: black means "no background" - the default one - so the black
+ * backdrop stays visible, which is the same test the Android renderer makes on
+ * the same snapshot. */
+static bool tty_cell_bg_argb(uint32_t argb, COLORREF* out)
 {
-    VTermColor c = cell->bg;
-    if (VTERM_COLOR_IS_DEFAULT_BG(&c)) {
-        return false; /* transparent: the black backdrop shows through */
+    if ((argb & 0x00FFFFFF) == 0) {
+        return false;
     }
-    vterm_screen_convert_color_to_rgb(scr, &c);
-    *out = RGB(c.rgb.red, c.rgb.green, c.rgb.blue);
+    *out = tty_argb(argb);
     return true;
 }
 
@@ -1617,7 +1631,8 @@ static void tty_fill_rect_bg(HDC cdc, int x0, int y0, int x1, int y1, COLORREF c
     DeleteObject(br);
 }
 
-/* Release the retained TTY layer bitmap (window teardown, no guest running). */
+/* Release the retained TTY layer bitmap and the snapshot buffer (window
+ * teardown, no guest running). */
 static void tty_layer_free(void)
 {
     if (g_tty_layer_dc) {
@@ -1631,17 +1646,50 @@ static void tty_layer_free(void)
         DeleteDC(g_tty_layer_dc);
         g_tty_layer_dc = NULL;
     }
+    free(g_tty_cells);
+    g_tty_cells     = NULL;
+    g_tty_cells_cap = 0;
     g_tty_layer_ok = false;
 }
 
 /* Render the TTY cell grid into the retained layer bitmap. Called only when
- * g_tty_dirty; every frame afterwards just blits the layer (tty_paint). */
+ * g_tty_dirty; every frame afterwards just blits the layer (tty_paint).
+ *
+ * The cells come from the session snapshot, taken under the session lock: the
+ * guest thread parses its output into that same VTerm, so the copy is what
+ * makes the GDI work below safe to do without holding the lock (and holding it
+ * across rendering is exactly what its contract forbids). It also leaves this
+ * renderer with no libvterm knowledge at all - colors arrive resolved, wide
+ * glyph gaps already zeroed. */
 static void tty_layer_render(void)
 {
-    VTermScreen* scr = vterm_obtain_screen(g_tty_vt);
-    vterm_screen_flush_damage(scr);
-
     tty_init_fonts();
+
+    int rows = 0, cols = 0;
+    rvvm_tty_lock(g_tty);
+    rvvm_tty_get_size(g_tty, &rows, &cols);
+    rvvm_tty_unlock(g_tty);
+    if (rows < 1 || cols < 1) {
+        g_tty_dirty = false;
+        return;
+    }
+
+    size_t need = (size_t)rows * cols;
+    if (need > g_tty_cells_cap) {
+        rvvm_tty_cell_t* grown = realloc(g_tty_cells, need * sizeof(*grown));
+        if (!grown) {
+            g_tty_dirty = false;
+            return;
+        }
+        g_tty_cells     = grown;
+        g_tty_cells_cap = need;
+    }
+
+    rvvm_tty_view_t view;
+    if (rvvm_tty_snapshot(g_tty, g_tty_cells, (int)g_tty_cells_cap, &view) <= 0) {
+        g_tty_dirty = false;
+        return;
+    }
 
     /* Measure the monospace cell size, then (re)create the layer at exactly
      * the grid's pixel extent. */
@@ -1650,7 +1698,7 @@ static void tty_layer_render(void)
     SIZE ch;
     GetTextExtentPoint32A(ref, "M", 1, &ch);
     int cw = ch.cx, chh = ch.cy;
-    int w  = cw * TTY_COLS, h = chh * TTY_ROWS;
+    int w  = cw * view.cols, h = chh * view.rows;
     g_tty_layer_w = w;
     g_tty_layer_h = h;
 
@@ -1680,32 +1728,22 @@ static void tty_layer_render(void)
     FillRect(cdc, &back, (HBRUSH)GetStockObject(BLACK_BRUSH));
     SetBkMode(cdc, TRANSPARENT);
 
-    /* Walk the grid and paint same-styled runs of cells. Every run is drawn
-     * at col * cw, so text advance never accumulates error across
-     * double-width or fallback-font cells. */
+    /* Walk the snapshot and paint same-styled runs of cells. Every run is drawn
+     * at col * cw, so text advance never accumulates error across double-width
+     * or fallback-font cells. */
     wchar_t wbuf[2 * TTY_COLS];
-    for (int r = 0; r < TTY_ROWS; r++) {
-        VTermPos pos;
-        pos.row = r;
+    const int grid_cols = view.cols;
+    for (int r = 0; r < view.rows; r++) {
+        const rvvm_tty_cell_t* row = g_tty_cells + (size_t)r * grid_cols;
         int c = 0;
-        while (c < TTY_COLS) {
-            VTermScreenCell cell;
-            pos.col = c;
-            if (!vterm_screen_get_cell(scr, pos, &cell)) {
-                c++;
-                continue;
-            }
-            /* Double-width gap cell: the lead char (drawn at c-1) covers it. */
-            if (cell.chars[0] == (uint32_t)-1) {
-                c++;
-                continue;
-            }
-            /* Erased cell: no glyph, but a non-default pen bg (SGR set before
-             * erase) still needs painting. */
-            COLORREF bg     = 0; /* read only while has_bg is true, but keep the
-                                  * compiler's dataflow happy */
-            bool has_bg = tty_cell_bg(scr, &cell, &bg);
-            if (!cell.chars[0]) {
+        while (c < grid_cols) {
+            const rvvm_tty_cell_t* cell = row + c;
+            /* Blank cell, or the gap cell a double-width glyph already covers
+             * (the packer zeroes those): no glyph, but a non-default background
+             * (SGR set before erase, reverse video) still needs painting. */
+            COLORREF bg = 0;
+            bool has_bg = tty_cell_bg_argb(cell->bg, &bg);
+            if (!cell->cp) {
                 if (has_bg) {
                     tty_fill_rect_bg(cdc, c * cw, r * chh, (c + 1) * cw, (r + 1) * chh, bg);
                 }
@@ -1713,42 +1751,33 @@ static void tty_layer_render(void)
                 continue;
             }
 
-            COLORREF fg       = tty_cell_fg(scr, &cell);
-            bool     bold     = cell.attrs.bold != 0;
-            bool     cjk      = tty_is_cjk(cell.chars[0]);
-            bool     dwidth   = cell.width == 2;
-            int      run_x    = c;
-            int      run_w    = dwidth ? 2 : 1;
-            int      n        = 0;
+            COLORREF fg     = tty_argb(cell->fg);
+            bool     bold   = (cell->flags & RVT_TTY_BOLD) != 0;
+            bool     cjk    = tty_is_cjk(cell->cp);
+            bool     dwidth = (cell->flags & RVT_TTY_WIDE) != 0;
+            int      run_x  = c;
+            int      run_w  = dwidth ? 2 : 1;
+            int      n      = 0;
 
-            n += tty_utf16(cell.chars[0], wbuf + n);
-            for (int i = 1; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i]; i++) {
-                n += tty_utf16(cell.chars[i], wbuf + n);
-            }
+            n += tty_utf16(cell->cp, wbuf + n);
 
             /* Width-1 runs extend while style and width match; double-width
              * chars always stand alone. */
             if (!dwidth) {
-                while (run_x + run_w < TTY_COLS) {
-                    VTermScreenCell nx;
-                    pos.col = run_x + run_w;
-                    if (!vterm_screen_get_cell(scr, pos, &nx) ||
-                        !nx.chars[0] || nx.chars[0] == (uint32_t)-1 ||
-                        nx.width == 2) {
+                while (run_x + run_w < grid_cols) {
+                    const rvvm_tty_cell_t* nx = row + run_x + run_w;
+                    if (!nx->cp || (nx->flags & RVT_TTY_WIDE)) {
                         break;
                     }
-                    bool nx_cjk = tty_is_cjk(nx.chars[0]);
-                    COLORREF nbg      = 0;
-                    bool nx_has_bg = tty_cell_bg(scr, &nx, &nbg);
-                    if (nx_cjk != cjk || nx.attrs.bold != cell.attrs.bold ||
-                        tty_cell_fg(scr, &nx) != fg ||
-                        nx_has_bg != has_bg || (nx_has_bg && nbg != bg)) {
+                    COLORREF nbg;
+                    bool nx_has_bg = tty_cell_bg_argb(nx->bg, &nbg);
+                    if (tty_is_cjk(nx->cp) != cjk ||
+                        ((nx->flags ^ cell->flags) & RVT_TTY_BOLD) ||
+                        nx->fg != cell->fg ||
+                        nx_has_bg != has_bg || (nx_has_bg && nx->bg != cell->bg)) {
                         break;
                     }
-                    n += tty_utf16(nx.chars[0], wbuf + n);
-                    for (int i = 1; i < VTERM_MAX_CHARS_PER_CELL && nx.chars[i]; i++) {
-                        n += tty_utf16(nx.chars[i], wbuf + n);
-                    }
+                    n += tty_utf16(nx->cp, wbuf + n);
                     run_w++;
                 }
             }
@@ -1768,9 +1797,10 @@ static void tty_layer_render(void)
 
 /* Blit the retained TTY layer onto @cdc (composition DC while running, window
  * DC in the launcher idle view). Renders the layer first when dirty. The
- * caller gates on g_tty_vt + g_tty_seen. Thread-safety: the VTerm only
- * mutates while a guest is running; layer blits happen on the UI thread
- * under g_surf_cs, and after guest exit the screen is frozen anyway. */
+ * caller gates on g_tty_vt + g_tty_seen. Thread-safety: the cell grid is read
+ * under the session lock inside tty_layer_render(), which copies it out before
+ * any drawing happens, so the UI thread and the guest thread no longer touch
+ * the VTerm at the same time. */
 static void tty_paint(HDC cdc)
 {
     if (g_tty_dirty) {
@@ -2359,25 +2389,26 @@ bool win32_host_start_guest(int argc, char** argv)
                              (host_prefix && host_prefix[0]) ? host_prefix : NULL);
     }
 
-    /* Route guest fd 1/2 through libvterm so CR / ANSI escapes render correctly
-     * (the win32 host's stdout is a real tty today, but the renderer below draws
-     * the parsed screen matrix, which is what makes in-place updates consistent
-     * across hosts). The VTerm is host-owned: created once and reset per launch,
-     * so the last screen stays renderable after the guest exits. */
-    if (!g_tty_vt) {
-        g_tty_vt = vterm_new(TTY_ROWS, TTY_COLS);
-        if (g_tty_vt) {
-            /* UTF-8 is OFF by default in libvterm; without it CJK/emoji get
-             * mangled into latin1 before reaching the cells. */
-            vterm_set_utf8(g_tty_vt, 1);
-            vterm_screen_reset(vterm_obtain_screen(g_tty_vt), true);
+    /* Route guest fd 1/2 through the console session so CR / ANSI escapes
+     * render correctly (the win32 host's stdout is a real tty today, but the
+     * renderer draws the parsed screen matrix, which is what makes in-place
+     * updates consistent across hosts). The session is host-owned: opened once
+     * and reset per launch, so the last screen stays renderable after the guest
+     * exits. */
+    if (!g_tty) {
+        /* First launch: the session is created here, and it owns the VTerm, the
+         * lock that serializes access to it, the scrollback and the view.
+         * UTF-8 and the initial screen reset are part of rvvm_tty_open. */
+        g_tty = rvvm_tty_open(TTY_ROWS, TTY_COLS);
+        if (g_tty) {
+            g_tty_vt = rvvm_tty_vterm(g_tty);
         }
     } else {
-        vterm_screen_reset(vterm_obtain_screen(g_tty_vt), true);
+        rvvm_tty_reset(g_tty);
     }
     g_tty_dirty = true;  /* fresh empty screen renders into the layer */
     g_tty_seen  = false; /* no guest output yet this launch */
-    rvvm_user_set_tty0(g_guest_machine, g_tty_vt);
+    rvvm_tty_attach(g_tty, g_guest_machine);
     rvvm_user_set_tty_callback(g_guest_machine, host_tty_cb, NULL);
 
     g_guest_argv = (char**)calloc((size_t)argc + 1, sizeof(char*));
