@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    One taskbar entry: the name of a guest whose window is minimized, and the
+    way back to that window. Inflated by MainActivity.addTaskbarEntry(), which
+    sets the text from @string/gl_taskbar_entry and the click listener - the
+    strip itself and the entries inside it are built in code, so the number of
+    entries follows the number of guest windows.
+-->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:background="?android:attr/selectableItemBackground"
+    android:paddingStart="8dp"
+    android:paddingEnd="8dp"
+    android:paddingTop="6dp"
+    android:paddingBottom="6dp"
+    android:singleLine="true"
+    android:textColor="#FFE0E0E0"
+    android:textSize="12sp" />

@@ -20,9 +20,10 @@
     <string name="gl_btn_min_desc">Minimize window</string>
     <string name="gl_btn_max_desc">Maximize or restore window</string>
     <string name="gl_btn_close_desc">Close window</string>
-    <!-- Shown in the corner while the window is minimized: the taskbar entry,
-         and the only way back to a window that is not on screen. -->
-    <string name="gl_show_window">\u2750 Guest</string>
+    <!-- Taskbar entries, in the corner the window's own chip used to occupy: one
+         per guest window that is minimized, and the way back to it. %1$s is the
+         name of the guest the window belongs to. -->
+    <string name="gl_taskbar_entry">\u2750 %1$s</string>
 
     <!-- Console keyboard bar: the terminal keys a soft keyboard cannot produce.
          The arrows are written as escapes so the file stays ASCII-only. -->

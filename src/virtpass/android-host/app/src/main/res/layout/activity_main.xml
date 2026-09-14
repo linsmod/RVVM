@@ -314,22 +314,22 @@
 
     </LinearLayout>
 
-    <!-- The taskbar, in one widget: while the window is minimized this chip
-         takes its place in the corner and is the way back. Only minimize uses
-         it - the close button stops the guest and leaves nothing behind. -->
-    <TextView
-        android:id="@+id/glShowChip"
+    <!-- The taskbar, in one strip: one entry per guest window that is minimized,
+         and the way back to it. Entries are made in Java
+         (MainActivity.rebuildTaskbar), so a second guest window adds a second
+         entry instead of a second mechanism, and an entry can carry the name of
+         the guest whose window it stands for. Only a minimized window puts one
+         here - the close button stops the guest and leaves nothing behind. -->
+    <LinearLayout
+        android:id="@+id/glTaskbar"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="top|end"
         android:layout_margin="12dp"
         android:background="@drawable/gl_window_frame"
         android:elevation="8dp"
-        android:padding="8dp"
-        android:singleLine="true"
-        android:text="@string/gl_show_window"
-        android:textColor="#FFE0E0E0"
-        android:textSize="12sp"
+        android:orientation="horizontal"
+        android:padding="6dp"
         android:visibility="gone" />
 
 </FrameLayout>

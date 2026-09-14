@@ -35,6 +35,7 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.Spinner;
 import android.widget.TextView;
 
@@ -139,7 +140,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     private View glCaptionBar;            // the title bar
     private TextView glCaption;           // the drag handle
     private TextView glBtnMin, glBtnMax, glBtnClose;
-    private TextView glShowChip;          // the minimized window, in the corner
+    private LinearLayout glTaskbar;       // one entry per minimized guest window
+    // The name of the guest this window belongs to, as shown in its title bar
+    // and in its taskbar entry. Set when a run starts (the window outlives the
+    // guest, so the name stays until the next run), empty before the first one.
+    private String glGuestName = "";
+    // Whether the window is minimized - on the taskbar - rather than on screen
+    // or closed. Not readable from the card's visibility: a closed window is
+    // just as gone, and leaves nothing behind.
+    private boolean glMinimized = false;
     // Floating geometry as inflated from the XML: the size and the gravity the
     // floating state is laid out with. Everything else about the position is a
     // margin, not a translation - see moveGlWindow() for why.
@@ -791,7 +800,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         glBtnMin = findViewById(R.id.glBtnMin);
         glBtnMax = findViewById(R.id.glBtnMax);
         glBtnClose = findViewById(R.id.glBtnClose);
-        glShowChip = findViewById(R.id.glShowChip);
+        glTaskbar = findViewById(R.id.glTaskbar);
 
         // The picture is fitted to the panel's ratio, never stretched: a
         // SurfaceView can only be scaled by the rectangle it is given, so the
@@ -819,11 +828,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         glBackground = glWindow.getBackground();
         hideGlWindow();
         applyGlWindowLayout();
+        rebuildTaskbar();
 
         glBtnMin.setOnClickListener(v -> minimizeGlWindow());
         glBtnMax.setOnClickListener(v -> toggleGlWindowMaximized());
         glBtnClose.setOnClickListener(v -> closeGlWindow());
-        glShowChip.setOnClickListener(v -> restoreMinimizedGlWindow());
 
         final int slop = ViewConfiguration.get(this).getScaledTouchSlop();
         glCaption.setOnTouchListener(new View.OnTouchListener() {
@@ -1039,11 +1048,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
      * state and the window would look like it was still minimized.
      */
     private void setGlWindowShown(boolean shown) {
-        glShowChip.setVisibility(shown ? View.GONE : View.VISIBLE);
+        glMinimized = !shown;
         glWindow.setVisibility(shown ? View.VISIBLE : View.GONE);
         if (shown) {
             revealGlWindow();
         }
+        rebuildTaskbar();
+    }
+
+    /**
+     * Rebuild the taskbar from the guest windows that are not on screen.
+     *
+     * One entry today - the host runs a guest at a time - but the strip belongs
+     * to the taskbar, not to the window: what it lists is every window that is
+     * minimized, and each entry carries the name of the guest it stands for. A
+     * second guest window adds a second entry here and nothing else.
+     */
+    private void rebuildTaskbar() {
+        glTaskbar.removeAllViews();
+        if (glMinimized) {
+            addTaskbarEntry();
+        }
+        glTaskbar.setVisibility(glTaskbar.getChildCount() > 0 ? View.VISIBLE : View.GONE);
+    }
+
+    /** One entry: the guest's name, and the way back to its window. */
+    private void addTaskbarEntry() {
+        String name = glGuestName.isEmpty() ? getString(R.string.gl_title) : glGuestName;
+        TextView entry = (TextView) getLayoutInflater().inflate(
+                R.layout.gl_taskbar_entry, glTaskbar, false);
+        entry.setText(getString(R.string.gl_taskbar_entry, name));
+        entry.setOnClickListener(v -> restoreMinimizedGlWindow());
+        glTaskbar.addView(entry);
     }
 
     /**
@@ -1072,7 +1108,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
      * window would have to be rebuilt around - all for a card nobody could see.
      */
     private void dismissGlWindow() {
-        glShowChip.setVisibility(View.GONE);
+        // Closed, not minimized: no taskbar entry - there is no guest left for
+        // one to belong to.
+        glMinimized = false;
+        rebuildTaskbar();
         if (glRevealed) {
             glWindow.setVisibility(View.GONE);
         }
@@ -1088,12 +1127,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
      * whether it was maximized - is deliberately kept: that is the user's
      * arrangement of the workspace, not the guest's.
      */
-    private void resetGlWindowForRun() {
-        glShowChip.setVisibility(View.GONE);
+    private void resetGlWindowForRun(String guestName) {
+        // This window now belongs to a named guest: its title bar and its
+        // taskbar entry say which one, and it is on screen rather than
+        // minimized (a window the user minimized or closed by hand belongs to
+        // the run that just ended).
+        glGuestName = guestName != null ? guestName : "";
+        glCaption.setText(glGuestName.isEmpty() ? getString(R.string.gl_title) : glGuestName);
+        glMinimized = false;
         glWindow.setVisibility(View.VISIBLE);
         glRevealed = false;
         hideGlWindow();
         applyGlWindowLayout();
+        rebuildTaskbar();
     }
 
     /** The maximize button's glyph: Windows' pair, a box for "fill the screen"
@@ -1587,7 +1633,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         // The window first: it goes back to waiting for content, and comes back
         // if the previous run's was minimized or closed. Doing this before the
         // guest starts is what (re)creates the surface a guest needs.
-        resetGlWindowForRun();
+        resetGlWindowForRun(elfName);
 
         /* ...but that surface is not there yet. Closing or minimizing the
          * window destroyed it, and the framework only creates the new one on
