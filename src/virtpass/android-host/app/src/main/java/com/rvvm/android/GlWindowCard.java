@@ -61,9 +61,6 @@ public class GlWindowCard {
 
     private static final String TAG = "RVVM-GlWindowCard";
 
-    /** Ladder positions before the cascade bounces (steps walked = this - 1). */
-    private static final int CASCADE_STEPS = 4;
-
     private final Host host;
     private final int guestId;
 
@@ -263,13 +260,10 @@ public class GlWindowCard {
             return;
         }
         FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) cardView.getLayoutParams();
-        // Position for the footprint the card will be SEEN at: while waiting
-        // for the first frame the layout params still say 1x1 - computing the
-        // margins for that would re-anchor the revealed card under the
-        // END gravity and swallow any cascade offset. The floating size is
-        // what the card grows into.
-        float w = revealed ? cardView.getWidth() : floatW;
-        float h = revealed ? cardView.getHeight() : floatH;
+        // Explicit sizes are what the floating state uses; the card still
+        // reports the maximized one until the next layout runs.
+        float w = lp.width > 0 ? lp.width : cardView.getWidth();
+        float h = lp.height > 0 ? lp.height : cardView.getHeight();
         float maxLeft = Math.max(0f, workspace.getWidth() - w);
         float maxTop = Math.max(0f, workspace.getHeight() - h);
         left = clamp(left, 0f, maxLeft);
@@ -312,22 +306,17 @@ public class GlWindowCard {
                 cascadeTo(index);
                 return;
             }
-            float w = floatW;
-            float h = floatH;
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) cardView.getLayoutParams();
+            float w = lp.width > 0 ? lp.width : cardView.getWidth();
+            float h = lp.height > 0 ? lp.height : cardView.getHeight();
             float margin = dp(12);
-            float baseStep = dp(28);
-
-            // One shared ladder of CASCADE_STEPS positions per axis, walked
-            // diagonally: the x step shrinks to whatever the (possibly very
-            // narrow) leftover width allows, so the staircase stays a
-            // staircase on a phone instead of collapsing into "only y".
-            int steps = CASCADE_STEPS - 1;
+            float step = dp(28);
             float spanX = Math.max(0f, workspace.getWidth() - w - 2f * margin);
             float spanY = Math.max(0f, workspace.getHeight() - h - 2f * margin);
-            float stepX = Math.min(baseStep, spanX / steps);
-            float stepY = Math.min(baseStep, spanY / steps);
-            float left = margin + triangle(index, steps) * stepX;
-            float top = margin + triangle(index, steps) * stepY;
+            int stepsX = Math.max(1, (int) (spanX / step));
+            int stepsY = Math.max(1, (int) (spanY / step));
+            float left = margin + triangle(index, stepsX) * step;
+            float top = margin + triangle(index, stepsY) * step;
             moveWindow(left, top);
         });
     }
