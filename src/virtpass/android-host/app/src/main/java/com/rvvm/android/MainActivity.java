@@ -113,11 +113,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     // The guest renders into a SurfaceView card that floats above the console
     // (setZOrderMediaOverlay), pinned to the top-right corner with a margin. It
     // is a window in the Windows sense: a title bar that drags, and the usual
-    // three buttons - minimize (rolls the card up to its title bar), maximize /
-    // restore, and close (hides it, leaving the console the whole screen).
-    // Everything except the title bar belongs to the guest: a touch on the
-    // video area is forwarded to it, which is also why the video cannot host a
-    // gesture of ours.
+    // three buttons - minimize (to the chip in the corner), maximize / restore,
+    // and close (stops the guest and takes the window down with it). Everything
+    // except the title bar belongs to the guest: a touch on the video area is
+    // forwarded to it, which is also why the video cannot host a gesture of
+    // ours.
+    //
+    // There is one window, reused by every run, so its state is split by owner:
+    //
+    //   * the USER's arrangement - where the window is, whether it fills the
+    //     workspace - is kept across runs, because it is the workspace's layout
+    //     and not the guest's;
+    //   * a RUN owns whether the window has content yet and whether its start is
+    //     held back for a surface. Those are reset for every run
+    //     (resetGlWindowForRun) and every signal that can arrive late carries
+    //     the runGeneration it was born with, so it cannot land on the run that
+    //     replaced it - a distinction window state alone cannot make.
+    //
+    // Three owners, then, and the window only knows about the first two on its
+    // own: the guest owns the pixels in the surface, the user owns the layout,
+    // and the run owns the lifetime.
     private View workspace;
     private View glWindow;                // the card: title bar + SurfaceView
     private FitFrameLayout glVideoArea;   // fits the picture (letterbox)
@@ -130,7 +145,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     // margin, not a translation - see moveGlWindow() for why.
     private int glFloatW, glFloatH, glFloatGravity;
     private float glRestoreLeft, glRestoreTop;
-    private boolean glMaximized = false;
+    private boolean glMaximized = false;  // user's arrangement, kept across runs
+
+    // ---- Run identity ----
+    // Bumped by every run that actually starts, and read by the signals a run
+    // leaves behind (its first frame, its exit). A window has no way of telling
+    // those apart on its own - it is one window, and the run it belonged to may
+    // already be over - so each of them carries the generation it was born with
+    // and is dropped when the current one has moved on. Volatile: written on
+    // the UI thread, read from the guest thread and the exit monitor.
+    private volatile int runGeneration = 0;
 
     // ---- Content-driven visibility ----
     // The window is not shown until the guest has a frame for it, so a guest
@@ -1030,12 +1054,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
      * window whose guest is gone has nothing left to show. No chip is left
      * behind either: the window belongs to the run that just ended, and the way
      * back is the Run button, which gives the next guest a window that appears
-     * with its first frame (resetGlWindowForRun).
+     * with its first frame (resetGlWindowForRun). The guest's own exit does the
+     * same thing, so a window does not outlive the run it belongs to.
      */
     private void closeGlWindow() {
         stopGuestElf();
+        dismissGlWindow();
+    }
+
+    /**
+     * Take the window down for good: no card, and no chip to restore it from
+     * either - there is no guest left for it to belong to.
+     *
+     * A card that never got its first frame is deliberately left alone. It is
+     * invisible anyway (the 1x1 waiting state), and hiding it would destroy the
+     * surface, which the next run would then have to wait for and the guest's
+     * window would have to be rebuilt around - all for a card nobody could see.
+     */
+    private void dismissGlWindow() {
         glShowChip.setVisibility(View.GONE);
-        glWindow.setVisibility(View.GONE);
+        if (glRevealed) {
+            glWindow.setVisibility(View.GONE);
+        }
     }
 
     /**
@@ -1570,6 +1610,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
             return;
         }
 
+        // From here on this is a run of its own: it gets a generation, and the
+        // signals it will leave behind (a first frame, an exit) are stamped
+        // with it. Bumped only once the run is really starting, so a refused or
+        // held-back attempt does not invalidate the run that is still going.
+        final int gen = ++runGeneration;
+
         // New run: a fresh log file. The console on screen is the guest's own
         // TTY, which keeps the previous run's last screen until new output
         // arrives, so there is nothing to reset here.
@@ -1600,8 +1646,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
             }
             int code = lastExitCode;
             runOnUiThread(() -> {
+                /* Everything here belongs to the run that just ended, and the
+                 * window, the log file and the status line are all shared with
+                 * whatever runs next. A run can start in between - the
+                 * launcher Activity is singleTask, so "am start --es guest ..."
+                 * goes through onNewIntent and can launch a new guest while
+                 * this callback is still on its way to the UI thread - and
+                 * applying a dead run's exit to it would close its window,
+                 * close its log file and overwrite its status line. The
+                 * generation is what tells the two apart. */
+                if (gen != runGeneration) {
+                    Log.i(TAG, "Exit of run " + gen + " ignored: run " + runGeneration + " owns the window now");
+                    return;
+                }
                 currentGuestApp = null;
                 closeGuestLogFile();
+                // The guest is gone: its window goes with it, the way closing
+                // an application takes its window with it. The next run brings
+                // a new one up - with whatever frame that guest produces
+                // (resetGlWindowForRun).
+                dismissGlWindow();
                 statusText.setText("Guest exited: " + elfName + " (exit " + code + ")");
                 Log.i(TAG, "Guest exited: " + elfName + " (exit " + code + ")");
                 // Nothing left to type into; the frozen last screen stays as it
@@ -1960,7 +2024,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
      */
     private void handleFirstFrame() {
         Log.i(TAG, "First frame presented");
-        runOnUiThread(this::revealGlWindow);
+        /* Stamped here, on the guest thread, where the frame still belongs to a
+         * known run: by the time the UI thread gets to it, a later run may own
+         * the window, and a frame of the previous one must not bring it up for
+         * the guest that replaced it (which would show that guest an empty
+         * window before it has drawn anything). */
+        final int gen = runGeneration;
+        runOnUiThread(() -> {
+            if (gen != runGeneration) {
+                Log.i(TAG, "First frame of run " + gen + " ignored: run "
+                        + runGeneration + " owns the window now");
+                return;
+            }
+            /* Same run, but its guest may already be gone: the exit path closes
+             * the window a moment later, and revealing first would flash a
+             * window for a guest that has exited. */
+            if (RvvmNative.nativeIsGuestRunning()) {
+                revealGlWindow();
+            }
+        });
     }
 
     // --- Activity lifecycle --------------------------------------------------
