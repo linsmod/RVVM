@@ -703,6 +703,18 @@ typedef struct rvvm_userland {
     uint32_t                      userland_suspend;
     uint32_t                      userland_parked;
 
+    // --- Guest signal delivery ---
+    // One process-wide pending signal (console ^C with a handler registered
+    // via rt_sigaction, or an in-guest kill to itself). The first vCPU thread
+    // that reaches its wrap-loop boundary consumes it: a signal frame is
+    // built on the guest stack and the registered handler runs; the handler
+    // returns through an rt_sigreturn trampoline inside the frame, and the
+    // wrap loop restores the interrupted context.
+    volatile uint32_t sig_pending;    // signal number awaiting delivery, 0 = none
+    volatile uint32_t sig_return;     // rt_sigreturn seen: restore at the boundary
+    volatile uint32_t sig_inflight;   // handler on the stack (same-number re-entry queues instead)
+    volatile uint64_t sig_frame;      // guest address of the in-flight frame
+
     // --- Guest virtual TTY (libvterm, optional) ---
     // When tty_cb is set, guest writes to fd 1/2 are parsed by libvterm and the
     // host renders the screen itself instead of writing raw bytes to a tty.
@@ -1329,6 +1341,7 @@ static void user_tty_vt_write(rvvm_userland_t* ctx, const char* buf, size_t len)
 #define UAPI_TCSETSF    0x5404
 #define UAPI_TIOCGWINSZ 0x5413
 #define UAPI_TIOCSWINSZ 0x5414
+#define UAPI_SIGINT     2
 
 /*
  * Termios bits the virtual TTY's input path acts on (asm-generic values, the
@@ -1601,6 +1614,9 @@ static size_t tty_line_erase(rvvm_userland_t* ctx)
     return nbytes;
 }
 
+// Defined with the guest signal delivery below the syscall dispatch.
+static bool userland_deliver_signal(rvvm_userland_t* ctx, uint32_t sig);
+
 // Run one host input burst through the line discipline.
 static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
 {
@@ -1701,8 +1717,14 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
         rvvm_event_wake(&ctx->tty_in_event);
     }
     if (interrupt) {
-        // 128 + SIGINT: what a shell reports for a Ctrl-C'd job.
-        rvvm_user_stop(ctx->machine, 130);
+        // SIGINT with a guest-registered handler is delivered in-guest: the
+        // handler runs at the vCPU's next instruction boundary, before the
+        // guest sees any EINTR from a read this unblocked. The default
+        // disposition is termination - what ^C has always meant here (130 =
+        // 128 + SIGINT, what a shell reports for a ^C'd job).
+        if (!userland_deliver_signal(ctx, UAPI_SIGINT)) {
+            rvvm_user_stop(ctx->machine, 130);
+        }
     }
 }
 
@@ -1734,6 +1756,13 @@ static int64_t user_tty_read(rvvm_userland_t* ctx, void* buf, size_t count, bool
 
     for (;;) {
         spin_lock(&ctx->tty_in_lock);
+        if (atomic_load_uint32(&ctx->sig_pending)) {
+            // A signal arrived while the guest was parked on read(0): return
+            // -EINTR so the vCPU reaches the delivery boundary. The handler
+            // runs before the guest observes the EINTR.
+            spin_unlock(&ctx->tty_in_lock);
+            return -UAPI_EINTR;
+        }
         if (ctx->tty_cooked_len) {
             size_t n = tty_cooked_pop(ctx, buf, count);
             spin_unlock(&ctx->tty_in_lock);
@@ -3248,6 +3277,130 @@ static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* bu
 /* Syscall traces below use rvvm_info(), which is hidden at the default
  * LOG_WARN level and shown only when verbose logging is enabled. */
 
+/* ============================================================
+ * Guest signal delivery
+ *
+ * The guest subscribes with rt_sigaction (the handler address lands in
+ * ctx->siga[signum]); the host side delivers by parking a signal number in
+ * ctx->sig_pending. The first vCPU thread that reaches its wrap-loop
+ * boundary consumes it: a signal frame goes on the guest stack, and the
+ * registered handler runs with SP on the frame and the signal number in a0.
+ *
+ * The frame layout is internal to this userland - it carries only what the
+ * delivery needs (the interrupted register file, the interrupted PC, the
+ * signal number) plus a two-instruction return trampoline (li a7, 139;
+ * ecall). The guest libc's rt_sigreturn wrapper is not involved: the
+ * trampoline issues the raw syscall with SP still on the frame, and the
+ * rt_sigreturn handler below flags the wrap loop, which restores the saved
+ * context at a clean instruction boundary.
+ *
+ * The process-wide single pending slot follows the kernel's blocked-signal
+ * rule for the common case: while a handler for the same signal is on the
+ * stack, further arrivals queue (one deep) instead of re-entering.
+ * ============================================================ */
+#define VP_SIGFRAME_MAGIC 0x4D49464753555356ULL
+#define UAPI_SIGINT       2
+
+struct vp_sigframe {
+    uint64_t magic;
+    uint64_t regs[31];    // x1..x31 at the interruption point
+    uint64_t pc;          // interrupted PC
+    uint64_t sig;         // signal being delivered
+    uint32_t retcode[2];  // li a7, 139; ecall
+};
+
+// Queue a signal for delivery to the guest. Returns true when the guest can
+// receive it (a handler is registered, or the signal is ignored and there is
+// nothing to do); false when the default disposition applies and the caller
+// must act on it itself (SIGINT: terminate the run).
+static bool userland_deliver_signal(rvvm_userland_t* ctx, uint32_t sig)
+{
+    if (sig == 0 || sig >= STATIC_ARRAY_SIZE(ctx->siga)) {
+        return false;
+    }
+    uint64_t handler = ctx->siga[sig].handler;
+    if (handler == (uint64_t)SIG_IGN) {
+        return true;   // ignored: consumed, nothing to deliver
+    }
+    if (handler != (uint64_t)SIG_DFL) {
+        atomic_store_uint32(&ctx->sig_pending, sig);
+        // Unblock a read(0) parked on the input event - it returns -EINTR
+        // and its vCPU walks into the delivery boundary, where the handler
+        // runs before the guest ever sees the EINTR.
+        rvvm_event_wake(&ctx->tty_in_event);
+        return true;
+    }
+    return false;  // default disposition
+}
+
+// Run the pending signal's handler on this vCPU: build the frame below the
+// interrupted SP, point the context at the handler through the trampoline.
+static void userland_siginject(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
+{
+    // A handler already on the stack blocks the same signal: leave the
+    // pending slot queued, it delivers when the handler returns.
+    if (atomic_load_uint32(&ctx->sig_inflight)) {
+        return;
+    }
+    uint32_t sig = atomic_swap_uint32(&ctx->sig_pending, 0);
+    if (!sig || sig >= STATIC_ARRAY_SIZE(ctx->siga)) {
+        return;
+    }
+    uint64_t handler = ctx->siga[sig].handler;
+    if (handler == (uint64_t)SIG_DFL || handler == (uint64_t)SIG_IGN) {
+        return;   // disposition changed behind our back; nothing to run
+    }
+    atomic_store_uint32(&ctx->sig_inflight, 1);
+
+    struct vp_sigframe frame;
+    frame.magic = VP_SIGFRAME_MAGIC;
+    for (uint32_t r = 0; r < 31; ++r) {
+        frame.regs[r] = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 1 + r);
+    }
+    frame.pc  = rvvm_read_cpu_reg(cpu, RVVM_REGID_PC);
+    frame.sig = sig;
+    frame.retcode[0] = 0x08B00893;  // li a7, 139
+    frame.retcode[1] = 0x00000073;  // ecall
+
+    uint64_t sp = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 2);
+    uint64_t frame_addr = (sp - sizeof(frame)) & ~(uint64_t)0xF;
+    struct vp_sigframe* host_frame = to_ptr_sz(frame_addr, sizeof(frame));
+    if (!host_frame) {
+        // The stack is not in guest RAM (should not happen): drop the signal
+        // rather than corrupting anything.
+        rvvm_warn("Signal %u dropped: stack frame %llx outside guest RAM", sig, (long long)frame_addr);
+        atomic_store_uint32(&ctx->sig_inflight, 0);
+        return;
+    }
+    memcpy(host_frame, &frame, sizeof(frame));
+    atomic_store_uint64(&ctx->sig_frame, frame_addr);
+
+    // Handler context: SP on the frame, the signal number as its first
+    // argument, RA on the return trampoline.
+    rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 2,  frame_addr);
+    rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 10, sig);
+    rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 1,  frame_addr + sizeof(frame) - sizeof(frame.retcode));
+    rvvm_write_cpu_reg(cpu, RVVM_REGID_PC,      handler);
+}
+
+// Pop the signal frame: restore the interrupted register file and PC. Called
+// at the wrap-loop boundary, after rt_sigreturn flagged the return - the
+// syscall's own a0/PC writeback has already happened and is overwritten here.
+static void userland_sigrestore(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
+{
+    uint64_t frame_addr = atomic_load_uint64(&ctx->sig_frame);
+    struct vp_sigframe* frame = to_ptr_sz(frame_addr, sizeof(struct vp_sigframe));
+    if (!frame || frame->magic != VP_SIGFRAME_MAGIC) {
+        rvvm_warn("sigreturn: no signal frame at %llx", (long long)frame_addr);
+        return;
+    }
+    for (uint32_t r = 0; r < 31; ++r) {
+        rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 1 + r, frame->regs[r]);
+    }
+    rvvm_write_cpu_reg(cpu, RVVM_REGID_PC, frame->pc);
+    atomic_store_uint32(&ctx->sig_inflight, 0);
+}
+
 static void* rvvm_user_thread_wrap(void* arg)
 {
     rvvm_user_thread_t* thread = arg;
@@ -3279,6 +3432,16 @@ static void* rvvm_user_thread_wrap(void* arg)
         if (atomic_load_uint32(&thread->finished)) {
             // Shutdown raced the suspend - do not re-enter the guest to unwind
             break;
+        }
+        // Signal delivery, at a clean instruction boundary: the register file
+        // is committed to the hart between interpreter rounds, so building a
+        // frame and pointing PC at the handler is safe here.
+        if (atomic_load_uint32(&uctx()->sig_pending)) {
+            userland_siginject(cpu, uctx());
+        }
+        if (atomic_load_uint32(&uctx()->sig_return)) {
+            atomic_store_uint32(&uctx()->sig_return, 0);
+            userland_sigrestore(cpu, uctx());
         }
         rvvm_addr_t cause = rvvm_run_user_thread(cpu);
         rvvm_warn("DBG loop: interpreter returned cause=%llx pc=%llx a7=%llx finished=%u",
@@ -3911,15 +4074,42 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 129: // kill
                     rvvm_warn("sys_kill(%lx, %lx)", a0, a1);
+                    // A signal the guest can receive (handler registered, or
+                    // ignored) is delivered in-guest; the default disposition
+                    // terminates the run - what kill() with SIGINT's default
+                    // means. Only unknown signal numbers reach the host.
+                    if (a1 > 0 && a1 < STATIC_ARRAY_SIZE(uctx()->siga)) {
+                        if (!userland_deliver_signal(uctx(), (uint32_t)a1)) {
+                            rvvm_user_stop(uctx()->machine, 128 + a1);
+                        }
+                        a0 = 0;
+                        break;
+                    }
                     a0 = errno_ret(kill(a0, a1));
                     break;
 #ifdef __linux__
                 case 130: // tkill
                     rvvm_warn("sys_tkill(%lx, %lx)", a0, a1);
+                    // Same in-guest routing as kill(); the target tid is not
+                    // tracked, so thread-directed signals land on the process.
+                    if (a1 > 0 && a1 < STATIC_ARRAY_SIZE(uctx()->siga)) {
+                        if (!userland_deliver_signal(uctx(), (uint32_t)a1)) {
+                            rvvm_user_stop(uctx()->machine, 128 + a1);
+                        }
+                        a0 = 0;
+                        break;
+                    }
                     a0 = errno_ret(tgkill(getpid(), a0, a1));
                     break;
                 case 131: // tgkill
                     rvvm_warn("sys_tgkill(%lx, %lx, %ld)", a0, a1, a2);
+                    if (a2 > 0 && a2 < STATIC_ARRAY_SIZE(uctx()->siga)) {
+                        if (!userland_deliver_signal(uctx(), (uint32_t)a2)) {
+                            rvvm_user_stop(uctx()->machine, 128 + a2);
+                        }
+                        a0 = 0;
+                        break;
+                    }
                     a0 = errno_ret(tgkill(a0, a1, a2));
                     break;
 #endif
@@ -3967,6 +4157,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                     sleep_ms(-1);
                     a0 = 0;
                     break;
+                case 139: { // rt_sigreturn
+                    // The trampoline inside the signal frame issues this with
+                    // SP on the frame. The restore itself happens at the
+                    // wrap-loop boundary (flagged here) - the a0/PC writeback
+                    // after this switch would otherwise clobber it.
+                    atomic_store_uint32(&uctx()->sig_return, 1);
+                    a0 = 0;
+                    break;
+                }
                 case 140: // setpriority - ignore
                     a0 = 0;
                     break;
