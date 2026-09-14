@@ -56,9 +56,56 @@ static JNIEnv* g_env = NULL;
  * every cmdpost_* call in this file writes into - that state used to be
  * file-scope globals in vp_cmdpost.c, one set for the whole process.
  *
- * Declared here rather than next to g_guest_machine because the vsync pump
+ * Declared here rather than next to g_run.machine because the vsync pump
  * (defined above that point) is one of its callers. */
-static vp_cmdpost_t* g_cmdpost = NULL;
+/* ------------------------------------------------------------------
+ * One run of one guest, and everything the host keeps for it.
+ *
+ * The state below used to be file-scope globals: one machine, one cmdpost
+ * instance, one set of lifecycle queues for the whole process - which is why a
+ * second guest could not exist beside the first. It is a struct now, and the
+ * JNI surface still operates on "the" run (g_run). Giving each guest its own
+ * copy and an id in the JNI surface is the step that turns this into N guests;
+ * none of the call sites change when that happens, they only name their run.
+ * ------------------------------------------------------------------ */
+struct android_run {
+    /* The bridge instance this run talks through, its sensor subscriber
+     * included. Its lifecycle: made when Java prepares a run
+     * (nativeClearLifecycleCmds), bound to the run's machine with
+     * rvvm_user_set_host_ctx(), freed by that run's guest thread as it ends. */
+    vp_cmdpost_t*   cmdpost;
+    /* Display + console state the run owns: the panel the guest renders into
+     * and the console line assembly (virtpass/vp_session.h).
+     *
+     * The tty *session* is deliberately NOT here: it is the host's console, it
+     * outlives the guest, and it is what lets the console keep showing - and
+     * scrolling through - the frozen last screen after the run ends. */
+    vp_session_t    session;
+    /* The guest itself. Created in nativeRunElf(), freed by
+     * rvvm_user_linux_ex() on the guest thread. */
+    rvvm_machine_t* machine;
+    pthread_t       thread;
+    volatile int    running;
+    /* Host-side mirror of the suspend request. rvvm_user_is_suspended() would
+     * answer the same, but only by dereferencing the machine - which the guest
+     * thread frees the instant it exits, while this flag stays valid from any
+     * thread (the UI polls it). */
+    volatile int    suspended;
+    char            elf_path[512];
+    int             argc;
+    char*           argv[16];
+    /* Guest exit callback (Java object reference, held by global ref). */
+    jobject         exit_listener;
+    /* Host-side mirror of the lifecycle commands. vp_cmdpost holds the
+     * guest-facing queue; this copy is what the JNI poller answers from. */
+    int32_t         lifecycle_queue[32];
+    int32_t         lifecycle_count;
+    int32_t         lifecycle_read;
+};
+
+/* The run in progress. One today; the table of runs is what a second guest
+ * adds, and everything in this file already names the run it means. */
+static struct android_run g_run;
 
 /* Window from Android (Layer 2: the viewport) */
 static ANativeWindow* g_native_window = NULL;
@@ -78,18 +125,13 @@ static ANativeWindow* g_native_window = NULL;
  * (virtpass/vp_session.h), which is the same state the win32 host keeps for its
  * own window and the shape a second instance would need a copy of. What is
  * left in this file is what is genuinely Android's business - the window, the
- * locks and the Java callbacks - driving that session under g_surf_cs.
+ * locks and the Java callbacks - driving that session (g_run.session) under
+ * g_surf_cs.
  * ------------------------------------------------------------------ */
-static vp_session_t g_session;
 
-/* Guards the session's geometry and the window. Held for short reads/writes
+/* Guards the run's display geometry and the window. Held for short reads/writes
  * only, never across an ANativeWindow_lock()/unlockAndPost() pair. */
 static pthread_mutex_t g_surf_cs = PTHREAD_MUTEX_INITIALIZER;
-
-/* GameActivity state */
-static int32_t g_lifecycle_cmd_queue[32];
-static int32_t g_lifecycle_cmd_count = 0;
-static int32_t g_lifecycle_cmd_read = 0;
 
 /* ============================================================
  * Choreographer (Phase 4): display vsync source
@@ -129,7 +171,7 @@ static void on_vsync_frame(long frame_time_nanos, void* data)
 
     /* fd path: hand the frame time to the guest's Looper pipe if it asked for
      * this vsync. Cheap no-op while nothing is armed. */
-    vp_cmdpost_vsync_tick(g_cmdpost, (int64_t)frame_time_nanos);
+    vp_cmdpost_vsync_tick(g_run.cmdpost, (int64_t)frame_time_nanos);
 
     /* Keep the tick continuous: re-arm immediately from inside the callback. */
     if (g_vsync_running) {
@@ -239,7 +281,7 @@ static void jni_vsync_stop(void)
     g_vsync_running = 0;
 
     /* Release a guest blocked in poll() on the vsync fd. */
-    vp_cmdpost_vsync_source_lost(g_cmdpost);
+    vp_cmdpost_vsync_source_lost(g_run.cmdpost);
 
     /* Wake a thread parked in ALooper_pollOnce(-1) ... */
     if (g_vsync_looper) {
@@ -254,24 +296,9 @@ static void jni_vsync_stop(void)
     g_vsync_looper = NULL;
 }
 
-/* Guest execution state */
-static pthread_t g_guest_thread;
-static int g_guest_running = 0;
-/* Host-side mirror of the suspend request. rvvm_user_is_suspended() would answer
- * the same, but only by dereferencing the machine - which the guest thread frees
- * the instant it exits, while this flag stays valid from any thread (the UI
- * polls it). */
-static volatile int g_guest_suspended = 0;
-static char g_guest_elf_path[512];
-static int g_guest_argc = 0;
-static char* g_guest_argv[16];
-/* Userland machine for the running guest. Created in nativeRunElf(), freed by
- * rvvm_user_linux_ex() on the guest thread. Each run binds it to g_cmdpost (the
- * host's cmdpost instance, declared at the top of this file). */
-static rvvm_machine_t* g_guest_machine = NULL;
-
-/* Guest exit callback (Java object reference, held by global ref) */
-static jobject g_exit_listener = NULL;
+/* The guest execution state that used to live here is g_run (see the top of
+ * this file): machine, thread, flags, argv and the lifecycle mirror all belong
+ * to a run, not to the process. */
 
 /* ============================================================
  * Guest console I/O: native -> Java bridge
@@ -291,7 +318,7 @@ static jmethodID  g_console_output_mid = NULL;
 static jmethodID  g_console_first_frame_mid = NULL;
 
 /* The pending line and the first-frame flag are per-run state and live in
- * g_session (virtpass/vp_session.h): this mutex is what serialises access to
+ * g_run.session (virtpass/vp_session.h): this mutex is what serialises access to
  * them, since the session itself takes no locks. */
 static pthread_mutex_t g_console_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -502,7 +529,7 @@ Java_com_rvvm_android_RvvmNative_nativeTtyScrollBy(JNIEnv* env, jobject thiz, ji
 JNIEXPORT void JNICALL
 Java_com_rvvm_android_RvvmNative_nativeTtyInput(JNIEnv* env, jobject thiz, jbyteArray in)
 {
-    rvvm_machine_t* machine = g_guest_machine;
+    rvvm_machine_t* machine = g_run.machine;
     jsize len;
     jbyte* buf;
 
@@ -575,7 +602,7 @@ void jni_guest_output(const char* data, size_t count)
     if (!data || !count) return;
 
     pthread_mutex_lock(&g_console_mutex);
-    vp_session_console_output(&g_session, data, count);
+    vp_session_console_output(&g_run.session, data, count);
     pthread_mutex_unlock(&g_console_mutex);
 }
 
@@ -588,10 +615,10 @@ void jni_guest_first_frame(void)
     int first;
 
     pthread_mutex_lock(&g_console_mutex);
-    first = vp_session_note_first_frame(&g_session);
+    first = vp_session_note_first_frame(&g_run.session);
     if (first) {
         /* Flush whatever output precedes the frame. */
-        vp_session_console_flush(&g_session);
+        vp_session_console_flush(&g_run.session);
     }
     pthread_mutex_unlock(&g_console_mutex);
 
@@ -609,7 +636,7 @@ void jni_guest_first_frame(void)
 static void console_reset(void)
 {
     pthread_mutex_lock(&g_console_mutex);
-    vp_session_reset_run(&g_session);
+    vp_session_reset_run(&g_run.session);
     pthread_mutex_unlock(&g_console_mutex);
 }
 
@@ -620,11 +647,11 @@ static void surf_finish_pending_lock(void);
 /* Guest thread function */
 static void* guest_thread_func(void* arg)
 {
-    rvvm_machine_t* machine = g_guest_machine;
+    rvvm_machine_t* machine = g_run.machine;
     /* The cmdpost instance this run was started with. Taken now, while the
      * UI thread is still inside nativeRunElf() (so it cannot be racing us), and
      * released at the end of this function. */
-    vp_cmdpost_t* cmdpost = g_cmdpost;
+    vp_cmdpost_t* cmdpost = g_run.cmdpost;
     (void)arg;
 
     /* Detach: the launcher runs guest after guest, so this thread must release
@@ -632,17 +659,17 @@ static void* guest_thread_func(void* arg)
      * (nothing ever pthread_join()s it). */
     pthread_detach(pthread_self());
 
-    LOGI("Guest thread started, ELF: %s", g_guest_elf_path);
+    LOGI("Guest thread started, ELF: %s", g_run.elf_path);
     
     /* Build argc/argv for rvvm_user_linux_ex() */
     /* argv[0] = ELF path, argv[1..] = guest args */
-    g_guest_argv[0] = g_guest_elf_path;
+    g_run.argv[0] = g_run.elf_path;
     
     /* On non-riscv hosts rvvm_user.c defaults prefix_path to a hardcoded
      * Debian userland path. Disable it so host paths pass through unchanged. */
     putenv("RVVM_USER_PREFIX=");
     
-    int result = rvvm_user_linux_ex(machine, g_guest_argc, g_guest_argv, NULL);
+    int result = rvvm_user_linux_ex(machine, g_run.argc, g_run.argv, NULL);
     
     LOGI("Guest thread finished with code: %d", result);
 
@@ -653,22 +680,22 @@ static void* guest_thread_func(void* arg)
     surf_finish_pending_lock();
 
     /* rvvm_user_linux_ex() owns and has just freed the machine */
-    g_guest_machine = NULL;
+    g_run.machine = NULL;
 
     /* This run is over, so its cmdpost instance - and the sensor state hanging
-     * off it - goes now, *before* g_guest_running drops: that flag is what Java
+     * off it - goes now, *before* g_run.running drops: that flag is what Java
      * polls to allow the next Run, and the next run makes its own instance in
      * nativeClearLifecycleCmds(). Releasing it after the flag would let the next
      * run create one and this thread free it. Compare before clearing so a
      * teardown that already dropped the pointer cannot make us clear a
      * successor's. */
-    if (g_cmdpost == cmdpost) {
-        g_cmdpost = NULL;
+    if (g_run.cmdpost == cmdpost) {
+        g_run.cmdpost = NULL;
     }
     cmdpost_destroy(cmdpost);
 
-    g_guest_running = 0;
-    g_guest_suspended = 0;
+    g_run.running = 0;
+    g_run.suspended = 0;
     
     return NULL;
 }
@@ -889,7 +916,7 @@ static void panel_latch_locked(void)
 
     w = ANativeWindow_getWidth(win);
     h = ANativeWindow_getHeight(win);
-    if (vp_session_latch_panel(&g_session, w, h)) {
+    if (vp_session_latch_panel(&g_run.session, w, h)) {
         LOGI("Virtual panel latched: %dx%d", w, h);
     }
 }
@@ -897,9 +924,9 @@ static void panel_latch_locked(void)
 /* Effective guest geometry. Caller holds g_surf_cs. */
 static void guest_geometry_locked(int32_t* w, int32_t* h, int32_t* fmt)
 {
-    if (vp_session_guest_geometry(&g_session, w, h, fmt)) {
+    if (vp_session_guest_geometry(&g_run.session, w, h, fmt)) {
         LOGI("Guest surface latched to panel: %dx%d",
-             g_session.gfx_w, g_session.gfx_h);
+             g_run.session.gfx_w, g_run.session.gfx_h);
     }
 }
 
@@ -927,9 +954,9 @@ void jni_apply_surface_geometry(struct ANativeWindow* w)
     pthread_mutex_lock(&g_surf_cs);
     panel_latch_locked();
     guest_geometry_locked(&gw, &gh, &gf);
-    if (vp_session_geometry_dirty(&g_session, gw, gh, gf)) {
+    if (vp_session_geometry_dirty(&g_run.session, gw, gh, gf)) {
         if (ANativeWindow_setBuffersGeometry(w, gw, gh, gf) == 0) {
-            vp_session_geometry_pushed(&g_session, gw, gh, gf);
+            vp_session_geometry_pushed(&g_run.session, gw, gh, gf);
         }
     }
     pthread_mutex_unlock(&g_surf_cs);
@@ -1129,7 +1156,7 @@ static int32_t on_window_set_buf(int32_t width, int32_t height, int32_t format)
     /* The session applies the guest's rule - a concrete size redefines the
      * surface, a bare format select leaves it alone - and retires the cached
      * push, so the real surface is re-applied at the next lock. */
-    vp_session_set_guest_geometry(&g_session, width, height, format);
+    vp_session_set_guest_geometry(&g_run.session, width, height, format);
     pthread_mutex_unlock(&g_surf_cs);
 
     LOGI("Window geometry set: %dx%d format=%d (guest geometry %s)",
@@ -1179,7 +1206,7 @@ static int32_t on_config_get(int32_t field, int32_t* outValue)
     pthread_mutex_lock(&g_surf_cs);
     panel_latch_locked();
     guest_geometry_locked(&w, &h, NULL);
-    ppi = (g_session.panel_ppi > 0) ? g_session.panel_ppi
+    ppi = (g_run.session.panel_ppi > 0) ? g_run.session.panel_ppi
                                     : ACONFIGURATION_DENSITY_MEDIUM;
     pthread_mutex_unlock(&g_surf_cs);
 
@@ -1226,8 +1253,8 @@ static void on_game_lifecycle(int32_t cmd)
     LOGI("GameActivity lifecycle cmd=%d", cmd);
     
     /* Queue the command for polling by Guest */
-    if (g_lifecycle_cmd_count < 32) {
-        g_lifecycle_cmd_queue[g_lifecycle_cmd_count++] = cmd;
+    if (g_run.lifecycle_count < 32) {
+        g_run.lifecycle_queue[g_run.lifecycle_count++] = cmd;
     }
 }
 
@@ -1276,26 +1303,26 @@ static void jni_register_cmdpost_callbacks(void)
     extern const vp_audio_ops_t* android_aaudio_ops(void);
 
     /* Window / surface + configuration */
-    cmdpost_set_window_callbacks(g_cmdpost, on_window_lock, on_window_unlock);
-    cmdpost_set_window_size_callback(g_cmdpost, on_window_size);
-    cmdpost_set_window_set_buf_callback(g_cmdpost, on_window_set_buf);
-    cmdpost_set_config_callback(g_cmdpost, on_config_get);
+    cmdpost_set_window_callbacks(g_run.cmdpost, on_window_lock, on_window_unlock);
+    cmdpost_set_window_size_callback(g_run.cmdpost, on_window_size);
+    cmdpost_set_window_set_buf_callback(g_run.cmdpost, on_window_set_buf);
+    cmdpost_set_config_callback(g_run.cmdpost, on_config_get);
 
     /* GameActivity lifecycle + input */
-    cmdpost_set_game_callbacks(g_cmdpost, on_game_lifecycle, on_game_input);
+    cmdpost_set_game_callbacks(g_run.cmdpost, on_game_lifecycle, on_game_input);
 
     /* Real display vsync as the guest's AChoreographer source. Only re-armed
      * while its owner thread is alive; otherwise the source stays unavailable
      * and the guest falls back to its own clock instead of waiting for a tick
      * that will never come. */
     if (g_vsync_running) {
-        cmdpost_set_choreographer_callback(g_cmdpost, android_vsync_wait);
+        cmdpost_set_choreographer_callback(g_run.cmdpost, android_vsync_wait);
         g_vsync_warned = 0;
     }
 
     /* Real AAudio backend: the pump thread in vp_aaudio_android.c bridges the
      * guest's SPSC ring to AAudioStream. */
-    cmdpost_set_audio_callbacks(g_cmdpost, android_aaudio_ops());
+    cmdpost_set_audio_callbacks(g_run.cmdpost, android_aaudio_ops());
 
     /* Real sensor backend: vp_sensor_android.c owns the platform
      * ASensorEventQueue and feeds the subsystem through vp_sensor_ingest().
@@ -1310,7 +1337,7 @@ static void jni_register_cmdpost_callbacks(void)
      * instance, so it has to be told which one this is before init() reaches
      * them. Set here rather than once at startup because the instance is per
      * run now. */
-    android_gl_set_cmdpost(g_cmdpost);
+    android_gl_set_cmdpost(g_run.cmdpost);
 
     /* System EGL/GLES backend for the marshalled GL calls. Loads the system
      * libraries on first use and re-installs the dispatch callbacks; on
@@ -1328,8 +1355,8 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
      * assembly of its output into console lines. Everything in it that is
      * per-run is reset by console_reset() in nativeRunElf(); the one thing it
      * needs from this side is where a finished line goes. */
-    vp_session_init(&g_session);
-    g_session.on_line = on_console_line;
+    vp_session_init(&g_run.session);
+    g_run.session.on_line = on_console_line;
 
     /* No cmdpost instance is made here: it belongs to a run, and is created by
      * nativeClearLifecycleCmds() (before Java seeds that run) and freed by the
@@ -1358,9 +1385,9 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
 
     /* A suspended guest is parked and would never poll again; wake it before
      * the teardown below so it is not left parked against a torn-down bridge. */
-    if (g_guest_suspended && g_guest_machine) {
-        rvvm_user_resume(g_guest_machine);
-        g_guest_suspended = 0;
+    if (g_run.suspended && g_run.machine) {
+        rvvm_user_resume(g_run.machine);
+        g_run.suspended = 0;
     }
 
     /* Stop the vsync source before tearing down the bridge. */
@@ -1374,7 +1401,7 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
      * its output into it. With one still unwinding, its ctx holds the session
      * and the process is going away anyway; the next run reopens it (the
      * screen is not kept across a native teardown, only across guest runs). */
-    if (!g_guest_machine && g_tty) {
+    if (!g_run.machine && g_tty) {
         rvvm_tty_close(g_tty);
         g_tty = NULL;
     }
@@ -1382,8 +1409,8 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
     /* A run frees its own instance as it ends (guest_thread_func), so this is
      * for the case where one was made and never ran - a start that failed
      * between nativeClearLifecycleCmds() and the guest thread. */
-    cmdpost_destroy(g_cmdpost);
-    g_cmdpost = NULL;
+    cmdpost_destroy(g_run.cmdpost);
+    g_run.cmdpost = NULL;
 
     LOGI("Native destroy complete");
 }
@@ -1419,7 +1446,7 @@ Java_com_rvvm_android_RvvmNative_nativeSetDisplayConfig(
     (void)screenRound;
 
     pthread_mutex_lock(&g_surf_cs);
-    vp_session_set_density(&g_session, (int32_t)densityDpi);
+    vp_session_set_density(&g_run.session, (int32_t)densityDpi);
     pthread_mutex_unlock(&g_surf_cs);
 
     LOGI("Display config: density=%d (real %dx%d dp ignored; panel-owned)",
@@ -1449,11 +1476,11 @@ Java_com_rvvm_android_RvvmNative_nativeSetPanelSize(JNIEnv* env, jobject thiz,
      * that, an already-latched panel is overwritten - it was latched from a
      * viewport size nobody has rendered into yet. */
     pthread_mutex_lock(&g_surf_cs);
-    if (vp_session_set_panel(&g_session, width, height)) {
+    if (vp_session_set_panel(&g_run.session, width, height)) {
         LOGI("Virtual panel pinned: %dx%d", width, height);
     } else {
         LOGI("Virtual panel already in use (%dx%d), ignoring %dx%d",
-             g_session.gfx_w, g_session.gfx_h, width, height);
+             g_run.session.gfx_w, g_run.session.gfx_h, width, height);
     }
     pthread_mutex_unlock(&g_surf_cs);
 }
@@ -1495,7 +1522,7 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
     if (old_window != new_window) {
         /* A brand new Surface starts with the platform's default geometry:
          * forget what we pushed so the next lock re-applies the panel size. */
-        vp_session_forget_geometry(&g_session);
+        vp_session_forget_geometry(&g_run.session);
     }
 
     /* Tells the GL backend a window came or went - a log line only: the pointer
@@ -1508,8 +1535,8 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
      * waiter sleeps on. */
     pthread_cond_broadcast(&g_window_cond);
 
-    pw = g_session.panel_w;
-    ph = g_session.panel_h;
+    pw = g_run.session.panel_w;
+    ph = g_run.session.panel_h;
     pthread_mutex_unlock(&g_surf_cs);
 
     if (old_window == new_window) {
@@ -1542,8 +1569,8 @@ Java_com_rvvm_android_RvvmNative_nativePollLifecycleCmd(JNIEnv* env, jobject thi
     (void)thiz;
     
     /* Return next lifecycle command from queue, or -1 if empty */
-    if (g_lifecycle_cmd_read < g_lifecycle_cmd_count) {
-        return g_lifecycle_cmd_queue[g_lifecycle_cmd_read++];
+    if (g_run.lifecycle_read < g_run.lifecycle_count) {
+        return g_run.lifecycle_queue[g_run.lifecycle_read++];
     }
     return -1;
 }
@@ -1560,12 +1587,12 @@ Java_com_rvvm_android_RvvmNative_nativeClearLifecycleCmds(JNIEnv* env, jobject t
      * commands queued next have to land in the instance the guest will poll.
      * The previous run freed its own as it handed control back
      * (guest_thread_func), so this is normally NULL. */
-    if (!g_cmdpost) {
-        g_cmdpost = cmdpost_create();
+    if (!g_run.cmdpost) {
+        g_run.cmdpost = cmdpost_create();
     }
 
-    g_lifecycle_cmd_count = 0;
-    g_lifecycle_cmd_read = 0;
+    g_run.lifecycle_count = 0;
+    g_run.lifecycle_read = 0;
 
     /* Called right before the machine is handed to the next guest, so drop
      * what the *guest* still has queued too: pending commands and input belong
@@ -1573,9 +1600,9 @@ Java_com_rvvm_android_RvvmNative_nativeClearLifecycleCmds(JNIEnv* env, jobject t
      * down on its very first poll, a stale touch would be delivered as if the
      * user had just tapped). The seed state for the new guest is then queued
      * explicitly by the Java side. */
-    cmdpost_clear_lifecycle_cmds(g_cmdpost);
-    cmdpost_clear_motion_events(g_cmdpost);
-    cmdpost_clear_key_events(g_cmdpost);
+    cmdpost_clear_lifecycle_cmds(g_run.cmdpost);
+    cmdpost_clear_motion_events(g_run.cmdpost);
+    cmdpost_clear_key_events(g_run.cmdpost);
 }
 
 JNIEXPORT void JNICALL
@@ -1586,9 +1613,9 @@ Java_com_rvvm_android_RvvmNative_nativePostLifecycleCmd(JNIEnv* env, jobject thi
     
     /* Queue a lifecycle command (called from Java when activity state changes)
      * Both into the guest-facing queue (via vp_cmdpost) and the local queue. */
-    cmdpost_queue_lifecycle_cmd(g_cmdpost, cmd);
-    if (g_lifecycle_cmd_count < 32) {
-        g_lifecycle_cmd_queue[g_lifecycle_cmd_count++] = cmd;
+    cmdpost_queue_lifecycle_cmd(g_run.cmdpost, cmd);
+    if (g_run.lifecycle_count < 32) {
+        g_run.lifecycle_queue[g_run.lifecycle_count++] = cmd;
         LOGI("Lifecycle command %d queued", cmd);
     }
 }
@@ -1652,7 +1679,7 @@ Java_com_rvvm_android_RvvmNative_nativePostMotionEvent(JNIEnv* env, jobject thiz
         ev.pointers[i].toolType = 1; /* AMOTION_EVENT_TOOL_TYPE_FINGER */
     }
 
-    cmdpost_queue_motion_event(g_cmdpost, &ev);
+    cmdpost_queue_motion_event(g_run.cmdpost, &ev);
     LOGI("Motion event queued: pointers=%d action=0x%x first=(%.0f,%.0f)",
          (int)count, (unsigned)action, xbuf[0], ybuf[0]);
 }
@@ -1662,7 +1689,7 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
 {
     (void)thiz;
     
-    if (g_guest_running) {
+    if (g_run.running) {
         LOGE("Guest already running");
         return JNI_FALSE;
     }
@@ -1674,31 +1701,31 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
         return JNI_FALSE;
     }
     
-    strncpy(g_guest_elf_path, path, sizeof(g_guest_elf_path) - 1);
-    g_guest_elf_path[sizeof(g_guest_elf_path) - 1] = '\0';
+    strncpy(g_run.elf_path, path, sizeof(g_run.elf_path) - 1);
+    g_run.elf_path[sizeof(g_run.elf_path) - 1] = '\0';
     (*env)->ReleaseStringUTFChars(env, elfPath, path);
     
     /* Get optional arguments */
-    g_guest_argc = 1;  /* argv[0] = ELF path */
+    g_run.argc = 1;  /* argv[0] = ELF path */
     if (args) {
         jsize len = (*env)->GetArrayLength(env, args);
-        for (int i = 0; i < len && g_guest_argc < 15; i++) {
+        for (int i = 0; i < len && g_run.argc < 15; i++) {
             jstring jstr = (jstring)(*env)->GetObjectArrayElement(env, args, i);
             const char* str = (*env)->GetStringUTFChars(env, jstr, NULL);
             if (str) {
                 /* Store in static buffer (simplified - no dynamic alloc) */
                 static char arg_buf[16][128];
-                strncpy(arg_buf[g_guest_argc], str, 127);
-                arg_buf[g_guest_argc][127] = '\0';
-                g_guest_argv[g_guest_argc] = arg_buf[g_guest_argc];
-                g_guest_argc++;
+                strncpy(arg_buf[g_run.argc], str, 127);
+                arg_buf[g_run.argc][127] = '\0';
+                g_run.argv[g_run.argc] = arg_buf[g_run.argc];
+                g_run.argc++;
                 (*env)->ReleaseStringUTFChars(env, jstr, str);
             }
             (*env)->DeleteLocalRef(env, jstr);
         }
     }
     
-    LOGI("Starting guest: %s (argc=%d)", g_guest_elf_path, g_guest_argc);
+    LOGI("Starting guest: %s (argc=%d)", g_run.elf_path, g_run.argc);
 
     /* New run: flush the previous guest's trailing partial line and let the
      * first frame of THIS guest re-hide the console overlay. */
@@ -1724,28 +1751,28 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
     surf_finish_pending_lock();
     
     /* Fresh userland instance per guest, so nothing leaks between runs. */
-    g_guest_machine = rvvm_user_create();
-    if (!g_guest_machine) {
+    g_run.machine = rvvm_user_create();
+    if (!g_run.machine) {
         LOGE("Failed to create userland machine");
         return JNI_FALSE;
     }
-    /* on_guest_exit re-reads g_exit_listener when it fires, so registering it
+    /* on_guest_exit re-reads g_run.exit_listener when it fires, so registering it
      * once per run covers a listener set before or after this point. */
-    rvvm_user_set_exit_callback(g_guest_machine, on_guest_exit);
+    rvvm_user_set_exit_callback(g_run.machine, on_guest_exit);
 
     /* This run's cmdpost instance is normally made by nativeClearLifecycleCmds()
      * (Java queues the startup sequence right after that call, and it has to
      * land in this run's instance); this is the safety net for a caller that
      * went straight to nativeRunElf. */
-    if (!g_cmdpost) {
-        g_cmdpost = cmdpost_create();
+    if (!g_run.cmdpost) {
+        g_run.cmdpost = cmdpost_create();
     }
 
     /* Bind this run's machine to the host's cmdpost instance: it is how a
      * syscall arriving on a guest thread finds the state it belongs to. Done
      * before the thread starts, since the first thing the guest does may be one
      * of these syscalls. */
-    rvvm_user_set_host_ctx(g_guest_machine, g_cmdpost);
+    rvvm_user_set_host_ctx(g_run.machine, g_run.cmdpost);
 
     /* Host-owned console session: wipe the screen for this run (the cells, the
      * scrollback, the view and the cursor state all belong to the run that just
@@ -1757,18 +1784,18 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
     jni_tty_init();
     if (g_tty) {
         rvvm_tty_reset(g_tty);
-        rvvm_tty_attach(g_tty, g_guest_machine);
+        rvvm_tty_attach(g_tty, g_run.machine);
     }
     
     /* Start guest thread */
-    g_guest_running = 1;
-    g_guest_suspended = 0;
-    if (pthread_create(&g_guest_thread, NULL, guest_thread_func, NULL) != 0) {
+    g_run.running = 1;
+    g_run.suspended = 0;
+    if (pthread_create(&g_run.thread, NULL, guest_thread_func, NULL) != 0) {
         LOGE("Failed to create guest thread");
-        g_guest_running = 0;
-        g_guest_suspended = 0;
-        rvvm_user_free(g_guest_machine);
-        g_guest_machine = NULL;
+        g_run.running = 0;
+        g_run.suspended = 0;
+        rvvm_user_free(g_run.machine);
+        g_run.machine = NULL;
         return JNI_FALSE;
     }
     
@@ -1780,7 +1807,7 @@ Java_com_rvvm_android_RvvmNative_nativeIsGuestRunning(JNIEnv* env, jobject thiz)
 {
     (void)env;
     (void)thiz;
-    return g_guest_running ? JNI_TRUE : JNI_FALSE;
+    return g_run.running ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL
@@ -1789,23 +1816,23 @@ Java_com_rvvm_android_RvvmNative_nativeStopGuest(JNIEnv* env, jobject thiz)
     (void)env;
     (void)thiz;
     
-    if (g_guest_running) {
+    if (g_run.running) {
         LOGI("Stopping guest...");
         /* A suspended guest is parked and cannot poll for the stop; resume it
          * first so it unwinds the normal way instead of being forced down. The
          * frame clock stays off: the guest degrades to its own clock while it
          * tears down, so there is no point restarting a source we are about to
          * retire. */
-        if (g_guest_suspended && g_guest_machine) {
-            rvvm_user_resume(g_guest_machine);
-            g_guest_suspended = 0;
+        if (g_run.suspended && g_run.machine) {
+            rvvm_user_resume(g_run.machine);
+            g_run.suspended = 0;
             LOGI("Stop: resumed the suspended guest first");
         }
         /* Kick every guest vCPU out of its run loop; the guest unwinds like a
          * sys_exit_group(0), so on_guest_exit fires and guest_thread_func
-         * clears g_guest_running once rvvm_user_linux_ex() returns. */
-        if (g_guest_machine) {
-            rvvm_user_stop(g_guest_machine, 0);
+         * clears g_run.running once rvvm_user_linux_ex() returns. */
+        if (g_run.machine) {
+            rvvm_user_stop(g_run.machine, 0);
         }
     }
 }
@@ -1816,12 +1843,12 @@ Java_com_rvvm_android_RvvmNative_nativeSuspendGuest(JNIEnv* env, jobject thiz)
     (void)env;
     (void)thiz;
 
-    if (!g_guest_running || !g_guest_machine || g_guest_suspended) {
+    if (!g_run.running || !g_run.machine || g_run.suspended) {
         return;
     }
 
-    bool parked = rvvm_user_suspend(g_guest_machine);
-    g_guest_suspended = 1;
+    bool parked = rvvm_user_suspend(g_run.machine);
+    g_run.suspended = 1;
 
     /* Park the frame clock too: a parked guest polls neither frames nor
      * lifecycle commands, so a running clock would only pile up vsync ticks
@@ -1838,7 +1865,7 @@ Java_com_rvvm_android_RvvmNative_nativeResumeGuest(JNIEnv* env, jobject thiz)
     (void)env;
     (void)thiz;
 
-    if (!g_guest_running || !g_guest_machine || !g_guest_suspended) {
+    if (!g_run.running || !g_run.machine || !g_run.suspended) {
         return;
     }
 
@@ -1848,8 +1875,8 @@ Java_com_rvvm_android_RvvmNative_nativeResumeGuest(JNIEnv* env, jobject thiz)
     jni_vsync_start();
     jni_register_cmdpost_callbacks();
 
-    g_guest_suspended = 0;
-    rvvm_user_resume(g_guest_machine);
+    g_run.suspended = 0;
+    rvvm_user_resume(g_run.machine);
     LOGI("Suspend: guest resumed");
 }
 
@@ -1858,12 +1885,12 @@ Java_com_rvvm_android_RvvmNative_nativeIsGuestSuspended(JNIEnv* env, jobject thi
 {
     (void)env;
     (void)thiz;
-    /* Reported from the host-side flag, not the machine: see g_guest_suspended. */
-    return g_guest_suspended ? JNI_TRUE : JNI_FALSE;
+    /* Reported from the host-side flag, not the machine: see g_run.suspended. */
+    return g_run.suspended ? JNI_TRUE : JNI_FALSE;
 }
 
 /* C callback invoked by rvvm_user when the guest exits.
- * NOTE: g_guest_running is NOT cleared here - the guest native thread is
+ * NOTE: g_run.running is NOT cleared here - the guest native thread is
  * still winding down (rvvm_user_linux has not returned yet). guest_thread_func
  * clears it after rvvm_user_linux() returns, keeping the "running" state in
  * sync with the actual thread and preventing a premature re-Run from starting
@@ -1872,17 +1899,17 @@ static void on_guest_exit(int exit_code)
 {
     LOGI("Guest exited with code: %d", exit_code);
 
-    if (g_exit_listener) {
+    if (g_run.exit_listener) {
         JNIEnv* env = NULL;
         int attached = (*g_jvm)->GetEnv(g_jvm, (void**)&env, JNI_VERSION_1_6);
         if (attached == JNI_EDETACHED) {
             (*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL);
         }
         if (env) {
-            jclass clazz = (*env)->GetObjectClass(env, g_exit_listener);
+            jclass clazz = (*env)->GetObjectClass(env, g_run.exit_listener);
             jmethodID mid = (*env)->GetMethodID(env, clazz, "onExit", "(I)V");
             if (mid) {
-                (*env)->CallVoidMethod(env, g_exit_listener, mid, (jint)exit_code);
+                (*env)->CallVoidMethod(env, g_run.exit_listener, mid, (jint)exit_code);
             }
             (*env)->DeleteLocalRef(env, clazz);
         }
@@ -1925,15 +1952,15 @@ Java_com_rvvm_android_RvvmNative_nativeSetExitCallback(JNIEnv* env, jobject thiz
 {
     (void)thiz;
 
-    if (g_exit_listener) {
-        (*env)->DeleteGlobalRef(env, g_exit_listener);
-        g_exit_listener = NULL;
+    if (g_run.exit_listener) {
+        (*env)->DeleteGlobalRef(env, g_run.exit_listener);
+        g_run.exit_listener = NULL;
     }
 
     if (listener) {
-        g_exit_listener = (*env)->NewGlobalRef(env, listener);
+        g_run.exit_listener = (*env)->NewGlobalRef(env, listener);
         /* The per-run machine is not alive yet (or already gone); on_guest_exit
-         * is registered on it in nativeRunElf() and re-reads g_exit_listener
+         * is registered on it in nativeRunElf() and re-reads g_run.exit_listener
          * when it fires, so there is nothing to wire up here. */
     }
 }
