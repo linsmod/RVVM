@@ -713,6 +713,11 @@ static inline rvvm_userland_t* rvvm_userland_ctx(rvvm_machine_t* machine)
  */
 #include <vterm.h>
 
+/* Default grid of the internally-created VTerm (the one used when no host has
+ * injected its own through rvvm_user_set_tty0). A host-injected VTerm owns its
+ * size - the Android console, for instance, follows its viewport height - and
+ * these two are then only the fallback TIOCGWINSZ answers when no VTerm is
+ * attached yet. */
 #define VTERM_ROWS 24
 #define VTERM_COLS 80
 
@@ -825,6 +830,7 @@ static void user_tty_vt_write(rvvm_userland_t* ctx, const char* buf, size_t len)
 #define TTY_LFLAG_DEFAULT  (TTY_LFLAG_ISIG | TTY_LFLAG_ICANON | TTY_LFLAG_ECHO | \
                             TTY_LFLAG_ECHOE | TTY_LFLAG_ECHOK | TTY_LFLAG_IEXTEN)
 
+#define TTY_CC_VINTR  0x03  // Ctrl-C, the default VINTR
 #define TTY_CC_ERASE  0x7F  // DEL, the default VERASE
 #define TTY_CC_VEOF   0x04  // Ctrl-D
 
@@ -860,7 +866,24 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg)
             return 0;
         }
         case UAPI_TIOCGWINSZ: {
+            /* Report the VTerm's real grid rather than the compile-time
+             * default: the host may have resized it to match its viewport (the
+             * Android console derives its row count from the view height while
+             * keeping the column count fixed), and a full-screen guest lays
+             * itself out from this value - answering 24x80 while the host
+             * shows, say, 60 rows would leave most of them permanently blank.
+             * Without a VTerm attached (or before it is initialized) this stays
+             * the built-in 24x80. */
+            rvvm_userland_t* ctx = uctx();
             uapi_winsize_t ws = { VTERM_ROWS, VTERM_COLS, 0, 0 };
+            if (ctx && ctx->tty_vt) {
+                int rows = VTERM_ROWS, cols = VTERM_COLS;
+                spin_lock(&ctx->tty_vt_lock);
+                vterm_get_size((VTerm*)ctx->tty_vt, &rows, &cols);
+                spin_unlock(&ctx->tty_vt_lock);
+                if (rows > 0 && rows <= 0xFFFF) ws.ws_row = (uint16_t)rows;
+                if (cols > 0 && cols <= 0xFFFF) ws.ws_col = (uint16_t)cols;
+            }
             memcpy(arg, &ws, sizeof(ws));
             return 0;
         }
@@ -877,8 +900,9 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg)
             }
             return 0;
         case UAPI_TIOCSWINSZ:
-            // Window size changes: accepted and ignored, the virtual TTY keeps
-            // its fixed 24x80 grid.
+            // Window size changes: accepted and ignored. The grid belongs to
+            // the host (it is sized to the host viewport, see TIOCGWINSZ
+            // above), so a guest-requested resize does not move it.
             return 0;
     }
     return -UAPI_ENOTTY;
@@ -955,8 +979,13 @@ static int user_tty_erased_cols(rvvm_userland_t* ctx)
     VTermScreen* scr = vterm_obtain_screen((VTerm*)ctx->tty_vt);
     VTermState*  st  = vterm_obtain_state((VTerm*)ctx->tty_vt);
     int cols = 1;
+    int trows = VTERM_ROWS, tcols = VTERM_COLS;
 
     spin_lock(&ctx->tty_vt_lock);
+    /* The right margin is wherever the VTerm currently ends: the host may have
+     * resized it to its viewport, so the compile-time default is only the
+     * fallback. */
+    vterm_get_size((VTerm*)ctx->tty_vt, &trows, &tcols);
     /* Pending scrolls are only folded into the matrix here, and a cell read
      * before that can still be the previous generation of the screen. */
     vterm_screen_flush_damage(scr);
@@ -965,7 +994,7 @@ static int user_tty_erased_cols(rvvm_userland_t* ctx)
 
     VTermScreenCell cell;
     if (vterm_screen_get_cell(scr, cur, &cell) && cell.chars[0]
-        && cur.col + cell.width >= VTERM_COLS) {
+        && cur.col + cell.width >= tcols) {
         cols = cell.width;              // right margin: cursor on the character
     } else if (cur.col > 0
         && vterm_screen_get_cell(scr, (VTermPos){ cur.row, cur.col - 1 }, &cell)) {
@@ -1060,6 +1089,7 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
 {
     const uint8_t* p = buf;
     bool wake = false;
+    bool interrupt = false;
 
     spin_lock(&ctx->tty_in_lock);
 
@@ -1067,6 +1097,7 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
     bool canon = (lflag & TTY_LFLAG_ICANON) != 0;
     bool echo  = (lflag & TTY_LFLAG_ECHO)   != 0;
     bool echoe = (lflag & TTY_LFLAG_ECHOE)  != 0;
+    bool isig  = (lflag & TTY_LFLAG_ISIG)   != 0;
 
     for (size_t i = 0; i < len; ++i) {
         uint8_t c = p[i];
@@ -1074,6 +1105,17 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
         // ICRNL: the keyboard's Enter arrives as CR and reads back as NL.
         if (c == '\r') {
             c = '\n';
+        }
+
+        // ISIG: Ctrl-C is not data. A real tty signals the foreground
+        // process, drops the pending line and never hands the byte over.
+        // The guest is that process; a guest-installed handler cannot be
+        // run, so the signal takes its default disposition: stop the run.
+        if (isig && c == TTY_CC_VINTR) {
+            interrupt = true;
+            ctx->tty_line_len = 0;
+            if (echo) user_tty_vt_write(ctx, "^C\r\n", 4);
+            continue;
         }
 
         if (!canon) {
@@ -1140,6 +1182,10 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
     spin_unlock(&ctx->tty_in_lock);
     if (wake) {
         rvvm_event_wake(&ctx->tty_in_event);
+    }
+    if (interrupt) {
+        // 128 + SIGINT: what a shell reports for a Ctrl-C'd job.
+        rvvm_user_stop(ctx->machine, 130);
     }
 }
 

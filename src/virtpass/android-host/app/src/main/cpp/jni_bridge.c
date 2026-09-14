@@ -304,8 +304,10 @@ static volatile int g_first_frame_sent = 0;
 /* ============================================================
  * Guest virtual TTY: host-owned libvterm + set_tty0 injection
  * ============================================================
- * Mirrors the win32 host: the process owns one persistent VTerm (24x80,
- * UTF-8), injected into every guest via rvvm_user_set_tty0(). Guest fd 1/2
+ * Mirrors the win32 host: the process owns one persistent VTerm (80 columns -
+ * the renderer scales the font to the view width - and a host-driven row count
+ * that follows the console viewport, see nativeTtyResize), injected into every
+ * guest via rvvm_user_set_tty0(). Guest fd 1/2
  * output is parsed into the screen matrix there, so the terminal survives
  * guest exit (the TextureView keeps showing the frozen last screen until
  * the next run resets it) and guest libc's isatty() probes are answered
@@ -335,10 +337,119 @@ static volatile int g_first_frame_sent = 0;
  * looks better because its WASAPI burst is smaller. A guest that wants live
  * progress must fflush (test_tty.c does). Do not "fix" this in the renderer.
  * ============================================================ */
-#define TTY_ROWS 24
-#define TTY_COLS 80
+#define TTY_DEF_ROWS 24
+#define TTY_MAX_ROWS 200
+#define TTY_COLS     80
+
+/* Grid height, in cells. The columns stay fixed at TTY_COLS - the renderer
+ * scales the font to the view width rather than moving the column count - but
+ * the row count is host-driven: the Android console measures how many whole
+ * rows fit under the cell height it laid the grid out with and reports it
+ * through nativeTtyResize(), so the VTerm, the snapshot window and the guest's
+ * TIOCGWINSZ all agree on the height. */
+static int            g_tty_rows   = TTY_DEF_ROWS;
 
 static VTerm*         g_tty_vt     = NULL;
+#define TTY_SB_LINES 1000
+static jint g_tty_sb[TTY_SB_LINES * TTY_COLS * 4];
+static int  g_tty_sb_count = 0;
+static int  g_tty_sb_next  = 0;
+static int  g_tty_scroll   = 0;
+static int  g_tty_follow   = 1;
+
+/* One VTerm cell -> the 4 ints the Java renderer reads (cp, fg, bg, flags).
+ * Both the live screen and the scrollback rows are packed here, so a line
+ * looks the same the moment it scrolls off the top and when it is later read
+ * back out of history. The cursor bit is left to the snapshot: it belongs to
+ * the live screen only. */
+static void jni_tty_pack_cell(VTermScreen* scr, const VTermScreenCell* cell, jint* out)
+{
+    uint32_t cp = cell->chars[0];
+    jint flags = 0;
+    if (cp == (uint32_t)-1) {
+        cp = 0; /* double-width gap: lead char already drawn */
+    } else if (cp) {
+        if (cell->attrs.bold)      flags |= 1 << 0;
+        if (cell->attrs.underline) flags |= 1 << 1;
+        /* libvterm's own wcwidth covers CJK *and* emoji (U+1F300+); a
+         * hand-rolled codepoint range list misses the latter and renders them
+         * overlapping the next cell. */
+        if (cell->width == 2)      flags |= 1 << 3;
+    }
+    /* Colors: resolve defaults and indexed palette to ARGB. */
+    VTermColor fg = cell->fg, bg = cell->bg;
+    if (VTERM_COLOR_IS_DEFAULT_FG(&fg)) {
+        out[1] = 0xFFDCDCDC; /* light gray on black */
+    } else {
+        vterm_screen_convert_color_to_rgb(scr, &fg);
+        out[1] = 0xFF000000u | ((jint)fg.rgb.red << 16) |
+                 ((jint)fg.rgb.green << 8) | (jint)fg.rgb.blue;
+    }
+    if (VTERM_COLOR_IS_DEFAULT_BG(&bg)) {
+        out[2] = 0xFF000000; /* black */
+    } else {
+        vterm_screen_convert_color_to_rgb(scr, &bg);
+        out[2] = 0xFF000000u | ((jint)bg.rgb.red << 16) |
+                 ((jint)bg.rgb.green << 8) | (jint)bg.rgb.blue;
+    }
+    if (cell->attrs.reverse) {
+        jint t = out[1]; out[1] = out[2]; out[2] = t;
+        flags |= 1 << 2;
+    }
+    out[0] = (jint)cp;
+    out[3] = flags;
+}
+
+/* Scrollback: libvterm's sb_pushline is a notification - the row is handed over
+ * and then forgotten - so a console that can be scrolled has to store the lines
+ * itself. They go in as the very 4 ints per cell the snapshot hands to Java,
+ * which makes a window that reaches into history a copy rather than a second
+ * rendering path. TTY_SB_LINES rows of ring, oldest at g_tty_sb_count - 1.
+ *
+ * Reached from the guest thread while it parses its own output (the core holds
+ * the VTerm lock across that write) and from the UI thread through
+ * vterm_screen_flush_damage() (the snapshot takes the same lock), so the ring
+ * is never touched outside it. */
+static int jni_tty_sb_pushline(int cols, const VTermScreenCell* cells, void* user)
+{
+    VTermScreen* scr = user;
+    jint* row = g_tty_sb + g_tty_sb_next * TTY_COLS * 4;
+    for (int c = 0; c < TTY_COLS; c++) {
+        if (c < cols) {
+            jni_tty_pack_cell(scr, &cells[c], row + c * 4);
+        } else {
+            /* Past what libvterm handed over: a blank cell of the same shape. */
+            row[c * 4 + 0] = 0;
+            row[c * 4 + 1] = 0xFFDCDCDC;
+            row[c * 4 + 2] = 0xFF000000;
+            row[c * 4 + 3] = 0;
+        }
+    }
+    g_tty_sb_next = (g_tty_sb_next + 1) % TTY_SB_LINES;
+    if (g_tty_sb_count < TTY_SB_LINES) {
+        g_tty_sb_count++;
+    }
+    /* A view dragged back is anchored on the lines it is showing: one line
+     * pushed is one more line between it and the live bottom, otherwise the
+     * text would drift up under the reader on every output burst. */
+    if (!g_tty_follow && g_tty_scroll < g_tty_sb_count) {
+        g_tty_scroll++;
+    }
+    return 1;
+}
+
+/* The guest asked for the scrollback to go away (CSI 3 J, a reset). It is gone,
+ * so a view parked in it has nowhere to be but back on the live screen. */
+static int jni_tty_sb_clear(void* user)
+{
+    (void)user;
+    g_tty_sb_count = 0;
+    g_tty_sb_next  = 0;
+    g_tty_scroll   = 0;
+    g_tty_follow   = 1;
+    return 1;
+}
+
 static volatile int   g_tty_serial = 0; /* bumped on every output burst */
 /* Cursor visibility: libvterm's DECTCEM state (ESC [ ? 25 h / l), which the
  * guest toggles to park or hide the cursor (a full-screen app does this on
@@ -365,10 +476,12 @@ static int jni_tty_settermprop(VTermProp prop, VTermValue* val, void* userdata)
     return 1;
 }
 
-/* Only settermprop is hooked, and the rest must stay NULL: moverect_user()
- * skips damagerect() when a moverect callback answers, so hooking it would
- * lose the damage markings of every scrolled row and the host would stop
- * repainting a scrolling screen. */
+/* settermprop records cursor visibility; sb_pushline / sb_clear keep the host's
+ * own scrollback (see jni_tty_sb_pushline). The rest must stay NULL:
+ * moverect_user() skips damagerect() when a moverect callback answers, so
+ * hooking it would lose the damage markings of every scrolled row and the host
+ * would stop repainting a scrolling screen - and sb_popline is only asked for
+ * when libvterm resizes a screen, which never happens here. */
 static const VTermScreenCallbacks jni_tty_screen_cbs = {
     .damage      = NULL,
     .moverect    = NULL,
@@ -376,9 +489,9 @@ static const VTermScreenCallbacks jni_tty_screen_cbs = {
     .settermprop = jni_tty_settermprop,
     .bell        = NULL,
     .resize      = NULL,
-    .sb_pushline = NULL,
+    .sb_pushline = jni_tty_sb_pushline,
     .sb_popline  = NULL,
-    .sb_clear    = NULL,
+    .sb_clear    = jni_tty_sb_clear,
 };
 
 /* Persistent VTerm for the process lifetime. */
@@ -387,16 +500,19 @@ static void jni_tty_init(void)
     if (g_tty_vt) {
         return;
     }
-    g_tty_vt = vterm_new(TTY_ROWS, TTY_COLS);
+    g_tty_vt = vterm_new(g_tty_rows, TTY_COLS);
     if (!g_tty_vt) {
         LOGE("vterm_new failed");
         return;
     }
     vterm_set_utf8(g_tty_vt, 1); /* UTF-8 is off by default in libvterm */
+    /* The screen travels as the callback's data: sb_pushline / sb_clear need it
+     * to resolve colours while libvterm hands a row over. */
     vterm_screen_set_callbacks(vterm_obtain_screen(g_tty_vt),
-                               &jni_tty_screen_cbs, NULL);
+                               &jni_tty_screen_cbs,
+                               vterm_obtain_screen(g_tty_vt));
     vterm_screen_reset(vterm_obtain_screen(g_tty_vt), true);
-    LOGI("Guest TTY initialized (%dx%d)", TTY_ROWS, TTY_COLS);
+    LOGI("Guest TTY initialized (%dx%d)", g_tty_rows, TTY_COLS);
 }
 
 /* Cell snapshot for the Java renderer: rows*cols cells, each 4 uint32:
@@ -406,16 +522,20 @@ static void jni_tty_init(void)
  * The cursor is part of the snapshot rather than a second entry point so the
  * position and the cells are read in one locked pass: separately they could
  * disagree by a frame.
+ * info[], when given, is filled in with {lines the view sits above the live
+ * bottom, lines stored in the scrollback}, so the renderer can place its
+ * scrollbar without a second locked pass.
  * Returns 0 if there is no TTY yet. */
 JNIEXPORT jint JNICALL
-Java_com_rvvm_android_RvvmNative_nativeTtySnapshot(JNIEnv* env, jobject thiz, jintArray out)
+Java_com_rvvm_android_RvvmNative_nativeTtySnapshot(JNIEnv* env, jobject thiz,
+                                                   jintArray out, jintArray info)
 {
     (void)thiz;
     if (!g_tty_vt || !out) {
         return 0;
     }
     jsize len = (*env)->GetArrayLength(env, out);
-    if (len < TTY_ROWS * TTY_COLS * 4) {
+    if (len < g_tty_rows * TTY_COLS * 4) {
         return 0;
     }
     jint* buf = (*env)->GetIntArrayElements(env, out, NULL);
@@ -438,67 +558,113 @@ Java_com_rvvm_android_RvvmNative_nativeTtySnapshot(JNIEnv* env, jobject thiz, ji
      * calls this before reading cells (tty_layer_render); without it the cells
      * read back below can be a stale generation of the screen. */
     vterm_screen_flush_damage(scr);
+    /* The window: the last g_tty_rows lines of "history + screen", shifted up
+     * by the scrollback offset, clamped to what is actually stored so a view
+     * parked in history cannot ask for lines that have been recycled. */
+    int scroll = g_tty_follow ? 0 : g_tty_scroll;
+    if (scroll > g_tty_sb_count) scroll = g_tty_sb_count;
+    if (scroll < 0) scroll = 0;
+
     /* Where the guest's own cursor sits, read in the same locked pass as the
-     * cells. -1/-1 means "no cursor to draw": the guest hid it (DECTCEM), or
-     * the VTerm has none yet. */
+     * cells. -1/-1 means "no cursor to draw": the guest hid it (DECTCEM), the
+     * VTerm has none yet, or the view is scrolled away from the live screen,
+     * where the cursor is not on screen at all. */
     VTermPos cursor = { -1, -1 };
-    if (g_tty_cursor_visible) {
+    if (!scroll && g_tty_cursor_visible) {
         vterm_state_get_cursorpos(vterm_obtain_state(g_tty_vt), &cursor);
     }
-    for (int r = 0; r < TTY_ROWS; r++) {
+    for (int r = 0; r < g_tty_rows; r++) {
+        /* Output row r is line (r - scroll) counted from the live screen's top
+         * row; a negative line is that many rows above it, in history. */
+        int line = r - scroll;
+        jint* rowout = buf + r * TTY_COLS * 4;
+        if (line < 0) {
+            int idx = g_tty_sb_count + line; /* -1 = the newest stored row */
+            if (idx >= 0) {
+                int slot = (g_tty_sb_next - g_tty_sb_count + idx + TTY_SB_LINES)
+                           % TTY_SB_LINES;
+                memcpy(rowout, g_tty_sb + slot * TTY_COLS * 4,
+                       TTY_COLS * 4 * sizeof(jint));
+            } else {
+                memset(rowout, 0, TTY_COLS * 4 * sizeof(jint)); /* never drawn */
+            }
+            continue;
+        }
         for (int c = 0; c < TTY_COLS; c++) {
-            VTermPos pos = { r, c };
+            VTermPos pos = { line, c };
             VTermScreenCell cell;
-            jint* cellout = buf + (r * TTY_COLS + c) * 4;
-            uint32_t cp = 0;
-            if (vterm_screen_get_cell(scr, pos, &cell) && cell.chars[0]) {
-                cp = cell.chars[0];
-            }
-            jint flags = 0;
-            if (cp == (uint32_t)-1) {
-                cp = 0; /* double-width gap: lead char already drawn */
-            } else if (cp) {
-                if (cell.attrs.bold)      flags |= 1 << 0;
-                if (cell.attrs.underline) flags |= 1 << 1;
-                /* libvterm's own wcwidth covers CJK *and* emoji (U+1F300+);
-                 * a hand-rolled codepoint range list misses the latter and
-                 * renders them overlapping the next cell. */
-                if (cell.width == 2) flags |= 1 << 3;
-            }
-            /* Colors: resolve defaults and indexed palette to ARGB. */
-            VTermColor fg = cell.fg, bg = cell.bg;
-            if (VTERM_COLOR_IS_DEFAULT_FG(&fg)) {
-                cellout[1] = 0xFFDCDCDC; /* light gray on black */
-            } else {
-                vterm_screen_convert_color_to_rgb(scr, &fg);
-                cellout[1] = 0xFF000000u | ((jint)fg.rgb.red << 16) |
-                             ((jint)fg.rgb.green << 8) | (jint)fg.rgb.blue;
-            }
-            if (VTERM_COLOR_IS_DEFAULT_BG(&bg)) {
-                cellout[2] = 0xFF000000; /* black */
-            } else {
-                vterm_screen_convert_color_to_rgb(scr, &bg);
-                cellout[2] = 0xFF000000u | ((jint)bg.rgb.red << 16) |
-                             ((jint)bg.rgb.green << 8) | (jint)bg.rgb.blue;
-            }
-            if (cell.attrs.reverse) {
-                jint t = cellout[1]; cellout[1] = cellout[2]; cellout[2] = t;
-                flags |= 1 << 2;
-            }
+            jint* cellout = rowout + c * 4;
+            memset(&cell, 0, sizeof(cell));
+            vterm_screen_get_cell(scr, pos, &cell);
+            jni_tty_pack_cell(scr, &cell, cellout);
             /* The cursor cell keeps its own colours: the renderer inverts them
              * for the block, so it needs the cell as the guest drew it. */
-            if (r == cursor.row && c == cursor.col) {
-                flags |= 1 << 4;
+            if (line == cursor.row && c == cursor.col) {
+                cellout[3] |= 1 << 4;
             }
-            cellout[0] = (jint)cp;
-            cellout[3] = flags;
         }
     }
+    jint info_vals[2] = { scroll, g_tty_sb_count };
     if (machine) {
         rvvm_user_tty_unlock(machine);
     }
     (*env)->ReleaseIntArrayElements(env, out, buf, 0);
-    return TTY_ROWS * TTY_COLS;
+    /* Handed over after the unlock: JNI array access can allocate, which must
+     * not happen while the core's VTerm lock is held. */
+    if (info && (*env)->GetArrayLength(env, info) >= 2) {
+        jint* ibuf = (*env)->GetIntArrayElements(env, info, NULL);
+        if (ibuf) {
+            ibuf[0] = info_vals[0];
+            ibuf[1] = info_vals[1];
+            (*env)->ReleaseIntArrayElements(env, info, ibuf, 0);
+        }
+    }
+    return g_tty_rows * TTY_COLS;
+}
+
+/* Host-driven console resize: the renderer measures how many whole rows fit
+ * under the cell height it laid the grid out with and reports it here. The
+ * VTerm is resized so the snapshot window and the guest's TIOCGWINSZ follow
+ * the view. `cols` is accepted for symmetry but pinned to TTY_COLS: the
+ * scrollback ring is stored TTY_COLS cells wide, and the renderer scales the
+ * font to the view width rather than changing the column count.
+ *
+ * A resize is remembered even before the VTerm exists (the renderer lays out
+ * its grid as soon as the console tab is up, which can precede the first
+ * guest), so jni_tty_init() then creates the VTerm at the requested height
+ * instead of the default. */
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeTtyResize(JNIEnv* env, jobject thiz,
+                                                 jint rows, jint cols)
+{
+    rvvm_machine_t* machine = g_guest_machine;
+    (void)env; (void)thiz; (void)cols;
+
+    if (rows < 1) {
+        rows = 1;
+    }
+    if (rows > TTY_MAX_ROWS) {
+        rows = TTY_MAX_ROWS;
+    }
+    if (rows == g_tty_rows) {
+        return;
+    }
+    g_tty_rows = rows;
+
+    if (!g_tty_vt) {
+        return;     /* remembered; jni_tty_init() creates it at this height */
+    }
+
+    /* Same lock the snapshot and the guest's own output parsing take: libvterm
+     * must not be resized while either is walking the matrix. */
+    if (machine) {
+        rvvm_user_tty_lock(machine);
+    }
+    vterm_set_size(g_tty_vt, rows, TTY_COLS);
+    if (machine) {
+        rvvm_user_tty_unlock(machine);
+    }
+    g_tty_serial++; /* the poller compares serials: this makes it redraw */
 }
 
 /* Repaint hint for the Java poller: bumped on every guest output burst. */
@@ -507,6 +673,46 @@ Java_com_rvvm_android_RvvmNative_nativeTtySerial(JNIEnv* env, jobject thiz)
 {
     (void)env; (void)thiz;
     return g_tty_serial;
+}
+
+/* Move the console's view through its scrollback: `lines` is a drag in whole
+ * terminal rows, positive looking back into history. Clamped to what is stored;
+ * dragging back past the live bottom re-pins the view there. A view that
+ * follows the live screen keeps up with output, one dragged back stays on the
+ * lines being read (see jni_tty_sb_pushline).
+ *
+ * The machine is NOT required. The console outlives the guest - it keeps the
+ * last screen and its whole scrollback after the run ends (Ctrl-C ends it too,
+ * through the core's ISIG handling) - and reading that output back is exactly
+ * what the scrollback is for. Only the lock comes from the machine: with no
+ * guest thread alive there is nothing left to serialize against, which is the
+ * same shape the snapshot path already uses. */
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeTtyScrollBy(JNIEnv* env, jobject thiz, jint lines)
+{
+    rvvm_machine_t* machine = g_guest_machine;
+    (void)env; (void)thiz;
+    if (!g_tty_vt) {
+        return;
+    }
+    if (machine) {
+        rvvm_user_tty_lock(machine);
+    }
+    int scroll = (g_tty_follow ? 0 : g_tty_scroll) + lines;
+    if (scroll <= 0) {
+        g_tty_follow = 1;
+        scroll = 0;
+    } else {
+        if (scroll > g_tty_sb_count) {
+            scroll = g_tty_sb_count;
+        }
+        g_tty_follow = 0;
+    }
+    g_tty_scroll = scroll;
+    if (machine) {
+        rvvm_user_tty_unlock(machine);
+    }
+    g_tty_serial++; /* the poller compares serials: this makes it redraw */
 }
 
 /* Host keyboard -> guest console, the input half of the TTY.
@@ -536,6 +742,16 @@ Java_com_rvvm_android_RvvmNative_nativeTtyInput(JNIEnv* env, jobject thiz, jbyte
     if (!buf) {
         return;
     }
+    /* Typing belongs to the live screen: a view left parked in history comes
+     * home first, or the echo of what is being typed would land off screen and
+     * the console would look dead. */
+    rvvm_user_tty_lock(machine);
+    if (!g_tty_follow || g_tty_scroll) {
+        g_tty_follow = 1;
+        g_tty_scroll = 0;
+        g_tty_serial++;
+    }
+    rvvm_user_tty_unlock(machine);
     rvvm_user_tty_input(machine, buf, (size_t)len);
     (*env)->ReleaseByteArrayElements(env, in, buf, JNI_ABORT);
 }
@@ -1606,6 +1822,13 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
          * not leave the next run without one. */
         g_tty_cursor_visible = 1;
         vterm_screen_reset(vterm_obtain_screen(g_tty_vt), true);
+        /* A fresh guest has no history behind it and no view to remember: the
+         * console starts on the live screen of the new run. */
+        g_tty_sb_count = 0;
+        g_tty_sb_next  = 0;
+        g_tty_scroll   = 0;
+        g_tty_follow   = 1;
+        g_tty_serial++; /* repaint the cleared screen instead of the old one */
         rvvm_user_set_tty0(g_guest_machine, g_tty_vt);
         rvvm_user_set_tty_callback(g_guest_machine, jni_tty_cb, NULL);
     }

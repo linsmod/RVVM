@@ -70,6 +70,11 @@ void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback 
 // rvvm_user never frees it. Without this call rvvm_user creates and owns an
 // internal VTerm, freed with the machine. Must be called before
 // rvvm_user_linux_ex().
+//
+// The grid size belongs to whoever owns the VTerm: a host may resize it (the
+// Android console derives its row count from its viewport, for example) and
+// the guest then observes the new size through TIOCGWINSZ. Only when no VTerm
+// is attached does rvvm_user report its built-in default grid.
 void rvvm_user_set_tty0(rvvm_machine_t* machine, void* tty);
 
 // Push host keyboard input toward the guest's virtual TTY - the input half of
@@ -81,6 +86,10 @@ void rvvm_user_set_tty0(rvvm_machine_t* machine, void* tty);
 // run through the line discipline the guest's termios advertises:
 //
 //   - ICRNL      '\r' is translated to '\n'
+//   - ISIG       Ctrl-C (0x03) discards the pending line and stops the guest.
+//                The emulator cannot run a guest-installed SIGINT handler, so
+//                the signal takes its default disposition: the run ends like
+//                rvvm_user_stop() ends it, with status 128 + SIGINT
 //   - ICANON     lines are assembled until Enter, Backspace erases and Ctrl-D
 //                ends the line / reports EOF; when the guest clears ICANON the
 //                bytes pass through raw, which is how a full-screen app gets

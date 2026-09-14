@@ -24,6 +24,7 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.TextureView;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
@@ -153,7 +154,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     // [2] bg ARGB, [3] flags (bit0 bold, bit1 underline, bit2 reverse,
     // bit3 wide). Drawn with a monospace Paint; nativeTtySerial() gates
     // re-snapshotting, so idle output costs nothing but a compare.
+    // Grid height: TTY_ROWS is the default, the viewport-derived height is
+    // clamped to [TTY_MIN_ROWS, TTY_MAX_ROWS] (see drawTty). The column count
+    // is fixed - the font is scaled to the view width instead - which is what
+    // keeps a wide terminal legible on a narrow phone.
     private static final int TTY_ROWS = 24;
+    private static final int TTY_MIN_ROWS = 8;
+    private static final int TTY_MAX_ROWS = 200;
     private static final int TTY_COLS = 80;
     private static final int TTY_CELL = 4;
     private static final float TTY_PAD = 8f;
@@ -165,18 +172,35 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     private static final int TTY_FLAG_WIDE      = 1 << 3;
     private static final int TTY_FLAG_CURSOR    = 1 << 4;
 
-    private final int[] ttyCells = new int[TTY_ROWS * TTY_COLS * TTY_CELL];
+    /* Snapshot buffer: sized for the tallest grid the viewport can ask for, not
+     * for the default height, because nativeTtySnapshot() fills however many
+     * rows the VTerm currently has (see ttyRows). */
+    private final int[] ttyCells = new int[TTY_MAX_ROWS * TTY_COLS * TTY_CELL];
+    /* Grid height last requested from native. Native keeps the same number, so
+     * a resize is only sent when the view actually changed height. */
+    private int ttyRows = TTY_ROWS;
     private int ttySerial = -1;
+
     private volatile boolean ttyRunning = false;
     private final Paint ttyTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint ttyBgPaint = new Paint();
     private final Paint ttyCursorPaint = new Paint();
     private final Paint ttyUnderlinePaint = new Paint();
+    private final Paint ttyScrollPaint = new Paint();
+
+    // Scrollback view: native holds the position (and clamps it), these are the
+    // numbers it reports back - {lines the window sits above the live bottom,
+    // lines stored} - plus the grid's cell height, which is what turns a drag
+    // in pixels into whole terminal lines.
+    private final int[] ttyScrollInfo = new int[2];
+    private float ttyCellH = 24f;
+    private float ttyDragFromY = 0f, ttyDragLastY = 0f, ttyDragRest = 0f;
+    private boolean ttyDragging = false;
 
     // Cursor blink. Its own clock is what makes the tick repaint even when the
     // guest is silent, which is the point: a console waiting for input has to
     // show where that input will land. A repaint is one canvas pass over the
-    // 24x80 grid, so 2 Hz of them costs less than the guest's own output does.
+    // visible grid, so 2 Hz of them costs less than the guest's own output does.
     private static final long TTY_BLINK_MS = 500;
     private boolean ttyCursorOn = true;
     private long ttyBlinkNext = 0;
@@ -340,39 +364,60 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     /** Snapshot the native TTY and render the grid onto the TextureView. */
     private void drawTty() {
         if (ttyView.getSurfaceTexture() == null) return;
-        if (RvvmNative.nativeTtySnapshot(ttyCells) <= 0) return;
+        int w = ttyView.getWidth(), h = ttyView.getHeight();
+        if (w <= 0 || h <= 0) return;
+
+        /* Font size: fit TTY_COLS columns into the view width by measuring
+         * the real monospace advance. At the 100px probe size the advance
+         * is adv100, so the size that fits TTY_COLS cells is
+         * 100 * availW / (cols * adv100), floored to a whole pixel - a
+         * fractional text size is what smeared the glyphs on low-density
+         * screens. The height only enters as a floor for a view too short to
+         * show TTY_MIN_ROWS rows: the row count itself is derived from the
+         * height below, so the grid fills the console instead of leaving
+         * black bands above and below a fixed 24. */
+        ttyTextPaint.setTextSize(100f);
+        float adv100 = ttyTextPaint.measureText("M");
+        float maxByWidth = 100f * (w - 2 * TTY_PAD) / (TTY_COLS * adv100);
+        float maxByHeight = (h - 2 * TTY_PAD) / (TTY_MIN_ROWS * 1.2f);
+        float size = (float) Math.floor(Math.min(100f, Math.min(maxByWidth, maxByHeight)));
+        size = Math.max(size, 9f);
+        ttyTextPaint.setTextSize(size);
+        if (ttyGlyphWidthSize != size) {
+            ttyGlyphWidths.clear();
+            ttyGlyphWidthSize = size;
+        }
+
+        // Whole-pixel grid: cellW may differ from the raw advance by a
+        // fraction, so glyphs are centered in their cell instead of being
+        // appended to a run - that keeps the columns exact even if the
+        // font that answered is not really monospaced.
+        float cellW = Math.max(1f, (float) Math.round(ttyTextPaint.measureText("M")));
+        float cellH = (float) Math.round(size * 1.2f);
+
+        /* Rows that fit under this cell height. The console grows and shrinks
+         * with the view (rotation, soft keyboard), so the height is handed to
+         * native, which resizes the VTerm: the snapshot below and the guest's
+         * own TIOCGWINSZ then agree with what is drawn. Sent before the
+         * snapshot, which reads the grid native was just given. */
+        int rows = (int) ((h - 2 * TTY_PAD) / cellH);
+        if (rows < TTY_MIN_ROWS) rows = TTY_MIN_ROWS;
+        if (rows > TTY_MAX_ROWS) rows = TTY_MAX_ROWS;
+        if (rows != ttyRows) {
+            ttyRows = rows;
+            RvvmNative.nativeTtyResize(rows, TTY_COLS);
+        }
+
+        if (RvvmNative.nativeTtySnapshot(ttyCells, ttyScrollInfo) <= 0) return;
 
         Canvas canvas = ttyView.lockCanvas(null);
         if (canvas == null) return;
         try {
-            int w = canvas.getWidth(), h = canvas.getHeight();
             canvas.drawColor(0xFF000000);
-
-            /* Fit the 80x24 grid by measuring the real monospace advance.
-             * At the 100px probe size the advance is adv100, so the size
-             * that fits TTY_COLS cells is 100 * availW / (cols * adv100);
-             * the height cap works directly on lineH = 1.2 * size. The size
-             * is then floored to a whole pixel - a fractional text size is
-             * what smeared the glyphs on low-density screens. */
-            ttyTextPaint.setTextSize(100f);
-            float adv100 = ttyTextPaint.measureText("M");
-            float maxByWidth = 100f * (w - 2 * TTY_PAD) / (TTY_COLS * adv100);
-            float maxByHeight = (h - 2 * TTY_PAD) / (TTY_ROWS * 1.2f);
-            float size = (float) Math.floor(Math.min(100f, Math.min(maxByWidth, maxByHeight)));
-            size = Math.max(size, 9f);
-            ttyTextPaint.setTextSize(size);
-            if (ttyGlyphWidthSize != size) {
-                ttyGlyphWidths.clear();
-                ttyGlyphWidthSize = size;
-            }
-
-            // Whole-pixel grid: cellW may differ from the raw advance by a
-            // fraction, so glyphs are centered in their cell instead of being
-            // appended to a run - that keeps the columns exact even if the
-            // font that answered is not really monospaced.
-            float cellW = Math.max(1f, (float) Math.round(ttyTextPaint.measureText("M")));
-            float cellH = (float) Math.round(size * 1.2f);
-            float gridW = cellW * TTY_COLS, gridH = cellH * TTY_ROWS;
+            float gridW = cellW * TTY_COLS, gridH = cellH * rows;
+            /* A drag on the console is turned into terminal lines by the touch
+             * listener using the same cell height the grid was laid out with. */
+            ttyCellH = cellH;
             float ox = (float) Math.floor((w - gridW) / 2f);
             float oy = (float) Math.floor((h - gridH) / 2f);
 
@@ -380,7 +425,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
             // attributes; located up front so its block can be painted before
             // the glyphs that sit on it.
             int curRow = -1, curCol = -1;
-            for (int r = 0; r < TTY_ROWS && curRow < 0; r++) {
+            for (int r = 0; r < rows && curRow < 0; r++) {
                 for (int c = 0; c < TTY_COLS; c++) {
                     if ((ttyCells[(r * TTY_COLS + c) * TTY_CELL + 3] & TTY_FLAG_CURSOR) != 0) {
                         curRow = r;
@@ -393,7 +438,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
             /* TEMP DIAG: one line per repaint, so the frame the renderer was
              * asked to draw can be matched against the native screen dump. */
             Log.i(TAG, "tty draw: canvas " + w + "x" + h + " size=" + size +
-                    " cell=" + cellW + "x" + cellH + " origin=(" + ox + "," + oy +
+                    " cell=" + cellW + "x" + cellH + " rows=" + rows +
+                    " origin=(" + ox + "," + oy +
                     ") grid=" + gridW + "x" + gridH + " serial=" + ttySerial +
                     " cursor=" + curRow + "," + curCol + (ttyCursorOn ? " on" : " off"));
 
@@ -403,7 +449,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
             ttyUnderlinePaint.setStyle(Paint.Style.STROKE);
             ttyUnderlinePaint.setStrokeWidth(Math.max(1f, size / 14f));
 
-            for (int r = 0; r < TTY_ROWS; r++) {
+            for (int r = 0; r < rows; r++) {
                 float y0 = oy + r * cellH;
                 float baseline = y0 + baselineOff;
 
@@ -483,6 +529,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
                         c++;    // the wide glyph's filler cell
                     }
                 }
+            }
+
+            /* Scrollback thumb, in the padding right of the grid so it never
+             * covers the last column. It is drawn whenever lines have scrolled
+             * off: dim while the live screen is showing, brighter while the
+             * view sits in history - the only cue that there is more to read
+             * than the rows on screen, and where in it the view is. Drag the
+             * console to move through it. */
+            int sbLines = ttyScrollInfo[1], sbScroll = ttyScrollInfo[0];
+            if (sbLines > 0) {
+                float span = sbLines + rows;
+                float barW = Math.max(2f, TTY_PAD / 3f);
+                float thumbH = Math.max(cellH, gridH * rows / span);
+                float thumbY = oy + gridH * (sbLines - sbScroll) / span;
+                ttyScrollPaint.setColor(sbScroll > 0 ? 0xB0FFFFFF : 0x38FFFFFF);
+                canvas.drawRect(ox + gridW + barW, thumbY,
+                        ox + gridW + 2f * barW, thumbY + thumbH, ttyScrollPaint);
             }
         } finally {
             ttyView.unlockCanvasAndPost(canvas);
@@ -586,6 +649,51 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         if (key != null) {
             key.setOnClickListener(v -> sendTtyBytes(bytes));
         }
+    }
+
+    /**
+     * Drag the console up and down through its scrollback. The position itself
+     * is native state: native holds it, clamps it to what is stored, keeps a
+     * view that was dragged back anchored on the lines it is showing while
+     * output keeps arriving, and hands it home on the next keystroke. So a drag
+     * only has to turn pixels into terminal lines - downward looks back into
+     * history, and carrying on past the bottom returns to the live screen. The
+     * view is tapped for the keyboard, so a drag only starts on touch slop.
+     */
+    private void initTtyScrolling() {
+        final int slop = ViewConfiguration.get(this).getScaledTouchSlop();
+        ttyView.setOnTouchListener((v, event) -> {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    ttyDragFromY = ttyDragLastY = event.getY();
+                    ttyDragRest = 0f;
+                    ttyDragging = false;
+                    return false;   // a tap must still reach the click listener
+                case MotionEvent.ACTION_MOVE: {
+                    if (!ttyDragging) {
+                        if (Math.abs(event.getY() - ttyDragFromY) < slop) {
+                            return false;   // not a drag yet
+                        }
+                        ttyDragging = true;
+                    }
+                    ttyDragRest += event.getY() - ttyDragLastY;
+                    ttyDragLastY = event.getY();
+                    int lines = (int) (ttyDragRest / ttyCellH);
+                    if (lines != 0) {
+                        ttyDragRest -= lines * ttyCellH;
+                        RvvmNative.nativeTtyScrollBy(lines);
+                    }
+                    return true;    // consumed: no click at the end of a drag
+                }
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    boolean dragged = ttyDragging;
+                    ttyDragging = false;
+                    return dragged;
+                default:
+                    return false;
+            }
+        });
     }
 
     /** Switch between the graphics tab (0) and the console tab (1). */
@@ -930,6 +1038,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         ttyView = findViewById(R.id.ttyView);
         ttyView.setSurfaceTextureListener(ttyTextureListener);
         initTtyInput();
+        initTtyScrolling();
 
         // Setup buttons
         runButton.setOnClickListener(v -> runGuestElf());

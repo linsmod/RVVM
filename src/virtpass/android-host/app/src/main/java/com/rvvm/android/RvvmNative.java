@@ -148,10 +148,45 @@ public class RvvmNative {
      * Snapshot of the persistent guest TTY (libvterm screen matrix) into
      * {@code out}, one cell = 4 ints: [0] UCS-4 codepoint (0 = erased),
      * [1] fg ARGB, [2] bg ARGB, [3] flags: bit0 bold, bit1 underline,
-     * bit2 reverse (already swapped into fg/bg), bit3 wide glyph.
-     * @return number of cells written (24*80), or 0 when no TTY exists
+     * bit2 reverse (already swapped into fg/bg), bit3 wide glyph, bit4 cursor
+     * cell. The rows are the view's window into history: it follows the live
+     * screen until {@link #nativeTtyScrollBy(int)} drags it back.
+     *
+     * {@code out} must hold at least TTY_MAX_ROWS*80*4 ints: the grid height is
+     * whatever {@link #nativeTtyResize(int, int)} last set.
+     *
+     * @param info when non-null, filled with {lines the window sits above the
+     *             live bottom, lines kept in the scrollback}
+     * @return number of cells written (rows*80), or 0 when no TTY exists
      */
-    public static native int nativeTtySnapshot(int[] out);
+    public static native int nativeTtySnapshot(int[] out, int[] info);
+
+    /**
+     * Resize the guest TTY grid to the console viewport.
+     *
+     * The renderer picks the font size that fits 80 columns into the view
+     * width, then reports how many whole rows that leaves room for; native
+     * resizes the libvterm grid so the snapshot, the scrollback window and the
+     * guest's own TIOCGWINSZ all agree on the height. The rows are clamped
+     * natively, and the request is remembered even before the first guest
+     * starts, so the VTerm is created at the right height.
+     *
+     * The column count is fixed at 80 - the console scales the font to the view
+     * width instead of changing it - so {@code cols} is pinned to TTY_COLS.
+     *
+     * @param rows grid height in cells
+     * @param cols grid width in cells (fixed 80)
+     */
+    public static native void nativeTtyResize(int rows, int cols);
+
+    /**
+     * Drag the console's view through its scrollback, in whole terminal rows:
+     * positive looks back into history. Clamped to what is stored, and dragging
+     * back past the bottom re-pins the view to the live screen. While the view
+     * is scrolled back it stays on the lines being read as new output arrives;
+     * typing, and starting a guest, bring it home.
+     */
+    public static native void nativeTtyScrollBy(int lines);
 
     /**
      * Repaint hint for the TTY console: bumped by native on every guest
@@ -167,13 +202,14 @@ public class RvvmNative {
      * {@code bytes} is the byte sequence a real terminal would receive from its
      * keyboard: UTF-8 text for typed characters, '\r' for Enter, 0x7F for
      * Backspace, "\u001b[A" (ESC [ A) and siblings for the arrow keys,
-     * 0x03/0x04 for Ctrl-C/Ctrl-D. Native runs them through the line discipline
+     * 0x03/0x04 for Ctrl-C/Ctrl-D (with ISIG on, Ctrl-C discards the pending
+     * line and stops the guest). Native runs them through the line discipline
      * the guest's termios advertises (ICRNL, canonical line assembly with erase,
      * ECHO) and queues the cooked result for the guest's read(0, ...).
      *
      * Because the guest never saw the keystroke, native echoes it into the
      * libvterm screen itself - typed characters appear through
-     * {@link #nativeTtySnapshot(int[])} just like guest output. No-op when no
+     * {@link #nativeTtySnapshot(int[], int[])} just like guest output. No-op when no
      * guest is running or no TTY is attached.
      *
      * @param bytes Terminal input bytes, already encoded
