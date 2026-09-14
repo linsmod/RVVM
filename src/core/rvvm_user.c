@@ -4977,8 +4977,15 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
         jump_start(uctx()->elf.entry, stack_top);
     }
 
-    /* Cleanup Android NDK API proxy */
-    cmdpost_cleanup();
+    /* End the Android NDK API proxy's part in this run - not cmdpost_cleanup():
+     * that dismantles the bridge the *host* owns, and the host may still want
+     * it for another guest (the Android activity reuses the process, the win32
+     * launcher boots guest after guest). Tearing it down from here is what left
+     * a relaunched guest without window/GL/audio callbacks, since this runs on
+     * the exiting guest's thread while the host may already be registering
+     * callbacks for the next one. The host calls cmdpost_cleanup() itself, from
+     * its own teardown. */
+    cmdpost_end_run();
 
     /* Guest threads wind down asynchronously: wait for them to leave the
      * machine before freeing it. On timeout, leak the machine instead of

@@ -1230,12 +1230,16 @@ static void on_guest_exit(int exit_code);
 /* ============================================================
  * (Re)install every vp_cmdpost callback the guest depends on.
  *
- * rvvm_user.c calls cmdpost_cleanup() when a guest exits, which NULLs every
- * callback and drops the audio backend. A host that reuses the process
- * (launcher: Run after Run) must therefore reinstall them before each guest -
- * the same role win32_cmdpost_register_callbacks() plays for the win32 host.
- * nativeInit() runs this once for the first guest; nativeRunElf() re-runs it
- * for every later one, so a relaunched guest never probes a dead proxy.
+ * A guest's exit no longer dismantles this bridge: the core now ends the *run*
+ * (queues, streams, sensor state - cmdpost_end_run()) and leaves the host's
+ * registrations alone, so the relaunch-racing-a-teardown failure is gone at the
+ * source. Re-running this before each guest is therefore no longer load-bearing
+ * - it stays as an idempotent belt (ten pointer stores) for a callback the
+ * guest or a mid-run failure might have replaced.
+ *
+ * nativeInit() runs it once for the first guest; nativeRunElf() re-runs it for
+ * every later one - the same role win32_cmdpost_register_callbacks() plays on
+ * the win32 side.
  * ============================================================ */
 static void jni_register_cmdpost_callbacks(void)
 {
@@ -1333,7 +1337,10 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
         g_tty = NULL;
     }
 
-    /* Cleanup vp_cmdpost */
+    /* Dismantle the cmdpost bridge. This is the host's to do, and since the
+     * core's guest-exit path was narrowed to cmdpost_end_run() it is the only
+     * place on this side that calls it: no guest will run again until a new
+     * nativeInit(). */
     cmdpost_cleanup();
 
     LOGI("Native destroy complete");
@@ -1644,10 +1651,10 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
      * first frame of THIS guest re-hide the console overlay. */
     console_reset();
 
-    /* The previous guest's exit ran cmdpost_cleanup(), which NULLed every
-     * host-side callback (audio backend included). Restore them before this
-     * guest starts, or it probes a dead proxy and exits(1) at its first
-     * AAUDIO_QUERY. */
+    /* Reinstall the callbacks for this guest. The exit of the previous one no
+     * longer clears them (it ends the run, not the bridge - cmdpost_end_run()),
+     * so this is an idempotent belt rather than the thing that keeps a
+     * relaunched guest from probing a dead proxy. */
     jni_register_cmdpost_callbacks();
 
     /* Per-guest diagnostics: report this guest's first frame/geometry too, not

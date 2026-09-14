@@ -747,54 +747,107 @@ void cmdpost_init(void)
     if (!g_initialized) {
         printf("vp_cmdpost: Initializing Android NDK API proxy\n");
         g_initialized = true;
+    } else {
+        printf("vp_cmdpost: Guest run starting\n");
     }
+
+    /* Per-run state belongs to the run that is starting, not to the one that
+     * ended. The core calls this from rvvm_user_linux_ex() on the guest thread
+     * *after* the host has registered its callbacks for this run, so nothing
+     * the host just installed (window/GL callbacks, the audio backend, the
+     * sensor ops) may be touched here - only what describes this run.
+     *
+     * The APP_CMD_* dedup flags especially: g_window_initialized left true by
+     * the previous guest would mean this one never receives its INIT_WINDOW. */
+    g_window_initialized = false;
+    g_input_initialized  = false;
+    g_looper_initialized = false;
+
+    /* Vsync wait state: the guest starting now has its own Looper fd, and the
+     * previous guest's "the clock is gone" verdict must not outlive the run it
+     * was about. */
+    g_choreographer_fd   = -1;
+    g_vsync_armed        = false;
+    g_vsync_source_lost  = false;
+
+    /* Nothing drains these queues while no guest is running, so anything a
+     * host queued against the previous one must not reach this one. The hosts
+     * clear them before a run as well; doing it here too is what makes this
+     * function sufficient on its own. */
+    cmdpost_clear_lifecycle_cmds();
+    cmdpost_clear_motion_events();
+}
+
+/* Drop everything that belonged to the run that just ended. No printing: the
+ * two callers below say which of them is running. */
+static void cmdpost_drop_run_state(void)
+{
+    g_window_initialized = false;
+    g_input_initialized  = false;
+    g_looper_initialized = false;
+    g_choreographer_fd   = -1;
+    g_vsync_armed        = false;
+    g_vsync_source_lost  = false;
+
+    /* Sensor queues, the staging FIFO and the platform sources armed by the
+     * guest all belong to the guest that just exited. vp_sensor_reset() drops
+     * them and detaches the backend; a relaunched guest installs its own ops
+     * through vp_sensor_set_ops() before it starts. */
+    vp_sensor_reset();
+
+    /* The guest that owned these queues is gone, so nothing will ever drain
+     * them. A host that reuses the process (launcher: Run after Run) must not
+     * hand the next guest the PAUSE/STOP/DESTROY left over from the previous
+     * teardown - it would destroy the new activity on its very first poll. */
+    cmdpost_clear_lifecycle_cmds();
+    cmdpost_clear_motion_events();
+
+    /* Tear down every live AAudio stream before dropping the backend. The next
+     * run's registration points this at a fresh backend, and the guest that
+     * drove these streams has exited, so its pump has nothing left to feed. */
+    if (g_audio_ops && g_audio_ops->close) {
+        for (int32_t i = 0; i < CMDPOST_MAX_AUDIO_STREAMS; i++) {
+            if (g_audio_streams[i].used) {
+                g_audio_ops->close(g_audio_streams[i].user);
+            }
+        }
+    }
+    memset(g_audio_streams, 0, sizeof(g_audio_streams));
+    g_audio_ops = NULL;
+}
+
+void cmdpost_end_run(void)
+{
+    printf("vp_cmdpost: Guest run ended\n");
+    cmdpost_drop_run_state();
 }
 
 void cmdpost_cleanup(void)
 {
-    if (g_initialized) {
-        printf("vp_cmdpost: Cleaning up\n");
-        g_initialized = false;
-        g_window_initialized = false;
-        g_input_initialized = false;
-        g_looper_initialized = false;
-        g_window_lock_cb = NULL;
-        g_window_unlock_cb = NULL;
-        g_window_size_cb = NULL;
-        g_window_set_buf_cb = NULL;
-        g_config_get_cb = NULL;
-        g_game_lifecycle_cb = NULL;
-        g_game_input_cb = NULL;
-        g_egl_dispatch_cb = NULL;
-        g_gl_dispatch_cb = NULL;
-        g_choreographer_wait_cb = NULL;
-        g_choreographer_fd = -1;
-        g_vsync_armed = false;
-        g_vsync_source_lost = false;
-
-        /* Sensor queues, the staging FIFO and the platform sources armed by
-         * the guest all belong to the guest that just exited. vp_sensor_reset()
-         * drops them and detaches the backend; a relaunched guest installs its
-         * own ops through vp_sensor_set_ops() before it starts. */
-        vp_sensor_reset();
-
-        /* The guest that owned these queues is gone, so nothing will ever
-         * drain them. A host that reuses the process (launcher: Run after
-         * Run) must not hand the next guest the PAUSE/STOP/DESTROY left over
-         * from the previous teardown - it would destroy the new activity on
-         * its very first poll. */
-        cmdpost_clear_lifecycle_cmds();
-        cmdpost_clear_motion_events();
-
-        /* Tear down every live AAudio stream before dropping the backend. */
-        if (g_audio_ops && g_audio_ops->close) {
-            for (int32_t i = 0; i < CMDPOST_MAX_AUDIO_STREAMS; i++) {
-                if (g_audio_streams[i].used) {
-                    g_audio_ops->close(g_audio_streams[i].user);
-                }
-            }
-        }
-        memset(g_audio_streams, 0, sizeof(g_audio_streams));
-        g_audio_ops = NULL;
+    if (!g_initialized) {
+        return;
     }
+    printf("vp_cmdpost: Cleaning up\n");
+
+    /* The per-run state first: a run whose exit never came through
+     * cmdpost_end_run() still gets its streams closed and its queues dropped
+     * here, rather than being handed to whoever runs next. */
+    cmdpost_drop_run_state();
+
+    /* Then the bridge itself. This is the host's to dismantle, and the host is
+     * the only caller left (nativeDestroy / win32_host_shutdown): a guest's own
+     * exit path must not do it, or the next run - which may already be starting
+     * - finds its callbacks gone. */
+    g_window_lock_cb = NULL;
+    g_window_unlock_cb = NULL;
+    g_window_size_cb = NULL;
+    g_window_set_buf_cb = NULL;
+    g_config_get_cb = NULL;
+    g_game_lifecycle_cb = NULL;
+    g_game_input_cb = NULL;
+    g_egl_dispatch_cb = NULL;
+    g_gl_dispatch_cb = NULL;
+    g_choreographer_wait_cb = NULL;
+
+    g_initialized = false;
 }

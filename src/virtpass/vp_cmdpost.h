@@ -222,8 +222,32 @@ void cmdpost_set_audio_callbacks(const vp_audio_ops_t* ops);
 int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                       int64_t a3, int64_t a4, int64_t a5, void* guest_mem);
 
-/* Initialization and cleanup */
+/* ============================================================
+ * Lifecycle: three calls with three different owners
+ *
+ * cmdpost_init()     per run, called by the core when a guest starts
+ *                    (rvvm_user_linux_ex). Resets everything that belongs to
+ *                    that run - the APP_CMD_* dedup flags, the vsync wait
+ *                    state, the host->guest queues - and must NOT touch the
+ *                    host's registrations, which were just made for this run
+ *                    (window/GL callbacks, audio backend, sensor ops).
+ *
+ * cmdpost_end_run()  per run, called by the core when the guest has exited.
+ *                    Drops that guest's queues, audio streams and sensor
+ *                    state, and leaves the host bridge standing: a relaunched
+ *                    guest must find its host still registered.
+ *
+ * cmdpost_cleanup()  once, called by the HOST when no guest will run again
+ *                    (Android nativeDestroy / win32_host_shutdown). Dismantles
+ *                    the bridge itself - callback table, audio backend.
+ *
+ * The split matters: before it, the guest-exit path called cmdpost_cleanup(),
+ * so the previous guest's unwinding thread cleared callbacks the next run had
+ * already registered, and the relaunch raced the teardown and lost (the new
+ * guest then probed a dead proxy: no window, no GL, no audio).
+ * ============================================================ */
 void cmdpost_init(void);
+void cmdpost_end_run(void);
 void cmdpost_cleanup(void);
 
 #endif /* vp_cmdpost_H */

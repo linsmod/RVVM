@@ -70,8 +70,10 @@ void vp_sensor_ingest(int32_t handle, const vp_sensor_event_t* ev);
  * addresses are translated here with rvvm_user_guest_ptr(). */
 int64_t vp_sensor_dispatch(int64_t sub, int64_t a1, int64_t a2, int64_t a3, int64_t a4);
 
-/* Forget every queue, stop the sensors we enabled and detach the backend
- * (called by cmdpost_cleanup()). */
+/* Forget every queue, stop the sensors we enabled and detach the backend.
+ * Called at the end of a guest run (cmdpost_end_run()) and at host teardown
+ * (cmdpost_cleanup()); a relaunched guest installs its own ops through
+ * vp_sensor_set_ops() before it starts. */
 void vp_sensor_reset(void);
 
 #ifdef __cplusplus

@@ -1356,7 +1356,7 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
              *
              * rvvm_user_stop() is not TerminateThread(): it pauses every guest
              * vCPU and marks every guest thread finished, so the guest unwinds
-             * through its normal exit path (cmdpost_cleanup, machine free) and
+             * through its normal exit path (cmdpost_end_run, machine free) and
              * WM_APP_GUEST_EXIT follows exactly as on a real guest exit. */
             KillTimer(hwnd, STOP_TIMER_ID);
             g_stop_watchdog = false;
@@ -1413,7 +1413,7 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             fflush(stdout);
         }
         /* Guest is gone: nobody polls lifecycle cmds / input anymore, and the
-         * guest thread already ran cmdpost_cleanup(). Queuing the Android
+         * guest thread already ran cmdpost_end_run(). Queuing the Android
          * teardown here (as WM_CLOSE does) would only leave PAUSE/STOP/DESTROY
          * sitting in the queue for the *next* guest booted in this process,
          * which then destroys itself on its first poll - the classic "second
@@ -2255,11 +2255,16 @@ static void launcher_toggle_suspend(void)
 }
 
 /* (Re)register every host-side cmdpost callback. Done once at init and again
- * before each launch: rvvm_user.c's guest exit path calls cmdpost_cleanup(),
- * which NULLs all callbacks and drops the AAudio backend - a relaunched guest
- * would probe a dead proxy (AAUDIO_QUERY -> 0 caps) and exit(1) before ever
- * reaching main(). Runs on the UI thread before the guest thread exists, so
- * there is no race with in-flight guest dispatches. */
+ * before each launch.
+ *
+ * This used to be load-bearing: the core's guest-exit path called
+ * cmdpost_cleanup(), which NULLed all callbacks and dropped the AAudio backend,
+ * so a relaunched guest would probe a dead proxy (AAUDIO_QUERY -> 0 caps) and
+ * exit(1) before ever reaching main(). The core now ends only the run
+ * (cmdpost_end_run()) and leaves the host's registrations alone, so re-running
+ * this is an idempotent belt rather than the thing that keeps relaunch working.
+ * Runs on the UI thread before the guest thread exists, so there is no race
+ * with in-flight guest dispatches. */
 static void win32_cmdpost_register_callbacks(void)
 {
     vp_sensor_set_ops(win32_sensor_stub_ops());
@@ -2372,10 +2377,10 @@ bool win32_host_start_guest(int argc, char** argv)
 
     if (g_guest_thread) return false;
 
-    /* The previous guest's exit ran cmdpost_cleanup(), which NULLed every
-     * host-side callback (audio backend included). Restore them before the
-     * guest thread starts, or the guest probes a dead proxy and exits(1)
-     * at its first AAUDIO_QUERY. */
+    /* Reinstall the callbacks for this guest. The previous guest's exit no
+     * longer clears them (cmdpost_end_run() ends the run, not the bridge), so
+     * this is an idempotent belt rather than what keeps a relaunched guest
+     * from probing a dead proxy. */
     win32_cmdpost_register_callbacks();
 
     /* Per-guest diagnostics: report this guest's first lock/frame too. */

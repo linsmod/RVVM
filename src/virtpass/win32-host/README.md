@@ -140,7 +140,7 @@ names are used as a fallback when the directory is missing or empty.
   `APP_CMD_DESTROY`), so the host takes it down itself via `rvvm_user_stop()`
   from `src/core/rvvm_user.c`. That is not `TerminateThread()`: it pauses every
   guest vCPU and marks every guest thread finished, so the guest still unwinds
-  through its normal exit path (`cmdpost_cleanup`, machine free) and the picker
+  through its normal exit path (`cmdpost_end_run`, machine free) and the picker
   comes back exactly as on a real guest exit. A forced stop reports exit code
   137 (128 + `SIGKILL`).
 - **Suspend** (toggles to **Resume**) parks the guest without tearing it down:

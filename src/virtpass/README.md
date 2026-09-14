@@ -68,8 +68,9 @@ backend behind each callback differs.
 - Gradle app; native side lives in `app/src/main/cpp/`. `jni_bridge.c` is the
   JNI surface (`RvvmNative.java`, `MainActivity.java`): guest thread
   management, sensor manager, lifecycle/motion queues, and reinstalling every
-  cmdpost callback before each guest run (`cmdpost_cleanup` NULLs them on
-  guest exit).
+  cmdpost callback before each guest run (idempotent: a guest's exit ends its
+  run - `cmdpost_end_run()` - and leaves the host's registrations alone; only
+  the host's own teardown calls `cmdpost_cleanup()`).
 - Display: the same two-layer model as win32, but layer 2 is a real
   SurfaceView. The CPU path locks the ANativeWindow and copies the guest frame
   on unlock, with the surface geometry re-applied lazily (panel size, not
