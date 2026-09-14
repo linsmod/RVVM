@@ -81,12 +81,15 @@
 
 static HWND            g_hwnd       = NULL;
 
-/* This host's cmdpost instance: created in win32_host_init(), bound to each
- * run's machine (rvvm_user_set_host_ctx) so the guest's syscalls reach it, and
- * freed in win32_host_shutdown(). Every cmdpost_* call in this file writes into
- * it - that state used to be file-scope globals in vp_cmdpost.c, one set for
- * the whole process. Declared here because the vsync clock (defined above the
- * registration function) calls into it. */
+/* This host's cmdpost instance for the run in progress: made by whoever queues
+ * that run's startup sequence (win32_host_init for the first run, before the
+ * window exists because WM_CREATE is where the sequence is queued;
+ * launcher_launch_sel for every later one), bound to the run's machine with
+ * rvvm_user_set_host_ctx() so the guest's syscalls reach it, and freed by that
+ * run's guest thread as it hands control back. NULL between runs. Every
+ * cmdpost_* call in this file writes into it - that state used to be file-scope
+ * globals in vp_cmdpost.c, one set for the whole process. Declared here because
+ * the vsync clock (defined above the registration function) calls into it. */
 static vp_cmdpost_t*   g_cmdpost    = NULL;
 
 /* Guest virtual TTY (libvterm) rendering state. g_tty is the host-owned console
@@ -1931,6 +1934,10 @@ static bool guest_env_build(void)
 static DWORD WINAPI guest_thread_main(LPVOID arg)
 {
     rvvm_machine_t* machine = g_guest_machine;
+    /* The cmdpost instance this run was started with. Taken now - the UI thread
+     * wrote it before CreateThread, which is a happens-before edge - and
+     * released at the end of this function. */
+    vp_cmdpost_t* cmdpost = g_cmdpost;
     (void)arg;
 
     guest_env_build();
@@ -1958,6 +1965,18 @@ static DWORD WINAPI guest_thread_main(LPVOID arg)
         g_guest_argc = 0;
     }
     guest_env_free();
+
+    /* This run is over, so its cmdpost instance - and the sensor state hanging
+     * off it - goes now. The UI thread reads the pointer again only after the
+     * PostMessage below: that is what makes this handoff ordered instead of a
+     * race with the next run's create (a guest thread freeing the instance the
+     * *next* run had already made is the failure this ordering rules out).
+     * Compare before clearing so a shutdown path that already dropped it cannot
+     * make this clear its successor. */
+    if (g_cmdpost == cmdpost) {
+        g_cmdpost = NULL;
+    }
+    cmdpost_destroy(cmdpost);
 
     PostMessage(g_hwnd, WM_APP_GUEST_EXIT, 0, 0);
     return 0;
@@ -2143,6 +2162,14 @@ static void launcher_launch_sel(int sel)
     if (_access(path, 0) != 0) {
         winhost_log("launcher: guest not found: %s", path);
         return;
+    }
+
+    /* This run's cmdpost instance, made here so the startup sequence queued
+     * just below lands in it (win32_host_init does the same for the first run,
+     * for the same reason). The previous run freed its own as it handed control
+     * back, so this is normally NULL. */
+    if (!g_cmdpost) {
+        g_cmdpost = cmdpost_create();
     }
 
     /* Boot on a clean slate: anything still queued belongs to the previous
@@ -2333,6 +2360,16 @@ bool win32_host_init(const char* title, int win_w, int win_h,
     InitializeCriticalSection(&g_surf_cs);
     g_cs_ready = true;
 
+    /* The cmdpost instance for the first run, created before the window exists
+     * because WM_CREATE queues the guest's startup sequence (APP_CMD_START and
+     * friends) into it: an instance made after CreateWindowExA would swallow
+     * them and the guest would never receive them. From the second run on, the
+     * launcher creates one in launcher_launch_sel(), and each run frees its own
+     * in guest_thread_main() as it hands control back. */
+    if (!g_cmdpost) {
+        g_cmdpost = cmdpost_create();
+    }
+
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc   = win_proc;
     wc.hInstance     = GetModuleHandleA(NULL);
@@ -2368,13 +2405,6 @@ bool win32_host_init(const char* title, int win_w, int win_h,
 
     SetTimer(g_hwnd, SENSOR_TIMER_ID, SENSOR_TIMER_MS, NULL);
 
-    /* The cmdpost instance this host owns, for the life of the process: created
-     * here and freed in win32_host_shutdown(). The per-run reset
-     * (cmdpost_init) is the core's to make, on the instance each run is bound
-     * to - see win32_host_start_guest(). */
-    if (!g_cmdpost) {
-        g_cmdpost = cmdpost_create();
-    }
     win32_cmdpost_register_callbacks();
     vsync_clock_start();
     /* Try to load the GL backend (angle/swiftshader) */
@@ -2451,6 +2481,13 @@ bool win32_host_start_guest(int argc, char** argv)
     g_tty_seen  = false; /* no guest output yet this launch */
     rvvm_tty_attach(g_tty, g_guest_machine);
     rvvm_user_set_tty_callback(g_guest_machine, host_tty_cb, NULL);
+
+    /* Whoever queued this run's startup sequence made its instance (see
+     * win32_host_init / launcher_launch_sel, and why it has to be before the
+     * queueing). This is only for a caller that went straight here. */
+    if (!g_cmdpost) {
+        g_cmdpost = cmdpost_create();
+    }
 
     /* Bind this run's machine to the host's cmdpost instance: it is how a
      * syscall arriving on a guest thread finds the state it belongs to. Done
@@ -2562,9 +2599,10 @@ void win32_host_shutdown(void)
          * every thread and handle) rather than racing a still-running guest. */
         return;
     }
-    /* Dismantle the cmdpost bridge and free the instance (cmdpost_destroy runs
-     * the same teardown, then frees). The guest is stopped by this point, so
-     * nothing can be using it. */
+    /* A guest run frees its own instance as it hands control back (see
+     * guest_thread_main), so this is for the case where one was made and no run
+     * ever took it - a launch that failed after the window was up. The guest is
+     * stopped by this point, so nothing can be using it. */
     cmdpost_destroy(g_cmdpost);
     g_cmdpost = NULL;
     if (g_cs_ready) {

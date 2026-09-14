@@ -48,11 +48,13 @@
 static JavaVM* g_jvm = NULL;
 static JNIEnv* g_env = NULL;
 
-/* This host's cmdpost instance: created in nativeInit(), bound to the machine
- * of each run (rvvm_user_set_host_ctx) so the guest's syscalls reach it, and
- * torn down in nativeDestroy(). It is what every cmdpost_* call in this file
- * writes into - that state used to be file-scope globals in vp_cmdpost.c, one
- * set for the whole process.
+/* This host's cmdpost instance for the run in progress: made by
+ * nativeClearLifecycleCmds() (the run preparation Java calls before it seeds
+ * the startup sequence, which has to land in this instance), bound to the run's
+ * machine with rvvm_user_set_host_ctx() so the guest's syscalls reach it, and
+ * freed by that run's guest thread as it ends. NULL between runs. It is what
+ * every cmdpost_* call in this file writes into - that state used to be
+ * file-scope globals in vp_cmdpost.c, one set for the whole process.
  *
  * Declared here rather than next to g_guest_machine because the vsync pump
  * (defined above that point) is one of its callers. */
@@ -619,6 +621,10 @@ static void surf_finish_pending_lock(void);
 static void* guest_thread_func(void* arg)
 {
     rvvm_machine_t* machine = g_guest_machine;
+    /* The cmdpost instance this run was started with. Taken now, while the
+     * UI thread is still inside nativeRunElf() (so it cannot be racing us), and
+     * released at the end of this function. */
+    vp_cmdpost_t* cmdpost = g_cmdpost;
     (void)arg;
 
     /* Detach: the launcher runs guest after guest, so this thread must release
@@ -648,6 +654,19 @@ static void* guest_thread_func(void* arg)
 
     /* rvvm_user_linux_ex() owns and has just freed the machine */
     g_guest_machine = NULL;
+
+    /* This run is over, so its cmdpost instance - and the sensor state hanging
+     * off it - goes now, *before* g_guest_running drops: that flag is what Java
+     * polls to allow the next Run, and the next run makes its own instance in
+     * nativeClearLifecycleCmds(). Releasing it after the flag would let the next
+     * run create one and this thread free it. Compare before clearing so a
+     * teardown that already dropped the pointer cannot make us clear a
+     * successor's. */
+    if (g_cmdpost == cmdpost) {
+        g_cmdpost = NULL;
+    }
+    cmdpost_destroy(cmdpost);
+
     g_guest_running = 0;
     g_guest_suspended = 0;
     
@@ -1287,6 +1306,12 @@ static void jni_register_cmdpost_callbacks(void)
     android_sensor_start();
     vp_sensor_set_ops(android_sensor_ops());
 
+    /* The GL backend registers its dispatch callbacks into the host's cmdpost
+     * instance, so it has to be told which one this is before init() reaches
+     * them. Set here rather than once at startup because the instance is per
+     * run now. */
+    android_gl_set_cmdpost(g_cmdpost);
+
     /* System EGL/GLES backend for the marshalled GL calls. Loads the system
      * libraries on first use and re-installs the dispatch callbacks; on
      * failure the guest falls back to CPU rendering like on win32. */
@@ -1306,16 +1331,10 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
     vp_session_init(&g_session);
     g_session.on_line = on_console_line;
 
-    /* The cmdpost instance this host owns. Created once, here, and destroyed in
-     * nativeDestroy(); the per-run reset (cmdpost_init) is the core's to make
-     * when a guest starts, on the instance each run is bound to. */
-    if (!g_cmdpost) {
-        g_cmdpost = cmdpost_create();
-    }
-    /* Hand it to the GL backend before the callback registration below reaches
-     * android_gl_host_init(), which registers the GL dispatch callbacks into
-     * the instance. */
-    android_gl_set_cmdpost(g_cmdpost);
+    /* No cmdpost instance is made here: it belongs to a run, and is created by
+     * nativeClearLifecycleCmds() (before Java seeds that run) and freed by the
+     * run's own guest thread. The callback registration below still runs, into
+     * whatever instance exists at the time - a no-op when there is none. */
 
     /* Expose the real display vsync as the guest's AChoreographer source. */
     jni_vsync_start();
@@ -1360,10 +1379,9 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
         g_tty = NULL;
     }
 
-    /* Dismantle the cmdpost bridge and free the instance. This is the host's to
-     * do, and since the core's guest-exit path was narrowed to
-     * cmdpost_end_run() it is the only place on this side that tears the bridge
-     * down: no guest will run again until a new nativeInit() creates one. */
+    /* A run frees its own instance as it ends (guest_thread_func), so this is
+     * for the case where one was made and never ran - a start that failed
+     * between nativeClearLifecycleCmds() and the guest thread. */
     cmdpost_destroy(g_cmdpost);
     g_cmdpost = NULL;
 
@@ -1535,6 +1553,17 @@ Java_com_rvvm_android_RvvmNative_nativeClearLifecycleCmds(JNIEnv* env, jobject t
 {
     (void)env;
     (void)thiz;
+
+    /* Java calls this to prepare a run (MainActivity.replayGuestStartupState:
+     * clear, then seed with the commands this guest would have seen on a cold
+     * start), so it is also where that run's cmdpost instance is made: the
+     * commands queued next have to land in the instance the guest will poll.
+     * The previous run freed its own as it handed control back
+     * (guest_thread_func), so this is normally NULL. */
+    if (!g_cmdpost) {
+        g_cmdpost = cmdpost_create();
+    }
+
     g_lifecycle_cmd_count = 0;
     g_lifecycle_cmd_read = 0;
 
@@ -1703,6 +1732,14 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
     /* on_guest_exit re-reads g_exit_listener when it fires, so registering it
      * once per run covers a listener set before or after this point. */
     rvvm_user_set_exit_callback(g_guest_machine, on_guest_exit);
+
+    /* This run's cmdpost instance is normally made by nativeClearLifecycleCmds()
+     * (Java queues the startup sequence right after that call, and it has to
+     * land in this run's instance); this is the safety net for a caller that
+     * went straight to nativeRunElf. */
+    if (!g_cmdpost) {
+        g_cmdpost = cmdpost_create();
+    }
 
     /* Bind this run's machine to the host's cmdpost instance: it is how a
      * syscall arriving on a guest thread finds the state it belongs to. Done
