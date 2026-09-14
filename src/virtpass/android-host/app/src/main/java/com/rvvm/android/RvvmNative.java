@@ -207,11 +207,14 @@ public class RvvmNative {
      * {@code out} must hold at least TTY_MAX_ROWS*80*4 ints: the grid height is
      * whatever {@link #nativeTtyResize(int, int)} last set.
      *
+     * @param guestId whose console to snapshot, or -1 for the foreground one
+     *                (falling back to the last retired session while no run
+     *                is alive)
      * @param info when non-null, filled with {lines the window sits above the
      *             live bottom, lines kept in the scrollback}
      * @return number of cells written (rows*80), or 0 when no TTY exists
      */
-    public static native int nativeTtySnapshot(int[] out, int[] info);
+    public static native int nativeTtySnapshot(int guestId, int[] out, int[] info);
 
     /**
      * Resize the guest TTY grid to the console viewport.
@@ -237,15 +240,19 @@ public class RvvmNative {
      * back past the bottom re-pins the view to the live screen. While the view
      * is scrolled back it stays on the lines being read as new output arrives;
      * typing, and starting a guest, bring it home.
+     *
+     * @param guestId whose console to scroll, or -1 for the foreground one
      */
-    public static native void nativeTtyScrollBy(int lines);
+    public static native void nativeTtyScrollBy(int guestId, int lines);
 
     /**
      * Repaint hint for the TTY console: bumped by native on every guest
      * output burst. Poll at ~30 Hz and re-snapshot + redraw only when the
      * value changes.
+     *
+     * @param guestId whose console serial to read, or -1 for the foreground one
      */
-    public static native int nativeTtySerial();
+    public static native int nativeTtySerial(int guestId);
 
     /**
      * Send host keyboard input to the guest's virtual TTY - the input half of

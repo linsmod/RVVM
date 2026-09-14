@@ -250,7 +250,7 @@ public class MainActivity extends Activity {
         @Override public void run() {
             if (!ttyRunning) return;
             if (ttyView != null && ttyView.isAvailable()) {
-                int serial = RvvmNative.nativeTtySerial();
+                int serial = RvvmNative.nativeTtySerial(activeGuestId);
                 long now = SystemClock.uptimeMillis();
                 boolean redraw = serial != ttySerial;
                 if (redraw) {
@@ -429,7 +429,7 @@ public class MainActivity extends Activity {
             RvvmNative.nativeTtyResize(rows, TTY_COLS);
         }
 
-        if (RvvmNative.nativeTtySnapshot(ttyCells, ttyScrollInfo) <= 0) return;
+        if (RvvmNative.nativeTtySnapshot(activeGuestId, ttyCells, ttyScrollInfo) <= 0) return;
 
         Canvas canvas = ttyView.lockCanvas(null);
         if (canvas == null) return;
@@ -708,7 +708,7 @@ public class MainActivity extends Activity {
                     int lines = (int) (ttyDragRest / ttyCellH);
                     if (lines != 0) {
                         ttyDragRest -= lines * ttyCellH;
-                        RvvmNative.nativeTtyScrollBy(lines);
+                        RvvmNative.nativeTtyScrollBy(activeGuestId, lines);
                     }
                     return true;    // consumed: no click at the end of a drag
                 }
@@ -794,6 +794,9 @@ public class MainActivity extends Activity {
             if (!isInitialized) {
                 return;
             }
+            // Touching a window focuses it: the tap itself is forwarded to the
+            // run that just became the foreground one.
+            focusCard(card);
             float viewW = card.surfaceView.getWidth(), viewH = card.surfaceView.getHeight();
             if (viewW <= 0f || viewH <= 0f) {
                 return;
@@ -819,6 +822,10 @@ public class MainActivity extends Activity {
             // the Stop button's action plus the card's dismissal.
             stopGuestElf(card.getGuestId());
             dismissCard(card);
+        }
+
+        @Override public void onCardFocused(GlWindowCard card) {
+            focusCard(card);
         }
 
         @Override public void onCardMaximized() {
@@ -864,11 +871,43 @@ public class MainActivity extends Activity {
         rebuildTaskbar();
     }
 
+    /**
+     * Make the given card's run the foreground one: the console, the keyboard
+     * input, the Suspend/Stop buttons and the touch stream all act on it.
+     *
+     * The guest losing the foreground hears LOST_FOCUS *before* the handover
+     * (lifecycle commands are queued to whichever run is active at that
+     * moment), the winner hears GAINED_FOCUS right after. Focus does not
+     * pause anyone: both guests keep rendering - a background window on a
+     * desktop keeps painting unless its app decides otherwise.
+     */
+    private void focusCard(GlWindowCard card) {
+        int id = card.getGuestId();
+        if (id == activeGuestId || !RvvmNative.nativeIsGuestRunning(id)) {
+            return;
+        }
+        Log.i(TAG, "Foreground: guest " + activeGuestId + " -> " + id);
+        postLifecycleCmd(APP_CMD_LOST_FOCUS);
+        activeGuestId = id;
+        RvvmNative.nativeSetActiveGuest(id);
+        postLifecycleCmd(APP_CMD_GAINED_FOCUS);
+        // The focused window comes to the front, desktop-style.
+        card.cardView.bringToFront();
+    }
+
     /** Create the card for a run: added to the workspace at 1x1, waiting for
-     *  its surface (which the run is then held back for, see runGuestElf). */
+     *  its surface (which the run is then held back for, see runGuestElf).
+     *  The card cascades off the cards already on screen, so simultaneously
+     *  running guests - even several of the same program - spawn visibly
+     *  staggered instead of stacked pixel-for-pixel. */
     private GlWindowCard createCard(int guestId, String guestName) {
+        int visible = 0;
+        for (GlWindowCard c : glCards.values()) {
+            if (!c.isMinimized()) visible++;
+        }
         GlWindowCard card = new GlWindowCard(this, (ViewGroup) workspace, guestId, guestName, glCardHost);
         glCards.put(guestId, card);
+        card.cascadeTo(visible);
         return card;
     }
 
@@ -1430,6 +1469,18 @@ public class MainActivity extends Activity {
                 GlWindowCard card = glCards.get(guestId);
                 if (card != null) {
                     dismissCard(card);
+                }
+                // A foreground run's exit hands the console to the next card
+                // still alive (or to the last retired screen when none is).
+                if (guestId == activeGuestId) {
+                    Integer next = null;
+                    for (Integer id : glCards.keySet()) {
+                        if (next == null || id < next) next = id;
+                    }
+                    activeGuestId = (next != null) ? next : -1;
+                    if (next != null) {
+                        RvvmNative.nativeSetActiveGuest(next);
+                    }
                 }
                 updateButtonStates();
             });

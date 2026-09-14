@@ -47,6 +47,10 @@ public class GlWindowCard {
         void onCardTouch(GlWindowCard card, MotionEvent event);
         /** The close button: end this card's run. */
         void onCardClosed(GlWindowCard card);
+        /** The card was tapped/dragged by the user: make its run the
+         *  foreground one (console, keyboard input and the run controls act
+         *  on the foreground guest). */
+        void onCardFocused(GlWindowCard card);
         /** The soft keyboard may be up; drop it (maximize takes the workspace). */
         void onCardMaximized();
         /** The card was minimized to the taskbar (rebuild the strip). */
@@ -56,6 +60,9 @@ public class GlWindowCard {
     }
 
     private static final String TAG = "RVVM-GlWindowCard";
+
+    /** Ladder positions before the cascade bounces (steps walked = this - 1). */
+    private static final int CASCADE_STEPS = 4;
 
     private final Host host;
     private final int guestId;
@@ -256,10 +263,13 @@ public class GlWindowCard {
             return;
         }
         FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) cardView.getLayoutParams();
-        // Explicit sizes are what the floating state uses; the card still
-        // reports the maximized one until the next layout runs.
-        float w = lp.width > 0 ? lp.width : cardView.getWidth();
-        float h = lp.height > 0 ? lp.height : cardView.getHeight();
+        // Position for the footprint the card will be SEEN at: while waiting
+        // for the first frame the layout params still say 1x1 - computing the
+        // margins for that would re-anchor the revealed card under the
+        // END gravity and swallow any cascade offset. The floating size is
+        // what the card grows into.
+        float w = revealed ? cardView.getWidth() : floatW;
+        float h = revealed ? cardView.getHeight() : floatH;
         float maxLeft = Math.max(0f, workspace.getWidth() - w);
         float maxTop = Math.max(0f, workspace.getHeight() - h);
         left = clamp(left, 0f, maxLeft);
@@ -280,6 +290,58 @@ public class GlWindowCard {
 
     private static float clamp(float value, float lo, float hi) {
         return value < lo ? lo : (value > hi ? hi : value);
+    }
+
+    /**
+     * Windows-style cascade: step this card down-right by {@code index}
+     * diagonal steps from its floating corner, so simultaneously-running
+     * guests do not stack pixel-for-pixel. When a step would leave the
+     * workspace the walk reflects off the edge (ping-pong) instead of
+     * wrapping past it - the same bounce a dragged window meets in
+     * moveWindow(), applied to the spawn point.
+     *
+     * Posted until the workspace is laid out: a card is created before its
+     * container has a size to cascade within.
+     */
+    public void cascadeTo(final int index) {
+        cardView.post(() -> {
+            if (workspace.getWidth() <= 0 || workspace.getHeight() <= 0) {
+                // The workspace is not laid out yet (the card was created in
+                // the same pass that first measures it): a cascade computed
+                // now would clamp to (0,0). Try again on the next pass.
+                cascadeTo(index);
+                return;
+            }
+            float w = floatW;
+            float h = floatH;
+            float margin = dp(12);
+            float baseStep = dp(28);
+
+            // One shared ladder of CASCADE_STEPS positions per axis, walked
+            // diagonally: the x step shrinks to whatever the (possibly very
+            // narrow) leftover width allows, so the staircase stays a
+            // staircase on a phone instead of collapsing into "only y".
+            int steps = CASCADE_STEPS - 1;
+            float spanX = Math.max(0f, workspace.getWidth() - w - 2f * margin);
+            float spanY = Math.max(0f, workspace.getHeight() - h - 2f * margin);
+            float stepX = Math.min(baseStep, spanX / steps);
+            float stepY = Math.min(baseStep, spanY / steps);
+            float left = margin + triangle(index, steps) * stepX;
+            float top = margin + triangle(index, steps) * stepY;
+            moveWindow(left, top);
+        });
+    }
+
+    /** Ping-pong walk: 0,1..steps,steps-1..1,0,1.. - the reflection at both
+     *  edges. steps >= 1. */
+    private static int triangle(int index, int steps) {
+        int period = 2 * steps;
+        int m = index % period;
+        return m <= steps ? m : period - m;
+    }
+
+    private float dp(int v) {
+        return v * cardView.getResources().getDisplayMetrics().density;
     }
 
     /* ============================================================
@@ -352,6 +414,8 @@ public class GlWindowCard {
             public boolean onTouch(View v, MotionEvent event) {
                 switch (event.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
+                        // Grabbing a window focuses it, the same as a desktop.
+                        host.onCardFocused(GlWindowCard.this);
                         // Raw coordinates: the view moves under the finger.
                         fromX = event.getRawX();
                         fromY = event.getRawY();

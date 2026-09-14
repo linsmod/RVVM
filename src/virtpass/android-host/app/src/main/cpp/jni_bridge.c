@@ -87,6 +87,11 @@ struct android_run {
     /* The guest itself. Created in nativeRunElf(), freed by
      * rvvm_user_linux_ex() on the guest thread. */
     rvvm_machine_t* machine;
+    /* The run's own console session (rvvm_tty_open). Output of fd 1/2 lands
+     * here because the session is attached to this run's machine; the console
+     * view shows the foreground run's session. On run end the session is
+     * retired (not destroyed) so its frozen last screen survives the guest. */
+    rvvm_tty_t*     tty;
     /* The run's own window (Layer 2: the viewport). Installed by
      * nativeSetWindow() with this run's id, holding a reference until the
      * window goes away; a reference is taken again for the duration of every
@@ -152,6 +157,10 @@ static int32_t g_host_density = 0;
  * which registers it once, and must stay reachable no matter which run is
  * active (or alive) when the guest exits. */
 static jobject g_exit_listener = NULL;
+
+/* The console session retired most recently (see android_run_destroy): the
+ * frozen last screen the console view falls back to while no run is alive. */
+static rvvm_tty_t* g_tty_retired_last = NULL;
 
 /* Guards the run table itself (g_runs / g_active_run): slot allocation,
  * teardown and the lookups (by id, by cmdpost) that other threads now make.
@@ -258,6 +267,18 @@ static void android_run_destroy(struct android_run* run)
     pthread_mutex_unlock(&g_runs_lock);
 
     cmdpost_destroy(run->cmdpost);
+
+    /* Retire the run's console session: the frozen last screen stays readable
+     * (the console view falls back to it while no run is alive) until another
+     * run ends and retires its own in turn, or the host tears down. */
+    if (run->tty) {
+        if (g_tty_retired_last) {
+            rvvm_tty_close(g_tty_retired_last);
+        }
+        g_tty_retired_last = run->tty;
+        run->tty = NULL;
+    }
+
     free(run);
 }
 
@@ -651,26 +672,28 @@ static pthread_mutex_t g_console_mutex = PTHREAD_MUTEX_INITIALIZER;
  * TIOCGWINSZ all agree on the height. */
 static int            g_tty_rows   = TTY_DEF_ROWS;
 
-/* The console session (rvvm_tty_open). It owns the VTerm, the lock that
- * serializes access to it, the scrollback and the view state, and it outlives
- * every guest: the renderer keeps snapshotting and scrolling the frozen last
- * screen with no machine - and no libvterm knowledge - of its own. */
-static rvvm_tty_t* g_tty = NULL;
+/* Per-run console sessions. Each run opens its own session at start (and
+ * attaches it to its machine), so guest outputs never share a VTerm; the
+ * single console view shows the foreground run's session. When a run ends,
+ * its session is RETIRED rather than destroyed - the frozen last screen and
+ * the scrollback survive the guest - until the next run retires it in turn
+ * or the host tears down. */
 
-/* The session is opened on first use: the renderer lays its grid out as soon as
- * the console tab is up, which can precede the first guest, so
- * nativeTtyResize() remembers a height that arrives before this. */
-static void jni_tty_init(void)
+/* The session the console view shows. An explicit guestId resolves to that
+ * run's session only (a dead id has no session - no borrowing the foreground
+ * one's screen); -1 resolves to the foreground run's session, falling back to
+ * the last retired one while no run is alive (the frozen last screen). */
+static rvvm_tty_t* android_tty_for_view(int guestId)
 {
-    if (g_tty) {
-        return;
+    struct android_run* run = (guestId >= 0) ? android_run_by_id(guestId)
+                                             : android_run_active();
+    if (run && run->tty) {
+        return run->tty;
     }
-    g_tty = rvvm_tty_open(g_tty_rows, TTY_COLS);
-    if (!g_tty) {
-        LOGE("rvvm_tty_open failed");
-        return;
+    if (guestId >= 0) {
+        return NULL;
     }
-    LOGI("Guest TTY session opened (%dx%d)", g_tty_rows, TTY_COLS);
+    return g_tty_retired_last;
 }
 
 /* Cell snapshot for the Java renderer. The session packs rows*cols cells into
@@ -689,11 +712,12 @@ static void jni_tty_init(void)
  * grid. */
 JNIEXPORT jint JNICALL
 Java_com_rvvm_android_RvvmNative_nativeTtySnapshot(JNIEnv* env, jobject thiz,
-                                                   jintArray out, jintArray info)
+                                                   jint guestId, jintArray out, jintArray info)
 {
     static rvvm_tty_cell_t cells[TTY_MAX_ROWS * TTY_COLS];
+    rvvm_tty_t* tty = android_tty_for_view(guestId);
     (void)thiz;
-    if (!g_tty || !out) {
+    if (!tty || !out) {
         return 0;
     }
     jsize len = (*env)->GetArrayLength(env, out);
@@ -706,7 +730,7 @@ Java_com_rvvm_android_RvvmNative_nativeTtySnapshot(JNIEnv* env, jobject thiz,
     }
 
     rvvm_tty_view_t view;
-    int n = rvvm_tty_snapshot(g_tty, cells, TTY_MAX_ROWS * TTY_COLS, &view);
+    int n = rvvm_tty_snapshot(tty, cells, TTY_MAX_ROWS * TTY_COLS, &view);
     if (n > 0 && len >= (jsize)(n * 4)) {
         memcpy(buf, cells, (size_t)n * sizeof(cells[0]));
     } else {
@@ -756,8 +780,15 @@ Java_com_rvvm_android_RvvmNative_nativeTtyResize(JNIEnv* env, jobject thiz,
     }
     g_tty_rows = rows;
 
-    if (g_tty) {
-        rvvm_tty_resize(g_tty, rows, TTY_COLS);   /* bumps the session serial */
+    /* Every live run's session is resized, so each guest's TIOCGWINSZ agrees
+     * with the console viewport no matter which one is in the foreground. */
+    {
+        int i;
+        for (i = 0; i < VP_ANDROID_MAX_GUESTS_CEILING; i++) {
+            if (g_runs[i] && g_runs[i]->tty) {
+                rvvm_tty_resize(g_runs[i]->tty, rows, TTY_COLS);   /* bumps the session serial */
+            }
+        }
     }
 }
 
@@ -765,10 +796,11 @@ Java_com_rvvm_android_RvvmNative_nativeTtyResize(JNIEnv* env, jobject thiz,
  * resize, reset and scroll, so a poll that finds it unchanged has nothing to
  * redraw. Cheap enough to call at any rate - it is a plain int read. */
 JNIEXPORT jint JNICALL
-Java_com_rvvm_android_RvvmNative_nativeTtySerial(JNIEnv* env, jobject thiz)
+Java_com_rvvm_android_RvvmNative_nativeTtySerial(JNIEnv* env, jobject thiz, jint guestId)
 {
+    rvvm_tty_t* tty = android_tty_for_view(guestId);
     (void)env; (void)thiz;
-    return g_tty ? rvvm_tty_serial(g_tty) : 0;
+    return tty ? rvvm_tty_serial(tty) : 0;
 }
 
 /* Drag the console's view through its scrollback: `lines` is a drag in whole
@@ -781,11 +813,12 @@ Java_com_rvvm_android_RvvmNative_nativeTtySerial(JNIEnv* env, jobject thiz)
  * too, through the core's ISIG handling) - and reading that output back is
  * exactly what the scrollback is for. */
 JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativeTtyScrollBy(JNIEnv* env, jobject thiz, jint lines)
+Java_com_rvvm_android_RvvmNative_nativeTtyScrollBy(JNIEnv* env, jobject thiz, jint guestId, jint lines)
 {
+    rvvm_tty_t* tty = android_tty_for_view(guestId);
     (void)env; (void)thiz;
-    if (g_tty) {
-        rvvm_tty_scroll(g_tty, lines);
+    if (tty) {
+        rvvm_tty_scroll(tty, lines);
     }
 }
 
@@ -1687,13 +1720,13 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
     extern void android_aaudio_shutdown(void);
     android_aaudio_shutdown();
 
-    /* Drop the console session - but only once no guest can still be parsing
-     * its output into it. With one still unwinding, its ctx holds the session
-     * and the process is going away anyway; the next run reopens it (the
-     * screen is not kept across a native teardown, only across guest runs). */
-    if (!android_run_any_machine() && g_tty) {
-        rvvm_tty_close(g_tty);
-        g_tty = NULL;
+    /* Drop the retired console session - but only once no guest can still be
+     * parsing output into a session. With one still unwinding, its ctx holds
+     * the session and the process is going away anyway; the screen is not
+     * kept across a native teardown, only across guest runs. */
+    if (!android_run_any_machine() && g_tty_retired_last) {
+        rvvm_tty_close(g_tty_retired_last);
+        g_tty_retired_last = NULL;
     }
 
     /* Every run goes with its bridge instance. A run that started frees its own
@@ -2130,17 +2163,22 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
      * of these syscalls. */
     rvvm_user_set_host_ctx(android_run_active()->machine, android_run_active()->cmdpost);
 
-    /* Host-owned console session: wipe the screen for this run (the cells, the
-     * scrollback, the view and the cursor state all belong to the run that just
-     * ended - rvvm_tty_reset covers those) and attach it to the machine for the
-     * length of the run. The session itself outlives the guest, so the console
-     * tab keeps showing - and scrolling through - the last screen afterwards.
-     * No output callback is registered: the session bumps its own serial, which
-     * is what the Java poller reads. */
-    jni_tty_init();
-    if (g_tty) {
-        rvvm_tty_reset(g_tty);
-        rvvm_tty_attach(g_tty, android_run_active()->machine);
+    /* This run's own console session: opened fresh (the previous run's frozen
+     * screen stays retired for the view to fall back to), wiped, and attached
+     * to this machine - fd 1/2 output lands in this run's VTerm alone, never
+     * in another guest's. No output callback is registered: the session bumps
+     * its own serial, which is what the Java poller reads. */
+    if (!android_run_active()->tty) {
+        android_run_active()->tty = rvvm_tty_open(g_tty_rows, TTY_COLS);
+        if (!android_run_active()->tty) {
+            LOGE("rvvm_tty_open failed for guest %d", android_run_active()->id);
+        } else {
+            LOGI("Guest %d TTY session opened (%dx%d)", android_run_active()->id, g_tty_rows, TTY_COLS);
+        }
+    }
+    if (android_run_active()->tty) {
+        rvvm_tty_reset(android_run_active()->tty);
+        rvvm_tty_attach(android_run_active()->tty, android_run_active()->machine);
     }
     
     /* Start guest thread */

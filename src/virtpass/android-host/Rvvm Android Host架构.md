@@ -351,8 +351,16 @@ sequenceDiagram
    下一个 guest 的标志而空转）。
    真机验证：息屏状态下连续 `am start` 两个 guest（test_render + test_render_gles），
    解锁后两者各自起跑，GL 12 阶段全 PASS、exit 0，卡片独立 reveal、互不干扰。
-4. **控制台/TTY 仍是单会话**：`g_tty` 一个 VTerm，多 guest 的 fd 1/2 会混流；
-   需 per-run tty 会话 + UI 切换（多卡片已就位，剩控制台归属这一层）。
+   新卡按 Windows 式级联生成（`cascadeTo`：对角线 28dp 步进，到工作区边界乒乓
+   反弹），同一程序的多个实例可并存且肉眼可分。
+4. ~~控制台/TTY 仍是单会话~~ **已落地（2026-09-14，形态 1：控制台跟随前台卡）**：
+   每个 run 打开自己的 `rvvm_tty_t`（`android_run.tty`）并 attach 到自己的 machine——
+   fd 1/2 输出天然分流，不再混流；`nativeTtySnapshot/Serial/ScrollBy` 按 guestId 取
+   会话（-1 = 前台），resize 广播到全部活动会话。run 结束时会话**退役**而非销毁
+   （`g_tty_retired_last`）：冻屏和回滚活得比 guest 长，控制台在无存活 run 时回退
+   显示最近一次退役的冻屏；前台 run 退出时控制台自动切到下一个存活卡。真机验证：
+   test_tty（满屏输出）→ test_render 先后运行，控制台正确切换、卡片独立渲染。
+   形态 2（控制台内嵌卡片/终端卡）留作后续 UI 演进。
 5. **GL guest 对瞬态丢窗仍然脆弱**：`eglCreateWindowSurface` 只给 `jni_wait_surface`
    250ms 等待。持有机制（surface 未起不启动 guest）已消除最常见的触发面，但
    guest 运行中窗口被最小化/关闭仍按设计返回 `EGL_NO_SURFACE`。
