@@ -145,7 +145,7 @@ override SRC_USE_JIT       := $(SRCDIR)/rvjit/rvjit.c $(SRCDIR)/rvjit/rvjit_emit
 override SRC_USE_RV32      := $(SRCDIR)/cpu/riscv32_interpreter.c
 override SRC_USE_RV64      := $(SRCDIR)/cpu/riscv64_interpreter.c
 override SRC_USE_LIBRETRO  := $(SRCDIR)/bindings/libretro/libretro.c
-override SRC_USE_VERTPASS  := $(SRCDIR)/virtpass/vp_cmdpost.c $(SRCDIR)/virtpass/vp_sensor.c
+override SRC_USE_VERTPASS  := $(SRCDIR)/virtpass/vp_cmdpost.c $(SRCDIR)/virtpass/vp_sensor.c $(SRCDIR)/virtpass/vp_session.c
 override SRC_USE_JNI       := $(SRCDIR)/bindings/jni/rvvm_jni.c
 # Win32 implementations of the POSIX API declared in include/mingw_compat
 # (win_socket.c is the WinSock 2 backend behind the BSD socket shim)

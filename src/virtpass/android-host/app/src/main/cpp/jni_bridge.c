@@ -28,6 +28,7 @@
 
 /* Include vp_cmdpost API */
 #include "virtpass/vp_cmdpost.h"
+#include "virtpass/vp_session.h"
 
 /* System EGL/GLES backend (marshalled GL dispatch) */
 #include "android_gl_host.h"
@@ -60,32 +61,18 @@ static ANativeWindow* g_native_window = NULL;
  * apart is what stops a surface resize from moving the geometry the guest is
  * already rendering into (that mismatch was what made the unlock copy run off
  * the end of the guest pixel buffer).
+ *
+ * The geometry state is not kept here: it lives in the session object
+ * (virtpass/vp_session.h), which is the same state the win32 host keeps for its
+ * own window and the shape a second instance would need a copy of. What is
+ * left in this file is what is genuinely Android's business - the window, the
+ * locks and the Java callbacks - driving that session under g_surf_cs.
  * ------------------------------------------------------------------ */
-static int32_t g_virt_w   = 0;                              /* panel, px */
-static int32_t g_virt_h   = 0;
-static int32_t g_virt_ppi = ACONFIGURATION_DENSITY_MEDIUM;  /* host-private */
+static vp_session_t g_session;
 
-/* Guest-visible surface geometry. Latched from the panel on first use and
- * afterwards changed only by the guest's ANativeWindow_setBuffersGeometry,
- * exactly like the win32 host's g_init -> g_surf hand-off. */
-static int32_t g_init_w   = 0;   /* panel snapshot taken at latch time */
-static int32_t g_init_h   = 0;
-static int32_t g_surf_w   = 0;
-static int32_t g_surf_h   = 0;
-static int32_t g_surf_fmt = WINDOW_FORMAT_RGBA_8888;
-
-/* Geometry last pushed to the real surface (skips redundant calls). */
-static int32_t g_applied_w   = 0;
-static int32_t g_applied_h   = 0;
-static int32_t g_applied_fmt = 0;
-
-/* Guards all of the above. Held for short reads/writes only, never across an
- * ANativeWindow_lock()/unlockAndPost() pair. */
+/* Guards the session's geometry and the window. Held for short reads/writes
+ * only, never across an ANativeWindow_lock()/unlockAndPost() pair. */
 static pthread_mutex_t g_surf_cs = PTHREAD_MUTEX_INITIALIZER;
-
-/* Provisional panel used until the first real surface size is known. */
-#define VP_PANEL_DEFAULT_W 640
-#define VP_PANEL_DEFAULT_H 480
 
 /* GameActivity state */
 static int32_t g_lifecycle_cmd_queue[32];
@@ -290,14 +277,10 @@ static jobject    g_console_listener = NULL;
 static jmethodID  g_console_output_mid = NULL;
 static jmethodID  g_console_first_frame_mid = NULL;
 
+/* The pending line and the first-frame flag are per-run state and live in
+ * g_session (virtpass/vp_session.h): this mutex is what serialises access to
+ * them, since the session itself takes no locks. */
 static pthread_mutex_t g_console_mutex = PTHREAD_MUTEX_INITIALIZER;
-static char            g_console_buf[2048];
-static size_t          g_console_len = 0;
-
-/* One per guest run: set when a frame has been presented, cleared in
- * nativeRunElf(). Read from the guest thread, written from the UI thread
- * (clear) and the guest thread (set); volatile is enough for this pattern. */
-static volatile int g_first_frame_sent = 0;
 
 /* ============================================================
  * Guest virtual TTY: host-owned libvterm session
@@ -543,66 +526,43 @@ static JNIEnv* console_env(int* attached)
     return NULL;
 }
 
-/* Guest bytes are not guaranteed to be text, and NewStringUTF expects
- * modified UTF-8. Keep printable ASCII + tabs, replace everything else - the
- * console is for diagnostics, not for binary payload. */
-static char console_sanitise(char c)
-{
-    unsigned char u = (unsigned char)c;
-    if (u == '\t') return c;
-    if (u < 0x20 || u > 0x7e) return '?';
-    return c;
-}
-
-static void console_flush_line_locked(void)
+/* A completed console line, from the session's line assembly. Called with
+ * g_console_mutex held; the session's own sanitising already turned the guest's
+ * bytes into text NewStringUTF accepts. */
+static void on_console_line(void* user, const char* line)
 {
     JNIEnv* env;
     int attached;
-    jstring line;
+    jstring str;
 
-    if (!g_console_len || !g_console_listener) {
-        g_console_len = 0;
+    (void)user;
+
+    if (!g_console_listener) {
+        return;     /* nobody to deliver to; the line is dropped */
+    }
+    env = console_env(&attached);
+    if (!env) {
         return;
     }
-    g_console_buf[g_console_len] = '\0';
-
-    env = console_env(&attached);
-    if (!env) { g_console_len = 0; return; }
-
-    for (size_t i = 0; i < g_console_len; i++) {
-        g_console_buf[i] = console_sanitise(g_console_buf[i]);
-    }
-    line = (*env)->NewStringUTF(env, g_console_buf);
-    if (line) {
-        (*env)->CallVoidMethod(env, g_console_listener, g_console_output_mid, line);
-        (*env)->DeleteLocalRef(env, line);
+    str = (*env)->NewStringUTF(env, line);
+    if (str) {
+        (*env)->CallVoidMethod(env, g_console_listener, g_console_output_mid, str);
+        (*env)->DeleteLocalRef(env, str);
     }
     if (attached) {
         (*g_jvm)->DetachCurrentThread(g_jvm);
     }
-    g_console_len = 0;
 }
 
-/* Called by rvvm_user's io callback for every write to fd 1/2. Splits the
- * stream into lines before crossing into Java. */
+/* Called by rvvm_user's io callback for every write to fd 1/2. The splitting
+ * into lines lives in the session, so both hosts split identically; what is
+ * here is the locking and the crossing into Java. */
 void jni_guest_output(const char* data, size_t count)
 {
-    if (!g_console_listener || !data || !count) return;
+    if (!data || !count) return;
 
     pthread_mutex_lock(&g_console_mutex);
-    for (size_t i = 0; i < count; i++) {
-        char c = data[i];
-        if (c == '\n') {
-            console_flush_line_locked();
-        } else if (c == '\r') {
-            /* CR alone never ends a guest line; LF does. */
-        } else if (g_console_len >= sizeof(g_console_buf) - 1) {
-            console_flush_line_locked();   /* oversized line: emit as-is */
-            g_console_buf[g_console_len++] = c;
-        } else {
-            g_console_buf[g_console_len++] = c;
-        }
-    }
+    vp_session_console_output(&g_session, data, count);
     pthread_mutex_unlock(&g_console_mutex);
 }
 
@@ -612,14 +572,17 @@ void jni_guest_first_frame(void)
 {
     JNIEnv* env;
     int attached;
-
-    if (g_first_frame_sent) return;
-    g_first_frame_sent = 1;
+    int first;
 
     pthread_mutex_lock(&g_console_mutex);
-    console_flush_line_locked();   /* flush whatever precedes the first frame */
+    first = vp_session_note_first_frame(&g_session);
+    if (first) {
+        /* Flush whatever output precedes the frame. */
+        vp_session_console_flush(&g_session);
+    }
     pthread_mutex_unlock(&g_console_mutex);
 
+    if (!first) return;
     if (!g_console_listener || !g_console_first_frame_mid) return;
     env = console_env(&attached);
     if (!env) return;
@@ -629,13 +592,12 @@ void jni_guest_first_frame(void)
     }
 }
 
-/* Flush a trailing partial line and drop the frame flag for the next run. */
+/* Flush a trailing partial line and re-arm the first-frame note. */
 static void console_reset(void)
 {
     pthread_mutex_lock(&g_console_mutex);
-    console_flush_line_locked();
+    vp_session_reset_run(&g_session);
     pthread_mutex_unlock(&g_console_mutex);
-    g_first_frame_sent = 0;
 }
 
 /* Defined with the window callbacks below; called from the guest thread once
@@ -880,51 +842,35 @@ static void surf_finish_pending_lock(void)
  * field name only. */
 
 /* Latch the panel from the first real surface size we ever see. Caller holds
- * g_surf_cs. Once the guest has observed a geometry the panel is frozen:
- * moving it afterwards would desynchronise the guest buffer from the bytes we
- * copy on unlock. Mirrors the win32 host, where the virtual panel defaults to
- * the window size and then stays put across resizes. */
+ * g_surf_cs.
+ *
+ * The policy is the session's (vp_session_latch_panel): the panel is frozen
+ * once the guest has observed a geometry, because moving it afterwards would
+ * desynchronise the guest buffer from the bytes we copy on unlock - the rule
+ * the win32 host follows too, where the virtual panel defaults to the window
+ * size and then stays put across resizes. What is Android's here is the
+ * reading of the window. */
 static void panel_latch_locked(void)
 {
     ANativeWindow* win = g_native_window;
     int32_t w, h;
 
-    if (g_surf_w > 0 && g_surf_h > 0) return;   /* guest already saw it */
-    if (g_virt_w > 0 && g_virt_h > 0) return;   /* already latched      */
     if (!win) return;
 
     w = ANativeWindow_getWidth(win);
     h = ANativeWindow_getHeight(win);
-    if (w <= 0 || h <= 0) return;
-
-    g_virt_w = w;
-    g_virt_h = h;
-    g_init_w = w;
-    g_init_h = h;
-    LOGI("Virtual panel latched: %dx%d", w, h);
+    if (vp_session_latch_panel(&g_session, w, h)) {
+        LOGI("Virtual panel latched: %dx%d", w, h);
+    }
 }
 
-/* Effective guest geometry. Caller holds g_surf_cs. Latches the panel into the
- * guest surface on first use; after that the value is stable, so the guest
- * allocates its pixel buffer once instead of chasing a moving target. */
+/* Effective guest geometry. Caller holds g_surf_cs. */
 static void guest_geometry_locked(int32_t* w, int32_t* h, int32_t* fmt)
 {
-    if (g_surf_w <= 0 || g_surf_h <= 0) {
-        int32_t pw = (g_virt_w > 0) ? g_virt_w
-                  : (g_init_w > 0) ? g_init_w : VP_PANEL_DEFAULT_W;
-        int32_t ph = (g_virt_h > 0) ? g_virt_h
-                  : (g_init_h > 0) ? g_init_h : VP_PANEL_DEFAULT_H;
-        g_surf_w = pw;
-        g_surf_h = ph;
-        LOGI("Guest surface latched to panel: %dx%d", pw, ph);
+    if (vp_session_guest_geometry(&g_session, w, h, fmt)) {
+        LOGI("Guest surface latched to panel: %dx%d",
+             g_session.gfx_w, g_session.gfx_h);
     }
-    if (g_surf_fmt != WINDOW_FORMAT_RGBA_8888 &&
-        g_surf_fmt != WINDOW_FORMAT_RGB_565) {
-        g_surf_fmt = WINDOW_FORMAT_RGBA_8888;
-    }
-    if (w)   *w   = g_surf_w;
-    if (h)   *h   = g_surf_h;
-    if (fmt) *fmt = g_surf_fmt;
 }
 
 /* Push the latched panel geometry onto a real surface.
@@ -951,11 +897,9 @@ void jni_apply_surface_geometry(struct ANativeWindow* w)
     pthread_mutex_lock(&g_surf_cs);
     panel_latch_locked();
     guest_geometry_locked(&gw, &gh, &gf);
-    if (g_applied_w != gw || g_applied_h != gh || g_applied_fmt != gf) {
+    if (vp_session_geometry_dirty(&g_session, gw, gh, gf)) {
         if (ANativeWindow_setBuffersGeometry(w, gw, gh, gf) == 0) {
-            g_applied_w   = gw;
-            g_applied_h   = gh;
-            g_applied_fmt = gf;
+            vp_session_geometry_pushed(&g_session, gw, gh, gf);
         }
     }
     pthread_mutex_unlock(&g_surf_cs);
@@ -1072,9 +1016,10 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
         size_t dbpp = (lbuf.format == WINDOW_FORMAT_RGB_565) ? 2 : 4;
 
         /* Copy only what BOTH sides agree on. The guest buffer is panel-sized
-         * (g_surf_w x g_surf_h); the surface buffer is whatever the platform
-         * granted for the lock. Clamping here means a surface that ignored our
-         * geometry can never turn this into an out-of-bounds access. */
+         * (the session's gfx_w x gfx_h); the surface buffer is whatever the
+         * platform granted for the lock. Clamping here means a surface that
+         * ignored our geometry can never turn this into an out-of-bounds
+         * access. */
         int32_t cols = (gw < lbuf.width)  ? gw : lbuf.width;
         int32_t rows = (gh < lbuf.height) ? gh : lbuf.height;
         if (cols < 0) cols = 0;
@@ -1151,20 +1096,10 @@ static void on_window_size(int64_t* width, int64_t* height)
 static int32_t on_window_set_buf(int32_t width, int32_t height, int32_t format)
 {
     pthread_mutex_lock(&g_surf_cs);
-    if (width > 0 && height > 0) {
-        g_surf_w = width;
-        g_surf_h = height;
-        if (g_virt_w <= 0 || g_virt_h <= 0) {
-            g_virt_w = width;
-            g_virt_h = height;
-        }
-    }
-    if (format == WINDOW_FORMAT_RGBA_8888 || format == WINDOW_FORMAT_RGB_565) {
-        g_surf_fmt = format;
-    }
-    g_applied_w   = 0;   /* force a re-apply against the real surface */
-    g_applied_h   = 0;
-    g_applied_fmt = 0;
+    /* The session applies the guest's rule - a concrete size redefines the
+     * surface, a bare format select leaves it alone - and retires the cached
+     * push, so the real surface is re-applied at the next lock. */
+    vp_session_set_guest_geometry(&g_session, width, height, format);
     pthread_mutex_unlock(&g_surf_cs);
 
     LOGI("Window geometry set: %dx%d format=%d (guest geometry %s)",
@@ -1214,7 +1149,8 @@ static int32_t on_config_get(int32_t field, int32_t* outValue)
     pthread_mutex_lock(&g_surf_cs);
     panel_latch_locked();
     guest_geometry_locked(&w, &h, NULL);
-    ppi = (g_virt_ppi > 0) ? g_virt_ppi : ACONFIGURATION_DENSITY_MEDIUM;
+    ppi = (g_session.panel_ppi > 0) ? g_session.panel_ppi
+                                    : ACONFIGURATION_DENSITY_MEDIUM;
     pthread_mutex_unlock(&g_surf_cs);
 
     width_dp  = w * 160 / ppi;
@@ -1344,6 +1280,13 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
     (void)thiz;
     g_env = env;
 
+    /* The host session: the display geometry the guest observes, and the
+     * assembly of its output into console lines. Everything in it that is
+     * per-run is reset by console_reset() in nativeRunElf(); the one thing it
+     * needs from this side is where a finished line goes. */
+    vp_session_init(&g_session);
+    g_session.on_line = on_console_line;
+
     /* Initialize vp_cmdpost */
     cmdpost_init();
 
@@ -1427,9 +1370,7 @@ Java_com_rvvm_android_RvvmNative_nativeSetDisplayConfig(
     (void)screenRound;
 
     pthread_mutex_lock(&g_surf_cs);
-    if (densityDpi > 0) {
-        g_virt_ppi = (int32_t)densityDpi;
-    }
+    vp_session_set_density(&g_session, (int32_t)densityDpi);
     pthread_mutex_unlock(&g_surf_cs);
 
     LOGI("Display config: density=%d (real %dx%d dp ignored; panel-owned)",
@@ -1453,21 +1394,17 @@ Java_com_rvvm_android_RvvmNative_nativeSetPanelSize(JNIEnv* env, jobject thiz,
      * pins it here instead (720p landscape), leaving the window as a viewport
      * onto a fixed geometry.
      *
-     * Ignored once the guest has observed a geometry (g_surf_* latched): that
-     * is the buffer it may be mid-frame on, and moving it under a running
-     * guest is exactly the desync this panel/surface split exists to prevent.
-     * Before that, an already-latched panel is overwritten - it was latched
-     * from a viewport size nobody has rendered into yet. */
+     * Refused by the session once the guest has observed a geometry: that is
+     * the buffer it may be mid-frame on, and moving it under a running guest is
+     * exactly the desync this panel/surface split exists to prevent. Before
+     * that, an already-latched panel is overwritten - it was latched from a
+     * viewport size nobody has rendered into yet. */
     pthread_mutex_lock(&g_surf_cs);
-    if (g_surf_w <= 0 && g_surf_h <= 0) {
-        g_virt_w = width;
-        g_virt_h = height;
-        g_init_w = width;
-        g_init_h = height;
+    if (vp_session_set_panel(&g_session, width, height)) {
         LOGI("Virtual panel pinned: %dx%d", width, height);
     } else {
         LOGI("Virtual panel already in use (%dx%d), ignoring %dx%d",
-             g_surf_w, g_surf_h, width, height);
+             g_session.gfx_w, g_session.gfx_h, width, height);
     }
     pthread_mutex_unlock(&g_surf_cs);
 }
@@ -1509,9 +1446,7 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
     if (old_window != new_window) {
         /* A brand new Surface starts with the platform's default geometry:
          * forget what we pushed so the next lock re-applies the panel size. */
-        g_applied_w   = 0;
-        g_applied_h   = 0;
-        g_applied_fmt = 0;
+        vp_session_forget_geometry(&g_session);
     }
 
     /* Tells the GL backend a window came or went - a log line only: the pointer
@@ -1524,8 +1459,8 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
      * waiter sleeps on. */
     pthread_cond_broadcast(&g_window_cond);
 
-    pw = g_virt_w;
-    ph = g_virt_h;
+    pw = g_session.panel_w;
+    ph = g_session.panel_h;
     pthread_mutex_unlock(&g_surf_cs);
 
     if (old_window == new_window) {

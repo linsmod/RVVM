@@ -94,6 +94,7 @@ add_library(rvvm_core STATIC
     # VirtPass host side
     ${RVVM_SRC}/virtpass/vp_cmdpost.c
     ${RVVM_SRC}/virtpass/vp_sensor.c
+    ${RVVM_SRC}/virtpass/vp_session.c
 )
 
 target_include_directories(rvvm_core PUBLIC

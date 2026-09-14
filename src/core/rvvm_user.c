@@ -490,13 +490,31 @@ static void uapi_sigaction_convert(struct uapi_sigaction* dst, const struct siga
 }
 */
 
-static rvvm_machine_t* userland; // Emulated RVVM process context
-
+/*
+ * The machine whose guest memory the calling thread is running in, or NULL when
+ * it is not running a guest at all (the RVVM_USER_TEST* native modes, where
+ * guest == host).
+ *
+ * This used to be a file-scope global written by rvvm_user_linux_ex(), and it
+ * made the whole module a singleton: with a second guest in the process, one
+ * instance's syscalls would translate their pointers through the other
+ * instance's memory. Guest memory is a private buffer per machine, so that is
+ * not merely the wrong byte range - it is the wrong buffer, and any address
+ * that happened to fall inside the other one would read or write that guest's
+ * memory instead. The per-thread context already knows its machine (see uctx(),
+ * bound on entry to every guest thread), so the translation helpers take it
+ * from there.
+ *
+ * Defined next to uctx() below; declared here because these helpers come first.
+ */
+static rvvm_machine_t* cur_machine(void);
 
 // Short cast rvvm_addr_t -> void*
 static void* to_ptr(rvvm_addr_t addr)
 {
-    if (!userland) {
+    rvvm_machine_t* machine = cur_machine();
+
+    if (!machine) {
         // RVVM_USER_TEST* modes run the guest natively, guest == host
         return (void*)(size_t)addr;
     }
@@ -505,10 +523,10 @@ static void* to_ptr(rvvm_addr_t addr)
     // offset must not make addr 0 look valid), above it there is nothing at all:
     // rejecting the upper end keeps a bogus guest address from turning into a
     // wild pointer into the host's own address space.
-    if (addr < userland->mem.addr || (addr - userland->mem.addr) >= userland->mem.size) {
+    if (addr < machine->mem.addr || (addr - machine->mem.addr) >= machine->mem.size) {
         return NULL;
     }
-    return ((uint8_t*)userland->mem.data) + (addr - userland->mem.addr);
+    return ((uint8_t*)machine->mem.data) + (addr - machine->mem.addr);
 }
 
 // Range-checked variant: the whole [addr, addr + size) window must lie inside
@@ -517,17 +535,19 @@ static void* to_ptr(rvvm_addr_t addr)
 // with -EFAULT instead of corrupting the host address space.
 static void* to_ptr_sz(rvvm_addr_t addr, size_t size)
 {
-    if (!userland) {
+    rvvm_machine_t* machine = cur_machine();
+
+    if (!machine) {
         return (void*)(size_t)addr;
     }
-    if (addr < userland->mem.addr) {
+    if (addr < machine->mem.addr) {
         return NULL;
     }
-    rvvm_addr_t off = addr - userland->mem.addr;
-    if (size > userland->mem.size || off > userland->mem.size - size) {
+    rvvm_addr_t off = addr - machine->mem.addr;
+    if (size > machine->mem.size || off > machine->mem.size - size) {
         return NULL;
     }
-    return ((uint8_t*)userland->mem.data) + off;
+    return ((uint8_t*)machine->mem.data) + off;
 }
 
 // Short cast rvvm_addr_t -> const char*
@@ -539,10 +559,12 @@ static const char* to_str(rvvm_addr_t addr)
 // Host pointer inside guest memory -> rvvm_addr_t
 static rvvm_addr_t to_addr(const void* ptr)
 {
-    if (!userland) {
+    rvvm_machine_t* machine = cur_machine();
+
+    if (!machine) {
         return (rvvm_addr_t)(size_t)ptr;
     }
-    return (rvvm_addr_t)(((const uint8_t*)ptr) - ((const uint8_t*)userland->mem.data)) + userland->mem.addr;
+    return (rvvm_addr_t)(((const uint8_t*)ptr) - ((const uint8_t*)machine->mem.data)) + machine->mem.addr;
 }
 
 #include <core/rvvm_user.h>
@@ -554,18 +576,21 @@ PUBLIC void* rvvm_user_guest_ptr(uint64_t addr)
 
 PUBLIC uint64_t rvvm_user_host_ptr(const void* ptr)
 {
+    rvvm_machine_t* machine;
+
     if (!ptr) {
         return 0;
     }
-    if (!userland) {
+    machine = cur_machine();
+    if (!machine) {
         return (uint64_t)(size_t)ptr;
     }
-    const uint8_t* data = (const uint8_t*)userland->mem.data;
+    const uint8_t* data = (const uint8_t*)machine->mem.data;
     const uint8_t* p    = (const uint8_t*)ptr;
-    if (p < data || (size_t)(p - data) >= userland->mem.size) {
+    if (p < data || (size_t)(p - data) >= machine->mem.size) {
         return 0;
     }
-    return userland->mem.addr + (uint64_t)(p - data);
+    return machine->mem.addr + (uint64_t)(p - data);
 }
 
 /* ============================================================
@@ -660,6 +685,11 @@ typedef struct rvvm_userland {
     struct uapi_sigaction siga[64];
     elf_desc_t            elf;
     elf_desc_t            interp;
+    // Host paths of the two images above, for crash symbolization
+    // (proc_symbolize() via RVVM_ADDR2LINE). Per instance: an addr2line lookup
+    // without the right image resolves frames into the wrong program entirely.
+    char                  main_elf_path[UAPI_PATH_MAX];
+    char                  interp_elf_path[UAPI_PATH_MAX];
 
     // --- Thread registry & lifecycle (group D) ---
     spinlock_t                    userland_threads_lock;
@@ -1786,11 +1816,20 @@ static inline rvvm_userland_t* uctx(void)
     return tls_userland;
 }
 
+/* The machine the calling thread is running a guest in, or NULL when it is not
+ * running one. Declared with the translation helpers at the top of the file,
+ * which is where the singleton it replaces used to live. */
+static rvvm_machine_t* cur_machine(void)
+{
+    rvvm_userland_t* ctx = uctx();
+    return ctx ? ctx->machine : NULL;
+}
+
 // Reset the guest address-space allocator for a fresh run (rvvm_user_linux)
 static void guest_vm_init(void)
 {
     rvvm_userland_t* ctx = uctx();
-    ctx->guest_stack_top  = (userland->mem.addr + userland->mem.size) & ~(rvvm_addr_t)(GUEST_PAGE_SIZE - 1);
+    ctx->guest_stack_top  = (ctx->machine->mem.addr + ctx->machine->mem.size) & ~(rvvm_addr_t)(GUEST_PAGE_SIZE - 1);
     ctx->guest_stack_base = ctx->guest_stack_top - GUEST_STACK_SIZE;
     ctx->guest_mmap_end   = ctx->guest_stack_base;
     ctx->guest_bump       = GUEST_MMAP_BASE;
@@ -2139,9 +2178,12 @@ static bool proc_mem_readable(const void* addr, size_t size)
  *
  * turns a frame into "CL_Init (client/cl_main.c:812)" instead of a bare
  * relocation offset. Off by default (no environment variable, no subprocess).
+ *
+ * The image paths are per instance, not file-scope: they live in
+ * rvvm_userland_t (group C) and are read back through uctx() when a crash is
+ * reported - with a second guest in the process, a shared pair of paths would
+ * resolve one guest's frames against the other's symbols.
  */
-static char proc_main_elf_path[UAPI_PATH_MAX];   // Host path of the guest ELF
-static char proc_interp_elf_path[UAPI_PATH_MAX]; // Host path of its interpreter
 
 #if defined(_WIN32)
 #define proc_popen  _popen
@@ -2736,7 +2778,7 @@ static int rvvm_sys_clone(rvvm_hart_t* cpu, uint32_t flags, size_t stack, uint32
         }
 
         rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
-        thread->cpu = rvvm_create_user_thread(userland);
+        thread->cpu = rvvm_create_user_thread(cpu->machine);
 
         // Clone all CPU state
         for (size_t i=1; i<32; ++i) {
@@ -4250,7 +4292,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 259: // riscv_flush_icache
                     //rvvm_warn("riscv_flush_icache(%lx, %lx, %lx)", a0, a1, a2);
-                    rvvm_flush_icache(userland, a0, a1 - a0);
+                    rvvm_flush_icache(cpu->machine, a0, a1 - a0);
                     if (getenv("RVVM_JITDUMP") && a1 > a0) {
                         static int jitdump_seq = 0;
                         char dump_name[128];
@@ -4450,8 +4492,8 @@ static void* rvvm_user_thread_wrap(void* arg)
             }
 
             // Resolve the frames through the ELF images on the host disk
-            proc_symbolize("Main binary", proc_main_elf_path, elf_frames, elf_frames_count);
-            proc_symbolize("Interpreter", proc_interp_elf_path, interp_frames, interp_frames_count);
+            proc_symbolize("Main binary", uctx()->main_elf_path, elf_frames, elf_frames_count);
+            proc_symbolize("Interpreter", uctx()->interp_elf_path, interp_frames, interp_frames_count);
 
             break;
         }
@@ -4515,7 +4557,7 @@ static void jump_start(size_t entry, size_t stack_top)
     spin_unlock(&ctx->tty_in_lock);
 
     rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
-    thread->cpu = rvvm_create_user_thread(userland);
+    thread->cpu = rvvm_create_user_thread(ctx->machine);
     ctx->userland_main_thread = thread;
 
     rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_X0 + 2, (size_t)stack_top);
@@ -4740,8 +4782,11 @@ PUBLIC void rvvm_user_free(rvvm_machine_t* machine)
     if (!machine) {
         return;
     }
-    if (userland == machine) {
-        userland = NULL;
+    /* If the calling thread is the one bound to this instance (the failure
+     * paths inside rvvm_user_linux_ex() run on the guest thread), drop the
+     * binding with it: the context it points at is about to be freed. A host
+     * thread freeing an instance it never ran holds no such binding. */
+    if (tls_userland == rvvm_userland_ctx(machine)) {
         tls_userland = NULL;
     }
     userland_destroy(machine);
@@ -4759,11 +4804,12 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
         rvvm_error("Invalid userland machine, use rvvm_user_create()");
         return -1;
     }
-    userland = machine;
 
     // Bind the calling (main) thread too, for the native paths that do not go
-    // through the wrap loop below
-    tls_userland = rvvm_userland_ctx(userland);
+    // through the wrap loop below. This binding is the whole of "which guest is
+    // this thread in": every translation helper reads the machine from it, and a
+    // second instance in the process binds its own threads to its own context.
+    tls_userland = rvvm_userland_ctx(machine);
 
     /* Reset this instance's per-launch state (a previous guest may have run on
      * the same machine):
@@ -4806,10 +4852,10 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
     /* Initialize Android NDK API proxy */
     cmdpost_init();
     // Remember the ELF images for crash symbolization (see proc_symbolize())
-    proc_main_elf_path[0] = 0;
-    proc_interp_elf_path[0] = 0;
+    uctx()->main_elf_path[0] = 0;
+    uctx()->interp_elf_path[0] = 0;
     const char* host_elf = wrap_path(path_buf, argv[0]);
-    rvvm_strlcpy(proc_main_elf_path, host_elf, sizeof(proc_main_elf_path));
+    rvvm_strlcpy(uctx()->main_elf_path, host_elf, sizeof(uctx()->main_elf_path));
     rvfile_t* file = rvopen(host_elf, 0);
     if (!file) {
         // drvfs (WSL) sometimes fails opening big files right after host-side
@@ -4862,7 +4908,7 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
         rvvm_info("ELF interpreter at %s", uctx()->elf.interp_path);
         // wrap_path() may pass the path through untouched - keep its result
         const char* host_interp = wrap_path(path_buf, uctx()->elf.interp_path);
-        rvvm_strlcpy(proc_interp_elf_path, host_interp, sizeof(proc_interp_elf_path));
+        rvvm_strlcpy(uctx()->interp_elf_path, host_interp, sizeof(uctx()->interp_elf_path));
         file = rvopen(host_interp, 0);
         if (file) {
             /* A relocatable interpreter needs a guest address picked upfront.
@@ -4939,7 +4985,6 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
      * leaving a running vCPU on freed memory. */
     if (userland_threads_gone(ctx, 1000)) {
         tls_userland = NULL;
-        userland = NULL;
         userland_destroy(machine);
     } else {
         rvvm_warn("Guest threads linger after exit, leaking userland machine");

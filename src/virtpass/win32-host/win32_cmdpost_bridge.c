@@ -34,6 +34,7 @@
 #include "virtpass/vp_cmdpost.h"  /* single copy lives in src/virtpass */
 #include "core/rvvm_user.h"       /* rvvm_user_linux() guest entry point */
 #include "virtpass/vp_android.h"  /* guest ABI constants: APP_CMD_*, WINDOW_FORMAT_*, ASENSOR_TYPE_* */
+#include "virtpass/vp_session.h"  /* display geometry + console lines, shared with the Android host */
 #include "win32_gl_dispatch.h" /* on_egl_dispatch, on_gl_dispatch, g_gl_active */
 #include "win32_gl_backend.h"  /* win32_gl_backend_load/ready/name/unload, w32gl_arg_f */
 #include "win32_aaudio_wasapi.h" /* win32_aaudio_ops, win32_aaudio_shutdown */
@@ -141,18 +142,22 @@ static BITMAPINFO      g_bmi;
 /* Guest surface geometry (as reported to the guest).
  *
  * Three nested layers, each owned by a different party:
- *   L3 OS window      g_win_w/h  - pure viewport; scales the panel to fit
- *   L2 virtual panel  g_virt_w/h - host-owned display; the composition surface
- *   L1 content        g_surf_w/h - the surface the guest draws into
+ *   L3 OS window      g_win_w/h           - pure viewport; scales the panel
+ *   L2 virtual panel  g_session.panel_*   - host-owned display; the composition
+ *   L1 content        g_session.gfx_*     - the surface the guest draws into
  *
  * L2 -> L1 is 1:1: the guest's surface is placed at the panel origin and the
  * rest of the panel stays background. L3 -> L2 is the only scaling step, so
- * the guest controls its own resolution without the host resampling twice. */
-static int32_t g_surf_w   = 0;
-static int32_t g_surf_h   = 0;
-static int32_t g_surf_fmt = WINDOW_FORMAT_RGBA_8888;
-static int32_t g_init_w   = 640;
-static int32_t g_init_h   = 480;
+ * the guest controls its own resolution without the host resampling twice.
+ *
+ * L2 and L1 live in the shared session object (virtpass/vp_session.h) rather
+ * than in globals here: they are the same state the Android host keeps while
+ * driving its SurfaceView, and keeping one implementation of the panel/surface
+ * policy is the whole point of that object. The panel is pinned once in
+ * win32_host_init() and the guest surface latches from it on first use; no
+ * resize path touches either, which is the guarantee the Android host has to
+ * spell out as a latch because its window is draggable. */
+static vp_session_t g_session;
 
 /* One-shot confirmations that the guest's render path works (first successful
  * WINDOW_LOCK, first posted frame). Per-guest, not per-process: the launcher
@@ -167,12 +172,10 @@ static bool g_logged_frame = false;
 static int32_t g_win_w    = 1024;
 static int32_t g_win_h    = 768;
 
-/* Layer-1 virtual display: host-owned panel parameters. The guest observes
- * them ONLY through the public NDK ABI (ANativeWindow_getWidth/Height and
- * AConfiguration_*); no virtpass-specific display ABI is exposed. */
-static int32_t g_virt_w   = 1024;
-static int32_t g_virt_h   = 768;
-static int32_t g_virt_ppi = ACONFIGURATION_DENSITY_MEDIUM;
+/* Layer-1 virtual display: host-owned panel parameters, held in the session
+ * above. The guest observes them ONLY through the public NDK ABI
+ * (ANativeWindow_getWidth/Height and AConfiguration_*); no virtpass-specific
+ * display ABI is exposed. Pinned once in win32_host_init() and never moved. */
 
 /* Guest thread */
 static HANDLE g_guest_thread = NULL;
@@ -494,7 +497,7 @@ static void vsync_clock_stop(void)
 
 static int surf_bpp(void)
 {
-    return (g_surf_fmt == WINDOW_FORMAT_RGB_565) ? 2 : 4;
+    return (g_session.gfx_fmt == WINDOW_FORMAT_RGB_565) ? 2 : 4;
 }
 
 /* Caller holds g_surf_cs.
@@ -559,8 +562,8 @@ static void content_rect_locked(int32_t* x, int32_t* y, int32_t* w, int32_t* h)
 {
     *x = 0;
     *y = 0;
-    *w = (g_surf_w > 0) ? g_surf_w : 0;
-    *h = (g_surf_h > 0) ? g_surf_h : 0;
+    *w = (g_session.gfx_w > 0) ? g_session.gfx_w : 0;
+    *h = (g_session.gfx_h > 0) ? g_session.gfx_h : 0;
 }
 
 /* Present is done exclusively on the UI thread in WM_PAINT; the guest
@@ -603,7 +606,8 @@ static void present_frame_impl(const uint8_t* rows, int32_t w, int32_t h,
     (void)src_fmt; /* conversion always uses the current surface format */
     EnterCriticalSection(&g_surf_cs);
     if (src_bpp <= 0) src_bpp = surf_bpp(); /* 0: source matches the surface */
-    if (!rows || !g_dib_back_bits || g_virt_w <= 0 || g_virt_h <= 0) {
+    if (!rows || !g_dib_back_bits ||
+        g_session.panel_w <= 0 || g_session.panel_h <= 0) {
         LeaveCriticalSection(&g_surf_cs);
         return;
     }
@@ -615,21 +619,21 @@ static void present_frame_impl(const uint8_t* rows, int32_t w, int32_t h,
     content_rect_locked(&cx, &cy, &cw, &ch);
     if (cw > w) cw = w;
     if (ch > h) ch = h;
-    if (cx + cw > g_virt_w) cw = g_virt_w - cx;
-    if (cy + ch > g_virt_h) ch = g_virt_h - cy;
+    if (cx + cw > g_session.panel_w) cw = g_session.panel_w - cx;
+    if (cy + ch > g_session.panel_h) ch = g_session.panel_h - cy;
 
     if (cw > 0 && ch > 0) {
         /* The source pitch belongs to the caller's buffer. Hard-coding four
          * bytes per pixel (as this used to) silently mis-strides RGB_565
          * frames; the GL path always hands over 4-byte RGBA and says so. */
         size_t src_pitch = (size_t)w * (size_t)src_bpp;
-        size_t dst_pitch = (size_t)g_virt_w * 4u;
+        size_t dst_pitch = (size_t)g_session.panel_w * 4u;
         for (int32_t y = 0; y < ch; y++) {
             int32_t sy = rows_bottom_up ? (h - 1 - y) : y;
             convert_row(g_dib_back_bits + (size_t)(cy + y) * dst_pitch
                             + (size_t)cx * 4u,
                         rows + (size_t)sy * src_pitch,
-                        cw, g_surf_fmt);
+                        cw, g_session.gfx_fmt);
         }
     }
     { HBITMAP tb = g_dib; uint8_t* tp = g_dib_bits;
@@ -641,10 +645,12 @@ static void present_frame_impl(const uint8_t* rows, int32_t w, int32_t h,
      * a frame that never reaches the window is indistinguishable from one
      * that was sized outside the panel. */
     static int32_t lg_w = -1, lg_h = -1, lg_pw = -1, lg_ph = -1;
-    if (w != lg_w || h != lg_h || g_virt_w != lg_pw || g_virt_h != lg_ph) {
-        lg_w = w; lg_h = h; lg_pw = g_virt_w; lg_ph = g_virt_h;
+    if (w != lg_w || h != lg_h ||
+        g_session.panel_w != lg_pw || g_session.panel_h != lg_ph) {
+        lg_w = w; lg_h = h;
+        lg_pw = g_session.panel_w; lg_ph = g_session.panel_h;
         winhost_log("panel %dx%d <- content %dx%d at (%d,%d) [%dx%d used]",
-                    (int)g_virt_w, (int)g_virt_h, (int)w, (int)h,
+                    (int)g_session.panel_w, (int)g_session.panel_h, (int)w, (int)h,
                     (int)cx, (int)cy, (int)cw, (int)ch);
     }
     LeaveCriticalSection(&g_surf_cs);
@@ -662,11 +668,12 @@ void present_gl_set_surface_size(int32_t cw, int32_t ch)
     EnterCriticalSection(&g_surf_cs);
     /* Layer 1 only. The panel (L2) is host-owned and unaffected: a surface
      * smaller than the panel simply occupies less of it. */
-    g_surf_w = cw;
-    g_surf_h = ch;
+    g_session.gfx_w = cw;
+    g_session.gfx_h = ch;
     if (!g_dib_bits) {
-        surf_recreate_locked((g_virt_w > 0) ? g_virt_w : g_init_w,
-                             (g_virt_h > 0) ? g_virt_h : g_init_h);
+        int32_t pw, ph;
+        vp_session_panel_size(&g_session, &pw, &ph);
+        surf_recreate_locked(pw, ph);
     }
     LeaveCriticalSection(&g_surf_cs);
 }
@@ -674,8 +681,7 @@ void present_gl_set_surface_size(int32_t cw, int32_t ch)
 void present_gl_panel_size(int32_t* w, int32_t* h)
 {
     EnterCriticalSection(&g_surf_cs);
-    if (w) *w = (g_virt_w > 0) ? g_virt_w : g_init_w;
-    if (h) *h = (g_virt_h > 0) ? g_virt_h : g_init_h;
+    vp_session_panel_size(&g_session, w, h);
     LeaveCriticalSection(&g_surf_cs);
 }
 
@@ -688,28 +694,26 @@ void present_gl_frame(void)
      * frame: a guest that only uses EGL should still reach the screen. */
     EnterCriticalSection(&g_surf_cs);
     if (!g_dib_bits || !g_dib_back_bits) {
-        int32_t pw = (g_virt_w > 0) ? g_virt_w : g_init_w;
-        int32_t ph = (g_virt_h > 0) ? g_virt_h : g_init_h;
+        int32_t pw, ph;
+        vp_session_panel_size(&g_session, &pw, &ph);
         surf_recreate_locked(pw, ph);
     }
-    if (!g_surf_w || !g_surf_h) {
-        /* No SET_BUF was ever seen: adopt the panel as the guest surface so
-         * the readback has a defined size. */
-        g_surf_w = (g_virt_w > 0) ? g_virt_w : g_init_w;
-        g_surf_h = (g_virt_h > 0) ? g_virt_h : g_init_h;
-    }
+    /* No SET_BUF was ever seen: adopt the panel as the guest surface so the
+     * readback has a defined size. Idempotent - it latches on the first call
+     * and does nothing after. */
+    vp_session_guest_geometry(&g_session, NULL, NULL, NULL);
     LeaveCriticalSection(&g_surf_cs);
 
     static uint8_t* rb = NULL; static int32_t rb_w = 0, rb_h = 0;
     EnterCriticalSection(&g_surf_cs);
-    if (rb_w != g_surf_w || rb_h != g_surf_h) {
+    if (rb_w != g_session.gfx_w || rb_h != g_session.gfx_h) {
         free(rb);
-        rb_w = g_surf_w; rb_h = g_surf_h;
+        rb_w = g_session.gfx_w; rb_h = g_session.gfx_h;
         if (rb_w > 0 && rb_h > 0) {
             rb = (uint8_t*)malloc((size_t)rb_w * (size_t)rb_h * 4);
         }
     }
-    int32_t w = g_surf_w, h = g_surf_h;
+    int32_t w = g_session.gfx_w, h = g_session.gfx_h;
     LeaveCriticalSection(&g_surf_cs);
 
     if (!rb || w <= 0 || h <= 0) return;
@@ -728,21 +732,21 @@ static int32_t on_window_lock(void* window, void* outBuffer, void* dirtyBounds)
     }
 
     EnterCriticalSection(&g_surf_cs);
-    if (g_surf_w <= 0) {
-        /* First lock before any SET_BUF: default to the panel geometry */
-        g_surf_w = (g_virt_w > 0) ? g_virt_w : g_init_w;
-        g_surf_h = (g_virt_h > 0) ? g_virt_h : g_init_h;
-    }
+    /* First lock before any SET_BUF: default to the panel geometry. Latched
+     * once, like the win32 host always did inline and the Android host does
+     * through the same call. */
+    vp_session_guest_geometry(&g_session, NULL, NULL, NULL);
     /* The composition surface is panel-sized (L2); the guest surface (L1) only
      * occupies its corner - see surf_recreate_locked(). */
     if (!g_dib_bits) {
-        surf_recreate_locked((g_virt_w > 0) ? g_virt_w : g_init_w,
-                             (g_virt_h > 0) ? g_virt_h : g_init_h);
+        int32_t pw, ph;
+        vp_session_panel_size(&g_session, &pw, &ph);
+        surf_recreate_locked(pw, ph);
     }
-    buf->width  = g_surf_w;
-    buf->height = g_surf_h;
-    buf->stride = g_surf_w;    /* pixels, matches guest expectation */
-    buf->format = g_surf_fmt;
+    buf->width  = g_session.gfx_w;
+    buf->height = g_session.gfx_h;
+    buf->stride = g_session.gfx_w;  /* pixels, matches guest expectation */
+    buf->format = g_session.gfx_fmt;
     buf->bits   = NULL;        /* guest allocates its own buffer (pixbuf_ensure) */
     if (!g_logged_lock) {
         g_logged_lock = true;
@@ -767,9 +771,9 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
                     "(lock succeeded, no frame posted)");
     }
     EnterCriticalSection(&g_surf_cs);
-    w   = g_surf_w;
-    h   = g_surf_h;
-    fmt = g_surf_fmt;
+    w   = g_session.gfx_w;
+    h   = g_session.gfx_h;
+    fmt = g_session.gfx_fmt;
     LeaveCriticalSection(&g_surf_cs);
 
     if (guestPixels && !g_logged_frame) {
@@ -791,37 +795,39 @@ static int32_t on_window_unlock(void* window, void* guestPixels)
 
 static void on_window_size(int64_t* width, int64_t* height)
 {
+    int32_t w = 0, h = 0;
+
     if (!width || !height) return;
     EnterCriticalSection(&g_surf_cs);
-    if (g_surf_w > 0 && g_surf_h > 0) {
-        *width  = (int64_t)g_surf_w;
-        *height = (int64_t)g_surf_h;
-    } else {
-        *width  = (int64_t)g_init_w;
-        *height = (int64_t)g_init_h;
-    }
+    /* The guest's window is its own surface (L1), never the panel: being asked
+     * for the size is what latches it from the panel the first time. */
+    vp_session_guest_geometry(&g_session, &w, &h, NULL);
     LeaveCriticalSection(&g_surf_cs);
+
+    *width  = (int64_t)w;
+    *height = (int64_t)h;
 }
 
 static int32_t on_window_set_buf(int32_t width, int32_t height, int32_t format)
 {
+    /* The guest ABI validation stays here: these are the NDK's formats, and a
+     * size or format outside them is a guest error it should hear about. */
     if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return -1;
     if (format != WINDOW_FORMAT_RGBA_8888 &&
         format != WINDOW_FORMAT_RGBX_8888 &&
         format != WINDOW_FORMAT_RGB_565) return -1;
 
     EnterCriticalSection(&g_surf_cs);
-    g_surf_w   = width;
-    g_surf_h   = height;
-    g_surf_fmt = format;
     /* Layer 1 only: the guest picked a content size. The composition surface
      * stays panel-sized, so the new content simply occupies a (possibly
      * different) corner of the existing panel - rebuilding the DIB here is
      * what used to collapse L2 onto L1. Create it if this is the first thing
      * the guest did, before any lock or GL present. */
+    vp_session_set_guest_geometry(&g_session, width, height, format);
     if (!g_dib_bits) {
-        surf_recreate_locked((g_virt_w > 0) ? g_virt_w : g_init_w,
-                             (g_virt_h > 0) ? g_virt_h : g_init_h);
+        int32_t pw, ph;
+        vp_session_panel_size(&g_session, &pw, &ph);
+        surf_recreate_locked(pw, ph);
     }
     LeaveCriticalSection(&g_surf_cs);
     return 0;
@@ -863,9 +869,12 @@ static int32_t on_config_get(int32_t field, int32_t* outValue)
     if (!outValue) return -1;
 
     EnterCriticalSection(&g_surf_cs);
-    w   = (g_surf_w > 0) ? g_surf_w : g_virt_w;
-    h   = (g_surf_h > 0) ? g_surf_h : g_virt_h;
-    ppi = (g_virt_ppi > 0) ? g_virt_ppi : ACONFIGURATION_DENSITY_MEDIUM;
+    /* The configuration describes the guest's own surface, falling back to the
+     * panel before a SET_BUF/LOCK has picked one. */
+    w   = (g_session.gfx_w > 0) ? g_session.gfx_w : g_session.panel_w;
+    h   = (g_session.gfx_h > 0) ? g_session.gfx_h : g_session.panel_h;
+    ppi = (g_session.panel_ppi > 0) ? g_session.panel_ppi
+                                    : ACONFIGURATION_DENSITY_MEDIUM;
     LeaveCriticalSection(&g_surf_cs);
 
     width_dp  = w * 160 / ppi;
@@ -965,8 +974,7 @@ static void queue_mouse_motion(int action, LPARAM lp)
     /* Input is delivered in layer-1 (content) coordinates: invert the same
      * layer-3 -> layer-2 transform WM_PAINT applies, then the 1:1 placement
      * of the content rect inside the panel carries the point to the guest. */
-    sw = (g_virt_w > 0) ? g_virt_w : g_init_w;
-    sh = (g_virt_h > 0) ? g_virt_h : g_init_h;
+    vp_session_panel_size(&g_session, &sw, &sh);
     LeaveCriticalSection(&g_surf_cs);
 
     /* Undo the letterbox transform: window pixel -> panel pixel */
@@ -1201,10 +1209,15 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         cdc = (rc.right > 0 && rc.bottom > 0)
             ? cmp_surface_get_locked(wdc, rc.right, rc.bottom) : NULL;
         if (cdc) {
+            /* The panel is immutable once win32_host_init() has pinned it, so
+             * this read needs no lock - as it never did. */
+            int32_t pw = 0, ph = 0;
+            vp_session_panel_size(&g_session, &pw, &ph);
+
             /* Letterbox background: the whole client area is black, the panel
              * goes on top inside the centred contain-fit rectangle. */
             FillRect(cdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-            if (g_dib && g_virt_w > 0 && g_virt_h > 0) {
+            if (g_dib && pw > 0 && ph > 0) {
                 /* The window is just a viewport onto the virtual panel: scale
                  * it uniformly to fit and centre it. The panel is never
                  * cropped and never distorted; window size and panel size are
@@ -1214,16 +1227,16 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 vp_view v;
                 HDC mdc;
                 HGDIOBJ old;
-                viewport_fit(rc.right, rc.bottom, g_virt_w, g_virt_h, &v);
+                viewport_fit(rc.right, rc.bottom, pw, ph, &v);
                 mdc = CreateCompatibleDC(cdc);
                 old = SelectObject(mdc, g_dib);
-                if (v.dw == g_virt_w && v.dh == g_virt_h) {
+                if (v.dw == pw && v.dh == ph) {
                     BitBlt(cdc, v.dx, v.dy, v.dw, v.dh, mdc, 0, 0, SRCCOPY);
                 } else {
                     SetStretchBltMode(cdc, HALFTONE);
                     SetBrushOrgEx(cdc, 0, 0, NULL);
                     StretchBlt(cdc, v.dx, v.dy, v.dw, v.dh,
-                               mdc, 0, 0, g_virt_w, g_virt_h, SRCCOPY);
+                               mdc, 0, 0, pw, ph, SRCCOPY);
                 }
                 SelectObject(mdc, old);
                 DeleteDC(mdc);
@@ -2075,15 +2088,18 @@ static void launcher_ui_idle(void)
     }
 
     EnterCriticalSection(&g_surf_cs);
-    /* Blank the panel (L2) and reset the content size (L1) to the panel, so
-     * the next guest starts on a clean surface. */
-    surf_recreate_locked((g_virt_w > 0) ? g_virt_w : g_init_w,
-                         (g_virt_h > 0) ? g_virt_h : g_init_h);
-    g_surf_w = (g_virt_w > 0) ? g_virt_w : g_init_w;
-    g_surf_h = (g_virt_h > 0) ? g_virt_h : g_init_h;
-    /* The geometry the previous guest negotiated (SET_BUF) must not leak into
-     * the next one: until it calls SET_BUF itself it gets the host default. */
-    g_surf_fmt = WINDOW_FORMAT_RGBA_8888;
+    /* Blank the panel (L2) and put the content size (L1) back to the panel's,
+     * so the next guest starts on a clean surface. The geometry the previous
+     * guest negotiated (SET_BUF) must not leak into it: reset_surface() drops
+     * it - format included - and the re-latch right after restores the host
+     * default, which is what this used to spell out by hand. */
+    {
+        int32_t pw, ph;
+        vp_session_panel_size(&g_session, &pw, &ph);
+        surf_recreate_locked(pw, ph);
+    }
+    vp_session_reset_surface(&g_session);
+    vp_session_guest_geometry(&g_session, NULL, NULL, NULL);
     LeaveCriticalSection(&g_surf_cs);
 
     vsync_clock_stop();
@@ -2275,24 +2291,26 @@ bool win32_host_init(const char* title, int win_w, int win_h,
     g_launcher = launcher;
 
     /* Layer 2: the OS window is only a viewport, sized independently of the
-     * virtual panel. */
+     * virtual panel. It stays state of this file - it is the one layer the
+     * session has no notion of, because no other host has one. */
     g_win_w = (win_w > 0) ? win_w : 1024;
     g_win_h = (win_h > 0) ? win_h : 768;
 
     /* Layer 1: the host-owned virtual display the guest renders into. When no
      * explicit panel geometry is requested it follows the window size, so the
-     * panel fills the viewport without borders. */
-    g_virt_w   = (virt_w > 0) ? virt_w : g_win_w;
-    g_virt_h   = (virt_h > 0) ? virt_h : g_win_h;
-    g_virt_ppi = (virt_ppi > 0) ? virt_ppi : ACONFIGURATION_DENSITY_MEDIUM;
-
-    /* The virtual panel is the surface geometry handed to the guest. */
-    g_init_w = g_virt_w;
-    g_init_h = g_virt_h;
+     * panel fills the viewport without borders. Pinned here and never moved;
+     * the guest's surface latches from it on first use, and the session keeps
+     * that snapshot (init_*) as the fallback - the same hand-off the Android
+     * host performs through its latch. */
+    vp_session_init(&g_session);
+    vp_session_set_panel(&g_session, (virt_w > 0) ? virt_w : g_win_w,
+                                    (virt_h > 0) ? virt_h : g_win_h);
+    vp_session_set_density(&g_session,
+                           (virt_ppi > 0) ? virt_ppi : ACONFIGURATION_DENSITY_MEDIUM);
 
     winhost_log("window: %dx%d px | virtual display: %dx%d px @ %d ppi (bucket %d)",
-                g_win_w, g_win_h, g_virt_w, g_virt_h, g_virt_ppi,
-                density_bucket_for_ppi(g_virt_ppi));
+                g_win_w, g_win_h, g_session.panel_w, g_session.panel_h,
+                g_session.panel_ppi, density_bucket_for_ppi(g_session.panel_ppi));
 
     SetProcessDPIAware();
     InitializeCriticalSection(&g_surf_cs);
