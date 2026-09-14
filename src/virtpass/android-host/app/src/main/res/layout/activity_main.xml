@@ -205,9 +205,13 @@
 
     <!-- The floating graphics window. It is a viewport onto the pinned 720p
          panel (see MainActivity.PANEL_W/H), not the panel itself, so its size
-         only decides how big the guest's screen is shown - the video area is
-         16:9 (318x179dp inside the 1dp frame, under the 32dp caption) to match
-         1280x720 and keep the guest's frame undistorted.
+         only decides how big the guest's screen is shown: the picture is fitted
+         into whatever video area the card ends up with (see FitFrameLayout), so
+         the card can be any shape - a maximized window on a portrait phone
+         letterboxes the guest's frame instead of stretching it.
+
+         The size below is 16:9 to match the panel, which is what the window
+         wants to open at, not a constraint on it.
 
          The 1dp padding is the window's border: the surface composites above
          this window, so the frame drawable is only visible in the ring the
@@ -289,11 +293,24 @@
 
         </LinearLayout>
 
-        <SurfaceView
-            android:id="@+id/surfaceView"
+        <!-- Video area: the letterbox. The SurfaceView inside it is measured to
+             the panel's aspect ratio (FitFrameLayout, ratio fed from
+             MainActivity.PANEL_W/H) and centred, so the guest's frame is shown
+             whole and never stretched - the black around it is this container. -->
+        <com.rvvm.android.FitFrameLayout
+            android:id="@+id/glVideoArea"
             android:layout_width="match_parent"
             android:layout_height="0dp"
-            android:layout_weight="1" />
+            android:layout_weight="1"
+            android:background="#FF000000">
+
+            <SurfaceView
+                android:id="@+id/surfaceView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:layout_gravity="center" />
+
+        </com.rvvm.android.FitFrameLayout>
 
     </LinearLayout>
 

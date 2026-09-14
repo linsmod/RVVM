@@ -120,6 +120,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     // gesture of ours.
     private View workspace;
     private View glWindow;                // the card: title bar + SurfaceView
+    private FitFrameLayout glVideoArea;   // fits the picture (letterbox)
     private View glCaptionBar;            // the title bar
     private TextView glCaption;           // the drag handle
     private TextView glBtnMin, glBtnMax, glBtnClose;
@@ -767,6 +768,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         glBtnMax = findViewById(R.id.glBtnMax);
         glBtnClose = findViewById(R.id.glBtnClose);
         glShowChip = findViewById(R.id.glShowChip);
+
+        // The picture is fitted to the panel's ratio, never stretched: a
+        // SurfaceView can only be scaled by the rectangle it is given, so the
+        // ratio goes on the video area and the bars around the frame are what
+        // shows through it. Set here, before the first layout, so the surface
+        // is created at its final size.
+        glVideoArea = findViewById(R.id.glVideoArea);
+        glVideoArea.setAspectRatio((float) PANEL_W / PANEL_H);
 
         // Has to be set before the surface is created to take effect.
         surfaceView.setZOrderMediaOverlay(true);
