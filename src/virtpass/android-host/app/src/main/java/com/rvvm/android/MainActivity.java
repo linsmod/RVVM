@@ -11,6 +11,7 @@ import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.SurfaceTexture;
 import android.graphics.drawable.Drawable;
+import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.text.Editable;
@@ -37,7 +38,7 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
-import android.widget.Spinner;
+import android.widget.ListPopupWindow;
 import android.widget.TextView;
 
 import java.io.BufferedWriter;
@@ -47,6 +48,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashMap;
 
 /**
@@ -105,10 +107,9 @@ public class MainActivity extends Activity {
     private TextureView ttyView;          // Console render target
     private FrameLayout ttyViewport;      // Console viewport (holds ttyView)
     private TtyEditText ttyInput;         // Console keyboard/IME focus target
-    private Button runButton;
-    private Button suspendButton;
-    private Button stopButton;
-    private Spinner guestAppSpinner;
+    private Button startButton;           // the launcher menu (new run)
+    private Button suspendButton;         // acts on the focused window
+    private Button stopButton;            // acts on the focused window
 
     // ---- Floating graphics windows ----
     // Each run gets its own floating card (GlWindowCard): a SurfaceView that
@@ -843,25 +844,74 @@ public class MainActivity extends Activity {
         }
     };
 
-    /** The taskbar strip: one entry per card that is minimized. */
-    private void rebuildTaskbar() {
-        glTaskbar.removeAllViews();
-        for (GlWindowCard card : glCards.values()) {
-            if (card.isMinimized()) {
-                addTaskbarEntry(card);
-            }
+    /** The Start menu: every guest app in assets. Tapping one starts a NEW
+     *  run of it - the launcher never "switches", that is what the taskbar
+     *  chips are for. */
+    private void showStartMenu() {
+        if (guestApps == null || guestApps.length == 0) {
+            return;
         }
-        glTaskbar.setVisibility(glTaskbar.getChildCount() > 0 ? View.VISIBLE : View.GONE);
+        ListPopupWindow menu = new ListPopupWindow(this);
+        menu.setAdapter(new ArrayAdapter<>(this,
+                android.R.layout.simple_list_item_1, guestApps));
+        menu.setAnchorView(startButton);
+        menu.setModal(true);
+        // The popup defaults to the anchor's width - the Start button is a
+        // small square, so every item would truncate. Size it to the longest
+        // app name instead, clamped to something sane on both ends.
+        android.graphics.Paint paint = new android.graphics.Paint();
+        paint.setTextSize(18f * getResources().getDisplayMetrics().density);
+        float widest = 0f;
+        for (String app : guestApps) {
+            widest = Math.max(widest, paint.measureText(app));
+        }
+        float dp = getResources().getDisplayMetrics().density;
+        menu.setContentWidth((int) Math.max(200f * dp,
+                Math.min(400f * dp, widest + 64f * dp)));
+        menu.setOnItemClickListener((parent, view, position, id) -> {
+            selectedGuestApp = guestApps[position];
+            Log.i(TAG, "Start menu launch: " + selectedGuestApp);
+            menu.dismiss();
+            runGuestElf();
+        });
+        menu.show();
     }
 
-    /** One entry: the guest's name, and the way back to its window. */
-    private void addTaskbarEntry(final GlWindowCard card) {
-        String name = card.getTitle().isEmpty() ? getString(R.string.gl_title) : card.getTitle();
-        TextView entry = (TextView) getLayoutInflater().inflate(
-                R.layout.gl_taskbar_entry, glTaskbar, false);
-        entry.setText(getString(R.string.gl_taskbar_entry, name));
-        entry.setOnClickListener(v -> card.restore());
-        glTaskbar.addView(entry);
+    /** The taskbar strip: one chip per running window - focused, on-screen or
+     *  minimized. Tap focuses (or restores) it; long-press closes it. The
+     *  focused chip is highlighted, the way the active taskbar button is on a
+     *  desktop. */
+    private void rebuildTaskbar() {
+        glTaskbar.removeAllViews();
+        ArrayList<Integer> ids = new ArrayList<>(glCards.keySet());
+        java.util.Collections.sort(ids);
+        for (Integer id : ids) {
+            final GlWindowCard card = glCards.get(id);
+            boolean focused = id == activeGuestId;
+            TextView chip = new TextView(this);
+            String name = card.getTitle().isEmpty() ? getString(R.string.gl_title) : card.getTitle();
+            chip.setText(card.isMinimized() ? getString(R.string.gl_taskbar_entry, name) : name);
+            chip.setPadding(24, 8, 24, 8);
+            chip.setMinWidth(96);
+            chip.setGravity(android.view.Gravity.CENTER);
+            chip.setTextSize(13f);
+            chip.setTypeface(null, focused ? Typeface.BOLD : Typeface.NORMAL);
+            chip.setBackgroundColor(focused ? 0xFF1F5FA8 : 0xFF2A2A2A);
+            chip.setTextColor(0xFFE0E0E0);
+            chip.setOnClickListener(v -> {
+                if (card.isMinimized()) {
+                    card.restore();
+                }
+                focusCard(card);
+            });
+            chip.setOnLongClickListener(v -> {
+                // The taskbar's "close window": same as the card's ✕.
+                stopGuestElf(id);
+                dismissCard(card);
+                return true;
+            });
+            glTaskbar.addView(chip);
+        }
     }
 
     /** Take a card down for good: off the workspace and out of the table. */
@@ -891,8 +941,17 @@ public class MainActivity extends Activity {
         activeGuestId = id;
         RvvmNative.nativeSetActiveGuest(id);
         postLifecycleCmd(APP_CMD_GAINED_FOCUS);
-        // The focused window comes to the front, desktop-style.
+        // The focused window comes to the front and takes the active-caption
+        // tint; the previous foreground drops back to grey.
+        GlWindowCard prev = glCards.get(id);
+        for (GlWindowCard c : glCards.values()) {
+            if (c != card) {
+                c.setFocused(false);
+            }
+        }
+        card.setFocused(true);
         card.cardView.bringToFront();
+        rebuildTaskbar();
     }
 
     /** Create the card for a run: added to the workspace at 1x1, waiting for
@@ -908,6 +967,10 @@ public class MainActivity extends Activity {
         GlWindowCard card = new GlWindowCard(this, (ViewGroup) workspace, guestId, guestName, glCardHost);
         glCards.put(guestId, card);
         card.cascadeTo(visible);
+        // The new run is the foreground one: it takes the active-caption tint.
+        for (GlWindowCard c : glCards.values()) {
+            c.setFocused(c.getGuestId() == guestId);
+        }
         return card;
     }
 
@@ -1175,27 +1238,12 @@ public class MainActivity extends Activity {
 
         // Find views
         statusText = findViewById(R.id.statusText);
-        runButton = findViewById(R.id.runButton);
+        startButton = findViewById(R.id.startButton);
         suspendButton = findViewById(R.id.suspendButton);
         stopButton = findViewById(R.id.stopButton);
-        guestAppSpinner = findViewById(R.id.guestAppSpinner);
 
-        // Populate guest app spinner from assets
+        // Populate the launcher menu from assets
         populateGuestApps();
-        ArrayAdapter<String> spinnerAdapter = new ArrayAdapter<>(this,
-                android.R.layout.simple_spinner_item, guestApps);
-        spinnerAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        guestAppSpinner.setAdapter(spinnerAdapter);
-        guestAppSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> parent, android.view.View view, int position, long id) {
-                selectedGuestApp = guestApps[position];
-                Log.i(TAG, "Selected guest app: " + selectedGuestApp);
-            }
-
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {}
-        });
 
         // Honor an explicit "which guest to run" Intent before the auto-start
         // path picks its default. The launch itself happens in
@@ -1221,8 +1269,10 @@ public class MainActivity extends Activity {
             }
         });
 
-        // Setup buttons
-        runButton.setOnClickListener(v -> runGuestElf());
+        // Setup the taskbar: the Start button opens the launcher menu (tapping
+        // an app starts a NEW run beside the running ones); SUSPEND/STOP act
+        // on the focused window.
+        startButton.setOnClickListener(v -> showStartMenu());
         suspendButton.setOnClickListener(v -> toggleSuspendGuest());
         stopButton.setOnClickListener(v -> stopGuestElf());
         updateButtonStates();
@@ -1421,7 +1471,7 @@ public class MainActivity extends Activity {
 
         replayGuestStartupState();
 
-        boolean started = RvvmNative.nativeRunElf(elfPath, null);
+        boolean started = RvvmNative.nativeRunElf(guestId, elfPath, null);
         if (started) {
             currentGuestApp = elfName;
             statusText.setText("Guest started: " + elfName);
@@ -1567,7 +1617,6 @@ public class MainActivity extends Activity {
         for (int i = 0; i < guestApps.length; i++) {
             if (guestApps[i].equalsIgnoreCase(requested) || guestApps[i].equalsIgnoreCase(withSuffix)) {
                 selectedGuestApp = guestApps[i];
-                guestAppSpinner.setSelection(i);
                 statusText.setText("Selected guest: " + guestApps[i]);
                 Log.i(TAG, "Intent selected guest app: " + guestApps[i]);
                 return true;
@@ -1617,11 +1666,9 @@ public class MainActivity extends Activity {
         // reports the requested state, so the label flips immediately even when
         // a vCPU is still unwinding a blocking host syscall.
         boolean suspended = running && RvvmNative.nativeIsGuestSuspended(activeGuestId);
-        runButton.setEnabled(!running);
         suspendButton.setEnabled(running);
         suspendButton.setText(suspended ? R.string.resume_guest : R.string.suspend_guest);
         stopButton.setEnabled(running);
-        guestAppSpinner.setEnabled(!running);
     }
 
     /**

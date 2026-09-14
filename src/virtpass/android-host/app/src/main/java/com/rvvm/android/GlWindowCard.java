@@ -89,6 +89,11 @@ public class GlWindowCard {
     private boolean surfaceReady = false;
     private String title = "";
 
+    // The focused window's title bar is tinted (the Windows active-caption
+    // cue); unfocused ones stay the plain dark grey from the layout.
+    private static final int CAPTION_FOCUSED = 0xFF1F5FA8;
+    private static final int CAPTION_UNFOCUSED = 0xFF303030;
+
     /** Create the card for a run and add it to the workspace, waiting at 1x1. */
     public GlWindowCard(Activity activity, ViewGroup workspace, int guestId, String guestName, Host host) {
         this.host = host;
@@ -172,6 +177,11 @@ public class GlWindowCard {
     public boolean isSurfaceReady() { return surfaceReady; }
 
     public boolean isMinimized() { return minimized; }
+
+    /** Focus cue: the active window's title bar is tinted, the rest stay grey. */
+    public void setFocused(boolean focused) {
+        captionBar.setBackgroundColor(focused ? CAPTION_FOCUSED : CAPTION_UNFOCUSED);
+    }
 
     /* ============================================================
      * Geometry

@@ -192,6 +192,10 @@ static int android_max_guests(void)
     return cached;
 }
 
+/* Console line delivery (defined with the console bridge below); every run's
+ * session is bound to it at creation. */
+static void on_console_line(void* user, const char* line);
+
 /* Slot allocation. Caller holds g_runs_lock. The session is initialized and
  * given the host's display config before the run is published, so no other
  * thread can observe a half-seeded run (and the session work needs no run
@@ -210,6 +214,7 @@ static struct android_run* android_run_create_locked(void)
      * from the first surface it sees. */
     pthread_mutex_lock(&g_surf_cs);
     vp_session_init(&run->session);
+    run->session.on_line = on_console_line;
     if (g_host_panel_w > 0 && g_host_panel_h > 0) {
         vp_session_set_panel(&run->session, g_host_panel_w, g_host_panel_h);
     }
@@ -220,6 +225,29 @@ static struct android_run* android_run_create_locked(void)
 
     for (i = 0; i < android_max_guests(); i++) {
         if (!g_runs[i]) {
+            g_runs[i] = run;
+            run->id = i;
+            return run;
+        }
+    }
+    /* Table full. Before giving up, evict a bootstrap run: early host-level
+     * calls (nativeInit's session setup, a display-config push before the
+     * first guest exists) create a run that never got a machine, a cmdpost or
+     * a card - it would hold its slot forever and silently shrink the table
+     * by one. Its state (panel pin, density) lives in the host-level globals,
+     * so nothing is lost. */
+    for (i = 0; i < android_max_guests(); i++) {
+        struct android_run* stale = g_runs[i];
+        if (stale && !stale->machine && !stale->cmdpost && !stale->running) {
+            LOGI("Evicting never-started run %d to free its slot", stale->id);
+            g_runs[i] = NULL;
+            if (g_active_run == stale) {
+                g_active_run = NULL;
+            }
+            if (stale->window) {
+                ANativeWindow_release(stale->window);
+            }
+            free(stale);
             g_runs[i] = run;
             run->id = i;
             return run;
@@ -296,9 +324,17 @@ static struct android_run* android_run_by_id(int id)
     return run;
 }
 
-/* The run the JNI surface addresses. Made on first use, so a host that only
- * ever runs one guest keeps exactly the behaviour it has always had. */
+/* The run the JNI surface addresses, or NULL when none exists. Deliberately
+ * NOT auto-creating: an early host-level call (a display-config push, a
+ * surface callback before the first guest) used to conjure an empty run that
+ * occupied a slot forever, silently shrinking the table. Config that must
+ * outlive runs lives in the host-level globals; runs are created explicitly
+ * by nativeCreateGuest(). */
 static struct android_run* android_run_active(void);
+
+/* Console line delivery (defined with the console bridge below); every run's
+ * session is bound to it at creation. */
+static void on_console_line(void* user, const char* line);
 
 /* The run a cmdpost instance belongs to - the inverse of
  * rvvm_user_set_host_ctx(). Guest-driven callbacks carry the instance they
@@ -382,16 +418,14 @@ static bool android_run_any_machine(void)
     return any;
 }
 
-/* The run the JNI surface addresses. Made on first use, so a host that only
- * ever runs one guest keeps exactly the behaviour it has always had. */
+/* The run the JNI surface addresses - without creating one. Runs come into
+ * existence only through nativeCreateGuest(); every caller of this function
+ * must treat NULL as "no guest yet" and carry on without one. */
 static struct android_run* android_run_active(void)
 {
     struct android_run* run;
 
     pthread_mutex_lock(&g_runs_lock);
-    if (!g_active_run) {
-        g_active_run = android_run_create_locked();
-    }
     run = g_active_run;
     pthread_mutex_unlock(&g_runs_lock);
     return run;
@@ -838,7 +872,8 @@ Java_com_rvvm_android_RvvmNative_nativeTtyScrollBy(JNIEnv* env, jobject thiz, ji
 JNIEXPORT void JNICALL
 Java_com_rvvm_android_RvvmNative_nativeTtyInput(JNIEnv* env, jobject thiz, jint guestId, jbyteArray in)
 {
-    rvvm_machine_t* machine = android_run_for_call(guestId)->machine;
+    struct android_run* run = android_run_for_call(guestId);
+    rvvm_machine_t* machine = run ? run->machine : NULL;
     jsize len;
     jbyte* buf;
 
@@ -908,10 +943,12 @@ static void on_console_line(void* user, const char* line)
  * here is the locking and the crossing into Java. */
 void jni_guest_output(const char* data, size_t count)
 {
-    if (!data || !count) return;
+    struct android_run* run = android_run_active();
+
+    if (!data || !count || !run) return;
 
     pthread_mutex_lock(&g_console_mutex);
-    vp_session_console_output(&android_run_active()->session, data, count);
+    vp_session_console_output(&run->session, data, count);
     pthread_mutex_unlock(&g_console_mutex);
 }
 
@@ -948,10 +985,11 @@ void jni_guest_first_frame(vp_cmdpost_t* inst)
 }
 
 /* Flush a trailing partial line and re-arm the first-frame note. */
-static void console_reset(void)
+static void console_reset(struct android_run* run)
 {
+    if (!run) return;
     pthread_mutex_lock(&g_console_mutex);
-    vp_session_reset_run(&android_run_active()->session);
+    vp_session_reset_run(&run->session);
     pthread_mutex_unlock(&g_console_mutex);
 }
 
@@ -1576,8 +1614,9 @@ static void on_game_lifecycle(int32_t cmd)
     LOGI("GameActivity lifecycle cmd=%d", cmd);
     
     /* Queue the command for polling by Guest */
-    if (android_run_active()->lifecycle_count < 32) {
-        android_run_active()->lifecycle_queue[android_run_active()->lifecycle_count++] = cmd;
+    struct android_run* run = android_run_active();
+    if (run && run->lifecycle_count < 32) {
+        run->lifecycle_queue[run->lifecycle_count++] = cmd;
     }
 }
 
@@ -1617,35 +1656,39 @@ static void on_guest_exit(int exit_code);
  * - it stays as an idempotent belt (ten pointer stores) for a callback the
  * guest or a mid-run failure might have replaced.
  *
- * nativeInit() runs it once for the first guest; nativeRunElf() re-runs it for
- * every later one - the same role win32_cmdpost_register_callbacks() plays on
- * the win32 side.
+ * nativeRunElf() runs it for every guest, into that guest's instance. With no
+ * instance (host startup, before any run exists) it is a no-op - the per-run
+ * registration in nativeRunElf() is the one that matters.
  * ============================================================ */
-static void jni_register_cmdpost_callbacks(void)
+static void jni_register_cmdpost_callbacks(vp_cmdpost_t* inst)
 {
     extern const vp_audio_ops_t* android_aaudio_ops(void);
 
+    if (!inst) {
+        return;
+    }
+
     /* Window / surface + configuration */
-    cmdpost_set_window_callbacks(android_run_active()->cmdpost, on_window_lock, on_window_unlock);
-    cmdpost_set_window_size_callback(android_run_active()->cmdpost, on_window_size);
-    cmdpost_set_window_set_buf_callback(android_run_active()->cmdpost, on_window_set_buf);
-    cmdpost_set_config_callback(android_run_active()->cmdpost, on_config_get);
+    cmdpost_set_window_callbacks(inst, on_window_lock, on_window_unlock);
+    cmdpost_set_window_size_callback(inst, on_window_size);
+    cmdpost_set_window_set_buf_callback(inst, on_window_set_buf);
+    cmdpost_set_config_callback(inst, on_config_get);
 
     /* GameActivity lifecycle + input */
-    cmdpost_set_game_callbacks(android_run_active()->cmdpost, on_game_lifecycle, on_game_input);
+    cmdpost_set_game_callbacks(inst, on_game_lifecycle, on_game_input);
 
     /* Real display vsync as the guest's AChoreographer source. Only re-armed
      * while its owner thread is alive; otherwise the source stays unavailable
      * and the guest falls back to its own clock instead of waiting for a tick
      * that will never come. */
     if (g_vsync_running) {
-        cmdpost_set_choreographer_callback(android_run_active()->cmdpost, android_vsync_wait);
+        cmdpost_set_choreographer_callback(inst, android_vsync_wait);
         g_vsync_warned = 0;
     }
 
     /* Real AAudio backend: the pump thread in vp_aaudio_android.c bridges the
      * guest's SPSC ring to AAudioStream. */
-    cmdpost_set_audio_callbacks(android_run_active()->cmdpost, android_aaudio_ops());
+    cmdpost_set_audio_callbacks(inst, android_aaudio_ops());
 
     /* Real sensor backend: vp_sensor_android.c owns the platform
      * ASensorEventQueue and feeds the subsystem through vp_sensor_ingest().
@@ -1660,7 +1703,7 @@ static void jni_register_cmdpost_callbacks(void)
      * instance, so it has to be told which one this is before init() reaches
      * them. Set here rather than once at startup because the instance is per
      * run now. */
-    android_gl_set_cmdpost(android_run_active()->cmdpost);
+    android_gl_set_cmdpost(inst);
 
     /* System EGL/GLES backend for the marshalled GL calls. Loads the system
      * libraries on first use and re-installs the dispatch callbacks; on
@@ -1674,25 +1717,14 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
     (void)thiz;
     g_env = env;
 
-    /* The host session: the display geometry the guest observes, and the
-     * assembly of its output into console lines. Everything in it that is
-     * per-run is reset by console_reset() in nativeRunElf(); the one thing it
-     * needs from this side is where a finished line goes. */
-    vp_session_init(&android_run_active()->session);
-    android_run_active()->session.on_line = on_console_line;
-
-    /* No cmdpost instance is made here: it belongs to a run, and is created by
-     * nativeClearLifecycleCmds() (before Java seeds that run) and freed by the
-     * run's own guest thread. The callback registration below still runs, into
-     * whatever instance exists at the time - a no-op when there is none. */
+    /* No session and no run exist here: runs are created explicitly by
+     * nativeCreateGuest(), and each one binds its own session (with this
+     * side's line callback) and registers its own cmdpost callbacks in
+     * nativeRunElf(). Host-level configuration (panel pin, density) lives in
+     * the process globals and is inherited by every run at creation. */
 
     /* Expose the real display vsync as the guest's AChoreographer source. */
     jni_vsync_start();
-
-    /* Install every bridge callback the guest needs: window/config/game, the
-     * vsync source and the real AAudio backend. nativeRunElf() re-runs this
-     * before every later guest - see jni_register_cmdpost_callbacks(). */
-    jni_register_cmdpost_callbacks();
 
     LOGI("Native init complete");
 }
@@ -1708,9 +1740,12 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
 
     /* A suspended guest is parked and would never poll again; wake it before
      * the teardown below so it is not left parked against a torn-down bridge. */
-    if (android_run_active()->suspended && android_run_active()->machine) {
-        rvvm_user_resume(android_run_active()->machine);
-        android_run_active()->suspended = 0;
+    {
+        struct android_run* run = android_run_active();
+        if (run && run->suspended && run->machine) {
+            rvvm_user_resume(run->machine);
+            run->suspended = 0;
+        }
     }
 
     /* Stop the vsync source before tearing down the bridge. */
@@ -1829,7 +1864,12 @@ Java_com_rvvm_android_RvvmNative_nativeSetDisplayConfig(
     pthread_mutex_lock(&g_surf_cs);
     /* Recorded beyond the active run: every later run inherits it at creation. */
     g_host_density = (int32_t)densityDpi;
-    vp_session_set_density(&android_run_active()->session, (int32_t)densityDpi);
+    {
+        struct android_run* run = android_run_active();
+        if (run) {
+            vp_session_set_density(&run->session, (int32_t)densityDpi);
+        }
+    }
     pthread_mutex_unlock(&g_surf_cs);
 
     LOGI("Display config: density=%d (real %dx%d dp ignored; panel-owned)",
@@ -1863,11 +1903,18 @@ Java_com_rvvm_android_RvvmNative_nativeSetPanelSize(JNIEnv* env, jobject thiz,
      * creation (see android_run_create). */
     g_host_panel_w = width;
     g_host_panel_h = height;
-    if (vp_session_set_panel(&android_run_active()->session, width, height)) {
-        LOGI("Virtual panel pinned: %dx%d", width, height);
-    } else {
-        LOGI("Virtual panel already in use (%dx%d), ignoring %dx%d",
-             android_run_active()->session.gfx_w, android_run_active()->session.gfx_h, width, height);
+    {
+        struct android_run* run = android_run_active();
+        if (run) {
+            if (vp_session_set_panel(&run->session, width, height)) {
+                LOGI("Virtual panel pinned: %dx%d", width, height);
+            } else {
+                LOGI("Virtual panel already in use (%dx%d), ignoring %dx%d",
+                     run->session.gfx_w, run->session.gfx_h, width, height);
+            }
+        } else {
+            LOGI("Virtual panel pinned: %dx%d (no run yet; inherited at creation)", width, height);
+        }
     }
     pthread_mutex_unlock(&g_surf_cs);
 }
@@ -1888,6 +1935,15 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz,
             LOGE("Failed to get native window from surface");
             return;
         }
+    }
+
+    if (!run) {
+        /* No run to bind the window to (a surface callback racing the run
+         * table): drop the reference and carry on. */
+        if (new_window) {
+            ANativeWindow_release(new_window);
+        }
+        return;
     }
 
     int32_t pw, ph;
@@ -1958,8 +2014,9 @@ Java_com_rvvm_android_RvvmNative_nativePollLifecycleCmd(JNIEnv* env, jobject thi
     (void)thiz;
     
     /* Return next lifecycle command from queue, or -1 if empty */
-    if (android_run_active()->lifecycle_read < android_run_active()->lifecycle_count) {
-        return android_run_active()->lifecycle_queue[android_run_active()->lifecycle_read++];
+    struct android_run* run = android_run_active();
+    if (run && run->lifecycle_read < run->lifecycle_count) {
+        return run->lifecycle_queue[run->lifecycle_read++];
     }
     return -1;
 }
@@ -1967,6 +2024,7 @@ Java_com_rvvm_android_RvvmNative_nativePollLifecycleCmd(JNIEnv* env, jobject thi
 JNIEXPORT void JNICALL
 Java_com_rvvm_android_RvvmNative_nativeClearLifecycleCmds(JNIEnv* env, jobject thiz)
 {
+    struct android_run* run = android_run_active();
     (void)env;
     (void)thiz;
 
@@ -1975,13 +2033,17 @@ Java_com_rvvm_android_RvvmNative_nativeClearLifecycleCmds(JNIEnv* env, jobject t
      * start), so it is also where that run's cmdpost instance is made: the
      * commands queued next have to land in the instance the guest will poll.
      * The previous run freed its own as it handed control back
-     * (guest_thread_func), so this is normally NULL. */
-    if (!android_run_active()->cmdpost) {
-        android_run_active()->cmdpost = cmdpost_create();
+     * (guest_thread_func), so this is normally NULL. With no run at all there
+     * is nothing to clear. */
+    if (!run) {
+        return;
+    }
+    if (!run->cmdpost) {
+        run->cmdpost = cmdpost_create();
     }
 
-    android_run_active()->lifecycle_count = 0;
-    android_run_active()->lifecycle_read = 0;
+    run->lifecycle_count = 0;
+    run->lifecycle_read = 0;
 
     /* Called right before the machine is handed to the next guest, so drop
      * what the *guest* still has queued too: pending commands and input belong
@@ -1989,22 +2051,27 @@ Java_com_rvvm_android_RvvmNative_nativeClearLifecycleCmds(JNIEnv* env, jobject t
      * down on its very first poll, a stale touch would be delivered as if the
      * user had just tapped). The seed state for the new guest is then queued
      * explicitly by the Java side. */
-    cmdpost_clear_lifecycle_cmds(android_run_active()->cmdpost);
-    cmdpost_clear_motion_events(android_run_active()->cmdpost);
-    cmdpost_clear_key_events(android_run_active()->cmdpost);
+    cmdpost_clear_lifecycle_cmds(run->cmdpost);
+    cmdpost_clear_motion_events(run->cmdpost);
+    cmdpost_clear_key_events(run->cmdpost);
 }
 
 JNIEXPORT void JNICALL
 Java_com_rvvm_android_RvvmNative_nativePostLifecycleCmd(JNIEnv* env, jobject thiz, jint cmd)
 {
+    struct android_run* run = android_run_active();
     (void)env;
     (void)thiz;
-    
+
     /* Queue a lifecycle command (called from Java when activity state changes)
-     * Both into the guest-facing queue (via vp_cmdpost) and the local queue. */
-    cmdpost_queue_lifecycle_cmd(android_run_active()->cmdpost, cmd);
-    if (android_run_active()->lifecycle_count < 32) {
-        android_run_active()->lifecycle_queue[android_run_active()->lifecycle_count++] = cmd;
+     * into the guest-facing queue (via vp_cmdpost) and the local mirror. With
+     * no run alive there is nobody to deliver to - the command is dropped. */
+    if (!run || !run->cmdpost) {
+        return;
+    }
+    cmdpost_queue_lifecycle_cmd(run->cmdpost, cmd);
+    if (run->lifecycle_count < 32) {
+        run->lifecycle_queue[run->lifecycle_count++] = cmd;
         LOGI("Lifecycle command %d queued", cmd);
     }
 }
@@ -2016,7 +2083,8 @@ Java_com_rvvm_android_RvvmNative_nativePostMotionEvent(JNIEnv* env, jobject thiz
                                                        jintArray ids, jint pointerCount,
                                                        jint action, jlong eventTime)
 {
-    vp_cmdpost_t* cmdpost = android_run_for_call(guestId)->cmdpost;
+    struct android_run* run = android_run_for_call(guestId);
+    vp_cmdpost_t* cmdpost = run ? run->cmdpost : NULL;
     (void)thiz;
 
     if (!xs || !ys || !cmdpost) {
@@ -2076,57 +2144,70 @@ Java_com_rvvm_android_RvvmNative_nativePostMotionEvent(JNIEnv* env, jobject thiz
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring elfPath, jobjectArray args)
+Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint guestId,
+                                              jstring elfPath, jobjectArray args)
 {
+    struct android_run* run = android_run_for_call(guestId);
     (void)thiz;
-    
-    if (android_run_active()->running) {
-        LOGE("Guest already running");
+
+    if (!run) {
+        LOGE("nativeRunElf with no run (guestId %d) - call nativeCreateGuest first", guestId);
         return JNI_FALSE;
     }
-    
+    if (run->running) {
+        LOGE("Guest %d already running", run->id);
+        return JNI_FALSE;
+    }
+
+    /* The run being started becomes the one the JNI surface addresses (the
+     * guest thread captures it on entry; Java has normally already focused
+     * its card, this is the belt for a caller that skipped that). */
+    pthread_mutex_lock(&g_runs_lock);
+    g_active_run = run;
+    pthread_mutex_unlock(&g_runs_lock);
+
     /* Get ELF path from Java string */
     const char* path = (*env)->GetStringUTFChars(env, elfPath, NULL);
     if (!path) {
         LOGE("Failed to get ELF path");
         return JNI_FALSE;
     }
-    
-    strncpy(android_run_active()->elf_path, path, sizeof(android_run_active()->elf_path) - 1);
-    android_run_active()->elf_path[sizeof(android_run_active()->elf_path) - 1] = '\0';
+
+    strncpy(run->elf_path, path, sizeof(run->elf_path) - 1);
+    run->elf_path[sizeof(run->elf_path) - 1] = '\0';
     (*env)->ReleaseStringUTFChars(env, elfPath, path);
-    
+
     /* Get optional arguments */
-    android_run_active()->argc = 1;  /* argv[0] = ELF path */
+    run->argc = 1;  /* argv[0] = ELF path */
     if (args) {
         jsize len = (*env)->GetArrayLength(env, args);
-        for (int i = 0; i < len && android_run_active()->argc < 15; i++) {
+        for (int i = 0; i < len && run->argc < 15; i++) {
             jstring jstr = (jstring)(*env)->GetObjectArrayElement(env, args, i);
             const char* str = (*env)->GetStringUTFChars(env, jstr, NULL);
             if (str) {
                 /* Store in static buffer (simplified - no dynamic alloc) */
                 static char arg_buf[16][128];
-                strncpy(arg_buf[android_run_active()->argc], str, 127);
-                arg_buf[android_run_active()->argc][127] = '\0';
-                android_run_active()->argv[android_run_active()->argc] = arg_buf[android_run_active()->argc];
-                android_run_active()->argc++;
+                strncpy(arg_buf[run->argc], str, 127);
+                arg_buf[run->argc][127] = '\0';
+                run->argv[run->argc] = arg_buf[run->argc];
+                run->argc++;
                 (*env)->ReleaseStringUTFChars(env, jstr, str);
             }
             (*env)->DeleteLocalRef(env, jstr);
         }
     }
-    
-    LOGI("Starting guest: %s (argc=%d)", android_run_active()->elf_path, android_run_active()->argc);
+
+    LOGI("Starting guest %d: %s (argc=%d)", run->id, run->elf_path, run->argc);
 
     /* New run: flush the previous guest's trailing partial line and let the
      * first frame of THIS guest re-hide the console overlay. */
-    console_reset();
+    console_reset(run);
 
     /* Reinstall the callbacks for this guest. The exit of the previous one no
      * longer clears them (it ends the run, not the bridge - cmdpost_end_run()),
      * so this is an idempotent belt rather than the thing that keeps a
      * relaunched guest from probing a dead proxy. */
-    jni_register_cmdpost_callbacks();
+    jni_register_cmdpost_callbacks(run->cmdpost);
 
     /* Per-guest diagnostics: report this guest's first frame/geometry too, not
      * just the first guest the process ever ran. */
@@ -2139,60 +2220,61 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
      * starting a guest with the surface still locked would let it render
      * nothing at all. Normally a no-op - the previous guest's thread already
      * released the lock on its way out. */
-    surf_finish_pending_lock(android_run_active());
-    android_run_active()->machine = rvvm_user_create();
-    if (!android_run_active()->machine) {
+    surf_finish_pending_lock(run);
+    run->machine = rvvm_user_create();
+    if (!run->machine) {
         LOGE("Failed to create userland machine");
         return JNI_FALSE;
     }
     /* on_guest_exit re-reads g_exit_listener (host-level state) when it fires,
      * so there is nothing per-run to wire up here. */
-    rvvm_user_set_exit_callback(android_run_active()->machine, on_guest_exit);
+    rvvm_user_set_exit_callback(run->machine, on_guest_exit);
 
     /* This run's cmdpost instance is normally made by nativeClearLifecycleCmds()
      * (Java queues the startup sequence right after that call, and it has to
      * land in this run's instance); this is the safety net for a caller that
      * went straight to nativeRunElf. */
-    if (!android_run_active()->cmdpost) {
-        android_run_active()->cmdpost = cmdpost_create();
+    if (!run->cmdpost) {
+        run->cmdpost = cmdpost_create();
+        jni_register_cmdpost_callbacks(run->cmdpost);
     }
 
     /* Bind this run's machine to the host's cmdpost instance: it is how a
      * syscall arriving on a guest thread finds the state it belongs to. Done
      * before the thread starts, since the first thing the guest does may be one
      * of these syscalls. */
-    rvvm_user_set_host_ctx(android_run_active()->machine, android_run_active()->cmdpost);
+    rvvm_user_set_host_ctx(run->machine, run->cmdpost);
 
     /* This run's own console session: opened fresh (the previous run's frozen
      * screen stays retired for the view to fall back to), wiped, and attached
      * to this machine - fd 1/2 output lands in this run's VTerm alone, never
      * in another guest's. No output callback is registered: the session bumps
      * its own serial, which is what the Java poller reads. */
-    if (!android_run_active()->tty) {
-        android_run_active()->tty = rvvm_tty_open(g_tty_rows, TTY_COLS);
-        if (!android_run_active()->tty) {
-            LOGE("rvvm_tty_open failed for guest %d", android_run_active()->id);
+    if (!run->tty) {
+        run->tty = rvvm_tty_open(g_tty_rows, TTY_COLS);
+        if (!run->tty) {
+            LOGE("rvvm_tty_open failed for guest %d", run->id);
         } else {
-            LOGI("Guest %d TTY session opened (%dx%d)", android_run_active()->id, g_tty_rows, TTY_COLS);
+            LOGI("Guest %d TTY session opened (%dx%d)", run->id, g_tty_rows, TTY_COLS);
         }
     }
-    if (android_run_active()->tty) {
-        rvvm_tty_reset(android_run_active()->tty);
-        rvvm_tty_attach(android_run_active()->tty, android_run_active()->machine);
+    if (run->tty) {
+        rvvm_tty_reset(run->tty);
+        rvvm_tty_attach(run->tty, run->machine);
     }
-    
+
     /* Start guest thread */
-    android_run_active()->running = 1;
-    android_run_active()->suspended = 0;
-    if (pthread_create(&android_run_active()->thread, NULL, guest_thread_func, NULL) != 0) {
+    run->running = 1;
+    run->suspended = 0;
+    if (pthread_create(&run->thread, NULL, guest_thread_func, NULL) != 0) {
         LOGE("Failed to create guest thread");
-        android_run_active()->running = 0;
-        android_run_active()->suspended = 0;
-        rvvm_user_free(android_run_active()->machine);
-        android_run_active()->machine = NULL;
+        run->running = 0;
+        run->suspended = 0;
+        rvvm_user_free(run->machine);
+        run->machine = NULL;
         return JNI_FALSE;
     }
-    
+
     return JNI_TRUE;
 }
 
@@ -2217,7 +2299,7 @@ Java_com_rvvm_android_RvvmNative_nativeStopGuest(JNIEnv* env, jobject thiz, jint
     (void)env;
     (void)thiz;
 
-    if (run->running) {
+    if (run && run->running) {
         LOGI("Stopping guest %d...", run->id);
         /* A suspended guest is parked and cannot poll for the stop; resume it
          * first so it unwinds the normal way instead of being forced down. The
@@ -2245,7 +2327,7 @@ Java_com_rvvm_android_RvvmNative_nativeSuspendGuest(JNIEnv* env, jobject thiz, j
     (void)env;
     (void)thiz;
 
-    if (!run->running || !run->machine || run->suspended) {
+    if (!run || !run->running || !run->machine || run->suspended) {
         return;
     }
 
@@ -2268,7 +2350,7 @@ Java_com_rvvm_android_RvvmNative_nativeResumeGuest(JNIEnv* env, jobject thiz, ji
     (void)env;
     (void)thiz;
 
-    if (!run->running || !run->machine || !run->suspended) {
+    if (!run || !run->running || !run->machine || !run->suspended) {
         return;
     }
 
@@ -2276,7 +2358,7 @@ Java_com_rvvm_android_RvvmNative_nativeResumeGuest(JNIEnv* env, jobject thiz, ji
      * source-lost flag, and re-registering the callbacks both clears that flag
      * and lets the resumed guest use the fd-wakeup path again. */
     jni_vsync_start();
-    jni_register_cmdpost_callbacks();
+    jni_register_cmdpost_callbacks(run->cmdpost);
 
     run->suspended = 0;
     rvvm_user_resume(run->machine);

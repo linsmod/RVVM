@@ -352,6 +352,20 @@ sequenceDiagram
    真机验证：息屏状态下连续 `am start` 两个 guest（test_render + test_render_gles），
    解锁后两者各自起跑，GL 12 阶段全 PASS、exit 0，卡片独立 reveal、互不干扰。
    新卡按 Windows 式级联生成（`cascadeTo`：对角线 28dp 步进，到工作区边界乒乓
+   反弹），同一程序的多个实例可并存且肉眼可分。点卡聚焦（视频区触摸或拖标题栏
+   均触发 `focusCard`：LOST_FOCUS→切换→GAINED_FOCUS、置顶、活动标题栏着色）。
+   底部控件已重构为 Windows 任务栏（2026-09-14）：⊞ 开始按钮弹出启动菜单
+   （assets 里的每个 guest app，点按即**新开**一个 run）；任务条上每个运行中的
+   窗口一枚芯片（聚焦高亮、最小化加前缀；点按聚焦/还原、长按关闭）；SUSPEND/
+   STOP 作用于聚焦窗口。旧的单开残留（spinner + RUN 禁用逻辑）已删除。
+5. **bootstrap run 已根除（2026-09-14）**：`android_run_active()` 不再隐式创建
+   run——过去 `nativeInit()` 等宿主级调用会凭空造出一个"从未启动"的空 run，
+   永久占据槽 0，使 4 槽表实际只有 3 个可用（症状：自动启动 1 + 手动开 2 个后
+   第三个手动启动报 `No guest slot left (max 4)`）。现在：runs 只由
+   `nativeCreateGuest()` 创建；`nativeRunElf` 显式带 guestId 并把该 run 置为
+   active；`jni_register_cmdpost_callbacks` 显式接收实例（无实例即 no-op）；
+   所有 active 路径 NULL 防护。另加固：新会话在创建时即绑定 `on_console_line`。
+   新卡按 Windows 式级联生成（`cascadeTo`：对角线 28dp 步进，到工作区边界乒乓
    反弹），同一程序的多个实例可并存且肉眼可分。
 4. ~~控制台/TTY 仍是单会话~~ **已落地（2026-09-14，形态 1：控制台跟随前台卡）**：
    每个 run 打开自己的 `rvvm_tty_t`（`android_run.tty`）并 attach 到自己的 machine——

@@ -134,12 +134,13 @@ public class RvvmNative {
                                                     int pointerCount, int action, long eventTime);
 
     /**
-     * Run a RISC-V ELF program.
+     * Run a RISC-V ELF program in the given guest's machine.
+     * @param guestId guest to run the ELF in, or -1 for the active one
      * @param elfPath Path to the ELF file
      * @param args Optional command-line arguments
      * @return true if the guest started successfully
      */
-    public static native boolean nativeRunElf(String elfPath, String[] args);
+    public static native boolean nativeRunElf(int guestId, String elfPath, String[] args);
 
     /**
      * Check if the given guest is currently running.
