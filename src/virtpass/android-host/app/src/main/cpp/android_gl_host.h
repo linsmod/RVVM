@@ -32,13 +32,18 @@ struct ANativeWindow;
 bool android_gl_host_init(void);
 
 /*
- * Hand the current SurfaceView window to the GL backend. Called from the
- * JNI surface lifecycle (nativeSetWindow) with the same ANativeWindow the
- * software-rendering path tracks; NULL when the surface is going away.
+ * Tell the GL backend that the SurfaceView window was attached or detached.
+ * Called from the JNI surface lifecycle (nativeSetWindow) with the same
+ * ANativeWindow the software-rendering path tracks; NULL when the surface is
+ * going away.
  *
- * The pointer is only read at eglCreateWindowSurface time and the resulting
- * EGLSurface keeps the window alive for its own lifetime, so no extra
- * ANativeWindow_acquire is taken here.
+ * The pointer is NOT kept. The host releases the previous wrapper the moment a
+ * new one arrives (the card is resized on every run), so a window cached here
+ * could be freed before the next guest call; the window is instead taken with a
+ * reference held across the platform call that needs it, through
+ * jni_wait_surface() in jni_bridge.c (which also gives a window that is on its
+ * way a moment to appear). This notification is what keeps the attach/detach
+ * visible in the log.
  */
 void android_gl_set_native_window(struct ANativeWindow* window);
 

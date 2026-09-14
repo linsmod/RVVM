@@ -714,6 +714,83 @@ static ANativeWindow* surf_acquire(void)
     return w;
 }
 
+/* Broadcast when a window is installed, under g_surf_cs (nativeSetWindow). */
+static pthread_cond_t g_window_cond = PTHREAD_COND_INITIALIZER;
+
+/* The window to bind, with a reference held for the caller - release it with
+ * ANativeWindow_release(). NULL when there is none.
+ *
+ * The GL path has to go through this instead of keeping its own copy of the
+ * pointer: the host swaps windows from the UI thread (every surfaceCreated /
+ * surfaceChanged) and releases the previous wrapper right away, so a pointer
+ * read outside this lock can be freed under the reader - which is exactly how a
+ * guest's eglCreateWindowSurface ends up handed a dead ANativeWindow and fails
+ * with EGL_BAD_NATIVE_WINDOW. The reference is only needed across the call: EGL
+ * keeps one of its own from the moment the EGLSurface exists.
+ *
+ * A window that is not there yet is given up to wait_ms to arrive.
+ *
+ * "Not there yet" is the normal state for a moment: the window is the card the
+ * host shows, and the host swaps it from the UI thread on every surfaceCreated/
+ * surfaceChanged - that is, every time the card is re-laid out or brought back
+ * from the taskbar chip. Most of those gaps are one UI pass wide, and losing a
+ * guest over one is the difference between a run that works and an
+ * eglCreateWindowSurface failure nothing was wrong with.
+ *
+ * The wait is bounded because the other way a window goes missing is not
+ * transient at all: the user minimized or closed it. Neither comes back because
+ * a guest asked - on a desktop a minimized window does not restore itself
+ * either - so after the timeout the guest is told "no surface" and can decide
+ * what to do about it. Called from the guest thread, inside a graphics entry
+ * point; the lock is released while waiting, so the UI thread can hand the
+ * window over. */
+struct ANativeWindow* jni_wait_surface(int wait_ms)
+{
+    struct timespec deadline;
+    ANativeWindow* w = NULL;
+
+    w = surf_acquire();
+    if (w || wait_ms <= 0) {
+        return w;
+    }
+
+    LOGI("No window yet: waiting up to %d ms for one", wait_ms);
+
+    /* Clock: the same one pthread_cond_timedwait() defaults to. */
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec  += wait_ms / 1000;
+    deadline.tv_nsec += (long)(wait_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&g_surf_cs);
+    while (!g_native_window) {
+        /* 0 is a wake-up call, from nativeSetWindow's broadcast or a spurious
+         * one - the predicate is re-tested either way. Anything else ends the
+         * wait: ETIMEDOUT in the normal case, and a bad clock or timespec must
+         * not turn this into a spin on a deadline that never expires. */
+        if (pthread_cond_timedwait(&g_window_cond, &g_surf_cs, &deadline) != 0) {
+            break;
+        }
+    }
+    w = g_native_window;
+    if (w) {
+        ANativeWindow_acquire(w);
+    }
+    pthread_mutex_unlock(&g_surf_cs);
+
+    if (!w) {
+        /* The window was not coming: minimized or closed by the user, or a host
+         * that cannot show it at all. Reported so the guest's own failure has a
+         * cause next to it in the log. */
+        LOGW("No window after %d ms", wait_ms);
+    }
+
+    return w;
+}
+
 /* Per-frame chatter guard. At 60 fps the lock/unlock path used to emit four
  * log lines per frame, which filled the logcat ring buffer in seconds and
  * buried the crash reports. Log one line whenever the geometry changes. */
@@ -1437,10 +1514,16 @@ Java_com_rvvm_android_RvvmNative_nativeSetWindow(JNIEnv* env, jobject thiz, jobj
         g_applied_fmt = 0;
     }
 
-    /* The GL backend only reads this at eglCreateWindowSurface time, and an
-     * EGLSurface holds the window for its own lifetime, so handing over the
-     * pointer (not a reference) is enough here. */
+    /* Tells the GL backend a window came or went - a log line only: the pointer
+     * is not kept, because it is released right below and re-taken with a
+     * reference by whoever needs it (jni_wait_surface). */
     android_gl_set_native_window(new_window);
+
+    /* Wake any guest parked in jni_wait_surface(): a window is here now, which
+     * is the only thing it was waiting for. Broadcast under the mutex the
+     * waiter sleeps on. */
+    pthread_cond_broadcast(&g_window_cond);
+
     pw = g_virt_w;
     ph = g_virt_h;
     pthread_mutex_unlock(&g_surf_cs);

@@ -172,6 +172,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     private boolean isInitialized = false;
     private boolean isSurfaceReady = false;
     private boolean hasAutoStarted = false;
+    // A run that asked to start before the window's surface was back: the guest
+    // is held back until surfaceCreated() has handed native a window, see
+    // runGuestElf().
+    private boolean glRunPending = false;
 
     // ---- TTY console (TextureView tab) ----
     // One cell = 4 ints from nativeTtySnapshot: [0] UCS-4 cp, [1] fg ARGB,
@@ -1531,14 +1535,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         String elfPath = elfFile.getAbsolutePath();
         statusText.setText("Running: " + elfName + "\nPath: " + elfPath);
 
+        // The window first: it goes back to waiting for content, and comes back
+        // if the previous run's was minimized or closed. Doing this before the
+        // guest starts is what (re)creates the surface a guest needs.
+        resetGlWindowForRun();
+
+        /* ...but that surface is not there yet. Closing or minimizing the
+         * window destroyed it, and the framework only creates the new one on
+         * the next traversal - a UI pass after this method returns. A guest
+         * started in between has no window at all: an EGL guest asks for one in
+         * its very first statements and gives up with EGL_NO_SURFACE when it
+         * does not get it (test_render_gles does exactly that, which is how a
+         * run right after a closed one ends in "eglCreateWindowSurface
+         * FAILED"), and a CPU guest has every lock refused until the window is
+         * back. So the run is held here and picked up by surfaceCreated(),
+         * which hands native the window before calling back in.
+         *
+         * A guest that needs no window at all is held back for a few
+         * milliseconds by this too, which is the price of not having to know
+         * which kind of guest this is. */
+        if (!isSurfaceReady) {
+            glRunPending = true;
+            statusText.setText("Waiting for the graphics window...");
+            Log.i(TAG, "Run held back until the window's surface is up");
+            return;
+        }
+
         // New run: a fresh log file. The console on screen is the guest's own
         // TTY, which keeps the previous run's last screen until new output
         // arrives, so there is nothing to reset here.
         openGuestLogFile(elfName);
-
-        // The window goes back to waiting for content, and comes back if the
-        // previous run's was minimized or closed.
-        resetGlWindowForRun();
 
         replayGuestStartupState();
 
@@ -1773,7 +1799,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         if (isInitialized) {
             RvvmNative.nativeSetWindow(holder.getSurface());
             postLifecycleCmd(APP_CMD_INIT_WINDOW);
-            maybeAutoStartGuest();
+            if (glRunPending) {
+                // A run held back for exactly this surface (runGuestElf). The
+                // window is in native hands now - that is the line above - so
+                // the guest can go ahead. The automatic first start is marked
+                // as done in its place: the guest it would have picked is the
+                // one about to launch.
+                Log.i(TAG, "Window up: starting the held-back run");
+                glRunPending = false;
+                hasAutoStarted = true;
+                runGuestElf();
+            } else {
+                maybeAutoStartGuest();
+            }
         }
     }
 

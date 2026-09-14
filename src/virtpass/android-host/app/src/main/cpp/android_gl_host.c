@@ -215,11 +215,29 @@ static int64_t vpgl_string_out(const int64_t* a, const char* str)
 #include "virtpass/vp_gl_dispatch_tables.h"
 
 static bool g_gl_active = false;
-static struct ANativeWindow* g_window = NULL; /* set via android_gl_set_native_window */
 
+/*
+ * How long eglCreateWindowSurface() gives the host to produce the window.
+ *
+ * The window is the card the host shows, and one UI pass is what it takes to
+ * (re)create it - so this covers a card that is being brought back from the
+ * taskbar chip or re-laid out, which used to end the guest with a failed
+ * eglCreateWindowSurface for no reason. It is deliberately short: the other way
+ * the window is missing is the user minimizing or closing it, and that is not
+ * going to resolve itself while the guest waits - a guest parked for seconds on
+ * a decision only a human can make is worse than being told EGL_NO_SURFACE.
+ */
+#define EGL_WINDOW_WAIT_MS 250
+
+/*
+ * Notification from the host that a window was attached or detached. The
+ * pointer is deliberately not kept: the host swaps windows from the UI thread
+ * and releases the old wrapper on the spot, so anything cached here could be
+ * freed before the next guest call. The window is taken with a reference held
+ * for the duration of the call that needs it (jni_acquire_surface).
+ */
 void android_gl_set_native_window(struct ANativeWindow* window)
 {
-    g_window = window;
     LOGI("GL window %s", window ? "attached" : "detached");
 }
 
@@ -249,19 +267,35 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
         *ret = (int64_t)(intptr_t)p_eglGetDisplay((vpgl_void*)0);
         break;
     case EGL_FN_CREATEWINDOWSURFACE: {
+        struct ANativeWindow* win;
+
         if (!g_gl_active) { g_gl_active = true; LOGI("GL mode active"); }
+
         /* Bind the REAL SurfaceView window: the Android host owns one, so
          * unlike the win32 host there is no pbuffer downgrade here and
          * eglSwapBuffers presents through SurfaceFlinger directly. The
-         * attribute list is a guest pointer like every data argument. */
-        if (!g_window) {
-            /* Surface not up yet. Fail the call (the guest sees
+         * attribute list is a guest pointer like every data argument.
+         *
+         * The window is taken under the host's lock, with a reference held
+         * across the call: nativeSetWindow() swaps it from the UI thread and
+         * releases the previous wrapper immediately, so a cached or unlocked
+         * read of it can be freed before EGL looks at it - which is what makes
+         * eglCreateWindowSurface fail with EGL_BAD_NATIVE_WINDOW after the host
+         * has resized the card. It is also given a moment to appear, for a card
+         * that is on its way back. */
+        {
+            extern struct ANativeWindow* jni_wait_surface(int wait_ms);
+            win = jni_wait_surface(EGL_WINDOW_WAIT_MS);
+        }
+        if (!win) {
+            /* No window, and none arrived. Fail the call (the guest sees
              * EGL_NO_SURFACE, exactly like a real EGL would) rather than
              * silently diverting to a pbuffer nothing would ever show. */
             LOGW("eglCreateWindowSurface with no window attached");
             *ret = 0;
             break;
         }
+
         /* The EGL surface sizes its buffers from the window's geometry, and
          * the window is the floating card's viewport, not the panel the guest
          * renders. Push the pinned panel size first, or the guest's
@@ -269,13 +303,17 @@ void on_egl_dispatch(uint32_t fn_id, const int64_t* args, int64_t* ret)
          * corner of a viewport-sized surface. */
         {
             extern void jni_apply_surface_geometry(struct ANativeWindow* w);
-            jni_apply_surface_geometry(g_window);
+            jni_apply_surface_geometry(win);
         }
+
         *ret = (int64_t)(intptr_t)p_eglCreateWindowSurface(
             (vpgl_EGLDisplay)(uintptr_t)args[0],
             (vpgl_EGLConfig)(uintptr_t)args[1],
-            (vpgl_EGLNativeWindowType)(void*)g_window,
+            (vpgl_EGLNativeWindowType)(void*)win,
             (const vpgl_EGLint*)vpgl_gptr(args[3]));
+
+        /* The EGLSurface holds its own reference from here on. */
+        ANativeWindow_release(win);
         break;
     }
     case EGL_FN_SWAPBUFFERS: {
