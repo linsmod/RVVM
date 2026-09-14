@@ -81,6 +81,14 @@
 
 static HWND            g_hwnd       = NULL;
 
+/* This host's cmdpost instance: created in win32_host_init(), bound to each
+ * run's machine (rvvm_user_set_host_ctx) so the guest's syscalls reach it, and
+ * freed in win32_host_shutdown(). Every cmdpost_* call in this file writes into
+ * it - that state used to be file-scope globals in vp_cmdpost.c, one set for
+ * the whole process. Declared here because the vsync clock (defined above the
+ * registration function) calls into it. */
+static vp_cmdpost_t*   g_cmdpost    = NULL;
+
 /* Guest virtual TTY (libvterm) rendering state. g_tty is the host-owned console
  * session (rvvm_tty_open: it owns the VTerm, the lock that serializes access to
  * it, the scrollback and the view state), created on first launch and attached
@@ -437,7 +445,7 @@ static DWORD WINAPI vsync_thread_main(LPVOID arg)
         if (InterlockedCompareExchange(&g_vsync_run, 1, 1) != 1) {
             break;
         }
-        vp_cmdpost_vsync_tick(t);
+        vp_cmdpost_vsync_tick(g_cmdpost, t);
     }
     return 0;
 }
@@ -477,7 +485,7 @@ static void vsync_clock_stop(void)
 
     /* Wake a guest parked in poll() and let it degrade: it would otherwise wait
      * for a frame that will never come. */
-    vp_cmdpost_vsync_source_lost();
+    vp_cmdpost_vsync_source_lost(g_cmdpost);
 
     InterlockedExchange(&g_vsync_run, 0);
     if (WaitForSingleObject(g_vsync_thread, 3000) == WAIT_OBJECT_0) {
@@ -1001,7 +1009,7 @@ static void queue_mouse_motion(int action, LPARAM lp)
     ev.pointers[0].size     = 1.0f;
     ev.pointers[0].id       = 0;
     ev.pointers[0].toolType = 1; /* AMOTION_EVENT_TOOL_TYPE_FINGER */
-    cmdpost_queue_motion_event(&ev);
+    cmdpost_queue_motion_event(g_cmdpost, &ev);
 }
 
 static void log_key(const char* what, UINT vk, LPARAM lp)
@@ -1018,7 +1026,7 @@ static void log_key(const char* what, UINT vk, LPARAM lp)
 
 static void queue_lifecycle(int32_t cmd)
 {
-    cmdpost_queue_lifecycle_cmd(cmd);
+    cmdpost_queue_lifecycle_cmd(g_cmdpost, cmd);
     winhost_log("lifecycle -> cmd=%d", cmd);
 }
 
@@ -1303,7 +1311,7 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
              * A host-suspended guest is parked and polls nothing, so the clock
              * stays off; launcher_toggle_suspend() re-arms it on resume. */
             g_minimized = false;
-            cmdpost_set_choreographer_callback(on_choreographer_wait);
+            cmdpost_set_choreographer_callback(g_cmdpost, on_choreographer_wait);
             if (!guest_suspended()) vsync_clock_start();
             queue_lifecycle(APP_CMD_START);
             queue_lifecycle(APP_CMD_RESUME);
@@ -1419,8 +1427,8 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
          * which then destroys itself on its first poll - the classic "second
          * Run does not work". Drop whatever is still pending instead; a new
          * launch queues a fresh startup sequence. */
-        cmdpost_clear_lifecycle_cmds();
-        cmdpost_clear_motion_events();
+        cmdpost_clear_lifecycle_cmds(g_cmdpost);
+        cmdpost_clear_motion_events(g_cmdpost);
         if (g_launcher) {
             /* Launcher mode: do NOT close the window. Reset the guest-owned
              * surface and re-show the picker so another guest can be booted
@@ -2140,8 +2148,8 @@ static void launcher_launch_sel(int sel)
     /* Boot on a clean slate: anything still queued belongs to the previous
      * guest, or to the idle window (e.g. PAUSE/STOP from a minimize). A stale
      * DESTROY reaching the new guest makes it exit before it ever renders. */
-    cmdpost_clear_lifecycle_cmds();
-    cmdpost_clear_motion_events();
+    cmdpost_clear_lifecycle_cmds(g_cmdpost);
+    cmdpost_clear_motion_events(g_cmdpost);
 
     /* Android GameActivity startup sequence. The WM_CREATE path is skipped
      * while the launcher is idle, so it is queued here - before the guest
@@ -2268,20 +2276,20 @@ static void launcher_toggle_suspend(void)
 static void win32_cmdpost_register_callbacks(void)
 {
     vp_sensor_set_ops(win32_sensor_stub_ops());
-    cmdpost_set_window_callbacks(on_window_lock, on_window_unlock);
-    cmdpost_set_window_size_callback(on_window_size);
-    cmdpost_set_window_set_buf_callback(on_window_set_buf);
-    cmdpost_set_config_callback(on_config_get);
-    cmdpost_set_game_callbacks(on_game_lifecycle, on_game_input);
+    cmdpost_set_window_callbacks(g_cmdpost, on_window_lock, on_window_unlock);
+    cmdpost_set_window_size_callback(g_cmdpost, on_window_size);
+    cmdpost_set_window_set_buf_callback(g_cmdpost, on_window_set_buf);
+    cmdpost_set_config_callback(g_cmdpost, on_config_get);
+    cmdpost_set_game_callbacks(g_cmdpost, on_game_lifecycle, on_game_input);
     /* Phase 3: GL/EGL dispatch callbacks */
-    cmdpost_set_gl_callbacks(on_egl_dispatch, on_gl_dispatch);
+    cmdpost_set_gl_callbacks(g_cmdpost, on_egl_dispatch, on_gl_dispatch);
     /* Phase 4: vsync source. Registering the blocker makes the guest advertise
      * the AChoreographer caps and, once the clock thread is up, it drives the
      * fd-wakeup path the guest's Looper polls. */
-    cmdpost_set_choreographer_callback(on_choreographer_wait);
+    cmdpost_set_choreographer_callback(g_cmdpost, on_choreographer_wait);
     /* Phase 5: AAudio backend (WASAPI). query() reports 0 caps when no audio
      * device exists, so every AAudio call on the guest fails gracefully. */
-    cmdpost_set_audio_callbacks(win32_aaudio_ops());
+    cmdpost_set_audio_callbacks(g_cmdpost, win32_aaudio_ops());
 }
 
 bool win32_host_init(const char* title, int win_w, int win_h,
@@ -2356,7 +2364,13 @@ bool win32_host_init(const char* title, int win_w, int win_h,
 
     SetTimer(g_hwnd, SENSOR_TIMER_ID, SENSOR_TIMER_MS, NULL);
 
-    cmdpost_init();
+    /* The cmdpost instance this host owns, for the life of the process: created
+     * here and freed in win32_host_shutdown(). The per-run reset
+     * (cmdpost_init) is the core's to make, on the instance each run is bound
+     * to - see win32_host_start_guest(). */
+    if (!g_cmdpost) {
+        g_cmdpost = cmdpost_create();
+    }
     win32_cmdpost_register_callbacks();
     vsync_clock_start();
     /* Try to load the GL backend (angle/swiftshader) */
@@ -2433,6 +2447,12 @@ bool win32_host_start_guest(int argc, char** argv)
     g_tty_seen  = false; /* no guest output yet this launch */
     rvvm_tty_attach(g_tty, g_guest_machine);
     rvvm_user_set_tty_callback(g_guest_machine, host_tty_cb, NULL);
+
+    /* Bind this run's machine to the host's cmdpost instance: it is how a
+     * syscall arriving on a guest thread finds the state it belongs to. Done
+     * before the thread is created, since the guest's first act may be one of
+     * these syscalls. */
+    rvvm_user_set_host_ctx(g_guest_machine, g_cmdpost);
 
     g_guest_argv = (char**)calloc((size_t)argc + 1, sizeof(char*));
     if (!g_guest_argv) {
@@ -2538,7 +2558,11 @@ void win32_host_shutdown(void)
          * every thread and handle) rather than racing a still-running guest. */
         return;
     }
-    cmdpost_cleanup();
+    /* Dismantle the cmdpost bridge and free the instance (cmdpost_destroy runs
+     * the same teardown, then frees). The guest is stopped by this point, so
+     * nothing can be using it. */
+    cmdpost_destroy(g_cmdpost);
+    g_cmdpost = NULL;
     if (g_cs_ready) {
         DeleteCriticalSection(&g_surf_cs);
         g_cs_ready = false;

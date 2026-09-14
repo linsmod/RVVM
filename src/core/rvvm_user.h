@@ -33,6 +33,14 @@ typedef ssize_t (*rvvm_user_io_callback)(int fd, const void* buf, size_t count);
 // If callback returns -1, the syscall will fail with errno
 void rvvm_user_set_io_callback(rvvm_machine_t* machine, rvvm_user_io_callback callback);
 
+// Opaque host context bound to a machine's userland instance. The host stores
+// whatever it needs to reach from a guest's syscall path (VirtPass stores its
+// vp_cmdpost_t there); the core only passes it back, and never dereferences it.
+// One context per machine, so a second guest in the same process cannot be
+// handed the first one's.
+void  rvvm_user_set_host_ctx(rvvm_machine_t* machine, void* ctx);
+void* rvvm_user_host_ctx(rvvm_machine_t* machine);
+
 // Callback type for guest exit event
 // Called when the guest exits (sys_exit or sys_exit_group)
 typedef void (*rvvm_user_exit_callback)(int exit_code);

@@ -48,6 +48,16 @@
 static JavaVM* g_jvm = NULL;
 static JNIEnv* g_env = NULL;
 
+/* This host's cmdpost instance: created in nativeInit(), bound to the machine
+ * of each run (rvvm_user_set_host_ctx) so the guest's syscalls reach it, and
+ * torn down in nativeDestroy(). It is what every cmdpost_* call in this file
+ * writes into - that state used to be file-scope globals in vp_cmdpost.c, one
+ * set for the whole process.
+ *
+ * Declared here rather than next to g_guest_machine because the vsync pump
+ * (defined above that point) is one of its callers. */
+static vp_cmdpost_t* g_cmdpost = NULL;
+
 /* Window from Android (Layer 2: the viewport) */
 static ANativeWindow* g_native_window = NULL;
 
@@ -117,7 +127,7 @@ static void on_vsync_frame(long frame_time_nanos, void* data)
 
     /* fd path: hand the frame time to the guest's Looper pipe if it asked for
      * this vsync. Cheap no-op while nothing is armed. */
-    vp_cmdpost_vsync_tick((int64_t)frame_time_nanos);
+    vp_cmdpost_vsync_tick(g_cmdpost, (int64_t)frame_time_nanos);
 
     /* Keep the tick continuous: re-arm immediately from inside the callback. */
     if (g_vsync_running) {
@@ -227,7 +237,7 @@ static void jni_vsync_stop(void)
     g_vsync_running = 0;
 
     /* Release a guest blocked in poll() on the vsync fd. */
-    vp_cmdpost_vsync_source_lost();
+    vp_cmdpost_vsync_source_lost(g_cmdpost);
 
     /* Wake a thread parked in ALooper_pollOnce(-1) ... */
     if (g_vsync_looper) {
@@ -254,7 +264,8 @@ static char g_guest_elf_path[512];
 static int g_guest_argc = 0;
 static char* g_guest_argv[16];
 /* Userland machine for the running guest. Created in nativeRunElf(), freed by
- * rvvm_user_linux_ex() on the guest thread. */
+ * rvvm_user_linux_ex() on the guest thread. Each run binds it to g_cmdpost (the
+ * host's cmdpost instance, declared at the top of this file). */
 static rvvm_machine_t* g_guest_machine = NULL;
 
 /* Guest exit callback (Java object reference, held by global ref) */
@@ -1246,26 +1257,26 @@ static void jni_register_cmdpost_callbacks(void)
     extern const vp_audio_ops_t* android_aaudio_ops(void);
 
     /* Window / surface + configuration */
-    cmdpost_set_window_callbacks(on_window_lock, on_window_unlock);
-    cmdpost_set_window_size_callback(on_window_size);
-    cmdpost_set_window_set_buf_callback(on_window_set_buf);
-    cmdpost_set_config_callback(on_config_get);
+    cmdpost_set_window_callbacks(g_cmdpost, on_window_lock, on_window_unlock);
+    cmdpost_set_window_size_callback(g_cmdpost, on_window_size);
+    cmdpost_set_window_set_buf_callback(g_cmdpost, on_window_set_buf);
+    cmdpost_set_config_callback(g_cmdpost, on_config_get);
 
     /* GameActivity lifecycle + input */
-    cmdpost_set_game_callbacks(on_game_lifecycle, on_game_input);
+    cmdpost_set_game_callbacks(g_cmdpost, on_game_lifecycle, on_game_input);
 
     /* Real display vsync as the guest's AChoreographer source. Only re-armed
      * while its owner thread is alive; otherwise the source stays unavailable
      * and the guest falls back to its own clock instead of waiting for a tick
      * that will never come. */
     if (g_vsync_running) {
-        cmdpost_set_choreographer_callback(android_vsync_wait);
+        cmdpost_set_choreographer_callback(g_cmdpost, android_vsync_wait);
         g_vsync_warned = 0;
     }
 
     /* Real AAudio backend: the pump thread in vp_aaudio_android.c bridges the
      * guest's SPSC ring to AAudioStream. */
-    cmdpost_set_audio_callbacks(android_aaudio_ops());
+    cmdpost_set_audio_callbacks(g_cmdpost, android_aaudio_ops());
 
     /* Real sensor backend: vp_sensor_android.c owns the platform
      * ASensorEventQueue and feeds the subsystem through vp_sensor_ingest(). */
@@ -1291,8 +1302,16 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
     vp_session_init(&g_session);
     g_session.on_line = on_console_line;
 
-    /* Initialize vp_cmdpost */
-    cmdpost_init();
+    /* The cmdpost instance this host owns. Created once, here, and destroyed in
+     * nativeDestroy(); the per-run reset (cmdpost_init) is the core's to make
+     * when a guest starts, on the instance each run is bound to. */
+    if (!g_cmdpost) {
+        g_cmdpost = cmdpost_create();
+    }
+    /* Hand it to the GL backend before the callback registration below reaches
+     * android_gl_host_init(), which registers the GL dispatch callbacks into
+     * the instance. */
+    android_gl_set_cmdpost(g_cmdpost);
 
     /* Expose the real display vsync as the guest's AChoreographer source. */
     jni_vsync_start();
@@ -1337,11 +1356,12 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
         g_tty = NULL;
     }
 
-    /* Dismantle the cmdpost bridge. This is the host's to do, and since the
-     * core's guest-exit path was narrowed to cmdpost_end_run() it is the only
-     * place on this side that calls it: no guest will run again until a new
-     * nativeInit(). */
-    cmdpost_cleanup();
+    /* Dismantle the cmdpost bridge and free the instance. This is the host's to
+     * do, and since the core's guest-exit path was narrowed to
+     * cmdpost_end_run() it is the only place on this side that tears the bridge
+     * down: no guest will run again until a new nativeInit() creates one. */
+    cmdpost_destroy(g_cmdpost);
+    g_cmdpost = NULL;
 
     LOGI("Native destroy complete");
 }
@@ -1520,9 +1540,9 @@ Java_com_rvvm_android_RvvmNative_nativeClearLifecycleCmds(JNIEnv* env, jobject t
      * down on its very first poll, a stale touch would be delivered as if the
      * user had just tapped). The seed state for the new guest is then queued
      * explicitly by the Java side. */
-    cmdpost_clear_lifecycle_cmds();
-    cmdpost_clear_motion_events();
-    cmdpost_clear_key_events();
+    cmdpost_clear_lifecycle_cmds(g_cmdpost);
+    cmdpost_clear_motion_events(g_cmdpost);
+    cmdpost_clear_key_events(g_cmdpost);
 }
 
 JNIEXPORT void JNICALL
@@ -1533,7 +1553,7 @@ Java_com_rvvm_android_RvvmNative_nativePostLifecycleCmd(JNIEnv* env, jobject thi
     
     /* Queue a lifecycle command (called from Java when activity state changes)
      * Both into the guest-facing queue (via vp_cmdpost) and the local queue. */
-    cmdpost_queue_lifecycle_cmd(cmd);
+    cmdpost_queue_lifecycle_cmd(g_cmdpost, cmd);
     if (g_lifecycle_cmd_count < 32) {
         g_lifecycle_cmd_queue[g_lifecycle_cmd_count++] = cmd;
         LOGI("Lifecycle command %d queued", cmd);
@@ -1599,7 +1619,7 @@ Java_com_rvvm_android_RvvmNative_nativePostMotionEvent(JNIEnv* env, jobject thiz
         ev.pointers[i].toolType = 1; /* AMOTION_EVENT_TOOL_TYPE_FINGER */
     }
 
-    cmdpost_queue_motion_event(&ev);
+    cmdpost_queue_motion_event(g_cmdpost, &ev);
     LOGI("Motion event queued: pointers=%d action=0x%x first=(%.0f,%.0f)",
          (int)count, (unsigned)action, xbuf[0], ybuf[0]);
 }
@@ -1679,6 +1699,12 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jstring
     /* on_guest_exit re-reads g_exit_listener when it fires, so registering it
      * once per run covers a listener set before or after this point. */
     rvvm_user_set_exit_callback(g_guest_machine, on_guest_exit);
+
+    /* Bind this run's machine to the host's cmdpost instance: it is how a
+     * syscall arriving on a guest thread finds the state it belongs to. Done
+     * before the thread starts, since the first thing the guest does may be one
+     * of these syscalls. */
+    rvvm_user_set_host_ctx(g_guest_machine, g_cmdpost);
 
     /* Host-owned console session: wipe the screen for this run (the cells, the
      * scrollback, the view and the cursor state all belong to the run that just

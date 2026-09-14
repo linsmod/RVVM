@@ -19,13 +19,21 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "virtpass/vp_cmdpost.h"  /* vp_cmdpost_t: the instance the callbacks go into */
+
 struct ANativeWindow;
 
 /*
+ * Bind the host's vp_cmdpost instance. The GL dispatch callbacks are registered
+ * into it, so this has to be called before the first android_gl_host_init().
+ */
+void android_gl_set_cmdpost(vp_cmdpost_t* inst);
+
+/*
  * dlopen the system EGL/GLES (once) and (re)install the GL dispatch callbacks
- * with vp_cmdpost. Safe and required to call before every guest: cmdpost_cleanup()
- * NULLs the callbacks when a guest exits, so a relaunched guest needs the
- * registration redone - same reason jni_register_cmdpost_callbacks() exists.
+ * with vp_cmdpost. Safe and required to call before every guest: it re-installs
+ * the callbacks into the host's instance, the same thing
+ * jni_register_cmdpost_callbacks() does for the rest of the bridge.
  * Returns false when the system libraries cannot be loaded (guests then fall
  * back to CPU rendering, as on win32).
  */

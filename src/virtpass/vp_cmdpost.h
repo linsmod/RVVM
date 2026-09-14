@@ -69,6 +69,22 @@ typedef void (*egl_dispatch_callback)(uint32_t fn_id, const int64_t* args, int64
 typedef void (*gl_dispatch_callback) (uint32_t fn_id, const int64_t* args, int64_t* ret);
 
 /* ============================================================
+ * Per-instance state
+ *
+ * One instance per host instance (today: one per process - the Android
+ * activity and the win32 launcher each own exactly one). Everything below that
+ * used to be a file-scope global hangs off this: the callback table, the
+ * host->guest queues, the vsync wait state and the AAudio slot table. The host
+ * creates it, registers its callbacks into it, hands it to the core with
+ * rvvm_user_set_host_ctx() so a guest's ecall path can find the instance its
+ * syscalls belong to, and destroys it at teardown.
+ * ============================================================ */
+typedef struct vp_cmdpost vp_cmdpost_t;
+
+vp_cmdpost_t* cmdpost_create(void);
+void cmdpost_destroy(vp_cmdpost_t* inst);
+
+/* ============================================================
  * GameActivity event structures (must match Guest ABI, packed)
  * ============================================================ */
 #define CMDPOST_MAX_NUM_POINTERS_IN_MOTION_EVENT 16
@@ -127,40 +143,43 @@ typedef struct {
 } __attribute__((packed)) cmdpost_GameActivityInputBuffer;
 
 /* Queue lifecycle commands from the host side (called from JNI/Java) */
-void cmdpost_queue_lifecycle_cmd(int32_t cmd);
+void cmdpost_queue_lifecycle_cmd(vp_cmdpost_t* inst, int32_t cmd);
 
 /* Queue a motion event from the host side (called from JNI/Java) */
-void cmdpost_queue_motion_event(const cmdpost_GameActivityMotionEvent* ev);
+void cmdpost_queue_motion_event(vp_cmdpost_t* inst, const cmdpost_GameActivityMotionEvent* ev);
 
 /* Clear queued host events */
-void cmdpost_clear_lifecycle_cmds(void);
-void cmdpost_clear_motion_events(void);
-void cmdpost_clear_key_events(void);
+void cmdpost_clear_lifecycle_cmds(vp_cmdpost_t* inst);
+void cmdpost_clear_motion_events(vp_cmdpost_t* inst);
+void cmdpost_clear_key_events(vp_cmdpost_t* inst);
 
 /* Set callback functions (called from JNI/Android side) */
-void cmdpost_set_window_callbacks(window_lock_callback lock,
+void cmdpost_set_window_callbacks(vp_cmdpost_t* inst,
+                                   window_lock_callback lock,
                                    window_unlock_callback unlock);
 
-void cmdpost_set_window_size_callback(window_size_callback size_cb);
+void cmdpost_set_window_size_callback(vp_cmdpost_t* inst, window_size_callback size_cb);
 
-void cmdpost_set_window_set_buf_callback(window_set_buf_callback set_buf_cb);
+void cmdpost_set_window_set_buf_callback(vp_cmdpost_t* inst, window_set_buf_callback set_buf_cb);
 
 /* Register the host-side device configuration provider (AConfiguration_*). */
-void cmdpost_set_config_callback(config_get_callback get_cb);
+void cmdpost_set_config_callback(vp_cmdpost_t* inst, config_get_callback get_cb);
 
-void cmdpost_set_game_callbacks(game_lifecycle_callback lifecycle,
+void cmdpost_set_game_callbacks(vp_cmdpost_t* inst,
+                                 game_lifecycle_callback lifecycle,
                                  game_input_callback input);
 
 /* Phase 3: register GL/EGL dispatch callbacks (gl_call layout in vp_cmdpost.c).
  * 未注册时 dispatch 仍成功但 ret=0：guest 可检测并退回 CPU 像素路径. */
-void cmdpost_set_gl_callbacks(egl_dispatch_callback egl, gl_dispatch_callback gl);
+void cmdpost_set_gl_callbacks(vp_cmdpost_t* inst,
+                              egl_dispatch_callback egl, gl_dispatch_callback gl);
 
 /* Phase 4: display vsync source for AChoreographer. The host registers a
  * blocking waiter returning the next frame time in nanoseconds (monotonic),
  * or a negative value when it has no vsync source. The guest's AChoreographer
  * stubs reach it through SYS_ANDROID_CHOREOGRAPHER_WAIT. */
 typedef int64_t (*choreographer_wait_callback)(void);
-void cmdpost_set_choreographer_callback(choreographer_wait_callback wait_cb);
+void cmdpost_set_choreographer_callback(vp_cmdpost_t* inst, choreographer_wait_callback wait_cb);
 
 /* Phase 4 (fd wakeup / 方案 B): the same vsync source can wake the guest
  * directly. The guest hands us the write end of a pipe that its Looper polls
@@ -172,8 +191,8 @@ void cmdpost_set_choreographer_callback(choreographer_wait_callback wait_cb);
  * clock goes away (activity destroyed) it must call
  * vp_cmdpost_vsync_source_lost(): that wakes a guest blocked in poll() once
  * with a negative frame time, so the stub degrades instead of hanging. */
-bool vp_cmdpost_vsync_tick(int64_t frame_time_ns);
-void vp_cmdpost_vsync_source_lost(void);
+bool vp_cmdpost_vsync_tick(vp_cmdpost_t* inst, int64_t frame_time_ns);
+void vp_cmdpost_vsync_source_lost(vp_cmdpost_t* inst);
 
 /* Capability bits reported to the guest by CHOREOGRAPHER_INIT.
  * Mirrored in virtpass/vp_android.h. */
@@ -211,15 +230,21 @@ typedef struct vp_audio_ops {
 } vp_audio_ops_t;
 
 /* Register the host audio backend. Pass NULL to detach (used on teardown). */
-void cmdpost_set_audio_callbacks(const vp_audio_ops_t* ops);
+void cmdpost_set_audio_callbacks(vp_cmdpost_t* inst, const vp_audio_ops_t* ops);
 
 /* Unified Android NDK API proxy syscall (sub-command passed in a0). The
  * numbers themselves live in virtpass/vp_syscall.h, shared verbatim with the
  * guest stub. */
 #include "virtpass/vp_syscall.h"
 
-/* Handle Android NDK API proxy syscall */
-int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
+/* Handle Android NDK API proxy syscall.
+ *
+ * `inst` is the host instance this guest's syscalls belong to, as bound with
+ * rvvm_user_set_host_ctx(). It may be NULL: a host-less run (rvvm_user_main.c
+ * boots a guest without any host bridge) has no instance to bind, and then the
+ * call works against a stand-in whose callbacks are all unregistered - which is
+ * exactly what the old file-scope globals meant in that case. */
+int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
                       int64_t a3, int64_t a4, int64_t a5, void* guest_mem);
 
 /* ============================================================
@@ -246,8 +271,8 @@ int64_t cmdpost_dispatch(int64_t syscall_nr, int64_t a0, int64_t a1, int64_t a2,
  * already registered, and the relaunch raced the teardown and lost (the new
  * guest then probed a dead proxy: no window, no GL, no audio).
  * ============================================================ */
-void cmdpost_init(void);
-void cmdpost_end_run(void);
-void cmdpost_cleanup(void);
+void cmdpost_init(vp_cmdpost_t* inst);
+void cmdpost_end_run(vp_cmdpost_t* inst);
+void cmdpost_cleanup(vp_cmdpost_t* inst);
 
 #endif /* vp_cmdpost_H */

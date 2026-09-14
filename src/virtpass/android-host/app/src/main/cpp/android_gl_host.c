@@ -58,14 +58,24 @@ static void* g_h_egl  = NULL;
 static void* g_h_gles = NULL;
 static const char* g_gl_lib = NULL; /* which soname g_h_gles came from */
 static bool  g_loaded = false;
+/* The host's cmdpost instance, handed over by jni_bridge before the first
+ * android_gl_host_init(). The GL dispatch callbacks are registered into it, so
+ * this backend has to know which instance it is talking to. */
+static vp_cmdpost_t* g_cmdpost = NULL;
+
+void android_gl_set_cmdpost(vp_cmdpost_t* inst)
+{
+    g_cmdpost = inst;
+}
 
 bool android_gl_host_init(void)
 {
     if (g_loaded) {
         /* Libraries stay loaded for the process lifetime; only the cmdpost
-         * callbacks need reinstalling (cmdpost_cleanup NULLs them on guest
-         * exit). */
-        cmdpost_set_gl_callbacks(on_egl_dispatch, on_gl_dispatch);
+         * callbacks need reinstalling (a guest's exit no longer clears them -
+         * cmdpost_end_run() leaves the host bridge standing - but a host that
+         * re-registers for every run gets the same result either way). */
+        cmdpost_set_gl_callbacks(g_cmdpost, on_egl_dispatch, on_gl_dispatch);
         return true;
     }
 
@@ -117,7 +127,7 @@ bool android_gl_host_init(void)
 
     g_loaded = true;
     LOGI("system GL backend loaded (libEGL.so + %s)", g_gl_lib);
-    cmdpost_set_gl_callbacks(on_egl_dispatch, on_gl_dispatch);
+    cmdpost_set_gl_callbacks(g_cmdpost, on_egl_dispatch, on_gl_dispatch);
     return true;
 
 fail:

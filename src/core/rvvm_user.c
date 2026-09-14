@@ -659,6 +659,10 @@ typedef struct rvvm_userland {
     // --- Configuration & callbacks (group A) ---
     rvvm_user_io_callback    io_callback;
     rvvm_user_exit_callback  exit_callback;
+    // Opaque host context. The host puts whatever it needs to reach from a
+    // guest's syscall path here (VirtPass: its vp_cmdpost_t); the core only
+    // hands it back through rvvm_user_host_ctx().
+    void*                    host_ctx;
     const char*              prefix_path;
     // Prefix set through rvvm_user_set_prefix(): the string is owned here and
     // the RVVM_USER_PREFIX environment must not override it
@@ -2124,6 +2128,21 @@ PUBLIC void rvvm_user_set_io_callback(rvvm_machine_t* machine, rvvm_user_io_call
 {
     rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
     if (ctx) ctx->io_callback = callback;
+}
+
+/* Bind/reach the host's own context for this machine. The core never looks
+ * inside it - it is the host's state that has to be reachable from a guest's
+ * syscall path, where the only thing available is the vCPU (cpu->machine). */
+PUBLIC void rvvm_user_set_host_ctx(rvvm_machine_t* machine, void* host_ctx)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (ctx) ctx->host_ctx = host_ctx;
+}
+
+PUBLIC void* rvvm_user_host_ctx(rvvm_machine_t* machine)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    return ctx ? ctx->host_ctx : NULL;
 }
 
 PUBLIC void rvvm_user_set_exit_callback(rvvm_machine_t* machine, rvvm_user_exit_callback callback)
@@ -4398,13 +4417,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                  */
                 case SYS_ANDROID_CALL: {
                     rvvm_info("cmdpost_dispatch a0=%lx a1=%lx a2=%lx", a0, a1, a2);
-                    a0 = cmdpost_dispatch(SYS_ANDROID_CALL, a0, a1, a2, a3, a4, a5, NULL);
+                    /* This thread's machine names the host context the guest
+                     * belongs to: NULL when nothing was bound (a host-less run
+                     * through rvvm_user_main.c), which vp_cmdpost handles by
+                     * falling back to its process-wide default instance. */
+                    a0 = cmdpost_dispatch(rvvm_user_host_ctx(cpu->machine),
+                                          SYS_ANDROID_CALL, a0, a1, a2, a3, a4, a5, NULL);
                     break;
                 }
                 case SYS_GL_CALL:
                 case SYS_EGL_CALL:
                     rvvm_info("cmdpost_dispatch nr=%lx a0=%lx a1=%lx", a7, a0, a1);
-                    a0 = cmdpost_dispatch(a7, a0, a1, a2, a3, a4, a5, NULL);
+                    a0 = cmdpost_dispatch(rvvm_user_host_ctx(cpu->machine),
+                                          a7, a0, a1, a2, a3, a4, a5, NULL);
                     break;
                 default:
 #ifndef __riscv
@@ -4849,8 +4874,10 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
     rvvm_user_set_io_callback(machine, android_io_callback);
 #endif
     
-    /* Initialize Android NDK API proxy */
-    cmdpost_init();
+    /* Initialize Android NDK API proxy. The context is whatever this machine's
+     * host bound (NULL for a host-less run: vp_cmdpost then falls back to its
+     * process-wide default instance, which is what the old globals were). */
+    cmdpost_init(rvvm_user_host_ctx(machine));
     // Remember the ELF images for crash symbolization (see proc_symbolize())
     uctx()->main_elf_path[0] = 0;
     uctx()->interp_elf_path[0] = 0;
@@ -4985,7 +5012,7 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
      * the exiting guest's thread while the host may already be registering
      * callbacks for the next one. The host calls cmdpost_cleanup() itself, from
      * its own teardown. */
-    cmdpost_end_run();
+    cmdpost_end_run(rvvm_user_host_ctx(machine));
 
     /* Guest threads wind down asynchronously: wait for them to leave the
      * machine before freeing it. On timeout, leak the machine instead of
@@ -5042,6 +5069,17 @@ void rvvm_user_free(rvvm_machine_t* machine)
 void rvvm_user_set_io_callback(rvvm_machine_t* machine, rvvm_user_io_callback callback)
 {
     UNUSED(machine); UNUSED(callback);
+}
+
+void rvvm_user_set_host_ctx(rvvm_machine_t* machine, void* host_ctx)
+{
+    UNUSED(machine); UNUSED(host_ctx);
+}
+
+void* rvvm_user_host_ctx(rvvm_machine_t* machine)
+{
+    UNUSED(machine);
+    return NULL;
 }
 
 void rvvm_user_set_exit_callback(rvvm_machine_t* machine, rvvm_user_exit_callback callback)
