@@ -10,6 +10,7 @@ import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.SurfaceTexture;
+import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.text.Editable;
@@ -119,19 +120,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     // gesture of ours.
     private View workspace;
     private View glWindow;                // the card: title bar + SurfaceView
-    private View glCaptionBar;            // the title bar (measured when rolled up)
+    private View glCaptionBar;            // the title bar
     private TextView glCaption;           // the drag handle
     private TextView glBtnMin, glBtnMax, glBtnClose;
-    private TextView glShowChip;          // shown while the window is closed
+    private TextView glShowChip;          // the minimized window, in the corner
     // Floating geometry as inflated from the XML: the size and the gravity the
     // floating state is laid out with. Everything else about the position is a
     // margin, not a translation - see moveGlWindow() for why.
     private int glFloatW, glFloatH, glFloatGravity;
     private float glRestoreLeft, glRestoreTop;
     private boolean glMaximized = false;
-    private boolean glCollapsed = false;
-    // What the window was before it was rolled up, so minimizing can be undone.
-    private boolean glMaximizedBeforeCollapse = false;
+
+    // ---- Content-driven visibility ----
+    // The window is not shown until the guest has a frame for it, so a guest
+    // that never draws (a plain console program) never puts an empty black
+    // rectangle on screen. The catch is that the *surface* cannot be hidden
+    // while waiting: an EGL guest builds its window surface from the window
+    // handle the moment it starts, and a GameActivity guest only draws after
+    // INIT_WINDOW - a window that appeared later would leave both of them stuck
+    // waiting. So the surface stays alive the whole time and only the card's
+    // footprint is taken away: it is laid out 1x1 px with no frame, no title
+    // bar and no shadow, and grows back into place on the first frame
+    // (revealGlWindow).
+    private boolean glRevealed = false;
+    // Card decorations as inflated, put back on the first frame.
+    private int glFramePadding;
+    private float glFloatElevation;
+    private Drawable glBackground;
 
     // The run's log file. Opened in runGuestElf (UI thread), written from the
     // guest thread (onOutput), closed when the guest exits - hence the lock.
@@ -731,11 +746,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
      * otherwise be unreachable, with no graphics tab left to switch back to.
      *
      * The three buttons are the Windows set and mean what they mean there.
-     * Minimize rolls the card up to its title bar and back; maximize fills the
-     * workspace and restore puts it back at its floating corner; close hides it
-     * and leaves the console the whole screen. None of them touches the guest -
-     * even close only takes its window away, which is the same
-     * TERM_WINDOW/INIT_WINDOW cycle a backgrounded Activity causes.
+     * Minimize takes the window off the workspace and leaves a chip in its
+     * place; maximize fills the workspace and restore puts the window back at
+     * its floating corner; close stops the guest and takes the window down with
+     * it. Minimize leaves the guest running and close is the only one that ends
+     * it, which is the same split a desktop draws between a minimized window
+     * and a closed one.
      * ============================================================ */
 
     private void initGlWindow() {
@@ -759,10 +775,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         glFloatH = lp.height;
         glFloatGravity = lp.gravity;
 
-        glBtnMin.setOnClickListener(v -> setGlWindowCollapsed(!glCollapsed));
+        // Nothing to show yet: the card waits for the guest's first frame
+        // (see the content-driven visibility note above).
+        glFramePadding = glWindow.getPaddingLeft();
+        glFloatElevation = glWindow.getElevation();
+        glBackground = glWindow.getBackground();
+        hideGlWindow();
+        applyGlWindowLayout();
+
+        glBtnMin.setOnClickListener(v -> minimizeGlWindow());
         glBtnMax.setOnClickListener(v -> toggleGlWindowMaximized());
-        glBtnClose.setOnClickListener(v -> setGlWindowClosed(true));
-        glShowChip.setOnClickListener(v -> setGlWindowClosed(false));
+        glBtnClose.setOnClickListener(v -> closeGlWindow());
+        glShowChip.setOnClickListener(v -> restoreMinimizedGlWindow());
 
         final int slop = ViewConfiguration.get(this).getScaledTouchSlop();
         glCaption.setOnTouchListener(new View.OnTouchListener() {
@@ -857,14 +881,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     }
 
     /**
-     * Lay the card out for its current state: maximized (fills the workspace),
-     * rolled up (title bar only) or floating (its own size). The position is
-     * not this method's business - that is a margin, see moveGlWindow(), which
-     * the callers re-apply when the card comes back from the maximized layout
-     * (it is laid out with its margins cleared).
+     * Lay the card out for its current state: waiting for a frame, maximized
+     * (fills the workspace) or floating (its own size). The position is not
+     * this method's business - that is a margin, see moveGlWindow(), which the
+     * callers re-apply when the card comes back from the maximized layout (it
+     * is laid out with its margins cleared).
+     *
+     * Until the guest has a frame, the card is 1x1 px: the surface inside it
+     * has to exist (see the content-driven visibility note above) but must not
+     * be given any room on screen.
      */
     private void applyGlWindowLayout() {
         FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) glWindow.getLayoutParams();
+        if (!glRevealed) {
+            // Waiting for a frame: the surface gets the smallest box that keeps
+            // it alive, parked where the window will grow from.
+            lp.width = 1;
+            lp.height = 1;
+            lp.gravity = glFloatGravity;
+            glWindow.setLayoutParams(lp);
+            return;
+        }
         if (glMaximized) {
             lp.width = FrameLayout.LayoutParams.MATCH_PARENT;
             lp.height = FrameLayout.LayoutParams.MATCH_PARENT;
@@ -872,36 +909,54 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
             lp.leftMargin = lp.topMargin = lp.rightMargin = lp.bottomMargin = 0;
         } else {
             lp.width = glFloatW;
-            lp.height = glCollapsed ? glCollapsedHeight() : glFloatH;
+            lp.height = glFloatH;
             lp.gravity = glFloatGravity;
         }
         glWindow.setLayoutParams(lp);
     }
 
-    /** Height of the rolled-up window: the title bar plus the frame the card
-     *  keeps around it. Measured, not hardcoded, so the title bar can change
-     *  size (a taller bar, a thicker border) without this following it. */
-    private int glCollapsedHeight() {
-        return glCaptionBar.getHeight()
-             + glWindow.getPaddingTop() + glWindow.getPaddingBottom();
+    /**
+     * Take the card's footprint away without taking its surface away.
+     *
+     * Every part of this matters, because a SurfaceView only has a surface
+     * while its content area is non-zero: at 1x1 px, the 1dp frame and the 32dp
+     * title bar would eat the whole box and the SurfaceView would be measured
+     * to nothing - and a zero-sized SurfaceView has no surface, which is
+     * exactly the state that strands a guest waiting for INIT_WINDOW.
+     */
+    private void hideGlWindow() {
+        glCaptionBar.setVisibility(View.GONE);
+        glWindow.setPadding(0, 0, 0, 0);
+        glWindow.setBackground(null);
+        glWindow.setElevation(0f);
+    }
+
+    /**
+     * The guest has a frame for the window (or the user asked for it back):
+     * put the card's frame, title bar, shadow and size back.
+     *
+     * Nothing is recreated under the guest: the card only grows over the
+     * surface that has been there all along, so the frame it already holds is
+     * what appears - no new surface, no INIT_WINDOW, and at most the resize the
+     * guest would see if the card had been dragged to that size by hand.
+     */
+    private void revealGlWindow() {
+        if (glRevealed) {
+            return;
+        }
+        glRevealed = true;
+        glWindow.setBackground(glBackground);
+        glWindow.setElevation(glFloatElevation);
+        glWindow.setPadding(glFramePadding, glFramePadding, glFramePadding, glFramePadding);
+        glCaptionBar.setVisibility(View.VISIBLE);
+        applyGlWindowLayout();
     }
 
     /**
      * Maximize button: fill the workspace with the guest's window, or put it
      * back at the corner and size it was floating at.
-     *
-     * Pressed while rolled up it unrolls the window too, straight to full size
-     * - the two title bar buttons differ only in the size they come back at,
-     * which is the one thing that makes either of them a safe way out of the
-     * rolled-up state.
      */
     private void toggleGlWindowMaximized() {
-        if (glCollapsed) {
-            // Unroll it into the floating state first, so the toggle below has
-            // a corner to remember and lands on "maximized".
-            glMaximizedBeforeCollapse = false;
-            setGlWindowCollapsed(false);
-        }
         if (glMaximized) {
             glMaximized = false;
             applyGlWindowLayout();
@@ -922,61 +977,70 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     }
 
     /**
-     * Minimize button: roll the card up to its title bar, and unroll it again.
+     * Minimize button: take the window off the workspace and leave it in the
+     * corner as a chip - the taskbar, in one widget.
      *
-     * Two things make this more than a size change. The video area carries the
-     * surface, so rolling it up hides the SurfaceView and costs the guest the
-     * TERM_WINDOW / INIT_WINDOW cycle any hidden surface does - the guest keeps
-     * running throughout. And a rolled-up *maximized* window would be a title
-     * bar across the whole screen, which is why it comes down to the corner it
-     * was floating in and goes back up on the way out.
+     * The guest is not touched. What changes on its side is the window: hiding
+     * the card takes the surface with it, so the guest gets the same
+     * TERM_WINDOW a minimized window gives it on a desktop and stops
+     * presenting, and the restore hands it a fresh surface and INIT_WINDOW to
+     * repaint into.
      */
-    private void setGlWindowCollapsed(boolean collapsed) {
-        if (collapsed == glCollapsed) {
-            return;
-        }
-        if (collapsed) {
-            glMaximizedBeforeCollapse = glMaximized;
-            glMaximized = false;
-            glCollapsed = true;
-            surfaceView.setVisibility(View.GONE);
-            applyGlWindowLayout();
-            if (glMaximizedBeforeCollapse) {
-                moveGlWindow(glRestoreLeft, glRestoreTop);
-            }
-        } else {
-            glCollapsed = false;
-            glMaximized = glMaximizedBeforeCollapse;
-            if (glMaximized) {
-                // On its way back up: the corner it is leaving becomes the one
-                // "restore" returns it to.
-                glRestoreLeft = glWindow.getLeft();
-                glRestoreTop = glWindow.getTop();
-            }
-            surfaceView.setVisibility(View.VISIBLE);
-            applyGlWindowLayout();
-            if (!glMaximized) {
-                // The card just grew: a strip dragged along the bottom edge
-                // would otherwise hang off the workspace as a full window.
-                moveGlWindow(glWindow.getLeft(), glWindow.getTop());
-            }
-        }
-        updateGlWindowButtons();
+    private void minimizeGlWindow() {
+        setGlWindowShown(false);
+    }
+
+    /** The chip: bring the minimized window back. */
+    private void restoreMinimizedGlWindow() {
+        setGlWindowShown(true);
     }
 
     /**
-     * Close button, and the chip that reopens: hide the window, leaving the
-     * console the whole screen.
-     *
-     * The guest is deliberately left alone - closing a window is not stopping a
-     * guest, and it simply loses its window the way it does when the Activity
-     * is backgrounded. The chip in the corner is then the way back, and the
-     * only one: there is no launcher or taskbar here, so a close without it
-     * would be a dead end with the guest still running.
+     * The card on screen, or the chip in its place. Revealing here covers the
+     * window that was minimized before it ever had a frame (nothing to show, so
+     * nothing was shown): without it, the chip would hand back the 1x1 waiting
+     * state and the window would look like it was still minimized.
      */
-    private void setGlWindowClosed(boolean closed) {
-        glWindow.setVisibility(closed ? View.GONE : View.VISIBLE);
-        glShowChip.setVisibility(closed ? View.VISIBLE : View.GONE);
+    private void setGlWindowShown(boolean shown) {
+        glShowChip.setVisibility(shown ? View.GONE : View.VISIBLE);
+        glWindow.setVisibility(shown ? View.VISIBLE : View.GONE);
+        if (shown) {
+            revealGlWindow();
+        }
+    }
+
+    /**
+     * Close button: stop the guest, and take the window down with it.
+     *
+     * This is the Stop button's action - the same asynchronous unwind, the same
+     * exit report in the status line - plus closing the window, because a
+     * window whose guest is gone has nothing left to show. No chip is left
+     * behind either: the window belongs to the run that just ended, and the way
+     * back is the Run button, which gives the next guest a window that appears
+     * with its first frame (resetGlWindowForRun).
+     */
+    private void closeGlWindow() {
+        stopGuestElf();
+        glShowChip.setVisibility(View.GONE);
+        glWindow.setVisibility(View.GONE);
+    }
+
+    /**
+     * Back to the state a run starts in: the card on screen, waiting at 1x1 px
+     * for the first frame, with no chip.
+     *
+     * This also takes back a window the user minimized or closed by hand: both
+     * belong to the run that just ended, and a new guest gets its own window as
+     * soon as it has a frame for it. The window's geometry - its corner, and
+     * whether it was maximized - is deliberately kept: that is the user's
+     * arrangement of the workspace, not the guest's.
+     */
+    private void resetGlWindowForRun() {
+        glShowChip.setVisibility(View.GONE);
+        glWindow.setVisibility(View.VISIBLE);
+        glRevealed = false;
+        hideGlWindow();
+        applyGlWindowLayout();
     }
 
     /** The maximize button's glyph: Windows' pair, a box for "fill the screen"
@@ -1472,6 +1536,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
         // arrives, so there is nothing to reset here.
         openGuestLogFile(elfName);
 
+        // The window goes back to waiting for content, and comes back if the
+        // previous run's was minimized or closed.
+        resetGlWindowForRun();
+
         replayGuestStartupState();
 
         boolean started = RvvmNative.nativeRunElf(elfPath, null);
@@ -1837,12 +1905,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback2 {
     /**
      * The first presented frame is on the surface. Guest thread.
      *
-     * Nothing on screen depends on it any more (that is what the text overlay
-     * used to wait for), so it is only a marker in the log: the guest's window
-     * is up and the floating card is showing the guest's own frames.
+     * This is what the window's visibility is driven by: the card has been
+     * waiting at 1x1 px (see the content-driven visibility note), and one frame
+     * is all it takes to bring it up. A guest that never draws never gets here,
+     * so it never puts a window on screen at all; a guest that does gets its
+     * window at the moment it has something to put in it.
      */
     private void handleFirstFrame() {
         Log.i(TAG, "First frame presented");
+        runOnUiThread(this::revealGlWindow);
     }
 
     // --- Activity lifecycle --------------------------------------------------

@@ -211,7 +211,13 @@
 
          The 1dp padding is the window's border: the surface composites above
          this window, so the frame drawable is only visible in the ring the
-         card keeps free around its content. See gl_window_frame.xml. -->
+         card keeps free around its content. See gl_window_frame.xml.
+
+         The size below is the window's *shown* state. Until the guest has a
+         frame to put in it, MainActivity lays the card out at 1x1 px with this
+         frame, the title bar and the shadow taken away, so a guest that never
+         draws never puts an empty window on screen - while its surface, which
+         has to exist from the start, stays alive. -->
     <LinearLayout
         android:id="@+id/glWindow"
         android:layout_width="320dp"
@@ -291,9 +297,9 @@
 
     </LinearLayout>
 
-    <!-- Stand-in for the taskbar: the window has no launcher to come back from,
-         so while it is closed this chip in the corner is the way to it. The
-         guest itself keeps running - closing a window is not stopping a guest. -->
+    <!-- The taskbar, in one widget: while the window is minimized this chip
+         takes its place in the corner and is the way back. Only minimize uses
+         it - the close button stops the guest and leaves nothing behind. -->
     <TextView
         android:id="@+id/glShowChip"
         android:layout_width="wrap_content"

@@ -20,7 +20,8 @@
     <string name="gl_btn_min_desc">Minimize window</string>
     <string name="gl_btn_max_desc">Maximize or restore window</string>
     <string name="gl_btn_close_desc">Close window</string>
-    <!-- Shown in the corner only while the window is closed: the way back. -->
+    <!-- Shown in the corner while the window is minimized: the taskbar entry,
+         and the only way back to a window that is not on screen. -->
     <string name="gl_show_window">\u2750 Guest</string>
 
     <!-- Console keyboard bar: the terminal keys a soft keyboard cannot produce.
