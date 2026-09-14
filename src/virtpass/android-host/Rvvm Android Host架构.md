@@ -358,6 +358,8 @@ sequenceDiagram
    （assets 里的每个 guest app，点按即**新开**一个 run）；任务条上每个运行中的
    窗口一枚芯片（聚焦高亮、最小化加前缀；点按聚焦/还原、长按关闭）；SUSPEND/
    STOP 作用于聚焦窗口。旧的单开残留（spinner + RUN 禁用逻辑）已删除。
+   芯片区为 `FlowLayout` 流式换行、任务条高度随窗口数自动扩展，超过屏幕 3/5
+   （`BoundedScrollView`）后转为垂直滚动——任何时刻所有运行中的任务都可见。
 5. **bootstrap run 已根除（2026-09-14）**：`android_run_active()` 不再隐式创建
    run——过去 `nativeInit()` 等宿主级调用会凭空造出一个"从未启动"的空 run，
    永久占据槽 0，使 4 槽表实际只有 3 个可用（症状：自动启动 1 + 手动开 2 个后

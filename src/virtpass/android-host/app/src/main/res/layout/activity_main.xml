@@ -160,19 +160,20 @@
                 android:text="@string/start_button"
                 android:textSize="14sp" />
 
-            <HorizontalScrollView
+            <!-- Chips wrap into rows (FlowLayout) and the strip grows with
+                 them; past 3/5 of the screen it stops growing and scrolls. -->
+            <com.rvvm.android.BoundedScrollView
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:scrollbars="none">
 
-                <LinearLayout
+                <com.rvvm.android.FlowLayout
                     android:id="@+id/glTaskbar"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:orientation="horizontal" />
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
 
-            </HorizontalScrollView>
+            </com.rvvm.android.BoundedScrollView>
 
             <Button
                 android:id="@+id/suspendButton"

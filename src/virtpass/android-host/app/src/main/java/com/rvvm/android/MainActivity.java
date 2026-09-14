@@ -40,6 +40,7 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ListPopupWindow;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.BufferedWriter;
 import java.io.File;
@@ -123,7 +124,7 @@ public class MainActivity extends Activity {
     // down). First-frame and exit signals still carry the runGeneration so a
     // late signal cannot land on the run that replaced this one.
     private View workspace;
-    private LinearLayout glTaskbar;       // one entry per minimized guest window
+    private FlowLayout glTaskbar;         // one chip per running guest window
     private final java.util.HashMap<Integer, GlWindowCard> glCards =
             new java.util.HashMap<>();
     // A run whose card is waiting for its surface: picked up by the card's
@@ -789,9 +790,11 @@ public class MainActivity extends Activity {
         }
 
         @Override public void onCardTouch(GlWindowCard card, MotionEvent event) {
-            // The card is a viewport: the guest's input space is the panel, and
-            // the frame buffer fills the whole card, so the mapping is a plain
-            // linear scale from card pixels to panel pixels.
+            // The card is a viewport: the guest's input space is the panel,
+            // and the frame buffer fills the whole card. Touches arrive in
+            // card coordinates (the listener owns the whole card, black
+            // letterbox bars included) - translate into the surface's own
+            // space first, then scale linearly onto the panel.
             if (!isInitialized) {
                 return;
             }
@@ -802,14 +805,22 @@ public class MainActivity extends Activity {
             if (viewW <= 0f || viewH <= 0f) {
                 return;
             }
+            // The surface sits centered inside the video area, which itself
+            // sits below the caption bar inside the card - offset by both.
+            ViewGroup video = (ViewGroup) card.surfaceView.getParent();
+            float offX = video.getLeft() + card.surfaceView.getLeft();
+            float offY = video.getTop() + card.surfaceView.getTop();
             float sx = PANEL_W / viewW, sy = PANEL_H / viewH;
             int count = event.getPointerCount();
             if (count > MAX_POINTERS) {
                 count = MAX_POINTERS;
             }
             for (int i = 0; i < count; i++) {
-                motionX[i] = event.getX(i) * sx;
-                motionY[i] = event.getY(i) * sy;
+                // Touches on the bars land outside the frame: clamped onto the
+                // panel edge, the same way a mouse dragged off a desktop
+                // window's content just stops at its border.
+                motionX[i] = Math.max(0f, Math.min(PANEL_W, (event.getX(i) - offX) * sx));
+                motionY[i] = Math.max(0f, Math.min(PANEL_H, (event.getY(i) - offY) * sy));
                 motionId[i] = event.getPointerId(i);
             }
             // Use the raw action: ACTION_POINTER_DOWN/UP encode the pointer
@@ -891,8 +902,13 @@ public class MainActivity extends Activity {
             TextView chip = new TextView(this);
             String name = card.getTitle().isEmpty() ? getString(R.string.gl_title) : card.getTitle();
             chip.setText(card.isMinimized() ? getString(R.string.gl_taskbar_entry, name) : name);
-            chip.setPadding(24, 8, 24, 8);
-            chip.setMinWidth(96);
+            // Uniform chip size: the flow layout wraps them into tidy rows,
+            // long names ellipsize instead of pushing the row wider.
+            float density = getResources().getDisplayMetrics().density;
+            chip.setWidth((int) (150 * density));
+            chip.setMaxLines(1);
+            chip.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            chip.setPadding(24, 12, 24, 12);
             chip.setGravity(android.view.Gravity.CENTER);
             chip.setTextSize(13f);
             chip.setTypeface(null, focused ? Typeface.BOLD : Typeface.NORMAL);
@@ -971,6 +987,7 @@ public class MainActivity extends Activity {
         for (GlWindowCard c : glCards.values()) {
             c.setFocused(c.getGuestId() == guestId);
         }
+        rebuildTaskbar();
         return card;
     }
 
@@ -1424,6 +1441,7 @@ public class MainActivity extends Activity {
         final int guestId = RvvmNative.nativeCreateGuest();
         if (guestId < 0) {
             statusText.setText("No guest slot left");
+            Toast.makeText(this, R.string.no_slot_left, Toast.LENGTH_SHORT).show();
             Log.i(TAG, "No guest slot left");
             return;
         }

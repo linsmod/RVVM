@@ -4,6 +4,7 @@
     <string name="guest_app_label">Guest App:</string>
     <string name="run_guest">Run</string>
     <string name="start_button">\u229E</string>
+    <string name="no_slot_left">Guest slots are full - close a window first (rvvm.max_guests raises the limit)</string>
     <string name="stop_guest">Stop</string>
     <string name="suspend_guest">Suspend</string>
     <string name="resume_guest">Resume</string>

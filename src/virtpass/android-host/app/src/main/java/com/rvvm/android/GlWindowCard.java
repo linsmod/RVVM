@@ -141,10 +141,13 @@ public class GlWindowCard {
 
         bindDrag();
 
-        surfaceView.setOnTouchListener((v, event) -> {
-            // The card is a viewport: the guest's input space is the panel, and
-            // the frame buffer fills the whole card. The host owns the mapping
-            // and the run table - hand the raw event over untouched.
+        // Touches are consumed by the WHOLE card, not just the SurfaceView:
+        // the letterboxed video leaves black bars around the frame (a
+        // maximized card on a tall phone has huge ones), and a tap there used
+        // to fall through to whatever view sat below - focusing another
+        // window or toggling the console. The host maps the coordinates into
+        // the surface's own space (see onCardTouch).
+        cardView.setOnTouchListener((v, event) -> {
             host.onCardTouch(this, event);
             return true;
         });
@@ -348,10 +351,17 @@ public class GlWindowCard {
      * ============================================================ */
 
     /** Maximize button: fill the workspace with the guest's window, or put it
-     *  back at the corner and size it was floating at. */
+     *  back at the corner and size it was floating at. Fullscreen drops the
+     *  1px border ring (the frame drawable only shows through the padding) -
+     *  a maximized window is edge-to-edge, like a desktop maximized one. The
+     *  button flips between the maximize and the restore glyph, so the state
+     *  is readable off the caption bar. */
     private void toggleMaximized() {
         if (maximized) {
             maximized = false;
+            // Border back: the 1dp frame ring around the surface.
+            cardView.setBackground(background);
+            cardView.setPadding(framePadding, framePadding, framePadding, framePadding);
             applyLayout();
             // Not restored from the margins, which the maximized layout
             // cleared: the position is re-derived from the corner it had, and
@@ -361,11 +371,14 @@ public class GlWindowCard {
             restoreLeft = cardView.getLeft();
             restoreTop = cardView.getTop();
             maximized = true;
+            cardView.setBackground(null);
+            cardView.setPadding(0, 0, 0, 0);
             applyLayout();
             // The console the card just covered is also where the keyboard
             // would have gone.
             host.onCardMaximized();
         }
+        btnMax.setText(maximized ? R.string.gl_btn_restore : R.string.gl_btn_max);
     }
 
     /** Minimize button: take the window off the workspace and leave it in the
