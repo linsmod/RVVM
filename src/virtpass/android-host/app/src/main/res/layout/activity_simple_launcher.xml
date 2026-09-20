@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#FF1C1C1C">
+
+    <!-- App grid/list area -->
+    <ListView
+        android:id="@+id/appListView"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:divider="#FF303030"
+        android:dividerHeight="1dp"
+        android:padding="8dp"
+        android:textColor="#FFE0E0E0"
+        android:textSize="14sp" />
+
+    <!-- Three-button taskbar at the bottom -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:background="#FF2A2A2A"
+        android:padding="8dp">
+
+        <Button
+            android:id="@+id/backButton"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:text="\u21E0"
+            android:textSize="18sp"
+            android:textColor="#FFE0E0E0"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="Back" />
+
+        <Button
+            android:id="@+id/homeButton"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:text="\u2302"
+            android:textSize="18sp"
+            android:textColor="#FFE0E0E0"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="Home" />
+
+        <Button
+            android:id="@+id/recentAppsButton"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:text="\u25A1\u25A1"
+            android:textSize="18sp"
+            android:textColor="#FFE0E0E0"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="Recent Apps" />
+
+    </LinearLayout>
+</LinearLayout>

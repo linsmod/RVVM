@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Single row of the launcher app list: explicit light text on the dark
+     launcher background (theme is Light, so simple_list_item_1 would render
+     dark text and be unreadable). -->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:paddingStart="12dp"
+    android:paddingEnd="12dp"
+    android:paddingTop="16dp"
+    android:paddingBottom="16dp"
+    android:textColor="#FFE0E0E0"
+    android:textSize="16sp"
+    android:background="?android:attr/selectableItemBackground" />

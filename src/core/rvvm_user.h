@@ -42,17 +42,24 @@ void  rvvm_user_set_host_ctx(rvvm_machine_t* machine, void* ctx);
 void* rvvm_user_host_ctx(rvvm_machine_t* machine);
 
 // The machine whose vCPU is running on the calling thread, or NULL when the
-// thread is not servicing a guest. What lets a host-side callback with no
-// context argument (e.g. the exit callback) find the run it belongs to when
-// several machines are alive.
+// thread is not servicing a guest. Lets a host map "the thread that tripped
+// an event" back to the run it belongs to when several machines are alive.
+// Note: prefer callbacks that carry the machine explicitly - the exit
+// callback does - over TLS-based lookup, which only works on vCPU threads.
 rvvm_machine_t* rvvm_user_current_machine(void);
 
 // Callback type for guest exit event
-// Called when the guest exits (sys_exit or sys_exit_group)
-typedef void (*rvvm_user_exit_callback)(int exit_code);
+// Called when the guest exits (sys_exit or sys_exit_group), and also when a
+// host-initiated stop (rvvm_user_stop) unwinds the guest. The machine is
+// passed explicitly: rvvm_user_stop may be called from any host thread, so
+// the callback can fire off a vCPU thread where TLS-based identity lookup
+// would find nothing.
+typedef void (*rvvm_user_exit_callback)(rvvm_machine_t* machine, int exit_code);
 
 // Set callback invoked when the guest exits
-// Called from the guest thread after the guest unwinds
+// Called with the exiting machine and its exit code. Fires on a guest vCPU
+// thread for a guest-driven exit, or on the thread that called
+// rvvm_user_stop() for a host-initiated stop.
 void rvvm_user_set_exit_callback(rvvm_machine_t* machine, rvvm_user_exit_callback callback);
 
 // --- Guest virtual TTY (libvterm-backed) ---
@@ -291,6 +298,15 @@ void rvvm_user_resume(rvvm_machine_t* machine);
 // right after rvvm_user_suspend() returns false, the guest is suspended but
 // some vCPU may still be draining a blocking host syscall.
 bool rvvm_user_is_suspended(rvvm_machine_t* machine);
+
+// True once every guest vCPU has actually reached the park point in response
+// to rvvm_user_suspend(). Unlike rvvm_user_is_suspended() (which reports the
+// request), this reports the quiesced state: a vCPU blocked in a host syscall
+// (read(), AAudio, EGL) has not parked yet, so this returns false until that
+// syscall returns and the vCPU reaches the next interpreter boundary. Host
+// code that tears down a resource the guest may still be touching (a window,
+// an audio device, ...) should gate on this, not on the request.
+bool rvvm_user_is_parked(rvvm_machine_t* machine);
 
 // Translate a guest virtual address into a host pointer.
 //

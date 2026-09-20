@@ -2623,6 +2623,31 @@ PUBLIC bool rvvm_user_is_suspended(rvvm_machine_t* machine)
     return ctx && atomic_load_uint32(&ctx->userland_suspend) != 0;
 }
 
+// True when every registered guest vCPU has reached the park point. Unlike
+// rvvm_user_is_suspended() (which reports the request), this is the ground
+// truth: it reads userland_parked - the counter each vCPU increments when it
+// sits in rvvm_futex_wait() inside userland_park_if_suspended() - and
+// compares it to the live thread count. A vCPU still inside a blocking host
+// syscall has not parked; it will once the syscall returns and the main loop
+// calls userland_park_if_suspended() on the next round. The same
+// parked >= total test rvvm_user_suspend()'s barrier uses, just sampled once
+// instead of polled.
+PUBLIC bool rvvm_user_is_parked(rvvm_machine_t* machine)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (!ctx) {
+        return false;
+    }
+    if (atomic_load_uint32(&ctx->userland_suspend) == 0) {
+        return false;
+    }
+    uint32_t parked = atomic_load_uint32(&ctx->userland_parked);
+    spin_lock(&ctx->userland_threads_lock);
+    uint32_t total = vector_size(ctx->userland_threads);
+    spin_unlock(&ctx->userland_threads_lock);
+    return parked >= total;
+}
+
 // Push/pop the calling guest thread onto its instance's registry. Called from
 // the guest threads themselves, so the context comes from the TLS binding.
 static void userland_thread_register(rvvm_user_thread_t* thread)
@@ -2655,7 +2680,10 @@ static void userland_thread_unregister(rvvm_user_thread_t* thread)
 static void userland_process_exit(rvvm_userland_t* ctx, int code, rvvm_user_thread_t* self)
 {
     if (atomic_swap_uint32(&ctx->userland_exit_reported, 1) == 0 && ctx->exit_callback) {
-        ctx->exit_callback(code);
+        // The machine goes with the code: rvvm_user_stop() may fire this on
+        // the calling host thread, where no TLS hart exists to identify the
+        // run from.
+        ctx->exit_callback(ctx->machine, code);
     }
 
     spin_lock(&ctx->userland_threads_lock);

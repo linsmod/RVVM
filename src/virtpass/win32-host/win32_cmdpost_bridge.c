@@ -1533,15 +1533,18 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
  * thread the instant the guest calls sys_exit / sys_exit_group, while
  * rvvm_user_linux_ex() is still unwinding the other vCPUs - so this must not
  * touch cmdpost, the surface or the window; the ordered teardown runs later
- * in WM_APP_GUEST_EXIT.
+ * in WM_APP_GUEST_EXIT. It also fires on the thread that called
+ * rvvm_user_stop() (host-initiated stop); the machine comes as an argument,
+ * so both paths are identified the same way.
  *
  * Registering it is load-bearing: with no callback registered, rvvm_user.c
  * falls back to _Exit(exit_code) inside the syscall path, which terminates
  * the whole WinHost process from the guest thread - guest_thread_main would
  * never post WM_APP_GUEST_EXIT and the launcher could never return to the
  * picker (and Stop would take the window down with the guest). */
-static void host_guest_exit_cb(int exit_code)
+static void host_guest_exit_cb(rvvm_machine_t* machine, int exit_code)
 {
+    (void)machine; /* one guest at a time on this host: g_guest_machine */
     /* rvvm_user_linux_ex() itself always returns 0 on a guest-driven exit, so
      * this callback is the only source of the real exit code. */
     g_guest_rc = exit_code;

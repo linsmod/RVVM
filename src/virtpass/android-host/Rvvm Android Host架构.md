@@ -219,7 +219,7 @@ sequenceDiagram
     Note over UI: guest-exit-monitor 轮询 nativeIsGuestRunning
     M-->>GT: 返回 exit code
     GT->>GT: surf_finish_pending_lock()（回收残留窗口锁）
-    GT->>JNI: on_guest_exit(code) → g_exit_listener → Java
+    GT->>JNI: on_guest_exit(machine, code) → g_exit_listener → Java
     GT->>JNI: android_run_destroy(run)<br/>cmdpost_destroy，槽位腾出
     Note over UI: monitor 发现 running 已清 → dismissGlWindow、关日志
 ```

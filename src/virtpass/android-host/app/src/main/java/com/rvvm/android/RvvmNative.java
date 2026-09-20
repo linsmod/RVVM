@@ -105,16 +105,19 @@ public class RvvmNative {
      */
     public static native int nativePollLifecycleCmd();
 
-    /**
-     * Clear all lifecycle commands from the queue.
-     */
-    public static native void nativeClearLifecycleCmds();
+/**
+      * Clear all lifecycle commands from the queue for the given guest.
+       * @param guestId guest whose queue is cleared, or -1 for the active one
+       * @param cmd The lifecycle command (APP_CMD_*)
+       */
+    public static native void nativeClearLifecycleCmds(int guestId);
 
     /**
-     * Post a lifecycle command to the native queue.
-     * @param cmd The lifecycle command (APP_CMD_*)
-     */
-    public static native void nativePostLifecycleCmd(int cmd);
+      * Post a lifecycle command to the native queue for the given guest.
+       * @param guestId guest to deliver the command to, or -1 for the active one
+       * @param cmd The lifecycle command (APP_CMD_*)
+       */
+    public static native void nativePostLifecycleCmd(int guestId, int cmd);
 
     /**
      * Post a motion event to the guest-facing input queue.
@@ -169,12 +172,12 @@ public class RvvmNative {
      */
     public static native void nativeResumeGuest(int guestId);
 
-    /**
-     * Check whether the given guest is suspended.
-     * @param guestId guest to query, or -1 for the active one
-     * @return true if the guest is currently suspended
-     */
-    public static native boolean nativeIsGuestSuspended(int guestId);
+/**
+       * Check whether the given guest's vCPUs are parked (suspended).
+       * @param guestId guest to query, or -1 for the active one
+       * @return true if the guest is parked (all vCPUs in syscall wait)
+       */
+    public static native boolean nativeIsGuestParked(int guestId);
 
     /**
       * Set a callback invoked when a guest exits.
@@ -277,17 +280,28 @@ public class RvvmNative {
      */
     public static native void nativeTtyInput(int guestId, byte[] bytes);
 
-    /**
-      * Listener for the guest's console I/O. onOutput receives one line per
-      * call (line breaks normalized); onFirstFrame fires once per guest run
-      * when the first frame has actually reached the screen - either through
-      * the CPU unlock path or a successful eglSwapBuffers - which is the UI's
-      * cue to reveal that guest's card. The id names the run that drew the
-      * frame, which is what keeps one guest's frame from revealing another
-      * guest's window.
-      */
+/**
+       * Listener for the guest's console I/O.  onOutput receives one line per
+       * call (line breaks normalized).
+       */
     public interface ConsoleListener {
-        void onOutput(String line);
+        void onOutput(int guestId, String line);
+    }
+
+    /**
+     * Callback for graphics frame lifecycle.  onFirstFrame fires once per
+     * guest run when the first frame has actually reached the screen --
+     * either through the CPU unlock path or a successful eglSwapBuffers --
+     * which is the UI's cue to reveal that guest's card.
+     */
+    public interface FrameCallback {
         void onFirstFrame(int guestId);
     }
+
+    /**
+     * Set a callback invoked when a guest renders its first frame.
+     * Called on the guest thread; hop to the UI thread for view work.
+     * @param callback Frame callback, or null to clear
+     */
+    public static native void nativeSetFrameCallback(FrameCallback callback);
 }

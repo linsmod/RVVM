@@ -159,8 +159,11 @@ static int32_t g_host_density = 0;
 static jobject g_exit_listener = NULL;
 
 /* The console session retired most recently (see android_run_destroy): the
- * frozen last screen the console view falls back to while no run is alive. */
+ * frozen last screen the console view falls back to while no run is alive,
+ * together with the id of the guest it belonged to - a per-guest view lookup
+ * may only fall back to its *own* retired screen, never to another guest's. */
 static rvvm_tty_t* g_tty_retired_last = NULL;
+static int g_tty_retired_guest = -1;
 
 /* Guards the run table itself (g_runs / g_active_run): slot allocation,
  * teardown and the lookups (by id, by cmdpost) that other threads now make.
@@ -215,6 +218,10 @@ static struct android_run* android_run_create_locked(void)
     pthread_mutex_lock(&g_surf_cs);
     vp_session_init(&run->session);
     run->session.on_line = on_console_line;
+    /* The line callback needs the run (for its guest id) but cannot read the
+     * globals: the session may deliver lines from any guest thread. Bind this
+     * run as the user so on_console_line() can name the right guest to Java. */
+    run->session.on_line_user = run;
     if (g_host_panel_w > 0 && g_host_panel_h > 0) {
         vp_session_set_panel(&run->session, g_host_panel_w, g_host_panel_h);
     }
@@ -304,6 +311,7 @@ static void android_run_destroy(struct android_run* run)
             rvvm_tty_close(g_tty_retired_last);
         }
         g_tty_retired_last = run->tty;
+        g_tty_retired_guest = run->id;
         run->tty = NULL;
     }
 
@@ -379,9 +387,9 @@ static struct android_run* android_run_for_call(int guestId)
     return android_run_active();
 }
 
-/* The run whose machine the calling vCPU belongs to. The exit callback fires
- * on a guest vCPU thread with no other identity available, so the machine is
- * looked up through the core's thread-local hart. */
+/* The run that owns the given machine. Exit events carry their machine
+ * explicitly, so the run is named the same way no matter which thread fired
+ * the event (vCPU thread or the host thread that called rvvm_user_stop). */
 static struct android_run* android_run_by_machine(rvvm_machine_t* machine)
 {
     struct android_run* found = NULL;
@@ -646,12 +654,17 @@ static void jni_vsync_stop(void)
  * ============================================================ */
 static jobject    g_console_listener = NULL;
 static jmethodID  g_console_output_mid = NULL;
-static jmethodID  g_console_first_frame_mid = NULL;
 
 /* The pending line and the first-frame flag are per-run state and live in
  * android_run_active()->session (virtpass/vp_session.h): this mutex is what serialises access to
  * them, since the session itself takes no locks. */
 static pthread_mutex_t g_console_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* ============================================================
+ * Graphics frame callback: onFirstFrame(int guestId)
+ * ============================================================ */
+static jobject    g_frame_callback = NULL;
+static jmethodID  g_frame_first_frame_mid = NULL;
 
 /* ============================================================
  * Guest virtual TTY: host-owned libvterm session
@@ -725,7 +738,11 @@ static rvvm_tty_t* android_tty_for_view(int guestId)
         return run->tty;
     }
     if (guestId >= 0) {
-        return NULL;
+        /* The guest whose console is being viewed has exited: its own retired
+         * session keeps the frozen last screen and the whole scrollback, which
+         * is exactly when the scrollback is read back. Another guest's retired
+         * screen must not leak into this view. */
+        return (guestId == g_tty_retired_guest) ? g_tty_retired_last : NULL;
     }
     return g_tty_retired_last;
 }
@@ -912,14 +929,20 @@ static JNIEnv* console_env(int* attached)
 
 /* A completed console line, from the session's line assembly. Called with
  * g_console_mutex held; the session's own sanitising already turned the guest's
- * bytes into text NewStringUTF accepts. */
+ * bytes into text NewStringUTF accepts. The user is the run the session
+ * belongs to (bound at android_run_create_locked): Java's onOutput carries the
+ * guest id, so each line names the guest that produced it. */
 static void on_console_line(void* user, const char* line)
 {
     JNIEnv* env;
     int attached;
     jstring str;
+    jint guest_id = -1;
+    struct android_run* run = (struct android_run*)user;
 
-    (void)user;
+    if (run) {
+        guest_id = (jint)run->id;
+    }
 
     if (!g_console_listener) {
         return;     /* nobody to deliver to; the line is dropped */
@@ -930,7 +953,8 @@ static void on_console_line(void* user, const char* line)
     }
     str = (*env)->NewStringUTF(env, line);
     if (str) {
-        (*env)->CallVoidMethod(env, g_console_listener, g_console_output_mid, str);
+        (*env)->CallVoidMethod(env, g_console_listener, g_console_output_mid,
+                               guest_id, str);
         (*env)->DeleteLocalRef(env, str);
     }
     if (attached) {
@@ -975,10 +999,10 @@ void jni_guest_first_frame(vp_cmdpost_t* inst)
     pthread_mutex_unlock(&g_console_mutex);
 
     if (!first) return;
-    if (!g_console_listener || !g_console_first_frame_mid) return;
+    if (!g_frame_callback || !g_frame_first_frame_mid) return;
     env = console_env(&attached);
     if (!env) return;
-    (*env)->CallVoidMethod(env, g_console_listener, g_console_first_frame_mid, (jint)run->id);
+    (*env)->CallVoidMethod(env, g_frame_callback, g_frame_first_frame_mid, (jint)run->id);
     if (attached) {
         (*g_jvm)->DetachCurrentThread(g_jvm);
     }
@@ -1644,7 +1668,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved)
  * ============================================================ */
 
 /* Forward declaration */
-static void on_guest_exit(int exit_code);
+static void on_guest_exit(rvvm_machine_t* machine, int exit_code);
 
 /* ============================================================
  * (Re)install every vp_cmdpost callback the guest depends on.
@@ -2022,9 +2046,12 @@ Java_com_rvvm_android_RvvmNative_nativePollLifecycleCmd(JNIEnv* env, jobject thi
 }
 
 JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativeClearLifecycleCmds(JNIEnv* env, jobject thiz)
+Java_com_rvvm_android_RvvmNative_nativeClearLifecycleCmds(JNIEnv* env, jobject thiz, jint guestId)
 {
-    struct android_run* run = android_run_active();
+    /* Java passes the guest the preparation is for: with multiple guests the
+     * active run is not necessarily this one (MainActivity.replayGuestStartupState
+     * clears a guest BEFORE it can become active, on the way in). */
+    struct android_run* run = android_run_for_call(guestId);
     (void)env;
     (void)thiz;
 
@@ -2057,22 +2084,28 @@ Java_com_rvvm_android_RvvmNative_nativeClearLifecycleCmds(JNIEnv* env, jobject t
 }
 
 JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativePostLifecycleCmd(JNIEnv* env, jobject thiz, jint cmd)
+Java_com_rvvm_android_RvvmNative_nativePostLifecycleCmd(JNIEnv* env, jobject thiz,
+                                                        jint guestId, jint cmd)
 {
-    struct android_run* run = android_run_active();
+    /* Java's signature is (guestId, cmd): JNI passes Java arguments in order
+     * after thiz, so the first jint here IS the guest id. Addressing the run
+     * explicitly is what keeps a backgrounded guest's lifecycle events (its
+     * Activity's onPause/onResume) landing on its own run instead of whichever
+     * guest happens to be active. */
+    struct android_run* run = android_run_for_call(guestId);
     (void)env;
     (void)thiz;
 
     /* Queue a lifecycle command (called from Java when activity state changes)
      * into the guest-facing queue (via vp_cmdpost) and the local mirror. With
-     * no run alive there is nobody to deliver to - the command is dropped. */
+     * no such run alive there is nobody to deliver to - the command is dropped. */
     if (!run || !run->cmdpost) {
         return;
     }
     cmdpost_queue_lifecycle_cmd(run->cmdpost, cmd);
     if (run->lifecycle_count < 32) {
         run->lifecycle_queue[run->lifecycle_count++] = cmd;
-        LOGI("Lifecycle command %d queued", cmd);
+        LOGI("Guest %d: lifecycle command %d queued", guestId, cmd);
     }
 }
 
@@ -2377,22 +2410,45 @@ Java_com_rvvm_android_RvvmNative_nativeIsGuestSuspended(JNIEnv* env, jobject thi
     return (run && run->suspended) ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_rvvm_android_RvvmNative_nativeIsGuestParked(JNIEnv* env, jobject thiz, jint guestId)
+{
+    struct android_run* run;
+    (void)env;
+    (void)thiz;
+    /* A guest that was never asked to suspend is not parked. Reading
+     * run->suspended (the host-side mirror of the request) first avoids
+     * touching run->machine - which the guest thread frees the instant it
+     * exits - for the common case where the answer is simply "no". Only when
+     * a suspend was requested do we ask the VM whether every vCPU has reached
+     * the park point, by dereferencing run->machine; that is the same
+     * dereference nativeSuspendGuest/nativeResumeGuest already make under the
+     * same running+machine guard. */
+    run = (guestId >= 0) ? android_run_by_id(guestId) : android_run_active();
+    if (!run || !run->suspended || !run->machine) {
+        return JNI_FALSE;
+    }
+    return rvvm_user_is_parked(run->machine) ? JNI_TRUE : JNI_FALSE;
+}
+
 /* C callback invoked by rvvm_user when the guest exits.
  * NOTE: android_run_active()->running is NOT cleared here - the guest native thread is
  * still winding down (rvvm_user_linux has not returned yet). guest_thread_func
  * clears it after rvvm_user_linux() returns, keeping the "running" state in
  * sync with the actual thread and preventing a premature re-Run from starting
  * a second userland over the existing one. */
-static void on_guest_exit(int exit_code)
+static void on_guest_exit(rvvm_machine_t* machine, int exit_code)
 {
     struct android_run* run;
     int guest_id = -1;
 
     LOGI("Guest exited with code: %d", exit_code);
 
-    /* The exit fires on one of the machine's vCPU threads: the machine names
-     * the run, and the run's id is what the listener is told. */
-    run = android_run_by_machine(rvvm_user_current_machine());
+    /* The machine comes with the callback, so the run is identified the same
+     * way no matter which thread fired the event: a guest vCPU thread on a
+     * guest-driven exit, or the host thread that called rvvm_user_stop()
+     * (console ^C with the default disposition, nativeStopGuest). */
+    run = android_run_by_machine(machine);
     if (run) {
         guest_id = run->id;
     }
@@ -2426,21 +2482,45 @@ Java_com_rvvm_android_RvvmNative_nativeSetConsoleListener(JNIEnv* env, jobject t
         (*env)->DeleteGlobalRef(env, g_console_listener);
         g_console_listener = NULL;
         g_console_output_mid = NULL;
-        g_console_first_frame_mid = NULL;
     }
 
     if (listener) {
         jclass clazz = (*env)->GetObjectClass(env, listener);
         g_console_listener = (*env)->NewGlobalRef(env, listener);
-        g_console_output_mid = (*env)->GetMethodID(env, clazz, "onOutput", "(Ljava/lang/String;)V");
-        g_console_first_frame_mid = (*env)->GetMethodID(env, clazz, "onFirstFrame", "(I)V");
+        g_console_output_mid = (*env)->GetMethodID(env, clazz, "onOutput", "(ILjava/lang/String;)V");
         (*env)->DeleteLocalRef(env, clazz);
-        if (!g_console_output_mid || !g_console_first_frame_mid) {
+        if (!g_console_output_mid) {
             LOGE("ConsoleListener method lookup failed");
             (*env)->DeleteGlobalRef(env, g_console_listener);
             g_console_listener = NULL;
         } else {
             LOGI("Guest console listener registered");
+        }
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeSetFrameCallback(JNIEnv* env, jobject thiz, jobject callback)
+{
+    (void)thiz;
+
+    if (g_frame_callback) {
+        (*env)->DeleteGlobalRef(env, g_frame_callback);
+        g_frame_callback = NULL;
+        g_frame_first_frame_mid = NULL;
+    }
+
+    if (callback) {
+        jclass clazz = (*env)->GetObjectClass(env, callback);
+        g_frame_callback = (*env)->NewGlobalRef(env, callback);
+        g_frame_first_frame_mid = (*env)->GetMethodID(env, clazz, "onFirstFrame", "(I)V");
+        (*env)->DeleteLocalRef(env, clazz);
+        if (!g_frame_first_frame_mid) {
+            LOGE("FrameCallback method lookup failed");
+            (*env)->DeleteGlobalRef(env, g_frame_callback);
+            g_frame_callback = NULL;
+        } else {
+            LOGI("Guest frame callback registered");
         }
     }
 }

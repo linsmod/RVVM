@@ -301,6 +301,18 @@ static void* android_sensor_thread(void* arg)
                 ASensorEventQueue_disableSensor(queue, g_platform[i]);
             }
         }
+        /* Destroy the queue here, while this thread's Looper (g_looper) is
+         * still alive. ALooper_prepare() stores the Looper in TLS; when this
+         * thread returns, pthread TLS destructors destroy it (and its internal
+         * mutexes). android_sensor_shutdown() then calls
+         * ASensorManager_destroyEventQueue() after pthread_join(), which tries
+         * to unregister from the already-destroyed Looper and hits
+         *   FORTIFY: pthread_mutex_lock called on a destroyed mutex
+         * Cleaning up here avoids the race entirely. */
+        pthread_mutex_lock(&g_lock);
+        g_queue = NULL;
+        pthread_mutex_unlock(&g_lock);
+        ASensorManager_destroyEventQueue(g_manager, queue);
     }
     return NULL;
 }

@@ -45,12 +45,14 @@ import android.widget.Toast;
 import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
-import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * Main Activity for RVVM Android host app.
@@ -148,14 +150,14 @@ public class MainActivity extends Activity {
     // surface the moment it starts), but the card takes no room on screen
     // until the guest has a frame for it.
 
+    // Guest runs kept under files/logs/, oldest pruned first.
+    private static final int LOG_MAX_FILES = 20;
+
     // The run's log file. Opened in runGuestElf (UI thread), written from the
     // guest thread (onOutput), closed when the guest exits - hence the lock.
     private final Object logFileLock = new Object();
     private BufferedWriter logWriter;
     private File logFile;
-
-    // Guest runs kept under files/logs/, oldest pruned first.
-    private static final int LOG_MAX_FILES = 20;
 
     // Guest app list: .exe files from assets
     private String[] guestApps;
@@ -171,6 +173,12 @@ public class MainActivity extends Activity {
 
     private boolean isInitialized = false;
     private boolean hasAutoStarted = false;
+    // Host-side mirror of the suspend request, per guest. The button label
+    // and the toggle action read this so they flip the instant the user
+    // clicks, without waiting for vCPUs to actually reach the park point
+    // (which can lag by a blocking host syscall). The teardown flow that
+    // needs the real quiesced state queries nativeIsGuestParked instead.
+    private final Set<Integer> suspendedGuests = new HashSet<>();
 
     // ---- TTY console (TextureView tab) ----
     // One cell = 4 ints from nativeTtySnapshot: [0] UCS-4 cp, [1] fg ARGB,
@@ -431,12 +439,13 @@ public class MainActivity extends Activity {
             RvvmNative.nativeTtyResize(rows, TTY_COLS);
         }
 
-        if (RvvmNative.nativeTtySnapshot(activeGuestId, ttyCells, ttyScrollInfo) <= 0) return;
+        
 
         Canvas canvas = ttyView.lockCanvas(null);
         if (canvas == null) return;
         try {
             canvas.drawColor(0xFF000000);
+            if (RvvmNative.nativeTtySnapshot(activeGuestId, ttyCells, ttyScrollInfo) <= 0) return;
             float gridW = cellW * TTY_COLS, gridH = cellH * rows;
             /* A drag on the console is turned into terminal lines by the touch
              * listener using the same cell height the grid was laid out with. */
@@ -1253,6 +1262,11 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        // Acquire the process-wide native host. Native init/destroy is now
+        // reference-counted by RvvmHost, so multiple Activities can share it.
+        RvvmHost host = RvvmHost.getInstance();
+        host.acquire();
+
         // Find views
         statusText = findViewById(R.id.statusText);
         startButton = findViewById(R.id.startButton);
@@ -1295,24 +1309,24 @@ public class MainActivity extends Activity {
         updateButtonStates();
 
         // Initialize native RVVM
-        initializeRvvm();
+        initializeRvvm(host);
     }
 
-    private void initializeRvvm() {
+    private void initializeRvvm(RvvmHost host) {
         try {
-            // Initialize native library
-            RvvmNative.nativeInit();
+            // host.acquire() (in onCreate) has booted the process-wide native
+            // host; this Activity now owns a reference for its lifetime.
             isInitialized = true;
 
             // Pin the virtual panel before any guest can observe a geometry:
             // after that the call is refused, by design (the buffer is what the
             // guest is mid-frame on).
-            RvvmNative.nativeSetPanelSize(PANEL_W, PANEL_H);
+            host.setPanelSize(PANEL_W, PANEL_H);
 
             // Record the guest's exit code as it fires (guest thread). The UI
             // is updated by the guest-exit-monitor, not here: the callback
             // runs while the guest thread has not finished unwinding yet.
-            RvvmNative.nativeSetExitCallback((guestId, code) -> {
+            host.setExitListener((guestId, code) -> {
                 // Only the guest the UI drives updates the status line; a
                 // background run's exit is visible through its own monitor.
                 if (guestId == activeGuestId) {
@@ -1322,19 +1336,16 @@ public class MainActivity extends Activity {
             });
 
             // Guest console I/O: rendered in the overlay and persisted to a
-            // file. Both callbacks fire on the guest thread; anything that
+            // file.  Both callbacks fire on the guest thread; anything that
             // touches a view hops to the UI thread first.
-            RvvmNative.nativeSetConsoleListener(new RvvmNative.ConsoleListener() {
+            host.setConsoleListener(new RvvmNative.ConsoleListener() {
                 @Override
-                public void onOutput(String line) {
-                    handleGuestOutput(line);
-                }
-
-                @Override
-                public void onFirstFrame(int guestId) {
-                    handleFirstFrame(guestId);
+                public void onOutput(int guestId, String line) {
+                    handleGuestOutput(guestId, line);
                 }
             });
+
+            host.setFrameCallback(guestId -> handleFirstFrame(guestId));
 
             // Push the real screen metrics (the AConfiguration source of truth)
             pushDisplayConfig();
@@ -1387,11 +1398,11 @@ public class MainActivity extends Activity {
      * rendered content" state after the Activity was backgrounded and resumed.
      */
     private void postLifecycleCmd(int cmd) {
-        if (!isInitialized) {
+        if (!isInitialized || activeGuestId < 0) {
             return;
         }
-        Log.i(TAG, "Lifecycle -> guest: cmd=" + cmd);
-        RvvmNative.nativePostLifecycleCmd(cmd);
+        Log.i(TAG, "Lifecycle -> guest " + activeGuestId + ": cmd=" + cmd);
+        RvvmNative.nativePostLifecycleCmd(activeGuestId, cmd);
     }
 
     @Override
@@ -1534,6 +1545,7 @@ public class MainActivity extends Activity {
                 // The guest is gone: its card goes with it, the way closing an
                 // application takes its window with it. The next run brings a
                 // new one up - with whatever frame that guest produces.
+                suspendedGuests.remove(guestId);
                 GlWindowCard card = glCards.get(guestId);
                 if (card != null) {
                     dismissCard(card);
@@ -1573,7 +1585,7 @@ public class MainActivity extends Activity {
      * have seen on a cold start: START -> RESUME -> INIT_WINDOW -> focus.
      */
     private void replayGuestStartupState() {
-        RvvmNative.nativeClearLifecycleCmds();
+        RvvmNative.nativeClearLifecycleCmds(activeGuestId);
         postLifecycleCmd(APP_CMD_START);
         postLifecycleCmd(APP_CMD_RESUME);
         // INIT_WINDOW: the card's surface is handed to native by
@@ -1595,6 +1607,10 @@ public class MainActivity extends Activity {
         }
         Log.i(TAG, "Stopping guest " + guestId);
         RvvmNative.nativeStopGuest(guestId);
+        // stop unsuspends natively (nativeStopGuest resumes first if the
+        // guest was parked); clear the request mirror so the label does not
+        // say "resume" while the guest is unwinding its way out.
+        suspendedGuests.remove(guestId);
         if (guestId == activeGuestId) {
             currentGuestApp = null;
         }
@@ -1666,12 +1682,14 @@ public class MainActivity extends Activity {
         if (!isInitialized || !RvvmNative.nativeIsGuestRunning(activeGuestId)) {
             return;
         }
-        if (RvvmNative.nativeIsGuestSuspended(activeGuestId)) {
+        if (suspendedGuests.contains(activeGuestId)) {
             RvvmNative.nativeResumeGuest(activeGuestId);
+            suspendedGuests.remove(activeGuestId);
             statusText.setText("Guest resumed");
             Log.i(TAG, "Guest resumed");
         } else {
             RvvmNative.nativeSuspendGuest(activeGuestId);
+            suspendedGuests.add(activeGuestId);
             statusText.setText("Guest suspended");
             Log.i(TAG, "Guest suspended");
         }
@@ -1680,10 +1698,13 @@ public class MainActivity extends Activity {
 
     private void updateButtonStates() {
         boolean running = RvvmNative.nativeIsGuestRunning(activeGuestId);
-        // nativeIsGuestSuspended() is only meaningful while a guest runs; it
-        // reports the requested state, so the label flips immediately even when
-        // a vCPU is still unwinding a blocking host syscall.
-        boolean suspended = running && RvvmNative.nativeIsGuestSuspended(activeGuestId);
+        // suspendedGuests is the request view, so the label flips the moment
+        // the user clicks - before the vCPUs have actually parked (which can
+        // lag by a blocking host syscall). The teardown flow that needs to
+        // know "is it safe to tear down the window" queries
+        // nativeIsGuestParked instead; that one only returns true once every
+        // vCPU has reached the park point.
+        boolean suspended = running && suspendedGuests.contains(activeGuestId);
         suspendButton.setEnabled(running);
         suspendButton.setText(suspended ? R.string.resume_guest : R.string.suspend_guest);
         stopButton.setEnabled(running);
@@ -1799,7 +1820,7 @@ public class MainActivity extends Activity {
     }
 
     /** One line of guest output, for the log file. Guest thread. */
-    private void handleGuestOutput(String line) {
+    private void handleGuestOutput(int guestId, String line) {
         synchronized (logFileLock) {
             if (logWriter != null) {
                 try {
@@ -1903,10 +1924,11 @@ public class MainActivity extends Activity {
         // Stop the console bridge before the native side goes away, so no
         // callback can reach this half-torn-down Activity.
         RvvmNative.nativeSetConsoleListener(null);
+        RvvmNative.nativeSetFrameCallback(null);
         closeGuestLogFile();
-        // Cleanup native resources
+        // Cleanup native resources through RvvmHost singleton
         if (isInitialized) {
-            RvvmNative.nativeDestroy();
+            RvvmHost.getInstance().release();
             isInitialized = false;
         }
     }

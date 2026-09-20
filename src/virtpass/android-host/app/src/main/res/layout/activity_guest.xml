@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FF000000">
+
+    <!-- TTY layer: console + key bar, always visible beneath the graphic.
+         Vertical stack so the console never extends under the bottom bar. -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <FrameLayout
+            android:id="@+id/consoleContainer"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1">
+
+            <TextureView
+                android:id="@+id/consoleView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:layout_gravity="center" />
+
+        </FrameLayout>
+
+        <!-- Terminal key bar: keys a soft keyboard cannot produce. -->
+        <LinearLayout
+            android:id="@+id/ttyKeyBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom"
+            android:background="#FF1C1C1C"
+            android:descendantFocusability="blocksDescendants"
+            android:orientation="horizontal"
+            android:padding="2dp">
+
+            <Button
+                android:id="@+id/ttyKeyEsc"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="Esc"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/ttyKeyTab"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="Tab"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/ttyKeyCtrlC"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="Ctrl-C"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/ttyKeyLeft"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="Left"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/ttyKeyUp"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="Up"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/ttyKeyDown"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="Down"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/ttyKeyRight"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp"
+                android:text="Right"
+                android:textSize="12sp" />
+
+        </LinearLayout>
+
+        <!-- Guest-exit status: shown in place of the key bar when the guest
+             exits in stay-open mode (key bar is hidden then). -->
+        <TextView
+            android:id="@+id/ttyStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:layout_gravity="bottom"
+            android:background="#FFE0E0E0"
+            android:gravity="center"
+            android:padding="2dp"
+            android:singleLine="true"
+            android:ellipsize="end"
+            android:textSize="12sp"
+            android:visibility="gone" />
+
+    </LinearLayout>
+
+    <!-- Video area: middle layer. Hidden on guest exit so the TTY shows through. -->
+    <com.rvvm.android.FitFrameLayout
+        android:id="@+id/videoArea"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#FF000000">
+
+        <SurfaceView
+            android:id="@+id/surfaceView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center" />
+
+    </com.rvvm.android.FitFrameLayout>
+
+</FrameLayout>
