@@ -2541,11 +2541,17 @@ static void userland_park_if_suspended(rvvm_user_thread_t* thread)
     }
 
     atomic_add_uint32(&ctx->userland_parked, 1);
+#ifdef RVVM_USER_PARK_TRACE
+    // Low-frequency (once per park/unpark) but still a debug aid, not
+    // production logging - opt in when chasing suspend/resume races.
     rvvm_warn("DBG park: guest thread parking (suspend=%u)", atomic_load_uint32(&ctx->userland_suspend));
+#endif
     while (atomic_load_uint32(&ctx->userland_suspend) && !atomic_load_uint32(&thread->finished)) {
         rvvm_futex_wait(&ctx->userland_suspend, 1, USERLAND_SUSPEND_POLL_NS);
     }
+#ifdef RVVM_USER_PARK_TRACE
     rvvm_warn("DBG park: guest thread resumed");
+#endif
     atomic_sub_uint32(&ctx->userland_parked, 1);
 }
 
@@ -3472,10 +3478,6 @@ static void* rvvm_user_thread_wrap(void* arg)
             userland_sigrestore(cpu, uctx());
         }
         rvvm_addr_t cause = rvvm_run_user_thread(cpu);
-        rvvm_warn("DBG loop: interpreter returned cause=%llx pc=%llx a7=%llx finished=%u",
-                  (long long)cause, (long long)rvvm_read_cpu_reg(cpu, RVVM_REGID_PC),
-                  (long long)rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 17),
-                  atomic_load_uint32(&thread->finished));
         if (atomic_load_uint32(&thread->finished)) {
             /*
              * A stop/exit request kicked this vCPU out of the interpreter (see

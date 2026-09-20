@@ -906,12 +906,16 @@ void cmdpost_init(vp_cmdpost_t* inst)
     inst->vsync_armed        = false;
     inst->vsync_source_lost  = false;
 
-    /* Nothing drains these queues while no guest is running, so anything a
-     * host queued against the previous one must not reach this one. The hosts
-     * clear them before a run as well; doing it here too is what makes this
-     * function sufficient on its own. */
-    cmdpost_clear_lifecycle_cmds(inst);
-    cmdpost_clear_motion_events(inst);
+    /* The host->guest queues are deliberately NOT cleared here, even though
+     * this runs on the guest thread inside rvvm_user_linux_ex(): the hosts
+     * seed the startup sequence (START / INIT_WINDOW / RESUME / ...) BEFORE
+     * starting the guest thread, so anything queued at this point is the
+     * fresh seed for THIS run - clearing it made the guest's first poll find
+     * an empty queue and boot with window=0 started=0 resumed=0. Stale
+     * commands from a previous run are already handled twice over: by
+     * cmdpost_end_run() when that run ended, and by the hosts' prepare step
+     * (nativeClearLifecycleCmds / win32_host_start_guest), which clears
+     * before it seeds. */
 }
 
 /* Drop everything that belonged to the run that just ended. No printing: the

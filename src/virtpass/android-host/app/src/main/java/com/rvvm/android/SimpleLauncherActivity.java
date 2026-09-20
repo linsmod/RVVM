@@ -1,6 +1,7 @@
 package com.rvvm.android;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.content.Intent;
 import android.os.Bundle;
 import android.util.Log;
@@ -17,13 +18,13 @@ import java.util.ArrayList;
  * Launcher activity: app grid list.
  *
  * <p>Tapping an app name launches it as a new Android activity (GuestActivity)
- * with {@link Intent#FLAG_ACTIVITY_NEW_DOCUMENT} and {@link
- * Intent#FLAG_ACTIVITY_MULTIPLE_TASK}. The app's {@link
- * Intent#CATEGORY_DEFAULT} (set to GuestActivity) gives each app its own window,
- * so the system Recents/Back stack works per application. One GuestActivity
- * can be visible at a time on the screen, but multiple instances exist in
- * background state (suspended/ended), and switching between them is the
- * responsibility of the system - not the RVVM host.
+ * in its own document task ({@link Intent#FLAG_ACTIVITY_NEW_DOCUMENT} plus
+ * {@link Intent#FLAG_ACTIVITY_MULTIPLE_TASK}, one task per app, the app name
+ * as the intent action). Re-tapping a running app brings its existing task -
+ * and its live guest - forward instead of starting the run over. One
+ * GuestActivity can be visible at a time on the screen, but multiple
+ * instances exist in background state (suspended/ended), and switching
+ * between them is the responsibility of the system - not the RVVM host.
  *
  * <p>The console is never visible here: all input to the launcher is from its
  * own 1x1 invisible EditText (managed in the hosting MainActivity), so the
@@ -147,6 +148,27 @@ public class SimpleLauncherActivity extends Activity {
      * @param afterGuestExit value for {@link GuestActivity#EXTRA_AFTER_GUEST_EXIT},
      *        null/"finish" closes the activity on guest exit, "stay" keeps it open. */
     private void launchGuestApp(String appName, String afterGuestExit) {
+        // Re-entry: a task rooted by GuestActivity whose base intent names this
+        // app already exists - bring it forward, its guest (suspended or
+        // running) keeps its state and onResume resumes it. Affinity-based
+        // reuse (documentLaunchMode="intoExisting") cannot be used here: every
+        // GuestActivity shares the default package affinity, so all guests
+        // would collapse into the first task.
+        ActivityManager am = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+        for (ActivityManager.AppTask task : am.getAppTasks()) {
+            Intent base = task.getTaskInfo().baseIntent;
+            if (base != null && base.getComponent() != null
+                    && GuestActivity.class.getName().equals(base.getComponent().getClassName())
+                    && appName.equals(base.getAction())) {
+                // The re-foregrounded activity keeps the afterGuestExit mode
+                // from its original launch; an updated mode would need a new
+                // intent path and is ignored here.
+                task.moveToFront();
+                return;
+            }
+        }
+
+        // New run: always a fresh document task, one per app.
         Intent intent = new Intent(this, GuestActivity.class);
         intent.setAction(appName);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);

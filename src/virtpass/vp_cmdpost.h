@@ -257,11 +257,15 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
  * Lifecycle: three calls with three different owners
  *
  * cmdpost_init()     per run, called by the core when a guest starts
- *                    (rvvm_user_linux_ex). Resets everything that belongs to
- *                    that run - the APP_CMD_* dedup flags, the vsync wait
- *                    state, the host->guest queues - and must NOT touch the
- *                    host's registrations, which were just made for this run
- *                    (window/GL callbacks, audio backend, sensor ops).
+ *                    (rvvm_user_linux_ex). Resets the per-run state that
+ *                    belongs to the run starting - the APP_CMD_* dedup flags,
+ *                    the vsync wait state - and must NOT touch the host's
+ *                    registrations (window/GL callbacks, audio backend,
+ *                    sensor ops) nor the host->guest queues: the hosts seed
+ *                    the startup sequence before the guest thread starts, so
+ *                    clearing here would drop it. Stale commands from a
+ *                    previous run are dropped by cmdpost_end_run() and by the
+ *                    hosts' own prepare step.
  *
  * cmdpost_end_run()  per run, called by the core when the guest has exited.
  *                    Drops that guest's queues, audio streams and sensor

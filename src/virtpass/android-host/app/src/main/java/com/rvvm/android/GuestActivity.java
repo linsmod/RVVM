@@ -109,6 +109,9 @@ public class GuestActivity extends Activity {
     private boolean isGuestStarted = false;
     private boolean isInitialized = false;
     private volatile boolean isSuspended = false;
+    /** onResume found the surface still down: hold the resume until
+     *  surfaceCreated binds the window (surface first, then guest). */
+    private boolean pendingResume = false;
 
     // Surface
     private SurfaceView surfaceView;
@@ -295,6 +298,24 @@ public class GuestActivity extends Activity {
 
         Log.i(TAG, "GuestActivity created for " + appName
                 + " (guestId=" + guestId + ", elf=" + elfPath + ")");
+    }
+
+    /**
+     * Re-entry through the launcher: documentLaunchMode="intoExisting" brings
+     * the existing task forward instead of starting a new guest run. The
+     * suspended (or running) guest keeps its state; onResume() resumes it.
+     */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        String incoming = intent.getStringExtra(EXTRA_APP_NAME);
+        if (incoming != null && !incoming.equals(appName)) {
+            // intoExisting matches the intent action (the app name), so this
+            // should not happen; keep the live guest over a silent swap.
+            Log.w(TAG, "Re-entry intent names a different app: " + incoming
+                    + " (running " + appName + ")");
+        }
     }
 
     /** Terminal font, resolved on first use. */
@@ -508,6 +529,18 @@ public class GuestActivity extends Activity {
                 isSurfaceReady = true;
                 RvvmNative.nativeSetWindow(holder.getSurface(), guestId);
                 postLifecycleCmd(APP_CMD_INIT_WINDOW);
+                // A resume held back in onResume (surface was still down):
+                // replay the lifecycle and unpark now that the window exists.
+                if (pendingResume) {
+                    pendingResume = false;
+                    postLifecycleCmd(APP_CMD_RESUME);
+                    postLifecycleCmd(APP_CMD_GAINED_FOCUS);
+                    if (isSuspended && guestId >= 0) {
+                        RvvmNative.nativeResumeGuest(guestId);
+                        isSuspended = false;
+                        Log.i(TAG, "Guest " + appName + " resumed with its surface");
+                    }
+                }
                 // Start the guest now that the surface is ready
                 startGuestIfNeeded();
             }
@@ -658,24 +691,39 @@ public class GuestActivity extends Activity {
 
         if (guestId < 0) return;
 
+        // Reveal the video layer for a live, already-started guest. The
+        // first-frame reveal fired once per run and is already consumed, so
+        // waiting for it on re-entry would leave an INVISIBLE SurfaceView -
+        // which gets no surface at all, and the guest would run windowless
+        // (every frame's lock failing).
+        if (isGuestStarted && RvvmNative.nativeIsGuestRunning(guestId)) {
+            videoArea.setVisibility(View.VISIBLE);
+        }
+
         // If surface was destroyed while paused, recreate it here
         if (!isSurfaceReady && surfaceHolder.getSurface().isValid()) {
             surfaceCallback.surfaceCreated(surfaceHolder);
         }
 
-        // Rebind the window and replay lifecycle for the guest
         if (isSurfaceReady) {
+            // Window up: rebind and resume right away
             RvvmNative.nativeSetWindow(surfaceHolder.getSurface(), guestId);
             postLifecycleCmd(APP_CMD_INIT_WINDOW);
-        }
-        postLifecycleCmd(APP_CMD_RESUME);
-        postLifecycleCmd(APP_CMD_GAINED_FOCUS);
-
-        // Resume the guest if it was suspended
-        if (isSuspended) {
-            RvvmNative.nativeResumeGuest(guestId);
-            isSuspended = false;
-            Log.i(TAG, "Guest " + appName + " resumed from suspension");
+            postLifecycleCmd(APP_CMD_RESUME);
+            postLifecycleCmd(APP_CMD_GAINED_FOCUS);
+            if (isSuspended) {
+                RvvmNative.nativeResumeGuest(guestId);
+                isSuspended = false;
+                Log.i(TAG, "Guest " + appName + " resumed from suspension");
+            }
+        } else if (isSuspended && isGuestStarted
+                && RvvmNative.nativeIsGuestRunning(guestId)) {
+            // Surface still down: the framework recreates it asynchronously.
+            // Hold the resume until surfaceCreated binds the window, so the
+            // guest never runs windowless and no frame's lock can fail - the
+            // same hold-back MainActivity applies to a run waiting for its
+            // card. Guest stays parked until then.
+            pendingResume = true;
         }
 
         // Try starting the guest if surface became ready before onResume
@@ -703,6 +751,10 @@ public class GuestActivity extends Activity {
 
         // The keyboard is dismissed along with the activity's input state
         ttyKeyboardVisible = false;
+
+        // A resume held back for a surface that never came up in this
+        // foreground round must not fire on a stale surfaceCreated later.
+        pendingResume = false;
 
         // Notify the guest it is losing focus and pausing
         postLifecycleCmd(APP_CMD_PAUSE);
@@ -732,6 +784,23 @@ public class GuestActivity extends Activity {
     protected void onStop() {
         super.onStop();
         Log.i(TAG, "Guest " + appName + " stopped (still suspended, guestId=" + guestId + ")");
+    }
+
+    /**
+     * Back does not tear the guest down. Like Home, it backgrounds the whole
+     * task: onPause suspends the guest (vCPUs parked) and it stays alive in
+     * the process-wide run table, exactly the window-card model. Re-entry
+     * through the launcher reuses this task (documentLaunchMode="intoExisting")
+     * and onResume resumes the guest where it left off. A guest that has
+     * already exited has nothing worth keeping - close the shell instead.
+     */
+    @Override
+    public void onBackPressed() {
+        if (guestId >= 0 && RvvmNative.nativeIsGuestRunning(guestId)) {
+            moveTaskToBack(true);
+        } else {
+            super.onBackPressed();
+        }
     }
 
     /**
