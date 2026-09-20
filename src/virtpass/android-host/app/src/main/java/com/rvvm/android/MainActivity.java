@@ -767,14 +767,20 @@ public class MainActivity extends Activity {
                 return;
             }
             RvvmNative.nativeSetWindow(holder.getSurface(), card.getGuestId());
-            postLifecycleCmd(APP_CMD_INIT_WINDOW);
             if (card.getGuestId() == glRunPendingId) {
                 // A run held back for exactly this surface (runGuestElf). The
                 // window is in native hands now - that is the line above - so
-                // the guest can go ahead.
+                // the guest can go ahead. Its startup seed
+                // (replayGuestStartupState) carries INIT_WINDOW: posting one
+                // here would only be wiped by the seed's own clear.
                 Log.i(TAG, "Window up: starting the held-back run " + card.getGuestId());
                 glRunPendingId = -1;
                 startRun(card.getGuestId(), pendingElfName, pendingElfPath);
+            } else {
+                // A guest that is already running got its surface back
+                // (minimize/restore): re-deliver the window. A fresh
+                // WINDOW_RESIZED follows from onCardSurfaceChanged.
+                postLifecycleCmd(APP_CMD_INIT_WINDOW);
             }
         }
 
@@ -1582,16 +1588,18 @@ public class MainActivity extends Activity {
      *
      * Called before the guest thread exists, so the queue is cleared of the
      * previous guest's leftovers and seeded with the commands this guest would
-     * have seen on a cold start: START -> RESUME -> INIT_WINDOW -> focus.
+     * have seen on a cold start: START -> INIT_WINDOW -> RESUME -> focus.
+     *
+     * The seed carries INIT_WINDOW itself: the card's surface is bound before
+     * this runs (onCardSurfaceCreated / runGuestElf), and the clear above
+     * wipes any INIT posted on the way here - seeding it again is what makes
+     * the guest observe window != NULL on its very first poll.
      */
     private void replayGuestStartupState() {
         RvvmNative.nativeClearLifecycleCmds(activeGuestId);
         postLifecycleCmd(APP_CMD_START);
+        postLifecycleCmd(APP_CMD_INIT_WINDOW);
         postLifecycleCmd(APP_CMD_RESUME);
-        // INIT_WINDOW: the card's surface is handed to native by
-        // onCardSurfaceCreated, which queues the window command there - the
-        // seed here only carries the state the guest would have seen before
-        // its surface existed.
         if (hasWindowFocus()) {
             postLifecycleCmd(APP_CMD_GAINED_FOCUS);
         }

@@ -70,6 +70,8 @@ public class SimpleLauncherActivity extends Activity {
         // Debug support: adb can launch a guest directly by index, e.g.
         //   adb shell am start -n com.rvvm.android/.SimpleLauncherActivity --ei guest_app_index 0
         // after_guest_exit is passed through to GuestActivity (e.g. "stay").
+        // --ez window_card true routes the direct launch into MainActivity's
+        // window-card mode instead of the dedicated GuestActivity.
         int index = getIntent().getIntExtra("guest_app_index", -1);
 
         // Load the guest apps from assets (exact same list as MainActivity).
@@ -77,8 +79,16 @@ public class SimpleLauncherActivity extends Activity {
 
         if (index >= 0 && index < guestApps.length) {
             Log.i(TAG, "Direct launch by index " + index + ": " + guestApps[index]);
-            launchGuestApp(guestApps[index],
-                    getIntent().getStringExtra(GuestActivity.EXTRA_AFTER_GUEST_EXIT));
+            if (getIntent().getBooleanExtra("window_card", false)) {
+                // Window-card mode: MainActivity picks the app up from its
+                // own EXTRA_GUEST_APP and runs it in a GlWindowCard.
+                Intent intent = new Intent(this, MainActivity.class);
+                intent.putExtra(MainActivity.EXTRA_GUEST_APP, guestApps[index]);
+                startActivity(intent);
+            } else {
+                launchGuestApp(guestApps[index],
+                        getIntent().getStringExtra(GuestActivity.EXTRA_AFTER_GUEST_EXIT));
+            }
             finish();
             return;
         }
