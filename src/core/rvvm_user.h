@@ -236,6 +236,72 @@ void rvvm_user_set_prefix(rvvm_machine_t* machine, const char* prefix);
 // pointer is owned by the machine.
 const char* rvvm_user_get_prefix(rvvm_machine_t* machine);
 
+// --- Bundled assets (the /assets directory) ---
+//
+// The APK's assets/ tree is not reachable through the guest's file system, so a
+// host that has one makes it visible as a mount: guest "/assets/foo/bar.png" is
+// a read-only path, and the host supplies how to open a name from it here. The
+// guest then uses plain open()/read().
+//
+// The mount is matched on the guest's own absolute path and is independent of
+// rvvm_user_set_prefix(): a host that disables the prefix (Android) still gets
+// the mount, and a host that uses one (win32) keeps both.
+//
+// The host owns everything behind the fd it returns - a plain seekable file, a
+// pipe fed from a decompressor, ... The core only routes the path and refuses the
+// mutating open flags with EROFS. lseek()/fstat() then report whatever POSIX says
+// about that kind of fd (ESPIPE for a pipe), which is how a guest can tell them
+// apart when it has to.
+typedef struct {
+    // Open @name - a path relative to the mount, e.g. "fonts/x.ttf" - for reading
+    // and return a host fd the guest will read() from, or a negative guest errno
+    // in Linux UAPI numbering (-ENOENT for an unknown name). Called on the
+    // guest's vCPU thread, from its openat() path, so it should return promptly.
+    //
+    // The fd may be a *stream*: a pipe the host fills on demand is what this is
+    // for - an asset need not be resident anywhere on the host - and the guest is
+    // free to read it a chunk at a time. Non-seekable is then the honest answer
+    // (lseek() reports ESPIPE, exactly like a real pipe), and a guest that needs
+    // random access has to be handed a seekable source instead.
+    //
+    // The core reaps the fd when the run ends. A guest that exits without closing
+    // its descriptors is the ordinary case and the emulator runs no process
+    // teardown, so a host may hang background work off the fd - a thread feeding
+    // that pipe - and rely on the run end unblocking it rather than stranding it.
+    int (*open_fd)(void* userdata, const char* name);
+
+    // The length of @name in bytes, or a negative guest errno. Answers stat() and
+    // access() without the host having to materialize anything: a guest that
+    // stats before it opens would otherwise pay for a full open_fd() just to
+    // learn a size.
+    int64_t (*size)(void* userdata, const char* name);
+
+    // Directory enumeration, for opendir()/readdir() inside the mount. The tree
+    // is not a directory anywhere on the host, so there is nothing to open() -
+    // the host hands back an opaque handle it can walk instead, one entry name at
+    // a time. Enumerate immediate children only: the core does not recurse, and a
+    // name that is itself a directory shows up as an entry like any other.
+    //
+    //   open_dir  - handle for directory @name ("" is the mount root), or NULL
+    //               when there is no such directory.
+    //   dir_next  - the next entry name, or NULL at the end. The pointer only has
+    //               to stay valid until the next call / dir_close. "." and ".."
+    //               need not be reported - the core supplies those - and one that
+    //               is reported anyway is skipped.
+    //   dir_close - release the handle.
+    //
+    // A host without these simply has no enumerable directories: stat() of a
+    // directory then fails, and opendir() answers ENOENT.
+    void*       (*open_dir)(void* userdata, const char* name);
+    const char* (*dir_next)(void* userdata, void* dir);
+    void        (*dir_close)(void* userdata, void* dir);
+} rvvm_asset_ops_t;
+
+// Mount the host's asset tree. Without this every open under the mount answers
+// ENOENT, which is also what a host with no asset tree should see. @ops must
+// outlive the run; call this before rvvm_user_linux_ex().
+void rvvm_user_set_assets(rvvm_machine_t* machine, const rvvm_asset_ops_t* ops, void* userdata);
+
 // Create a userland machine instance without starting it.
 //
 // This is the multi-instance entry point: everything the guest needs (memory,

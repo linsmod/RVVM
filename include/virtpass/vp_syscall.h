@@ -36,7 +36,9 @@
 #define SYS_ANDROID_LIFECYCLE     (SYS_ANDROID_BASE + 7)
 #define SYS_ANDROID_CONFIG        (SYS_ANDROID_BASE + 8)
 #define SYS_ANDROID_LOOPER_INIT   (SYS_ANDROID_BASE + 9)
-#define SYS_ANDROID_ASSET_OPEN    (SYS_ANDROID_BASE + 10)
+
+/* BASE + 10 is retired: bundled assets were proxied through it and are now a
+ * mount the guest reads with plain open()/read() - see virtpass/vp_asset.h. */
 
 /* Window lock/unlock (Phase 1: software rendering). */
 #define SYS_ANDROID_WINDOW_LOCK      (SYS_ANDROID_BASE + 11)

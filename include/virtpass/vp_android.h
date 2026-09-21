@@ -158,6 +158,10 @@ typedef struct {
  * ============================================================ */
 typedef struct ANativeWindow ANativeWindow;
 
+/* The asset manager handle (android/asset_manager.h). Forward declared here
+ * because android_app carries one; the API itself is declared below. */
+typedef struct AAssetManager AAssetManager;
+
 /* ============================================================
  * android_app (simplified NativeAppGlue struct)
  * ============================================================ */
@@ -178,6 +182,10 @@ typedef struct android_app {
     /* Internal state */
     int32_t cmdPipe[2];  /* Pipe for lifecycle commands */
     int32_t inputPipe[2]; /* Pipe for input events */
+
+    /* Bundled assets, as in the NDK's android_app. Always non-NULL here: the
+     * host owns the single asset tree, so AAssetManager_open() ignores it. */
+    AAssetManager* assetManager;
 } android_app;
 
 /* ============================================================
@@ -328,6 +336,58 @@ int32_t ANativeWindow_getFormat(ANativeWindow* window);
 int32_t ANativeWindow_setBuffersGeometry(ANativeWindow* window, int32_t width, int32_t height, int32_t format);
 int32_t ANativeWindow_lock(ANativeWindow* window, ANativeWindow_Buffer* outBuffer, ARect* inOutDirtyBounds);
 int32_t ANativeWindow_unlockAndPost(ANativeWindow* window);
+
+/* ============================================================
+ * Asset API (android/asset_manager.h)
+ *
+ * A thin shell over the host's asset mount: the stub resolves the name under
+ * VP_ASSET_MOUNT and reads the file with plain POSIX calls, so assets arrive the
+ * same way everything else in that tree does (see virtpass/vp_asset.h) and there
+ * is no asset-specific transport of its own.
+ *
+ * The NDK contract is random access, so the whole asset is read into guest memory
+ * at open() time and AAsset_read()/AAsset_seek()/AAsset_getBuffer() then work on
+ * that copy. That is why an asset has to fit in guest RAM - true for the
+ * game-style payloads this ABI targets.
+ *
+ * Not covered (deliberately): AAssetManager_openDir(). The tree is enumerable
+ * through opendir() on the mount; the NDK-shaped wrapper for it is simply not
+ * written.
+ *
+ * AAsset_openFileDescriptor() is served from the same mount - it opens the asset
+ * as an object and reports start 0 with the object's own length, since the mount
+ * exposes the asset rather than the container holding it. A host that streams its
+ * assets cannot hand out an addressable descriptor and answers -1, which is the
+ * same refusal the NDK makes for an asset it cannot point at directly.
+ * ============================================================ */
+
+typedef struct AAsset AAsset;   /* AAssetManager is forward declared above */
+
+/* Open modes, mirroring the NDK. They only describe intent for us: the content
+ * is always read in full at open time. */
+enum {
+    AASSET_MODE_UNKNOWN   = 0,
+    AASSET_MODE_RANDOM    = 1,
+    AASSET_MODE_STREAMING = 2,
+    AASSET_MODE_BUFFER    = 3,
+};
+
+AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode);
+
+int AAsset_read(AAsset* asset, void* buf, size_t count);
+off_t AAsset_seek(AAsset* asset, off_t offset, int whence);
+off_t AAsset_getLength(AAsset* asset);
+int64_t AAsset_getLength64(AAsset* asset);
+off_t AAsset_getRemainingLength(AAsset* asset);
+int64_t AAsset_getRemainingLength64(AAsset* asset);
+void AAsset_close(AAsset* asset);
+const void* AAsset_getBuffer(AAsset* asset);
+int AAsset_isAllocated(AAsset* asset);
+
+/* A descriptor on the asset itself (start 0, its own length), or -1 when the host
+ * cannot address it directly - see the stub for why start is always 0 here and why
+ * a host that streams its assets refuses. The caller owns the descriptor. */
+int AAsset_openFileDescriptor(AAsset* asset, off_t* outStart, off_t* outLength);
 
 /* ============================================================
  * Configuration API (android/configuration.h)

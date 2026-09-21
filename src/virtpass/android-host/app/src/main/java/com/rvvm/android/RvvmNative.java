@@ -15,8 +15,14 @@ public class RvvmNative {
     /**
      * Initialize the native RVVM system.
      * Must be called before any other native methods.
+     *
+     * @param assets the Application's AssetManager. The APK's assets/ tree is
+     *               only reachable from Java (the NDK has no process-global
+     *               AssetManager), so native is handed it here once; pass null
+     *               when this host serves no assets, and every asset open then
+     *               fails with ENOENT.
      */
-    public static native void nativeInit();
+    public static native void nativeInit(android.content.res.AssetManager assets);
 
     /**
      * Create a guest run and return its id (or -1 when the run table is full).

@@ -63,7 +63,7 @@ public final class RvvmHost extends Application {
             return;
         }
         try {
-            RvvmNative.nativeInit();
+            RvvmNative.nativeInit(getAssets());
             initialized = true;
             if (panelWidth > 0 && panelHeight > 0) {
                 RvvmNative.nativeSetPanelSize(panelWidth, panelHeight);

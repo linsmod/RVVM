@@ -19,11 +19,14 @@
 #include <android/configuration.h>  /* ACONFIGURATION_* constants */
 #include <android/choreographer.h> /* AChoreographer_* (display vsync) */
 #include <android/looper.h>        /* ALooper_* (vsync pump) */
+#include <android/asset_manager.h>     /* AAssetManager_*, AAsset_*   */
+#include <android/asset_manager_jni.h> /* AAssetManager_fromJava()    */
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <time.h>
 #include <pthread.h>
+#include <signal.h>   /* pthread_sigmask() for the asset feeder's SIGPIPE */
 #include <unistd.h>
 #include <sys/system_properties.h>  /* rvvm.max_guests capacity knob */
 
@@ -48,6 +51,15 @@
 /* Global references to Java objects */
 static JavaVM* g_jvm = NULL;
 static JNIEnv* g_env = NULL;
+
+/* The APK's asset tree, handed over from Java once in nativeInit().
+ *
+ * The NDK has no process-global AssetManager - one is only reachable from a
+ * Java Context - so the Application's arrives through JNI and stays valid for
+ * the process's lifetime. Every guest in the process reads the same tree, which
+ * is the model the VirtPass asset callback describes: one namespace per guest,
+ * owned by the host. NULL until nativeInit() runs, or when Java passed none. */
+static AAssetManager* g_asset_mgr = NULL;
 
 /* This host's cmdpost instance for the run in progress: made by
  * nativeClearLifecycleCmds() (the run preparation Java calls before it seeds
@@ -113,6 +125,13 @@ struct android_run {
     char            elf_path[512];
     int             argc;
     char*           argv[16];
+    /* Storage for those argv strings, one set per run. It used to be a single
+     * `static` inside nativeRunElf - shared by every run and only 128 bytes per
+     * argument. That meant a second run being prepared overwrote the first run's
+     * argv (the guest thread reads it while the UI thread may already be setting
+     * up the next run), and any longer argument was silently cut, which turns a
+     * host-driven test into a confusing result at the other end. */
+    char            arg_buf[16][1024];
     /* Host-side mirror of the lifecycle commands. vp_cmdpost holds the
      * guest-facing queue; this copy is what the JNI poller answers from. */
     int32_t         lifecycle_queue[32];
@@ -1651,6 +1670,193 @@ static void on_game_input(void* motionEvent)
     LOGI("GameActivity input event received");
 }
 
+/* Bundled assets are not served through a cmdpost callback any more: they are the
+ * mount registered with rvvm_user_set_assets() below, which the guest reaches
+ * with plain open()/read()/stat()/opendir(). The callback used to be a second,
+ * worse way to do the same thing - it copied the whole asset through a
+ * length-then-content handshake and could not stream, stat or enumerate. See
+ * virtpass/vp_asset.h. */
+
+/* ============================================================
+ * The /assets mount (rvvm_user_set_assets)
+ *
+ * A guest that opens "/assets/<name>" gets a real pipe: a feeder thread pulls the
+ * asset through AAssetManager and writes it into the pipe while the guest reads
+ * the other end. Nothing is buffered whole - the asset is never resident on the
+ * host - and the copy back-pressures, because a full pipe parks the feeder until
+ * the guest drains it.
+ *
+ * That is what makes the fd a *pipe* rather than a file, which is the honest POSIX
+ * answer for a stream: lseek() reports ESPIPE and fstat() says FIFO, so a guest
+ * that needs random access is told as much instead of quietly being handed a copy.
+ * A seekable source is a separate thing - a stored (uncompressed) APK entry could
+ * offer one through AAsset_openFileDescriptor().
+ *
+ * The feeder is only safe because the core reaps the fd when the run ends: a guest
+ * exiting mid-read is the ordinary case, and closing the read end there is what
+ * gives this thread its EPIPE and lets it unwind. Without that sweep an abandoned
+ * stream would strand the thread, and the strandings would accumulate run after
+ * run.
+ * ============================================================ */
+
+typedef struct {
+    AAsset* asset;
+    int     wfd;
+} android_asset_stream_t;
+
+/* Pull the asset into the pipe until it is drained or the guest hangs up. A
+ * write() to a pipe whose read end is gone raises SIGPIPE, which would take the
+ * whole host process down - so the thread blocks it and takes the EPIPE instead,
+ * which is the normal end when the guest closed the fd (or the run ended). */
+static void* android_asset_feeder(void* arg)
+{
+    android_asset_stream_t* s = arg;
+    char buf[64 * 1024];
+    sigset_t set;
+
+    sigemptyset(&set);
+    sigaddset(&set, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+    for (;;) {
+        int got = AAsset_read(s->asset, buf, sizeof(buf));
+        size_t done = 0;
+
+        if (got <= 0) {
+            break;                          /* EOF, or the source failed */
+        }
+        while (done < (size_t)got) {
+            ssize_t n = write(s->wfd, buf + done, (size_t)got - done);
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n <= 0) {
+                goto out;                   /* the guest is gone */
+            }
+            done += (size_t)n;
+        }
+    }
+
+out:
+    close(s->wfd);
+    AAsset_close(s->asset);
+    free(s);
+    return NULL;
+}
+
+/* rvvm_asset_ops_t::open_fd: a stream over one asset name. */
+static int android_asset_open_fd(void* user, const char* name)
+{
+    android_asset_stream_t* s;
+    pthread_t th;
+    int fds[2];
+
+    (void)user;
+
+    if (!name || !*name) {
+        return -EISDIR;                     /* the mount root, not a file */
+    }
+    if (!g_asset_mgr) {
+        return -ENOENT;
+    }
+
+    s = calloc(1, sizeof(*s));
+    if (!s) {
+        return -ENOMEM;
+    }
+
+    /* STREAMING, not BUFFER: the point of the mount is that the asset is resident
+     * nowhere. An entry the APK stored deflated still comes back inflated, and in
+     * this mode it is inflated incrementally - the host peeling its own packaging,
+     * not an application codec. */
+    s->asset = AAssetManager_open(g_asset_mgr, name, AASSET_MODE_STREAMING);
+    if (!s->asset) {
+        free(s);
+        return -ENOENT;
+    }
+
+    if (pipe(fds) != 0) {
+        int err = errno;
+        AAsset_close(s->asset);
+        free(s);
+        return -err;
+    }
+    s->wfd = fds[1];
+
+    if (pthread_create(&th, NULL, android_asset_feeder, s) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        AAsset_close(s->asset);
+        free(s);
+        return -EAGAIN;
+    }
+    pthread_detach(th);
+
+    return fds[0];
+}
+
+/* rvvm_asset_ops_t::size: the asset's length straight from the platform. This is
+ * what stat() and access() are answered from, so a guest that stats before it
+ * opens does not pay for a full copy just to learn a size. */
+static int64_t android_asset_size(void* user, const char* name)
+{
+    AAsset* asset;
+    int64_t len;
+
+    (void)user;
+
+    if (!name || !*name) {
+        return -EISDIR;                     /* the mount root, not a file */
+    }
+    if (!g_asset_mgr) {
+        return -ENOENT;
+    }
+
+    asset = AAssetManager_open(g_asset_mgr, name, AASSET_MODE_UNKNOWN);
+    if (!asset) {
+        return -ENOENT;
+    }
+    len = AAsset_getLength64(asset);
+    AAsset_close(asset);
+    return len < 0 ? -EIO : len;
+}
+
+/* rvvm_asset_ops_t::open_dir / dir_next / dir_close: the APK's directory
+ * listing. AAssetManager has its own handle for a directory and the core never
+ * sees inside it - it stores the opaque handle and pulls one name at a time, so
+ * the handle travels as a void* in both directions. */
+static void* android_asset_open_dir(void* user, const char* name)
+{
+    (void)user;
+
+    if (!g_asset_mgr) {
+        return NULL;
+    }
+    /* "" is the assets root, which is what an empty asset name means to
+     * AAssetManager_openDir() - and it is what the core passes for the mount. */
+    return AAssetManager_openDir(g_asset_mgr, name ? name : "");
+}
+
+static const char* android_asset_dir_next(void* user, void* dir)
+{
+    (void)user;
+    return AAssetDir_getNextFileName(dir);
+}
+
+static void android_asset_dir_close(void* user, void* dir)
+{
+    (void)user;
+    AAssetDir_close(dir);
+}
+
+static const rvvm_asset_ops_t android_asset_ops = {
+    .open_fd   = android_asset_open_fd,
+    .size      = android_asset_size,
+    .open_dir  = android_asset_open_dir,
+    .dir_next  = android_asset_dir_next,
+    .dir_close = android_asset_dir_close,
+};
+
 /* ============================================================
  * JNI Initialization
  * ============================================================ */
@@ -1736,10 +1942,16 @@ static void jni_register_cmdpost_callbacks(vp_cmdpost_t* inst)
 }
 
 JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz)
+Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz, jobject assets)
 {
     (void)thiz;
     g_env = env;
+
+    /* The APK's assets/ tree is only reachable from Java, so the Application's
+     * AssetManager is handed over here once. It outlives every guest run (it
+     * belongs to the Application), which is why the pointer can be cached for
+     * the process. NULL is accepted: this host then serves no assets. */
+    g_asset_mgr = assets ? AAssetManager_fromJava(env, assets) : NULL;
 
     /* No session and no run exist here: runs are created explicitly by
      * nativeCreateGuest(), and each one binds its own session (with this
@@ -2214,15 +2426,21 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
     run->argc = 1;  /* argv[0] = ELF path */
     if (args) {
         jsize len = (*env)->GetArrayLength(env, args);
-        for (int i = 0; i < len && run->argc < 15; i++) {
+        for (int i = 0; i < len && run->argc < 16; i++) {
             jstring jstr = (jstring)(*env)->GetObjectArrayElement(env, args, i);
             const char* str = (*env)->GetStringUTFChars(env, jstr, NULL);
             if (str) {
-                /* Store in static buffer (simplified - no dynamic alloc) */
-                static char arg_buf[16][128];
-                strncpy(arg_buf[run->argc], str, 127);
-                arg_buf[run->argc][127] = '\0';
-                run->argv[run->argc] = arg_buf[run->argc];
+                char* dst = run->arg_buf[run->argc];
+                size_t cap = sizeof(run->arg_buf[0]);
+
+                if (strlen(str) >= cap) {
+                    /* Loud on purpose: a silently cut argument is a confusing
+                     * thing to debug from the guest's end. */
+                    LOGW("Guest %d argv[%d] truncated to %zu bytes",
+                         run->id, run->argc, cap - 1);
+                }
+                snprintf(dst, cap, "%s", str);
+                run->argv[run->argc] = dst;
                 run->argc++;
                 (*env)->ReleaseStringUTFChars(env, jstr, str);
             }
@@ -2231,6 +2449,12 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
     }
 
     LOGI("Starting guest %d: %s (argc=%d)", run->id, run->elf_path, run->argc);
+    /* Echo what the guest is being asked to do. A host-driven test is defined by
+     * its arguments, and reading them back out of logcat is how a mangled one
+     * gets noticed instead of being misread as a guest bug. */
+    if (run->argc > 1) {
+        LOGI("Guest %d argv: %s%s", run->id, run->argv[1], run->argc > 2 ? " ..." : "");
+    }
 
     /* New run: flush the previous guest's trailing partial line and let the
      * first frame of THIS guest re-hide the console overlay. */
@@ -2277,6 +2501,11 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
      * before the thread starts, since the first thing the guest does may be one
      * of these syscalls. */
     rvvm_user_set_host_ctx(run->machine, run->cmdpost);
+
+    /* The host's asset tree, mounted at /assets for this run. Per run like the
+     * rest of the host context; the manager it reads through is process-global,
+     * handed over once in nativeInit(). */
+    rvvm_user_set_assets(run->machine, &android_asset_ops, NULL);
 
     /* This run's own console session: opened fresh (the previous run's frozen
      * screen stays retired for the view to fall back to), wiped, and attached

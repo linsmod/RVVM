@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 /* Sensor subsystem: vp_sensor_ops_t, vp_sensor_set_ops(), vp_sensor_ingest()
  * and the vp_sensor_dispatch() entry point used by the dispatcher below. */
@@ -66,6 +67,13 @@ typedef int32_t (*window_set_buf_callback)(vp_cmdpost_t* inst, int32_t width, in
 /* Configuration callback: host fills *outValue for the requested field
  * (VP_ACONFIG_QUERY_* selector) and returns 0 on success. */
 typedef int32_t (*config_get_callback)(vp_cmdpost_t* inst, int32_t field, int32_t* outValue);
+
+/* Bundled assets deliberately have no callback here: they are a mount the guest
+ * reaches with plain open()/read()/stat()/opendir(), served by the host's
+ * rvvm_user_set_assets() ops. One transport instead of two - the mount streams,
+ * answers stat() without a copy and can be enumerated, so an asset-specific
+ * proxy would only be a worse second way to do the same thing. See
+ * virtpass/vp_asset.h. */
 
 /* GameActivity callbacks */
 typedef void (*game_lifecycle_callback)(int32_t cmd);

@@ -139,6 +139,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 /* Android NDK API Proxy - vp_cmdpost integration (single copy lives in src/virtpass) */
 #include "virtpass/vp_cmdpost.h"
 
+/* The guest-visible mount of the host's bundled asset tree (VP_ASSET_MOUNT) */
+#include "virtpass/vp_asset.h"
+
 #if defined(ANDROID)
 #include <android/log.h>
 
@@ -180,6 +183,11 @@ typedef int32_t  uapi_long_t;
 #endif
 
 #define UAPI_PATH_MAX 4096
+
+// asm-generic AT_FDCWD: the guest's "resolve against the current directory"
+// dirfd. Part of the guest ABI, so it is spelled out here rather than taken
+// from the host's <fcntl.h>.
+#define UAPI_AT_FDCWD (-100)
 
 /*
  * Guest-visible errno values (riscv64 Linux UAPI).
@@ -646,6 +654,41 @@ typedef struct {
  * no behaviour. Later steps move one group at a time into the context.
  * ============================================================ */
 
+/* ============================================================
+ * Asset mount: directory fds
+ *
+ * Everywhere else in this file a guest fd *is* a host fd, and the host opens
+ * whatever the guest asked for. An asset directory breaks that: the tree is not a
+ * directory on the host at all (it lives inside the app package), so there is no
+ * host fd to hand out. The mount therefore hands out a synthetic fd from a
+ * reserved range and keeps the fd -> enumeration-handle mapping here;
+ * getdents64(), close() and fstat() consult it before falling through to the
+ * host.
+ * ============================================================ */
+#define RVVM_ASSET_DIR_FD_BASE  0x7A000000  /* far above any host fd */
+#define RVVM_ASSET_DIR_MAX      8
+#define RVVM_ASSET_DIR_NAME_MAX 256
+
+/* Descriptors the mount handed out and has not seen closed. The emulator runs no
+ * process teardown, so these are what a run that ends mid-read would otherwise
+ * leave behind; see the sweep in userland_destroy(). */
+#define RVVM_ASSET_FD_MAX       64
+
+/* DT_* values, as getdents64 callers expect them. DT_UNKNOWN leaves the type to
+ * the reader, which the mount answers through stat(). */
+#define RVVM_DT_UNKNOWN 0
+#define RVVM_DT_DIR     4
+
+typedef struct {
+    int      fd;            /* synthetic fd the guest holds; 0 = free slot      */
+    void*    dir;           /* host enumeration handle                          */
+    uint32_t phase;         /* 0 = ".", 1 = "..", 2.. = host entries            */
+    uint64_t ino;           /* handed out as d_ino / d_off                      */
+    uint8_t  pending_type;
+    bool     has_pending;   /* pending holds an entry already pulled from the host */
+    char     pending[RVVM_ASSET_DIR_NAME_MAX];
+} rvvm_asset_dir_t;
+
 // Virtual TTY input ring (cooked bytes waiting for the guest) and the
 // canonical line buffer under construction. Both are small: this is an
 // interactive console, not a pipe.
@@ -671,6 +714,21 @@ typedef struct rvvm_userland {
     bool                     fake_root;
     int                      fake_uid;
     int                      fake_gid;
+    // Guest-virtual working directory. Relative paths in guest syscalls are
+    // resolved against this, never against the host process's own cwd: the host
+    // cwd is wherever the emulator happened to be started from, which has
+    // nothing to do with the guest's namespace, and unwrap_path() can only turn
+    // it back into a guest path when it literally starts with the prefix.
+    char                     cwd[UAPI_PATH_MAX];
+
+    // Host-provided asset tree, mounted at VP_ASSET_MOUNT. The ops are the
+    // host's (rvvm_user_set_assets); the core only routes paths into them.
+    const rvvm_asset_ops_t*  asset_ops;
+    void*                    asset_user;
+    // Open directories inside the mount, keyed by their synthetic fd.
+    rvvm_asset_dir_t         asset_dirs[RVVM_ASSET_DIR_MAX];
+    // Descriptors the mount handed out, for the run-end sweep. 0 = free slot.
+    int                      asset_fds[RVVM_ASSET_FD_MAX];
 
     // --- Guest virtual memory allocator (group B) ---
     spinlock_t    guest_lock;
@@ -2206,6 +2264,15 @@ PUBLIC const char* rvvm_user_get_prefix(rvvm_machine_t* machine)
     return ctx ? ctx->prefix_path : NULL;
 }
 
+PUBLIC void rvvm_user_set_assets(rvvm_machine_t* machine, const rvvm_asset_ops_t* ops, void* userdata)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (ctx) {
+        ctx->asset_ops  = ops;
+        ctx->asset_user = userdata;
+    }
+}
+
 static bool proc_mem_readable(const void* addr, size_t size)
 {
     static int fd = 0;
@@ -2310,15 +2377,25 @@ static void proc_symbolize(const char* label, const char* elf, const rvvm_addr_t
 // Defaults applied when a userland context is created (see rvvm_user_linux)
 #define USERLAND_DEFAULT_FAKE_ROOT true
 
+/* Component-aware prefix match: "/tmp" has to be followed by '/' or end the
+ * path. A bare rvvm_strfind() prefix test also accepted "/tmpfoo", which took
+ * any such path out of the prefix and onto the host's own root - a guest could
+ * leave its namespace just by naming a directory "/tmp-something". */
+static bool path_has_prefix(const char* path, const char* prefix)
+{
+    size_t len = rvvm_strlen(prefix);
+    return rvvm_strfind(path, prefix) == path && (path[len] == '/' || path[len] == 0);
+}
+
 static bool path_bypass(const char* path)
 {
     const char* prefix = uctx()->prefix_path;
     return prefix == NULL
-        || rvvm_strfind(path, "/dev") == path
-        || rvvm_strfind(path, "/sys") == path
-        || rvvm_strfind(path, "/proc") == path
-        || rvvm_strfind(path, "/tmp") == path
-        || rvvm_strfind(path, "/var/tmp") == path;
+        || path_has_prefix(path, "/dev")
+        || path_has_prefix(path, "/sys")
+        || path_has_prefix(path, "/proc")
+        || path_has_prefix(path, "/tmp")
+        || path_has_prefix(path, "/var/tmp");
 }
 
 static bool path_wrapped(const char* path)
@@ -2329,7 +2406,14 @@ static bool path_wrapped(const char* path)
         || path_bypass(path);
 }
 
-static const char* wrap_path(char* buffer, const char* path)
+/* Map an already-absolute guest path into the host namespace: "<prefix><path>",
+ * with the path_bypass() directories left alone.
+ *
+ * A relative path is returned untouched. This is the entry point for paths that
+ * do NOT come from a syscall argument - the guest ELF named on the command
+ * line, a symlink target - so the guest cwd has nothing to do with them. Guest
+ * syscalls must go through wrap_guest_path(). */
+static const char* map_abs_path(char* buffer, const char* path)
 {
     const char* prefix = uctx()->prefix_path;
     if (prefix && path) {
@@ -2339,11 +2423,414 @@ static const char* wrap_path(char* buffer, const char* path)
 
         if (rvvm_strfind(path, "/") == path) {
             size_t prefix_len = rvvm_strlcpy(buffer, prefix, UAPI_PATH_MAX);
+            /* "/" is the prefix directory itself. Appending it would leave a
+             * trailing separator, which the host's stat()/open() may refuse
+             * (MinGW is strict about this, and "cd .." lands exactly here). */
+            if (path[1] == 0) {
+                return buffer;
+            }
             rvvm_strlcpy(buffer + prefix_len, path, UAPI_PATH_MAX - prefix_len);
             return buffer;
         }
     }
     return path;
+}
+
+// Deepest path guest_path_absolutize() will normalize. A deeper one is refused
+// (ENAMETOOLONG) instead of being silently truncated.
+#define GUEST_PATH_MAX_SEGS 64
+
+/* Resolve a path against the guest's virtual cwd and normalize it into an
+ * absolute guest path. "." drops out and ".." pops a component, so the result
+ * can never walk above "/". Returns false when it would not fit in @size. */
+static bool guest_path_absolutize(char* out, size_t size, const char* path)
+{
+    char full[UAPI_PATH_MAX];
+    const char* segs[GUEST_PATH_MAX_SEGS];
+    size_t lens[GUEST_PATH_MAX_SEGS];
+    size_t nsegs = 0;
+    size_t o = 0;
+    const char* p;
+
+    if (path[0] == '/') {
+        rvvm_strlcpy(full, path, sizeof(full));
+    } else {
+        // The virtual cwd is always absolute, so a plain join is enough
+        size_t n = rvvm_strlen(uctx()->cwd);
+        if (n + 1 >= sizeof(full)) {
+            return false;
+        }
+        memcpy(full, uctx()->cwd, n);
+        full[n] = '/';
+        rvvm_strlcpy(full + n + 1, path, sizeof(full) - n - 1);
+    }
+
+    p = full;
+    while (*p) {
+        const char* seg;
+        size_t len;
+
+        while (*p == '/') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+
+        seg = p;
+        while (*p && *p != '/') {
+            p++;
+        }
+        len = (size_t)(p - seg);
+
+        if (len == 1 && seg[0] == '.') {
+            continue;
+        }
+        if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            if (nsegs) {
+                nsegs--;
+            }
+            continue;
+        }
+        if (nsegs == GUEST_PATH_MAX_SEGS) {
+            return false;
+        }
+        segs[nsegs] = seg;
+        lens[nsegs] = len;
+        nsegs++;
+    }
+
+    if (size < 2) {
+        return false;
+    }
+    out[o++] = '/';
+    for (size_t i = 0; i < nsegs; i++) {
+        if (i) {
+            if (o + 1 >= size) {
+                return false;
+            }
+            out[o++] = '/';
+        }
+        for (size_t j = 0; j < lens[i]; j++) {
+            if (o + 1 >= size) {
+                return false;
+            }
+            out[o++] = segs[i][j];
+        }
+    }
+    out[o] = 0;
+    return true;
+}
+
+/* The entry point every guest path syscall argument goes through.
+ *
+ * A relative path resolves against the guest's cwd when dirfd is AT_FDCWD. With
+ * a real dirfd it is passed on untouched and the host resolves it: that dirfd
+ * is a host fd which already refers to the right directory, and resolving it
+ * against the guest cwd instead would be exactly wrong.
+ *
+ * A path that will not normalize (absurdly deep) is passed on as-is, so the
+ * host syscall reports the failure itself. */
+static const char* wrap_guest_path(char* buffer, int dirfd, const char* path)
+{
+    if (!path) {
+        return NULL;
+    }
+    if (path[0] == '/' || dirfd == UAPI_AT_FDCWD) {
+        char abs[UAPI_PATH_MAX];
+        if (guest_path_absolutize(abs, sizeof(abs), path)) {
+            return map_abs_path(buffer, abs);
+        }
+    }
+    return path;
+}
+
+/* The asset name of a guest-absolute path under VP_ASSET_MOUNT, or NULL when the
+ * path is not in the host's asset tree. Component-aware like path_has_prefix():
+ * "/assetsfoo" is not under "/assets". The mount root itself yields "" - a
+ * directory, which openat() cannot serve until directory fds exist. */
+static const char* asset_mount_name(const char* abs_path)
+{
+    if (!path_has_prefix(abs_path, VP_ASSET_MOUNT)) {
+        return NULL;
+    }
+    return abs_path[sizeof(VP_ASSET_MOUNT) - 1] == '/' ? abs_path + sizeof(VP_ASSET_MOUNT) : "";
+}
+
+/* Remember a descriptor the mount handed out, so userland_destroy() can reap it
+ * if the guest never closes it. False when the table is full - an untracked fd is
+ * exactly the leak the sweep exists to prevent, so the caller refuses it. */
+static bool asset_fd_track(int fd)
+{
+    rvvm_userland_t* ctx = uctx();
+    for (size_t i = 0; i < RVVM_ASSET_FD_MAX; i++) {
+        if (ctx->asset_fds[i] == 0) {
+            ctx->asset_fds[i] = fd;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The guest closed @fd itself, so the sweep must not touch that number again - it
+ * may already have been handed to something else. */
+static void asset_fd_forget(int fd)
+{
+    rvvm_userland_t* ctx = uctx();
+    for (size_t i = 0; i < RVVM_ASSET_FD_MAX; i++) {
+        if (ctx->asset_fds[i] == fd) {
+            ctx->asset_fds[i] = 0;
+            return;
+        }
+    }
+}
+
+/* openat() inside the asset mount.
+ *
+ * The tree is packaged with the app, so it is read-only: a mutating access mode
+ * or flag is refused here rather than by the host, which then never has to
+ * consider writes at all. What is left is the one question the host answers - a
+ * readable fd for this name - and everything about that fd (seekable or not,
+ * buffered or piped) stays its business.
+ *
+ * Note the path reached here is already absolutized and normalized, so ".." can
+ * not climb out of the mount: "/assets/../etc/passwd" normalizes to "/etc/passwd"
+ * and never matches. */
+static rvvm_addr_t rvvm_sys_asset_open(const char* name, int flags)
+{
+    rvvm_userland_t* ctx = uctx();
+    int fd;
+
+    /* O_ACCMODE != O_RDONLY, or a flag that would create / truncate / append -
+     * the same bit numbers uapi_open_flags() translates above. */
+    if ((flags & 3) != 0 || (flags & (0x40 | 0x80 | 0x200 | 0x400))) {
+        return -UAPI_EROFS;
+    }
+    if (!*name) {
+        /* The mount root is the directory the opendir() path serves, not a file;
+         * openat() on it is routed there before it gets here. */
+        return -UAPI_EISDIR;
+    }
+    if (!ctx->asset_ops || !ctx->asset_ops->open_fd) {
+        return -UAPI_ENOENT;
+    }
+    /* A host fd, or the host's own negative errno passed straight through. */
+    fd = ctx->asset_ops->open_fd(ctx->asset_user, name);
+    if (fd >= 0 && !asset_fd_track(fd)) {
+        /* Untracked means unreapable, which is the leak the table exists to
+         * prevent - so refuse one instead of handing it out. Closing it here is
+         * also what tells a streaming host that its back end is no longer
+         * wanted. */
+        close(fd);
+        return -UAPI_EMFILE;
+    }
+    return fd;
+}
+
+/* What a directory inside the mount looks like to stat(): read-only, same owner
+ * as everything else there, no size. Defined up here because stat() needs it
+ * before the enumeration helpers below exist. */
+static void asset_dir_fill_stat(struct stat* st)
+{
+    rvvm_userland_t* ctx = uctx();
+    memset(st, 0, sizeof(*st));
+    st->st_mode  = S_IFDIR | 0555;
+    st->st_nlink = 2;
+    st->st_uid   = (unsigned)ctx->fake_uid;
+    st->st_gid   = (unsigned)ctx->fake_gid;
+}
+
+/* stat() inside the asset mount: a read-only regular file, with the size the
+ * host's size op reports - or a read-only directory, which is what the mount
+ * root and any subdirectory of the tree are. Nothing is opened to measure a
+ * file: the tree is not a directory that can be stat()ed, and opening the asset
+ * just to learn its size would copy the whole thing. */
+static int rvvm_sys_asset_stat(const char* name, struct stat* st)
+{
+    rvvm_userland_t* ctx = uctx();
+    int64_t len;
+
+    if (!ctx->asset_ops || !ctx->asset_ops->size) {
+        return -UAPI_ENOENT;
+    }
+    len = ctx->asset_ops->size(ctx->asset_user, name);
+    if (len < 0) {
+        /* Not a file. It may be a directory - the mount root, or a subdirectory -
+         * which the host can tell by being able to open it for enumeration. */
+        if (ctx->asset_ops->open_dir && ctx->asset_ops->dir_close) {
+            void* dir = ctx->asset_ops->open_dir(ctx->asset_user, name);
+            if (dir) {
+                ctx->asset_ops->dir_close(ctx->asset_user, dir);
+                asset_dir_fill_stat(st);
+                return 0;
+            }
+        }
+        return (int)len;
+    }
+
+    memset(st, 0, sizeof(*st));
+    st->st_mode  = S_IFREG | 0444;  /* packaged with the app: read-only */
+    st->st_nlink = 1;
+    st->st_size  = (off_t)len;
+    st->st_uid   = (unsigned)ctx->fake_uid;
+    st->st_gid   = (unsigned)ctx->fake_gid;
+    return 0;
+}
+
+/* access() inside the asset mount. Only existence and read permission can be
+ * granted: the tree is read-only, so a write request is refused here instead of
+ * being left to the host. There are no symlinks and no per-process credentials
+ * in it, so the at-flags make no difference. */
+static rvvm_addr_t rvvm_sys_asset_access(const char* name, int mode)
+{
+    struct stat st;
+
+    int ret = rvvm_sys_asset_stat(name, &st);
+    if (ret) {
+        return ret;
+    }
+    if (mode & 2) {         /* W_OK */
+        return -UAPI_EACCESS;
+    }
+    return 0;               /* F_OK / R_OK / X_OK and friends */
+}
+
+/* faccessat()/faccessat2() with the asset mount handled. */
+static rvvm_addr_t rvvm_sys_faccessat(int dirfd, const char* path, int mode, int flags)
+{
+    char pbuf[UAPI_PATH_MAX];
+    char abs[UAPI_PATH_MAX];
+
+    if (path && (path[0] == '/' || dirfd == UAPI_AT_FDCWD) &&
+        guest_path_absolutize(abs, sizeof(abs), path)) {
+        const char* asset = asset_mount_name(abs);
+        if (asset) {
+            return rvvm_sys_asset_access(asset, mode);
+        }
+    }
+    return errno_ret(faccessat(dirfd, wrap_guest_path(pbuf, dirfd, path), mode, flags));
+}
+
+/* The synthetic directory fd -> handle mapping, or NULL when @fd is a host fd. */
+static rvvm_asset_dir_t* asset_dir_lookup(int fd)
+{
+    rvvm_userland_t* ctx = uctx();
+    for (size_t i = 0; i < RVVM_ASSET_DIR_MAX; i++) {
+        if (fd != 0 && ctx->asset_dirs[i].fd == fd) {
+            return &ctx->asset_dirs[i];
+        }
+    }
+    return NULL;
+}
+
+/* openat() of a directory inside the mount: a synthetic fd for the enumeration
+ * path below. Only reached for O_DIRECTORY or the mount root - see the openat()
+ * case. */
+static rvvm_addr_t rvvm_sys_asset_opendir(const char* name, int flags)
+{
+    rvvm_userland_t* ctx = uctx();
+    rvvm_asset_dir_t* slot = NULL;
+    void* dir;
+
+    /* Same read-only rule as a file: enumerating never implies writing. */
+    if ((flags & 3) != 0 || (flags & (0x40 | 0x80 | 0x200 | 0x400))) {
+        return -UAPI_EROFS;
+    }
+    if (!ctx->asset_ops || !ctx->asset_ops->open_dir || !ctx->asset_ops->dir_next ||
+        !ctx->asset_ops->dir_close) {
+        return -UAPI_ENOENT;
+    }
+
+    /* The slot first, so the host handle is only opened once one is guaranteed. */
+    for (size_t i = 0; i < RVVM_ASSET_DIR_MAX; i++) {
+        if (ctx->asset_dirs[i].fd == 0) {
+            slot = &ctx->asset_dirs[i];
+            break;
+        }
+    }
+    if (!slot) {
+        return -UAPI_EMFILE;
+    }
+
+    dir = ctx->asset_ops->open_dir(ctx->asset_user, name);
+    if (!dir) {
+        return -UAPI_ENOENT;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    slot->fd  = RVVM_ASSET_DIR_FD_BASE + (int)(slot - ctx->asset_dirs);
+    slot->dir = dir;
+    return slot->fd;
+}
+
+static rvvm_addr_t rvvm_sys_asset_closedir(int fd)
+{
+    rvvm_userland_t* ctx = uctx();
+    rvvm_asset_dir_t* d = asset_dir_lookup(fd);
+    if (!d) {
+        return -UAPI_EBADF;
+    }
+    ctx->asset_ops->dir_close(ctx->asset_user, d->dir);
+    memset(d, 0, sizeof(*d));
+    return 0;
+}
+
+/* getdents64() on a synthetic directory: one record per call, so the guest's
+ * readdir loop drives it. The position lives in the host handle plus the phase
+ * counter, and one entry is buffered so that a destination buffer too small for
+ * it does not consume the entry. */
+static int64_t rvvm_sys_asset_getdents(rvvm_asset_dir_t* d, void* out, size_t size)
+{
+    rvvm_userland_t* ctx = uctx();
+    struct uapi_linux_dirent64* de;
+    size_t name_len;
+    size_t reclen;
+
+    if (!d->has_pending) {
+        const char* name;
+        uint8_t type = RVVM_DT_UNKNOWN;
+
+        if (d->phase == 0) {
+            name = ".";
+            type = RVVM_DT_DIR;
+        } else if (d->phase == 1) {
+            name = "..";
+            type = RVVM_DT_DIR;
+        } else {
+            /* "." and ".." are the core's (above), so a host whose own readdir()
+             * reports them must not produce them twice. */
+            do {
+                name = ctx->asset_ops->dir_next(ctx->asset_user, d->dir);
+                if (!name || !*name) {
+                    return 0;           /* end of the directory */
+                }
+            } while (!strcmp(name, ".") || !strcmp(name, ".."));
+        }
+        rvvm_strlcpy(d->pending, name, sizeof(d->pending));
+        d->pending_type = type;
+        d->has_pending = true;
+    }
+
+    name_len = rvvm_strlen(d->pending);
+    reclen = (sizeof(*de) + name_len + 1 + 7) & ~(size_t)7;
+
+    /* A record has to fit in one call: the answer a real getdents64 gives when the
+     * caller's buffer cannot hold even one entry. */
+    if (reclen > size) {
+        return -UAPI_EINVAL;
+    }
+
+    de = out;
+    memset(de, 0, reclen);
+    de->d_ino    = ++d->ino;
+    de->d_off    = (int64_t)d->ino;
+    de->d_reclen = (uint16_t)reclen;
+    de->d_type   = d->pending_type;
+    memcpy(de->d_name, d->pending, name_len + 1);
+
+    d->has_pending = false;
+    d->phase++;
+    return (int64_t)reclen;
 }
 
 static size_t unwrap_path(char* buffer, const char* path, size_t size)
@@ -2355,7 +2842,7 @@ static size_t unwrap_path(char* buffer, const char* path, size_t size)
         return rvvm_strlcpy(buffer + off, path + len, size - off);
     }
 
-    return rvvm_strlcpy(buffer, path, UAPI_PATH_MAX);
+    return rvvm_strlcpy(buffer, path, size);
 }
 
 /* Guest open(2) flags -> host open() flags.
@@ -3086,6 +3573,17 @@ static int rvvm_sys_poll_time32(void* pfds, size_t npfds, const struct uapi_time
 
 static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
 {
+    rvvm_asset_dir_t* asset_dir = asset_dir_lookup(fd);
+
+    /* A directory inside the asset mount: the entries come from the host's
+     * enumeration handle, not from a file system. */
+    if (asset_dir) {
+        if (!dirp) {
+            return -UAPI_EFAULT;
+        }
+        return rvvm_sys_asset_getdents(asset_dir, dirp, size);
+    }
+
     /* SYS_getdents64 is served by the host layer: the native syscall on Linux,
      * the Win32 directory walk in posix_shim.c elsewhere. The guest structure
      * (struct uapi_linux_dirent64 above) is filled by that layer. */
@@ -3286,23 +3784,80 @@ static int rvvm_sys_getresgid(int* rgid, int* egid, int* sgid)
     return 0;
 }
 
+/* getcwd(2): answered from the guest's own cwd. The host cwd is deliberately
+ * not consulted - it is the emulator's, and turning it into a guest path only
+ * worked while it happened to lie inside the prefix. */
 static rvvm_addr_t rvvm_sys_getcwd(char* buffer, size_t size)
 {
-    char tmp[UAPI_PATH_MAX] = {0};
-    if (!getcwd(tmp, size)) {
+    size_t len = rvvm_strlen(uctx()->cwd);
+
+    if (len + 1 > size) {
+        return -UAPI_ERANGE;
+    }
+    /* The kernel returns the length without the NUL, and libc getcwd() reads a
+     * 0 as ENOENT, so the length is reported explicitly. */
+    rvvm_strlcpy(buffer, uctx()->cwd, size);
+    return len;
+}
+
+/* chdir(2): moves the guest's cwd, not the host's. The target decides success
+ * by really existing as a directory in the host namespace - the same thing the
+ * guest then sees through the prefix mapping. */
+static rvvm_addr_t rvvm_sys_chdir(const char* path)
+{
+    char abs[UAPI_PATH_MAX];
+    char host[UAPI_PATH_MAX];
+    struct stat st;
+
+    if (!path) {
+        return -UAPI_EFAULT;
+    }
+    if (!guest_path_absolutize(abs, sizeof(abs), path)) {
+        return -UAPI_ENAMETOOLONG;
+    }
+    if (stat(map_abs_path(host, abs), &st) != 0) {
         return last_errno();
     }
-    /* The kernel returns the string length (NUL excluded) and libc getcwd()
-     * treats a 0 as ENOENT, so report it explicitly instead of forwarding
-     * whatever the copy helper happens to return. */
-    unwrap_path(buffer, tmp, size);
-    return rvvm_strlen(buffer);
+    if (!S_ISDIR(st.st_mode)) {
+        return -UAPI_ENOTDIR;
+    }
+    rvvm_strlcpy(uctx()->cwd, abs, sizeof(uctx()->cwd));
+    return 0;
+}
+
+/* fchdir(2): the fd is a host fd, and there is no portable way to ask where it
+ * points. The host fchdir() is done first, so dirfd-relative syscalls keep
+ * working, and then the host cwd is mapped back into the guest namespace. On a
+ * host that reports a path outside the prefix - Windows and its drive letters,
+ * typically - nothing maps back and the guest cwd is reset to "/": a
+ * valid-but-wrong state instead of a path that no longer exists. Guests must
+ * not expect fchdir to preserve the cwd exactly here. */
+static rvvm_addr_t rvvm_sys_fchdir(int fd)
+{
+    char host[UAPI_PATH_MAX];
+
+    if (fchdir(fd) != 0) {
+        return last_errno();
+    }
+    if (getcwd(host, sizeof(host)) && host[0] == '/') {
+        char virt[UAPI_PATH_MAX] = {0};
+        unwrap_path(virt, host, sizeof(virt));
+        if (virt[0] == '/') {
+            rvvm_strlcpy(uctx()->cwd, virt, sizeof(uctx()->cwd));
+            return 0;
+        }
+    }
+    rvvm_strlcpy(uctx()->cwd, "/", sizeof(uctx()->cwd));
+    return 0;
 }
 
 static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* buffer, size_t size)
 {
+    char host[UAPI_PATH_MAX] = {0};
     char tmp[UAPI_PATH_MAX] = {0};
-    if (readlinkat(dirfd, wrap_path(tmp, pathname), tmp, size) < 0) {
+    /* Separate buffers: the mapped host path and the link target are both
+     * strings, and reading one into the other's storage is asking for it. */
+    if (readlinkat(dirfd, wrap_guest_path(host, dirfd, pathname), tmp, size) < 0) {
         return last_errno();
     }
     return unwrap_path(buffer, tmp, size);
@@ -3616,25 +4171,28 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 33: // mknodat
                     rvvm_info("sys_mknodat(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
-                    a0 = errno_ret(mknodat(a0, wrap_path(path_buf, to_str(a1)), a2, a3));
+                    a0 = errno_ret(mknodat(a0, wrap_guest_path(path_buf, a0, to_str(a1)), a2, a3));
                     break;
                 case 34: // mkdirat
                     rvvm_info("sys_mkdirat(%ld, %s, %lx)", a0, to_str(a1), a2);
-                    a0 = errno_ret(mkdirat(a0, wrap_path(path_buf, to_str(a1)), a2));
+                    a0 = errno_ret(mkdirat(a0, wrap_guest_path(path_buf, a0, to_str(a1)), a2));
                     break;
                 case 35: // unlinkat
                     rvvm_info("sys_unlinkat(%ld, %s, %lx)", a0, to_str(a1), a2);
-                    a0 = errno_ret(unlinkat(a0, wrap_path(path_buf, to_str(a1)), a2));
+                    a0 = errno_ret(unlinkat(a0, wrap_guest_path(path_buf, a0, to_str(a1)), a2));
                     break;
                 case 36: // symlinkat
                     rvvm_info("sys_symlinkat(%s, %ld, %s)", to_str(a0), a1, to_str(a2));
-                    a0 = errno_ret(symlinkat(wrap_path(path_buf, to_str(a0)), a1,
-                                             wrap_path(path_buf1, to_str(a2))));
+                    /* The target is stored verbatim by the kernel, so it is not
+                     * resolved against a cwd - only mapped as an absolute path.
+                     * The link path is an ordinary guest path. */
+                    a0 = errno_ret(symlinkat(map_abs_path(path_buf, to_str(a0)), a1,
+                                             wrap_guest_path(path_buf1, a1, to_str(a2))));
                     break;
                 case 37: // linkat
                     rvvm_info("sys_linkat(%ld, %s, %ld, %s, %lx)", a0, to_str(a1), a2, to_str(a3), a4);
-                    a0 = errno_ret(linkat(a0, wrap_path(path_buf, to_str(a1)),
-                                          a2, wrap_path(path_buf1, to_str(a3)), a4));
+                    a0 = errno_ret(linkat(a0, wrap_guest_path(path_buf, a0, to_str(a1)),
+                                          a2, wrap_guest_path(path_buf1, a2, to_str(a3)), a4));
                     break;
                 case 43: { // statfs64
                     struct statfs stfs = {0};
@@ -3644,7 +4202,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -UAPI_EFAULT;
                         break;
                     }
-                    a0 = errno_ret(statfs(wrap_path(path_buf, to_str(a0)), &stfs));
+                    a0 = errno_ret(statfs(wrap_guest_path(path_buf, UAPI_AT_FDCWD, to_str(a0)), &stfs));
                     uapi_statfs64_convert(out, &stfs);
                     break;
                 }
@@ -3662,7 +4220,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 45: // truncate64
                     rvvm_info("sys_truncate64(%s, %lx)", to_str(a0), a1);
-                    a0 = errno_ret(truncate(wrap_path(path_buf, to_str(a0)), a1));
+                    a0 = errno_ret(truncate(wrap_guest_path(path_buf, UAPI_AT_FDCWD, to_str(a0)), a1));
                     break;
                 case 46: // ftruncate64
                     rvvm_info("sys_ftruncate64(%ld, %lx)", a0, a1);
@@ -3676,15 +4234,15 @@ static void* rvvm_user_thread_wrap(void* arg)
 #endif
                 case 48: // faccessat
                     rvvm_info("sys_faccessat(%ld, %s, %lx)", a0, to_str(a1), a2);
-                    a0 = errno_ret(faccessat(a0, wrap_path(path_buf, to_str(a1)), a2, 0));
+                    a0 = rvvm_sys_faccessat((int)a0, to_str(a1), a2, 0);
                     break;
                 case 49: // chdir
                     rvvm_info("sys_chdir(%s)", to_str(a0));
-                    a0 = errno_ret(chdir(wrap_path(path_buf, to_str(a0))));
+                    a0 = rvvm_sys_chdir(to_str(a0));
                     break;
                 case 50: // fchdir
                     rvvm_info("sys_fchdir(%ld)", a0);
-                    a0 = errno_ret(fchdir(a0));
+                    a0 = rvvm_sys_fchdir((int)a0);
                     break;
                 case 52: // fchmod
                     rvvm_info("sys_fchmodat(%ld, %lx)", a0, a1);
@@ -3692,14 +4250,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 53: // fchmodat
                     rvvm_info("sys_fchmodat(%ld, %s, %lx)", a0, to_str(a1), a2);
-                    a0 = errno_ret(fchmodat(a0, wrap_path(path_buf, to_str(a1)), a2, 0));
+                    a0 = errno_ret(fchmodat(a0, wrap_guest_path(path_buf, a0, to_str(a1)), a2, 0));
                     break;
                 case 54: // fchownat
                     if (uctx()->fake_root) {
                         a0 = 0;
                     } else {
                         rvvm_info("sys_fchownat(%ld, %s, %lx, %lx, %lx)", a0, to_str(a1), a2, a3, a4);
-                        a0 = errno_ret(fchownat(a0, wrap_path(path_buf, to_str(a1)), a2, a3, a4));
+                        a0 = errno_ret(fchownat(a0, wrap_guest_path(path_buf, a0, to_str(a1)), a2, a3, a4));
                     }
                     break;
                 case 55: // fchown
@@ -3717,17 +4275,45 @@ static void* rvvm_user_thread_wrap(void* arg)
                         /* openat would dereference the NULL path */
                         a0 = -EFAULT;
                     } else {
-                        /* NULL path with AT_EMPTY_PATH refers to the dirfd */
-                        const char* host_path = path ? wrap_path(path_buf, path) : path;
-                        a0 = errno_ret(openat(a0, host_path, uapi_open_flags(a2), a3));
-                        if (host_path && a0 < 0x1000) {
-                            rvvm_warn("DBG openat %s -> fd %ld", host_path, (long)a0);
+                        char abs[UAPI_PATH_MAX];
+                        const char* asset = NULL;
+                        /* The asset mount is matched on the guest's own absolute
+                         * path, before the prefix mapping - the host's asset tree
+                         * is not a path in any file system, so there is nothing
+                         * to translate it to. */
+                        if (path && (path[0] == '/' || (int)a0 == UAPI_AT_FDCWD) &&
+                            guest_path_absolutize(abs, sizeof(abs), path)) {
+                            asset = asset_mount_name(abs);
+                        }
+                        if (asset) {
+                            /* O_DIRECTORY, or the mount root itself, is a
+                             * listing: it gets a synthetic fd the getdents64
+                             * path knows. Everything else is a file. */
+                            if ((a2 & 0x10000) || !*asset) {
+                                a0 = rvvm_sys_asset_opendir(asset, a2);
+                            } else {
+                                a0 = rvvm_sys_asset_open(asset, a2);
+                            }
+                        } else {
+                            /* NULL path with AT_EMPTY_PATH refers to the dirfd */
+                            const char* host_path = wrap_guest_path(path_buf, (int)a0, path);
+                            a0 = errno_ret(openat(a0, host_path, uapi_open_flags(a2), a3));
+                            if (host_path && a0 < 0x1000) {
+                                rvvm_warn("DBG openat %s -> fd %ld", host_path, (long)a0);
+                            }
                         }
                     }
                     break;
                 }
                 case 57: // close
-                    a0 = errno_ret(close(a0));
+                    if (asset_dir_lookup((int)a0)) {
+                        a0 = rvvm_sys_asset_closedir((int)a0);
+                    } else {
+                        /* The guest closed a mount fd itself: drop it from the
+                         * run-end sweep before the number can be reused. */
+                        asset_fd_forget((int)a0);
+                        a0 = errno_ret(close(a0));
+                    }
                     break;
                 case 59: { // pipe2
                     rvvm_info("sys_pipe2(%lx, %lx)", a0, a1);
@@ -3755,6 +4341,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                         // host process's own stdin. Blocks until a line has been
                         // assembled by the line discipline.
                         a0 = (rvvm_addr_t)user_tty_read(uctx(), buf, a2, true);
+                        break;
+                    }
+                    if (asset_dir_lookup((int)a0)) {
+                        /* A directory fd: reading it directly is EISDIR, exactly
+                         * like a real one - the entries come from getdents64. */
+                        a0 = -UAPI_EISDIR;
                         break;
                     }
                     a0 = errno_ret(read(a0, buf, a2));
@@ -3875,10 +4467,36 @@ static void* rvvm_user_thread_wrap(void* arg)
                     struct stat st = {0};
                     const char* path = to_str(a1);
                     struct uapi_stat* out = to_ptr_sz(a2, sizeof(*out));
+                    char abs[UAPI_PATH_MAX];
+                    const char* asset = NULL;
                     int ret;
                     rvvm_info("sys_newfstatat(%ld, %s, %lx, %lx)", a0, path, a2, a3);
                     if (!out) {
                         a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    if (path && (path[0] == '/' || (int)a0 == UAPI_AT_FDCWD) &&
+                        guest_path_absolutize(abs, sizeof(abs), path)) {
+                        asset = asset_mount_name(abs);
+                    }
+                    if (asset) {
+                        /* Inside the asset mount: answered from the host's size
+                         * op, with no fd involved. */
+                        int rc = rvvm_sys_asset_stat(asset, &st);
+                        if (rc) {
+                            a0 = rc;
+                            break;
+                        }
+                        a0 = 0;
+                        uapi_stat_convert(out, &st);
+                        break;
+                    }
+                    /* fstatat(fd, NULL, AT_EMPTY_PATH) on a synthetic asset
+                     * directory fd - there is no host fd to hand to fstatat. */
+                    if (!path && (a3 & AT_EMPTY_PATH) && asset_dir_lookup((int)a0)) {
+                        asset_dir_fill_stat(&st);
+                        a0 = 0;
+                        uapi_stat_convert(out, &st);
                         break;
                     }
                     if (!path && !(a3 & AT_EMPTY_PATH)) {
@@ -3887,8 +4505,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                         errno = EFAULT;
                     } else {
                         /* NULL path with AT_EMPTY_PATH means "fstat the fd";
-                         * fstatat() accepts it but wrap_path() would not. */
-                        ret = fstatat(a0, path ? wrap_path(path_buf, path) : path, &st, a3);
+                         * fstatat() accepts it, and wrap_guest_path() passes
+                         * NULL straight through. */
+                        ret = fstatat(a0, wrap_guest_path(path_buf, (int)a0, path), &st, a3);
                     }
                     a0 = errno_ret(ret);
                     uapi_stat_convert(out, &st);
@@ -3903,7 +4522,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -UAPI_EFAULT;
                         break;
                     }
-                    a0 = errno_ret(fstat(fd, &st));
+                    if (asset_dir_lookup((int)fd)) {
+                        /* A synthetic asset directory: there is no host fd to
+                         * fstat. fdopendir() does exactly this to validate its
+                         * argument, so it has to answer S_IFDIR. */
+                        asset_dir_fill_stat(&st);
+                        a0 = 0;
+                    } else {
+                        a0 = errno_ret(fstat(fd, &st));
+                    }
                     rvvm_warn("DBG newfstat fd=%ld ret=%ld host_size=%lld", fd, (long)a0, (long long)st.st_size);
                     uapi_stat_convert(out, &st);
                     break;
@@ -4505,7 +5132,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 221: { // execve
                     rvvm_info("sys_execve(%lx, %lx, %lx)", a0, a1, a2);
-                    if (access(wrap_path(path_buf, to_str(a0)), F_OK)) {
+                    if (access(wrap_guest_path(path_buf, UAPI_AT_FDCWD, to_str(a0)), F_OK)) {
                         a0 = -ENOENT;
                         break;
                     }
@@ -4591,8 +5218,8 @@ static void* rvvm_user_thread_wrap(void* arg)
 #endif
                 case 276: // renameat2
                     rvvm_info("sys_renameat2(%ld, %s, %ld, %s, %lx)", a0, to_str(a1), a2, to_str(a3), a4);
-                    a0 = errno_ret(renameat(a0, wrap_path(path_buf, to_str(a1)),
-                                            a2, wrap_path(path_buf1, to_str(a3))));
+                    a0 = errno_ret(renameat(a0, wrap_guest_path(path_buf, a0, to_str(a1)),
+                                            a2, wrap_guest_path(path_buf1, a2, to_str(a3))));
                     break;
                 case 277: // seccomp - stub
                     // Hitler SHOT HIMSELF after seeing this...
@@ -4624,7 +5251,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     if (!stx) {
                         a0 = -UAPI_EFAULT;
                     } else {
-                        a0 = errno_ret(statx(a0, wrap_path(path_buf, to_str(a1)), a2, a3, stx));
+                        a0 = errno_ret(statx(a0, wrap_guest_path(path_buf, a0, to_str(a1)), a2, a3, stx));
                     }
                     break;
                 }
@@ -4641,7 +5268,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 439: // faccessat2
                     rvvm_info("sys_faccessat2(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
-                    a0 = errno_ret(faccessat(a0, wrap_path(path_buf, to_str(a1)), a2, a3));
+                    a0 = rvvm_sys_faccessat((int)a0, to_str(a1), a2, a3);
                     break;
                 /*
                  * Android NDK API Proxy syscalls (0x10000+)
@@ -5006,6 +5633,7 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
     ctx->machine      = machine;
     ctx->prefix_path  = USERLAND_DEFAULT_PREFIX;
     ctx->fake_root    = USERLAND_DEFAULT_FAKE_ROOT;
+    rvvm_strlcpy(ctx->cwd, "/", sizeof(ctx->cwd));
     // Terminal state before the guest changes it - must match the TCGETS
     // answer in user_tty_ioctl(): canonical, echoing, line editing.
     ctx->tty_lflag    = TTY_LFLAG_DEFAULT;
@@ -5027,6 +5655,26 @@ static void userland_destroy(rvvm_machine_t* machine)
      * outlives the machine by design (see rvvm_tty_detach). */
     if (ctx->tty && ctx->tty_owned) {
         rvvm_tty_close(ctx->tty);
+    }
+    /* Reap what the asset mount handed out. The emulator runs no process
+     * teardown, so a guest that exited (or was stopped) without closing its
+     * descriptors would otherwise leave the host resources behind them alive -
+     * for a stream, the thread pumping it - and that would accumulate run after
+     * run until the descriptor table ran out. Closing the read end is also what
+     * hands a streaming host its EPIPE so its thread can unwind. */
+    for (size_t i = 0; i < RVVM_ASSET_FD_MAX; i++) {
+        if (ctx->asset_fds[i]) {
+            close(ctx->asset_fds[i]);
+            ctx->asset_fds[i] = 0;
+        }
+    }
+    for (size_t i = 0; i < RVVM_ASSET_DIR_MAX; i++) {
+        if (ctx->asset_dirs[i].fd) {
+            if (ctx->asset_ops && ctx->asset_ops->dir_close) {
+                ctx->asset_ops->dir_close(ctx->asset_user, ctx->asset_dirs[i].dir);
+            }
+            ctx->asset_dirs[i].fd = 0;
+        }
     }
     rvvm_free_machine(machine);
     safe_free(ctx);
@@ -5092,6 +5740,13 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
         ctx->prefix_path = env_prefix[0] ? env_prefix : NULL;
     }
 
+    /* The guest starts at its own root. The host process's cwd is not it, and
+     * resolving relative guest paths against that host cwd only looked right
+     * while the emulator happened to run from inside the prefix. Reset here
+     * rather than in create() for the same reason as the prefix above: one
+     * machine may boot several guests in a row. */
+    rvvm_strlcpy(ctx->cwd, "/", sizeof(ctx->cwd));
+
     guest_vm_init();
     /* Host pointer standing for guest address 0. Deliberately computed with
      * integer math: the result points below the allocation and must never be
@@ -5116,7 +5771,7 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
     // Remember the ELF images for crash symbolization (see proc_symbolize())
     uctx()->main_elf_path[0] = 0;
     uctx()->interp_elf_path[0] = 0;
-    const char* host_elf = wrap_path(path_buf, argv[0]);
+    const char* host_elf = map_abs_path(path_buf, argv[0]);
     rvvm_strlcpy(uctx()->main_elf_path, host_elf, sizeof(uctx()->main_elf_path));
     rvfile_t* file = rvopen(host_elf, 0);
     if (!file) {
@@ -5168,8 +5823,8 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
 
     if (uctx()->elf.interp_path) {
         rvvm_info("ELF interpreter at %s", uctx()->elf.interp_path);
-        // wrap_path() may pass the path through untouched - keep its result
-        const char* host_interp = wrap_path(path_buf, uctx()->elf.interp_path);
+        // map_abs_path() may pass the path through untouched - keep its result
+        const char* host_interp = map_abs_path(path_buf, uctx()->elf.interp_path);
         rvvm_strlcpy(uctx()->interp_elf_path, host_interp, sizeof(uctx()->interp_elf_path));
         file = rvopen(host_interp, 0);
         if (file) {

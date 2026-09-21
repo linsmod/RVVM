@@ -27,8 +27,12 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h> /* -ENOENT/-EINVAL from the asset mount ops */
 #include <time.h>
-#include <io.h>  /* _access(): launcher guest-existence check */
+#include <io.h>       /* _access(), _setmode() */
+#include <fcntl.h>    /* open() */
+#include <sys/stat.h> /* stat() for the asset mount's size op */
+#include <dirent.h>   /* opendir()/readdir() for its directory ops */
 
 #include "win32_cmdpost_bridge.h" /* self-protypes for forward refs (launcher) */
 #include "virtpass/vp_cmdpost.h"  /* single copy lives in src/virtpass */
@@ -2297,6 +2301,114 @@ static void launcher_toggle_suspend(void)
     }
 }
 
+/* ============================================================
+ * Bundled assets (the /assets mount)
+ *
+ * The WinHost has no APK: its asset tree is a real directory - the same one the
+ * launcher lists guests from (--assets / RVVM_ASSETS) - so every op here is a
+ * plain file call. The descriptors the mount hands out are ordinary seekable
+ * files, a guest can lseek() an asset like any other file, and nothing is
+ * buffered and nothing needs a thread.
+ * ============================================================ */
+
+/* Resolve an asset name under g_assets_dir, refusing anything that climbs out of
+ * it: the tree belongs to the guest and must not turn into a way to read the
+ * host's disk. Returns false when @name is not a plain relative path. */
+static bool asset_host_path(char* out, size_t outsz, const char* name)
+{
+    if (!name || !*name || name[0] == '/' || name[0] == '\\' || strstr(name, "..")) {
+        return false;
+    }
+    /* APK asset names use '/', Windows accepts it as a separator too, so a nested
+     * name like "shaders/basic.glsl" resolves as-is. */
+    snprintf(out, outsz, "%s\\%s", g_assets_dir, name);
+    return true;
+}
+
+static int win32_asset_open_fd(void* user, const char* name)
+{
+    char path[MAX_PATH + 128];
+    int fd;
+
+    (void)user;
+
+    if (!asset_host_path(path, sizeof(path), name)) {
+        return -EINVAL;
+    }
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return -ENOENT;
+    }
+    /* The guest reads raw bytes: no CRLF translation on the way through. */
+    _setmode(fd, _O_BINARY);
+    return fd;
+}
+
+static int64_t win32_asset_size(void* user, const char* name)
+{
+    char path[MAX_PATH + 128];
+    struct stat st;
+
+    (void)user;
+
+    if (!asset_host_path(path, sizeof(path), name)) {
+        return -EINVAL;
+    }
+    if (stat(path, &st) != 0) {
+        return -ENOENT;
+    }
+    /* A directory says so by refusing to answer a size - the core then asks
+     * open_dir() and reports S_IFDIR. */
+    if (S_ISDIR(st.st_mode)) {
+        return -EISDIR;
+    }
+    return (int64_t)st.st_size;
+}
+
+static void* win32_asset_open_dir(void* user, const char* name)
+{
+    char path[MAX_PATH + 128];
+
+    (void)user;
+
+    if (!name || !*name) {
+        /* The mount root is the asset directory itself. */
+        snprintf(path, sizeof(path), "%s", g_assets_dir);
+    } else if (!asset_host_path(path, sizeof(path), name)) {
+        return NULL;
+    }
+    return opendir(path);
+}
+
+static const char* win32_asset_dir_next(void* user, void* dir)
+{
+    struct dirent* de;
+    (void)user;
+    de = readdir(dir);
+    return de ? de->d_name : NULL;   /* "." and ".." are the core's to report */
+}
+
+static void win32_asset_dir_close(void* user, void* dir)
+{
+    (void)user;
+    closedir(dir);
+}
+
+static const rvvm_asset_ops_t win32_asset_ops = {
+    .open_fd   = win32_asset_open_fd,
+    .size      = win32_asset_size,
+    .open_dir  = win32_asset_open_dir,
+    .dir_next  = win32_asset_dir_next,
+    .dir_close = win32_asset_dir_close,
+};
+
+void win32_host_set_assets_dir(const char* dir)
+{
+    if (dir && *dir) {
+        snprintf(g_assets_dir, sizeof(g_assets_dir), "%s", dir);
+    }
+}
+
 /* (Re)register every host-side cmdpost callback. Done once at init and again
  * before each launch.
  *
@@ -2502,6 +2614,11 @@ bool win32_host_start_guest(int argc, char** argv)
      * before the thread is created, since the guest's first act may be one of
      * these syscalls. */
     rvvm_user_set_host_ctx(g_guest_machine, g_cmdpost);
+
+    /* The host's asset tree, mounted at /assets. This host's tree is a real
+     * directory, so the mount serves plain seekable files; see the ops above.
+     * Registered per run like the rest of the host context. */
+    rvvm_user_set_assets(g_guest_machine, &win32_asset_ops, NULL);
 
     g_guest_argv = (char**)calloc((size_t)argc + 1, sizeof(char*));
     if (!g_guest_argv) {

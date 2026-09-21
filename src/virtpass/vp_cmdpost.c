@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <errno.h> /* -ENOENT / -EFAULT on the dispatch error paths */
 /* write(): used to publish vsync frame times into the guest's Looper pipe */
 #include <unistd.h>
 
@@ -495,12 +496,6 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
                         inst->looper_initialized = true;
                     }
                     return 0;
-                }
-
-                case SYS_ANDROID_ASSET_OPEN: {
-                    /* Open asset file */
-                    // TODO: Open asset from APK
-                    return -1; /* Not implemented */
                 }
 
                 case SYS_ANDROID_WINDOW_LOCK: {

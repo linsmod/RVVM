@@ -52,6 +52,14 @@ bool win32_host_init(const char* title, int win_w, int win_h,
 bool win32_host_set_launcher(const char* assets_dir);
 
 /*
+ * Directory the guest's AAssetManager_* calls read from. This host has no APK,
+ * so an asset is simply a file under this directory - the same one the launcher
+ * lists its guests from. Asset names are resolved relative to it; a name that
+ * tries to leave it is refused. Call before the guest starts.
+ */
+void win32_host_set_assets_dir(const char* dir);
+
+/*
  * Launch the guest Linux ELF (argv[0] = ELF path, argv[1..] = guest args)
  * on a dedicated thread. Does not block.
  */

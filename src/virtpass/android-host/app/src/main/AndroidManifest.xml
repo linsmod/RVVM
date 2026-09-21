@@ -37,9 +37,16 @@
             android:configChanges="orientation|screenSize|keyboardHidden">
         </activity>
 
+        <!-- Exported so `adb shell am start` can drive a run: the shell uid
+             (2000) is refused when starting a non-exported activity, which
+             silently made the documented adb launch command fail on current
+             Android. EXTRA_GUEST_APP / EXTRA_GUEST_ARGS are the whole reason -
+             a host test is then one am start instead of driving the picker by
+             hand. No intent-filter (it must not add a launcher entry) and no
+             permission: this is a development console. -->
         <activity
             android:name=".MainActivity"
-            android:exported="false"
+            android:exported="true"
             android:launchMode="singleTask"
             android:screenOrientation="portrait"
             android:windowSoftInputMode="adjustResize">

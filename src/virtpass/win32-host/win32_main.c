@@ -192,6 +192,11 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    /* The picker's guest directory doubles as the guest's asset tree: with no
+     * APK on this host, AAssetManager_* reads files from under it. Set before
+     * either launch path, so both see the same tree. */
+    win32_host_set_assets_dir(assets_dir);
+
     if (i >= argc) {
         /* No guest given: show the Android-style picker instead of running a
          * specific guest. The launcher manages guest launches (Run/Stop) and

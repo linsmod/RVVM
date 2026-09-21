@@ -117,6 +117,32 @@ Build the guests first (`mingw32-make android-assets`, zig/musl - see
 .\release.windows.x86_64\rvvm_winhost_x86_64.exe --help   # options + environment
 ```
 
+### Scripted runs (non-interactive)
+
+A guest and its arguments go on the command line - the counterpart of the Android
+host's `--es guest` / `--esa argv`, the launcher being only the no-argument case.
+The host exits with the **guest's** exit code, so a check needs nothing more than
+to wait on the process:
+
+```powershell
+$p = Start-Process -FilePath .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
+     -ArgumentList 'src\virtpass\android-host\app\src\main\assets\test_cli.exe',
+                   'asset','fonts/JetBrainsMono-OFL.txt' `
+     -NoNewWindow -PassThru -RedirectStandardOutput guest.log
+$p | Wait-Process -Timeout 45
+$p.ExitCode        # the guest's own code
+```
+
+Guest output arrives on the host's stdout unprefixed and as it is written; the
+host's own lines carry a `[winhost <ms>]` prefix (`gl_log`/`winhost_log`), and
+rvvm's warnings go to stderr. That is why a run can be asserted on directly here:
+the equivalent Android check has to pull the output out of logcat by its
+`RVVM-GUEST` tag and parse the exit code out of a line, while on this host both
+are the process's own stdout and exit status.
+
+The one prerequisite is an interactive desktop session - the host always creates
+its window, guest or not.
+
 ### Launcher (Android-style picker)
 
 Run with **no guest argument** and the host shows a picker instead: a dropdown
@@ -220,13 +246,34 @@ Debug switches:
 4. **Sensors are stubs.** Fixed values pushed on a timer; wire up
    `Windows.Devices.Sensors` (WinRT) for real data.
 
-5. **Assets.** `ASSET_OPEN` is unimplemented in vp_cmdpost; guest asset reads
-   resolve relative to the current working directory. Guest absolute paths pass
-   through to the host unchanged unless `RVVM_USER_PREFIX` names a real rootfs
-   directory when the WinHost is launched. The value is applied through
-   `rvvm_user_set_prefix()`; an empty environment value cannot express
-   "no prefix" on Win32, because there `putenv("NAME=")` removes the variable
-   and a removed variable means "keep the build-time default".
+5. **Assets.** The host mounts its assets directory - the same tree the picker
+   lists guests from (`--assets DIR` / `RVVM_ASSETS`, default
+   `src\virtpass\android-host\app\src\main\assets`) - at `/assets`, and the
+   guest's `AAssetManager_*` calls are a shell over that mount. Because the tree
+   is a real directory here, every mount op is a plain file call: `open()` hands
+   out a real seekable descriptor (unlike the Android host, which streams through
+   a pipe), `stat()` answers a size, `opendir()` the entries, and a name that
+   tries to leave the tree is refused. `AAsset_openFileDescriptor()` therefore
+   succeeds here - an asset is a plain uncompressed file, which is exactly the
+   case the NDK allows - and reports start 0 with the file's own length, the mount
+   opening the asset rather than a container that holds it. (The Android host
+   streams its assets, so it cannot address one and answers -1: the NDK's own rule
+   for an asset it cannot point at directly.) The guest side reads a whole asset
+   into guest RAM at `AAssetManager_open()` - the NDK contract is random access -
+   so an asset has to fit there.
+   Guest *file system* paths are a separate matter: a relative path resolves
+   against the guest's own virtual cwd - it starts at "/" and only `chdir(2)`
+   moves it, never the host process's cwd - and is then mapped through the
+   prefix; an absolute path is mapped directly. That mapping is a string join, so
+   whether a path resolves at all depends on the prefix directory really
+   existing: by default that is the build-time
+   `/home/lekkit/stuff/userland/debian`, and `RVVM_USER_PREFIX` (read by
+   `rvvm_user`, applied via `rvvm_user_set_prefix()` by the WinHost) is what
+   points it at a real rootfs. `/dev`, `/sys`, `/proc`, `/tmp` and `/var/tmp`
+   are deliberate exceptions that pass through unmapped. An empty environment
+   value cannot express "no prefix" on Win32, because there `putenv("NAME=")`
+   removes the variable and a removed variable means "keep the build-time
+   default".
 
 ## Suggested next steps
 

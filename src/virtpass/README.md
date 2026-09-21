@@ -94,6 +94,41 @@ backend behind each callback differs.
   the io_callback are complementary sinks, not alternatives. A guest can be
   launched directly with
   `am start -n com.rvvm.android/.MainActivity --es guest <name>.exe`.
+- Assets: the host mounts its asset tree at `/assets` (`rvvm_user_set_assets()`),
+  and that mount is the only transport - the guest's `AAssetManager_*` calls are a
+  shell over it in `vp_ndk_stub.c` (`stat()` for the length, `open()`/`read()` for
+  the bytes), so there is no asset-specific syscall or cmdpost callback at all.
+  On Android the mount hands back a *stream*: a pipe fed by a thread pulling
+  through the platform `AAssetManager`, so nothing is resident on the host and the
+  copy back-pressures on the guest's own reads. On win32 the tree is a real
+  directory, so the descriptors are plain seekable files. `lseek()` on a stream
+  reports `ESPIPE`, which is the honest answer for one; see
+  `include/virtpass/vp_asset.h`.
+  The core reaps those descriptors when the run ends (a guest that exits mid-read
+  is the ordinary case, and the emulator runs no process teardown), which is what
+  lets a feeder thread unwind instead of being stranded; the same sweep closes
+  directories left open.
+  `stat`/`access` are answered from `android_asset_size()` (a stat never copies
+  the asset), a directory reports `S_IFDIR`, and writes inside the mount fail
+  with `EROFS` before the host is ever asked.
+  `opendir()`/`readdir()` enumerate through `AAssetManager_openDir()` on a
+  synthetic fd, because an asset directory has no host fd to hand out. That
+  enumeration is the NDK's, so it reports the *files* at that level and does not
+  return subdirectory names: `ls /assets` lists the guest ELFs but not `fonts/`,
+  which stays reachable by name (`ls /assets/fonts`).
+- Scripted runs: `MainActivity` is exported (`android:exported="true"` - the
+  shell uid is refused for a non-exported activity) and takes the guest's argv
+  as a string array, which is what lets a device test be one command:
+
+  ```sh
+  adb shell "am start -n com.rvvm.android/.MainActivity \
+      --es guest test_cli.exe \
+      --esa argv 'stat /assets/fonts/JetBrainsMono-OFL.txt; cat /assets/nope'"
+  ```
+
+  `test_cli` treats its arguments as a command line (`;` separates commands) and
+  exits with the number of failures, so the result is the guest's exit code in
+  logcat plus the `RVVM-GUEST` output - no on-screen interaction.
 
 ## Test knobs (guest side, `guest-samples/test_render_gles.c`)
 

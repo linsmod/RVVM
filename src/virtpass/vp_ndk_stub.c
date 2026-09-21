@@ -18,11 +18,13 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include "virtpass/vp_android.h"
+#include "virtpass/vp_asset.h" /* VP_ASSET_MOUNT: where the asset tree is mounted */
 /*
  * Custom syscall numbers for Android NDK API proxying come from
  * virtpass/vp_syscall.h (included through virtpass/vp_android.h above), the
@@ -649,6 +651,271 @@ static void* pixbuf_ensure(size_t need)
         g_pixbuf_size = need;
     }
     return g_pixbuf;
+}
+
+/* ============================================================
+ * Asset API (android/asset_manager.h)
+ *
+ * A thin shell over the host's asset mount: the name is resolved under
+ * VP_ASSET_MOUNT and read with plain POSIX calls, so assets arrive the same way
+ * everything else in that tree does (see virtpass/vp_asset.h) and this API needs
+ * no transport of its own.
+ *
+ * The NDK contract is random access, so the whole asset is read into guest memory
+ * at open() time and AAsset_read()/seek()/getBuffer() then work on that copy. The
+ * one consequence worth knowing: an asset has to fit in guest RAM. That is true
+ * for the game-style payloads this ABI targets (shaders, textures, level data).
+ * ============================================================ */
+
+/* One asset tree per guest, owned by the host. A placeholder so that
+ * app->assetManager can be non-NULL, the way the NDK contract assumes; the host
+ * owns the real tree, and this handle is not what names it. */
+struct AAssetManager {
+    int unused;
+};
+
+static struct AAssetManager g_asset_manager;
+
+struct AAsset {
+    unsigned char* data;   /* guest-side copy of the whole asset */
+    int64_t        length;
+    int64_t        pos;
+    char*          path;   /* the mount path, kept for AAsset_openFileDescriptor() */
+};
+
+AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode)
+{
+    char path[512];
+    struct stat st;
+    AAsset* asset;
+    unsigned char* data;
+    size_t want, got = 0;
+    int fd;
+
+    (void)mgr;      /* a single asset tree per guest: the host owns it */
+    (void)mode;     /* the content is always read in full, see above */
+
+    /* A name relative to the asset root. A name that climbs out of it - or is
+     * absolute - is refused rather than resolved: the mount would normalize it
+     * away from /assets, and the call would quietly read the guest's own file
+     * system instead of an asset. */
+    if (!filename || !*filename || filename[0] == '/' || strstr(filename, "..")) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (snprintf(path, sizeof(path), VP_ASSET_MOUNT "/%s", filename) >= (int)sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+
+    /* No host asset tree mounted, or no such asset: the same answer either way. */
+    if (stat(path, &st) != 0) {
+        return NULL;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        errno = EISDIR;
+        return NULL;
+    }
+    want = (size_t)st.st_size;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return NULL;
+    }
+
+    data = malloc(want ? want : 1);
+    if (!data) {
+        close(fd);
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    /* Read what stat() promised. A short read just means EOF came early, and the
+     * bytes actually read are the asset's length - no point inventing more. */
+    while (got < want) {
+        ssize_t n = read(fd, data + got, want - got);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            free(data);
+            close(fd);
+            return NULL;
+        }
+        if (n == 0) {
+            break;
+        }
+        got += (size_t)n;
+    }
+    close(fd);
+
+    asset = malloc(sizeof(*asset));
+    if (!asset) {
+        free(data);
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    /* The resolved path is kept so AAsset_openFileDescriptor() has something to
+     * open: a descriptor on the asset is one on the mount, not another view of
+     * the copy held here. */
+    asset->path = malloc(strlen(path) + 1);
+    if (!asset->path) {
+        free(data);
+        free(asset);
+        errno = ENOMEM;
+        return NULL;
+    }
+    memcpy(asset->path, path, strlen(path) + 1);
+
+    asset->data   = data;
+    asset->length = (int64_t)got;
+    asset->pos    = 0;
+    return asset;
+}
+
+int AAsset_read(AAsset* asset, void* buf, size_t count)
+{
+    int64_t remaining;
+    size_t n;
+
+    if (!asset || (!buf && count)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    remaining = asset->length - asset->pos;
+    if (remaining <= 0) {
+        return 0;                        /* EOF, like the NDK's */
+    }
+
+    n = count < (size_t)remaining ? count : (size_t)remaining;
+    memcpy(buf, asset->data + asset->pos, n);
+    asset->pos += (int64_t)n;
+    return (int)n;
+}
+
+off_t AAsset_seek(AAsset* asset, off_t offset, int whence)
+{
+    int64_t base, target;
+
+    if (!asset) {
+        errno = EINVAL;
+        return (off_t)-1;
+    }
+
+    switch (whence) {
+        case SEEK_SET: base = 0;               break;
+        case SEEK_CUR: base = asset->pos;      break;
+        case SEEK_END: base = asset->length;   break;
+        default:
+            errno = EINVAL;
+            return (off_t)-1;
+    }
+
+    target = base + (int64_t)offset;
+    if (target < 0 || target > asset->length) {
+        errno = EINVAL;
+        return (off_t)-1;
+    }
+    asset->pos = target;
+    return (off_t)target;
+}
+
+off_t AAsset_getLength(AAsset* asset)
+{
+    return asset ? (off_t)asset->length : 0;
+}
+
+int64_t AAsset_getLength64(AAsset* asset)
+{
+    return asset ? asset->length : 0;
+}
+
+off_t AAsset_getRemainingLength(AAsset* asset)
+{
+    return asset ? (off_t)(asset->length - asset->pos) : 0;
+}
+
+int64_t AAsset_getRemainingLength64(AAsset* asset)
+{
+    return asset ? asset->length - asset->pos : 0;
+}
+
+void AAsset_close(AAsset* asset)
+{
+    if (!asset) {
+        return;
+    }
+    free(asset->data);
+    free(asset->path);
+    free(asset);
+}
+
+/* Hand the caller a descriptor on the asset.
+ *
+ * The NDK's contract is "a descriptor, plus where the asset's bytes start and how
+ * long they are", because on a real device the descriptor is on the *containing*
+ * file (the APK) and the asset is a range inside it. Nothing here can express a
+ * range - the mount hands out a descriptor for the asset, not for a container - so
+ * the extent reported is the whole object: start 0, its length. That is equivalent
+ * for what the call exists for (read()/pread()/mmap() of the asset's bytes) and
+ * narrower than the NDK, never wider.
+ *
+ * Whether one can be given at all is the storage's answer, and the descriptor is
+ * the only honest place to read it from: stat() on the path is no use, because the
+ * mount deliberately describes the *resource* there (a read-only regular file),
+ * while what a descriptor can do depends on how the host serves it. A regular file
+ * can be addressed and mapped; a stream cannot, and refusing that is the same rule
+ * the NDK applies to an asset it cannot point at directly.
+ *
+ * The Android mount streams (an asset is never resident on the host), so its
+ * descriptor is a pipe and this answers -1 there. Asking costs one open: the host
+ * starts its pump only to be told immediately to drop it.
+ *
+ * The caller owns the descriptor, as with the NDK's. */
+int AAsset_openFileDescriptor(AAsset* asset, off_t* outStart, off_t* outLength)
+{
+    struct stat st;
+    int fd;
+
+    if (!asset || !asset->path) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    fd = open(asset->path, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    if (outStart) {
+        *outStart = 0;
+    }
+    if (outLength) {
+        *outLength = (off_t)st.st_size;
+    }
+    return fd;
+}
+
+const void* AAsset_getBuffer(AAsset* asset)
+{
+    return asset ? asset->data : NULL;
+}
+
+int AAsset_isAllocated(AAsset* asset)
+{
+    /* The stub always holds a private copy - it never maps an APK entry. */
+    return asset ? 1 : 0;
 }
 
 /* NDK API: Lock the window's drawing surface for writing */
@@ -1407,6 +1674,9 @@ static GameActivityKeyEvent g_key_event_buf[16];
 android_app* android_app_create(void)
 {
     virtpass_syscall(SYS_ANDROID_CALL, SYS_ANDROID_GAME_CREATE, 0, 0, 0, 0, 0, 0);
+
+    /* The asset manager is a placeholder - the host owns the one asset tree. */
+    g_app.assetManager = &g_asset_manager;
 
     /* Point the input buffer at guest-visible arrays so the host side
      * (which shares the address space in rvvm-user mode) can fill them. */

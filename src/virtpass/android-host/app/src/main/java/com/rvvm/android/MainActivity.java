@@ -74,6 +74,20 @@ public class MainActivity extends Activity {
     public static final String EXTRA_GUEST_APP = "guest";
 
     /**
+     * Intent extra: the guest's own argv, as a string array. Element 0 is the
+     * guest's argv[1] (argv[0] is always the ELF path).
+     *
+     *   adb shell am start -n com.rvvm.android/.MainActivity \
+     *     --es guest test_cli.exe \
+     *     --esa argv "cat,/assets/fonts/JetBrainsMono-OFL.txt"
+     *
+     * This is what makes a run scriptable: a guest that takes a command as its
+     * arguments (test_cli) then needs no on-screen console interaction at all,
+     * so a host-side test is one am start plus a logcat read.
+     */
+    public static final String EXTRA_GUEST_ARGS = "argv";
+
+    /**
      * The virtual panel: the pixel geometry the guest renders into and the
      * space its input is expressed in.
      *
@@ -162,6 +176,11 @@ public class MainActivity extends Activity {
     // Guest app list: .exe files from assets
     private String[] guestApps;
     private String selectedGuestApp;
+
+    // The argv a launching Intent asked for (EXTRA_GUEST_ARGS), applied to the
+    // next run. Held rather than read per run because the run may start later,
+    // from a card's surface callback.
+    private String[] selectedGuestArgs;
 
     // Reusable per-pointer buffers for multi-touch passthrough. Sized to match
     // CMDPOST_MAX_NUM_POINTERS_IN_MOTION_EVENT on the native side; reused to
@@ -1285,6 +1304,7 @@ public class MainActivity extends Activity {
         // Honor an explicit "which guest to run" Intent before the auto-start
         // path picks its default. The launch itself happens in
         // maybeAutoStartGuest(), so only the selection is applied here.
+        applyGuestArgsFromIntent(getIntent());
         applyGuestSelectionFromIntent(getIntent());
 
         // The console owns the workspace; the guest's graphics output lives in
@@ -1506,7 +1526,7 @@ public class MainActivity extends Activity {
 
         replayGuestStartupState();
 
-        boolean started = RvvmNative.nativeRunElf(guestId, elfPath, null);
+        boolean started = RvvmNative.nativeRunElf(guestId, elfPath, selectedGuestArgs);
         if (started) {
             currentGuestApp = elfName;
             statusText.setText("Guest started: " + elfName);
@@ -1636,8 +1656,25 @@ public class MainActivity extends Activity {
         // The launcher Activity is singleTask, so a repeated
         // "am start --es guest ..." lands here instead of onCreate: reselect the
         // requested guest and relaunch if it differs from the running one.
+        applyGuestArgsFromIntent(intent);
         if (applyGuestSelectionFromIntent(intent)) {
             startSelectedGuestIfNeeded();
+        }
+    }
+
+    /**
+     * Pick up a guest argv from the launching Intent (EXTRA_GUEST_ARGS) and hold
+     * it for the next run. Separate from applyGuestSelectionFromIntent() because
+     * it applies whether or not the Intent also named a guest.
+     */
+    private void applyGuestArgsFromIntent(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        String[] args = intent.getStringArrayExtra(EXTRA_GUEST_ARGS);
+        if (args != null) {
+            selectedGuestArgs = args;
+            Log.i(TAG, "Guest argv from Intent: " + args.length + " element(s)");
         }
     }
 

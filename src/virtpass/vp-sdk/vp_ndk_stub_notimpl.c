@@ -30,11 +30,13 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include "virtpass/vp_android.h"
+#include "virtpass/vp_asset.h" /* VP_ASSET_MOUNT: where the asset tree is mounted */
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wunused-variable"
@@ -544,6 +546,142 @@ static void* pixbuf_ensure(size_t need)
     vp_stub_not_implemented(__func__);
     (void)need;
     return NULL;
+}
+
+/* ============================================================
+ * Asset API (android/asset_manager.h)
+ *
+ * A thin shell over the host's asset mount: the name is resolved under
+ * VP_ASSET_MOUNT and read with plain POSIX calls, so assets arrive the same way
+ * everything else in that tree does (see virtpass/vp_asset.h) and this API needs
+ * no transport of its own.
+ *
+ * The NDK contract is random access, so the whole asset is read into guest memory
+ * at open() time and AAsset_read()/seek()/getBuffer() then work on that copy. The
+ * one consequence worth knowing: an asset has to fit in guest RAM. That is true
+ * for the game-style payloads this ABI targets (shaders, textures, level data).
+ * ============================================================ */
+
+/* One asset tree per guest, owned by the host. A placeholder so that
+ * app->assetManager can be non-NULL, the way the NDK contract assumes; the host
+ * owns the real tree, and this handle is not what names it. */
+struct AAssetManager {
+    int unused;
+};
+
+static struct AAssetManager g_asset_manager;
+
+struct AAsset {
+    unsigned char* data;   /* guest-side copy of the whole asset */
+    int64_t        length;
+    int64_t        pos;
+    char*          path;   /* the mount path, kept for AAsset_openFileDescriptor() */
+};
+
+AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode)
+{
+    vp_stub_not_implemented(__func__);
+    (void)mgr;
+    (void)filename;
+    (void)mode;
+    return NULL;
+}
+
+int AAsset_read(AAsset* asset, void* buf, size_t count)
+{
+    vp_stub_not_implemented(__func__);
+    (void)asset;
+    (void)buf;
+    (void)count;
+    return 0;
+}
+
+off_t AAsset_seek(AAsset* asset, off_t offset, int whence)
+{
+    vp_stub_not_implemented(__func__);
+    (void)asset;
+    (void)offset;
+    (void)whence;
+    return 0;
+}
+
+off_t AAsset_getLength(AAsset* asset)
+{
+    vp_stub_not_implemented(__func__);
+    (void)asset;
+    return 0;
+}
+
+int64_t AAsset_getLength64(AAsset* asset)
+{
+    vp_stub_not_implemented(__func__);
+    (void)asset;
+    return 0;
+}
+
+off_t AAsset_getRemainingLength(AAsset* asset)
+{
+    vp_stub_not_implemented(__func__);
+    (void)asset;
+    return 0;
+}
+
+int64_t AAsset_getRemainingLength64(AAsset* asset)
+{
+    vp_stub_not_implemented(__func__);
+    (void)asset;
+    return 0;
+}
+
+void AAsset_close(AAsset* asset)
+{
+    vp_stub_not_implemented(__func__);
+    (void)asset;
+}
+
+/* Hand the caller a descriptor on the asset.
+ *
+ * The NDK's contract is "a descriptor, plus where the asset's bytes start and how
+ * long they are", because on a real device the descriptor is on the *containing*
+ * file (the APK) and the asset is a range inside it. Nothing here can express a
+ * range - the mount hands out a descriptor for the asset, not for a container - so
+ * the extent reported is the whole object: start 0, its length. That is equivalent
+ * for what the call exists for (read()/pread()/mmap() of the asset's bytes) and
+ * narrower than the NDK, never wider.
+ *
+ * Whether one can be given at all is the storage's answer, and the descriptor is
+ * the only honest place to read it from: stat() on the path is no use, because the
+ * mount deliberately describes the *resource* there (a read-only regular file),
+ * while what a descriptor can do depends on how the host serves it. A regular file
+ * can be addressed and mapped; a stream cannot, and refusing that is the same rule
+ * the NDK applies to an asset it cannot point at directly.
+ *
+ * The Android mount streams (an asset is never resident on the host), so its
+ * descriptor is a pipe and this answers -1 there. Asking costs one open: the host
+ * starts its pump only to be told immediately to drop it.
+ *
+ * The caller owns the descriptor, as with the NDK's. */
+int AAsset_openFileDescriptor(AAsset* asset, off_t* outStart, off_t* outLength)
+{
+    vp_stub_not_implemented(__func__);
+    (void)asset;
+    (void)outStart;
+    (void)outLength;
+    return 0;
+}
+
+const void* AAsset_getBuffer(AAsset* asset)
+{
+    vp_stub_not_implemented(__func__);
+    (void)asset;
+    return NULL;
+}
+
+int AAsset_isAllocated(AAsset* asset)
+{
+    vp_stub_not_implemented(__func__);
+    (void)asset;
+    return 0;
 }
 
 /* NDK API: Lock the window's drawing surface for writing */
