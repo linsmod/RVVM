@@ -1135,16 +1135,33 @@ static void stdin_pump_start(void)
     }
 
     if (type == FILE_TYPE_CHAR) {
-        /* A console: read it raw and without its own echo. The guest's line
-         * discipline is the one that assembles lines and echoes them into the
-         * console window, so leaving the console's line mode on would deliver
-         * input only after Enter (and echo every keystroke a second time, in
-         * the wrong window). Ctrl+C stays processed: it is the graceful
-         * shutdown the console handler owns. */
+        /* A console: leave it in the mode an ssh client leaves its terminal in.
+         *
+         * Input is raw - no line assembly, no echo, and, the important one,
+         * ENABLE_PROCESSED_INPUT off: ^C/^Z/^S/^Q then arrive as bytes instead
+         * of being turned into console events here, and the guest's own termios
+         * decides what they mean (a guest shell gets its SIGINT, vi gets its
+         * literal ^Z). ENABLE_VIRTUAL_TERMINAL_INPUT is what makes conhost hand
+         * the arrows and function keys over as the escapes a terminal sends.
+         *
+         * Output keeps VT processing on, so the guest's escape sequences are
+         * interpreted by the console instead of being printed as text - the
+         * guest is the application and this window is its terminal.
+         *
+         * ENABLE_WINDOW_INPUT is deliberately not requested: the pump reads
+         * bytes with ReadFile() and ReadConsoleInput() cannot share the handle.
+         * The geometry is polled instead (see console_apply_size()). */
         DWORD mode = 0;
+        HANDLE hout = GetStdHandle(STD_OUTPUT_HANDLE);
+
         if (GetConsoleMode(hin, &mode)) {
-            SetConsoleMode(hin, (mode & ~(DWORD)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT))
+            SetConsoleMode(hin, (mode & ~(DWORD)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT |
+                                                 ENABLE_PROCESSED_INPUT))
                                     | ENABLE_VIRTUAL_TERMINAL_INPUT);
+        }
+        if (hout && hout != INVALID_HANDLE_VALUE && GetConsoleMode(hout, &mode)) {
+            SetConsoleMode(hout, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING |
+                                          ENABLE_PROCESSED_OUTPUT);
         }
     }
 
@@ -1154,6 +1171,98 @@ static void stdin_pump_start(void)
     }
     started = true;
     winhost_log("stdin pump: started (stdin type %lu)", (unsigned long)type);
+}
+
+/* ------------------------------------------------------------------ */
+/* Console geometry                                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The guest's terminal is this console, so TIOCGWINSZ has to answer with the
+ * console's real dimensions and a resize has to reach the guest as SIGWINCH -
+ * that is how a full-screen program (vi, less, top) knows to re-lay itself out.
+ *
+ * Polled rather than driven by WINDOW_BUFFER_SIZE_EVENT: the stdin pump owns
+ * the input handle with ReadFile(), and ReadConsoleInput() cannot share it.
+ * 250 ms is far below what a user notices after dragging a window edge.
+ *
+ * rvvm_user_tty_resize() ignores a size the session already has, so this can be
+ * called unconditionally - no signal is raised unless something really changed.
+ */
+/* Window size of the console this process is attached to, in rows/columns.
+ *
+ * Reached through CONOUT$ rather than STD_OUTPUT_HANDLE: a host whose stdout is
+ * redirected (a check capturing the guest's console into a file) is still
+ * attached to a console, and the geometry is a property of that console, not of
+ * whichever handle stdout happens to be. STD_OUTPUT_HANDLE is preferred while
+ * it really is the console, since that is the common case. */
+static bool console_window_size(int* rows, int* cols)
+{
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    bool owned = false;
+    bool ok;
+
+    if (!h || h == INVALID_HANDLE_VALUE || !GetConsoleMode(h, &mode)) {
+        h = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                        OPEN_EXISTING, 0, NULL);
+        if (!h || h == INVALID_HANDLE_VALUE) {
+            return false; /* no console at all (started detached from one) */
+        }
+        owned = true;
+    }
+
+    ok = GetConsoleScreenBufferInfo(h, &info) != 0;
+    if (owned) {
+        CloseHandle(h);
+    }
+    if (!ok) {
+        return false;
+    }
+
+    *rows = (int)(info.srWindow.Bottom - info.srWindow.Top) + 1;
+    *cols = (int)(info.srWindow.Right - info.srWindow.Left) + 1;
+    return *rows > 0 && *cols > 0;
+}
+
+static void console_apply_size(void)
+{
+    int rows = 0, cols = 0;
+
+    if (!g_guest_machine) {
+        return;
+    }
+    if (!console_window_size(&rows, &cols)) {
+        return;
+    }
+    rvvm_user_tty_resize(g_guest_machine, rows, cols);
+}
+
+static DWORD WINAPI console_geometry_thread(LPVOID param)
+{
+    (void)param;
+    for (;;) {
+        Sleep(250);
+        console_apply_size();
+    }
+    return 0; /* not reached: the loop only ends with the process */
+}
+
+/* Start the geometry watcher once per process. */
+static void console_geometry_start(void)
+{
+    static bool started = false;
+
+    if (started) {
+        return;
+    }
+    if (CreateThread(NULL, 0, console_geometry_thread, NULL, 0, NULL) == NULL) {
+        winhost_log("console geometry: CreateThread failed, resizes will not reach the guest");
+        return;
+    }
+    started = true;
 }
 
 /* VK -> terminal byte sequence, for the keys that never produce a WM_CHAR.
@@ -2210,6 +2319,14 @@ static bool guest_env_build(void)
         n++;
     }
 
+    /* The guest's terminal is this console, and a program that cares what it is
+     * talking to (a full-screen one, or anything reading terminfo) has to be
+     * told. xterm-256color is what the console's VT processing emulates closely
+     * enough for the sequences the guest emits to come out right. */
+    env[n] = _strdup("TERM=xterm-256color");
+    if (!env[n]) { free(env); return false; }
+    n++;
+
     {
         /* environ is the live host block; _wenviron is the wide variant, so
          * read the narrow one and match on name. */
@@ -2902,6 +3019,18 @@ bool win32_host_start_guest(int argc, char** argv)
     rvvm_tty_attach(g_tty, g_guest_machine);
     rvvm_user_set_tty_callback(g_guest_machine, host_tty_cb, NULL);
 
+    /* The guest's terminal is the host's own console, so adopt its geometry
+     * before the guest can ask: a full-screen program reads the size once as it
+     * starts up, and the session's 24x80 default would be a lie. Set through the
+     * session directly - the guest is not running yet, so there is nobody to
+     * signal. */
+    {
+        int rows = 0, cols = 0;
+        if (console_window_size(&rows, &cols)) {
+            rvvm_tty_resize(g_tty, rows, cols);
+        }
+    }
+
     /* Whoever queued this run's startup sequence made its instance (see
      * win32_host_init / launcher_launch_sel, and why it has to be before the
      * queueing). This is only for a caller that went straight here. */
@@ -2966,6 +3095,9 @@ bool win32_host_start_guest(int argc, char** argv)
      * stdin pump). Started per run on purpose: a redirected stdin may hold its
      * input already, and reading it before a guest exists would drop it. */
     stdin_pump_start();
+
+    /* ...and from here a console resize reaches the guest as SIGWINCH. */
+    console_geometry_start();
     return true;
 }
 

@@ -808,6 +808,7 @@ typedef struct rvvm_userland {
     uint8_t      tty_line[TTY_IN_LINE];
     size_t       tty_line_len;     // canonical line under construction
     uint32_t     tty_lflag;        // c_lflag from the last TCGETS/TCSETS
+    uint32_t     tty_iflag;        // c_iflag from the last TCSETS (ICRNL is acted on)
     uint32_t     tty_eof_pending;  // Ctrl-D delivered: next read returns 0
     bool         tty_in_eof;       // teardown: unblock reads that are waiting
 } rvvm_userland_t;
@@ -1406,14 +1407,17 @@ static void user_tty_vt_write(rvvm_userland_t* ctx, const char* buf, size_t len)
 #define UAPI_TIOCGWINSZ 0x5413
 #define UAPI_TIOCSWINSZ 0x5414
 #define UAPI_SIGINT     2
+#define UAPI_SIGWINCH   28
 
 /*
  * Termios bits the virtual TTY's input path acts on (asm-generic values, the
- * guest ABI's, not the host's). TTY_LFLAG_DEFAULT is the state TCGETS reports
+ * guest ABI's, not the host's). TTY_*_DEFAULT is the state TCGETS reports
  * before the guest changes anything and therefore what the line discipline
  * starts in - it must stay in sync with the TCGETS answer in user_tty_ioctl().
  */
 #define TTY_IFLAG_ICRNL    0x0100  // input CR -> NL
+#define TTY_IFLAG_IXON     0x0400  // Ctrl-S/Ctrl-Q flow control (reported only)
+#define TTY_IFLAG_DEFAULT  (TTY_IFLAG_ICRNL | TTY_IFLAG_IXON)
 #define TTY_LFLAG_ISIG     0x0001  // Ctrl-C: signal the foreground process
 #define TTY_LFLAG_ICANON   0x0002  // canonical: assemble lines, handle erase
 #define TTY_LFLAG_ECHO     0x0008  // echo typed characters
@@ -1449,7 +1453,7 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg)
         case UAPI_TCGETS: {
             uapi_termios_t t;
             memset(&t, 0, sizeof(t));
-            t.c_iflag = TTY_IFLAG_ICRNL | 0x400; // ICRNL | IXON
+            t.c_iflag = uctx()->tty_iflag;
             t.c_oflag = 0x1 | 0x4;          // OPOST | ONLCR (matches user_tty_write LF->CRLF)
             t.c_cflag = 0x30 | 0x80 | 0xF;  // CS8 | CREAD | B38400
             t.c_lflag = uctx()->tty_lflag;
@@ -1489,6 +1493,7 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg)
             if (arg) {
                 const uapi_termios_t* t = arg;
                 uctx()->tty_lflag = t->c_lflag;
+                uctx()->tty_iflag = t->c_iflag;
             }
             return 0;
         case UAPI_TIOCSWINSZ:
@@ -1691,7 +1696,9 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
     spin_lock(&ctx->tty_in_lock);
 
     uint32_t lflag = ctx->tty_lflag;
+    uint32_t iflag = ctx->tty_iflag;
     bool canon = (lflag & TTY_LFLAG_ICANON) != 0;
+    bool icrnl = (iflag & TTY_IFLAG_ICRNL) != 0;
     bool echo  = (lflag & TTY_LFLAG_ECHO)   != 0;
     bool echoe = (lflag & TTY_LFLAG_ECHOE)  != 0;
     bool isig  = (lflag & TTY_LFLAG_ISIG)   != 0;
@@ -1699,8 +1706,12 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
     for (size_t i = 0; i < len; ++i) {
         uint8_t c = p[i];
 
-        // ICRNL: the keyboard's Enter arrives as CR and reads back as NL.
-        if (c == '\r') {
+        // ICRNL: the keyboard's Enter arrives as CR and reads back as NL -
+        // but only while the guest still has ICRNL set. A full-screen program
+        // that switches to raw mode clears it (it does its own key handling),
+        // and then Enter has to stay CR: that is the byte vi waits for before
+        // it will accept an ex command.
+        if (icrnl && c == '\r') {
             c = '\n';
         }
 
@@ -3939,6 +3950,37 @@ static bool userland_deliver_signal(rvvm_userland_t* ctx, uint32_t sig)
     return false;  // default disposition
 }
 
+/* Resize the guest's console and tell it so.
+ *
+ * The geometry belongs to the host (its own window or terminal), so it is the
+ * host that calls this when its viewport changes. The grid the guest reads
+ * through TIOCGWINSZ moves first, then SIGWINCH is delivered - a full-screen
+ * program only re-lays itself out when it receives that signal.
+ *
+ * A size the session already has is a no-op, signal included, which is what
+ * makes this safe to call from a polling thread. */
+PUBLIC void rvvm_user_tty_resize(rvvm_machine_t* machine, int rows, int cols)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (!ctx || rows < 1 || cols < 1) {
+        return;
+    }
+    if (ctx->tty) {
+        int cur_rows = 0, cur_cols = 0;
+        rvvm_tty_lock(ctx->tty);
+        rvvm_tty_get_size(ctx->tty, &cur_rows, &cur_cols);
+        rvvm_tty_unlock(ctx->tty);
+        if (cur_rows == rows && cur_cols == cols) {
+            return;
+        }
+        rvvm_tty_resize(ctx->tty, rows, cols);
+    }
+    /* SIGWINCH's default disposition is "ignore", so a guest with no handler
+     * just observes the new size on its next query - which is why the delivery
+     * result is not acted on here (unlike SIGINT's, which terminates). */
+    (void)userland_deliver_signal(ctx, UAPI_SIGWINCH);
+}
+
 // Run the pending signal's handler on this vCPU: build the frame below the
 // interrupted SP, point the context at the handler through the trampoline.
 static void userland_siginject(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
@@ -5459,6 +5501,7 @@ static void jump_start(size_t entry, size_t stack_top)
     ctx->tty_eof_pending = 0;
     ctx->tty_in_eof      = false;
     ctx->tty_lflag       = TTY_LFLAG_DEFAULT;
+    ctx->tty_iflag       = TTY_IFLAG_DEFAULT;
     spin_unlock(&ctx->tty_in_lock);
 
     // Past the reset above, so a host may feed this guest's console from now
@@ -5607,7 +5650,8 @@ static rvvm_addr_t rvvm_user_init_stack(void* stack, exec_desc_t* desc)
         UAPI_AT_EXECFN,        (uapi_size_t)to_addr(execfn),
         UAPI_AT_NULL,
     };
-    stack = stack_put_mem(stack, auxv, sizeof(auxv));
+    stack = stack_put_mem(stack, au.\release.windows.x86_64\rvvm_winhost_x86_64.exe --guest src/virtpass/android-host/app/src/main/assets/busybox vi src/virtpass/android-host/app/src/main/assets/fonts/JetBrainsMono-OFL.txt
+xv, sizeof(auxv));
 
     // 2. string pointers
     stack = stack_put_mem(stack, string_ptrs, sizeof(uapi_size_t) * string_num);

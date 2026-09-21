@@ -84,6 +84,18 @@ typedef void (*rvvm_user_tty_callback)(void* userdata, int fd, void* tty);
 
 void rvvm_user_set_tty_callback(rvvm_machine_t* machine, rvvm_user_tty_callback callback, void* userdata);
 
+// Resize the guest's console from the host side and notify the guest: the grid
+// TIOCGWINSZ reports moves, and SIGWINCH is delivered when the guest installed
+// a handler - a full-screen program only re-lays itself out on that signal. A
+// guest without one just sees the new size on its next query, since SIGWINCH's
+// default disposition is to be ignored.
+//
+// The geometry belongs to the host (its own window, its own terminal), so it is
+// the host that calls this when the viewport changes. A size the session
+// already has is a no-op, signal included, which is what makes it safe to call
+// from a polling thread. No-op when no session is attached.
+void rvvm_user_tty_resize(rvvm_machine_t* machine, int rows, int cols);
+
 // --- Host-owned terminal session ---
 //
 // A console is a session, not a property of a run. The session owns the screen
