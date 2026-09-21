@@ -136,6 +136,10 @@ struct vp_cmdpost {
     int32_t motion_event_count;
     int32_t motion_event_read;
 
+    cmdpost_GameActivityKeyEvent key_events[CMDPOST_MAX_KEY_EVENTS];
+    int32_t key_event_count;
+    int32_t key_event_read;
+
     /* ---- Audio streams ---- */
     const vp_audio_ops_t*  audio_ops;
     cmdpost_audio_stream_t audio_streams[CMDPOST_MAX_AUDIO_STREAMS];
@@ -242,10 +246,23 @@ void cmdpost_clear_motion_events(vp_cmdpost_t* inst)
     inst->motion_event_read = 0;
 }
 
+void cmdpost_queue_key_event(vp_cmdpost_t* inst, const cmdpost_GameActivityKeyEvent* ev)
+{
+    if (!inst || !ev) {
+        return;
+    }
+    if (inst->key_event_count < CMDPOST_MAX_KEY_EVENTS) {
+        inst->key_events[inst->key_event_count++] = *ev;
+    }
+}
+
 void cmdpost_clear_key_events(vp_cmdpost_t* inst)
 {
-    /* No key events queued in this build */
-    (void)inst;
+    if (!inst) {
+        return;
+    }
+    inst->key_event_count = 0;
+    inst->key_event_read = 0;
 }
 
 /* ============================================================
@@ -560,6 +577,7 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
                     printf("vp_cmdpost: GameActivity destroy (cmdpost)\n");
                     cmdpost_clear_lifecycle_cmds(inst);
                     cmdpost_clear_motion_events(inst);
+                    cmdpost_clear_key_events(inst);
                     return 0;
                 }
 
@@ -603,6 +621,26 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
                                    copy_count, capacity, max_pointers);
                         }
                     }
+                    /* Key events travel in their own array of the same buffer
+                     * struct. keyEventsCount is written on every swap - 0
+                     * included - so a guest cannot read back the previous
+                     * swap's count when this one brought no keys. */
+                    {
+                        int32_t kcount = inst->key_event_count;
+                        cmdpost_GameActivityKeyEvent* kdst =
+                            rvvm_user_guest_ptr((uint64_t)(size_t)guest_buf->keyEvents);
+                        int32_t kcap = guest_buf->keyEventsCapacity > 0
+                                     ? guest_buf->keyEventsCapacity : CMDPOST_MAX_KEY_EVENTS;
+                        int32_t kcopy = kcount < kcap ? kcount : kcap;
+                        if (kdst && kcopy > 0) {
+                            memcpy(kdst, inst->key_events, sizeof(cmdpost_GameActivityKeyEvent) * kcopy);
+                            guest_buf->keyEventsCount = kcopy;
+                            CMDLOG("Guest swapped input: %d key events (capacity %d)", kcopy, kcap);
+                        } else {
+                            guest_buf->keyEventsCount = 0;
+                        }
+                    }
+                    cmdpost_clear_key_events(inst);
                     cmdpost_clear_motion_events(inst);
                     return out_count;
                 }
@@ -937,6 +975,7 @@ static void cmdpost_drop_run_state(vp_cmdpost_t* inst)
      * teardown - it would destroy the new activity on its very first poll. */
     cmdpost_clear_lifecycle_cmds(inst);
     cmdpost_clear_motion_events(inst);
+    cmdpost_clear_key_events(inst);
 
     /* Tear down every live AAudio stream before dropping the backend. The next
      * run's registration points this at a fresh backend, and the guest that

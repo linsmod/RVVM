@@ -2,14 +2,27 @@
  * win32_main.c - Entry point of the RVVM Windows host skeleton.
  *
  * Usage:
- *   rvvm_winhost.exe [--display WxH@PPI] [--assets DIR] <guest-elf> [guest args...]
- *   rvvm_winhost.exe            (no guest: Android-style launcher picker)
+ *   rvvm_winhost.exe [options] --launcher
+ *   rvvm_winhost.exe [options] --guest <guest-elf> [guest args...]
  *   rvvm_winhost.exe --help     (options + environment, exits)
  *
- * With no guest given, an Android-style launcher picker is shown: a dropdown
- * listing the guest programs in the assets directory plus Run / Stop / Exit.
- * --assets points at that directory (default: src\virtpass\android-host\app\
- * src\main\assets, overridable via the RVVM_ASSETS environment variable).
+ * The launch target is named with --launcher / --guest; options come before
+ * it, so a guest argument can never be taken for a host option. The implicit
+ * forms mean the same thing and still work:
+ *
+ *   rvvm_winhost.exe [options] <guest-elf> [guest args...]  == --guest
+ *   rvvm_winhost.exe [options]           (no guest)         == --launcher
+ *   rvvm_winhost.exe [options] <dir>     (a directory)      == --launcher
+ *
+ * --launcher shows an Android-style picker: a dropdown listing the guest
+ * programs in the assets directory plus Run / Stop / Exit. --assets points at
+ * that directory (default: src\virtpass\android-host\app\src\main\assets,
+ * overridable via the RVVM_ASSETS environment variable).
+ *
+ * This is a console application: its stdout carries the guest's console output
+ * and its stdin is pumped into the guest's console, so a run can be scripted
+ * (`printf 'ls /\nexit\n' | rvvm_winhost.exe --guest test_cli.exe`) while the
+ * window keyboard remains the interactive path.
  *
  * Two independent display layers:
  *   - Layer 2 (OS window): a fixed 1024x768 viewport by default. It is a pure
@@ -87,11 +100,12 @@ static void print_help(const char* prog)
         "RVVM WinHost - RISC-V Linux userland emulator with a Win32 surface\n"
         "\n"
         "Usage:\n"
-        "  %s [options] <guest-elf> [guest args...]\n"
-        "  %s                (no guest: show the Android-style launcher picker)\n"
-        "  %s <assets-dir>   (a directory is taken as the picker's guest folder)\n"
+        "  %s [options] --launcher\n"
+        "  %s [options] --guest <guest-elf> [guest args...]\n"
+        "  %s [options] <guest-elf> [guest args...]  (same as --guest)\n"
+        "  %s [options] <assets-dir>                 (same as --launcher)\n"
         "\n"
-        "Options:\n"
+        "Options (before the target; everything after <guest-elf> is the guest's):\n"
         "  --display SPEC   Layer-1 virtual panel geometry: \"WxH\", \"@PPI\" or\n"
         "                   \"WxH@PPI\" (default 640x480@160; env RVVM_VIRT_W/H/PPI)\n"
         "  --assets DIR     Directory the launcher picker lists guests from\n"
@@ -113,9 +127,13 @@ static void print_help(const char* prog)
         "                               (or <sdk>\\emulator\\lib64\\gles_<name>)\n"
         "  RVVM_GL_TRACE=1              Trace every GL/EGL call on stderr\n"
         "\n"
+        "Console: the guest's output goes to this process's stdout and this\n"
+        "process's stdin is fed to the guest's console, so a run can be scripted:\n"
+        "  printf 'ls /\\nexit\\n' | %s --guest test_cli.exe\n"
+        "\n"
         "Exit status: the guest's exit code in direct mode (1 on a host error);\n"
         "in launcher mode the window stays open across guests.\n",
-        prog, prog, prog);
+        prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char** argv)
@@ -168,7 +186,28 @@ int main(int argc, char** argv)
             print_help(argv[0]);
             return 0;
         }
-        break; /* first non-option argument: the guest ELF */
+        break; /* first non-option argument: the launch target */
+    }
+
+    /* Explicit launch target. The options above are parsed before it, so a
+     * guest argument can never be read as a host option - which is what makes
+     * `--guest <elf> --anything` safe: from <elf> on, everything is the
+     * guest's, verbatim. */
+    if (i < argc && strcmp(argv[i], "--launcher") == 0) {
+        i++;
+        if (i < argc) {
+            fprintf(stderr, "winhost: --launcher takes no arguments (got '%s')\n", argv[i]);
+            return 2;
+        }
+        /* i == argc: the picker path below */
+    } else if (i < argc && strcmp(argv[i], "--guest") == 0) {
+        i++;
+        if (i >= argc) {
+            fprintf(stderr, "winhost: --guest needs a guest ELF\n");
+            fprintf(stderr, "run '%s --help' for usage\n", argv[0]);
+            return 2;
+        }
+        /* argv[i..] is the guest ELF and its arguments; leave i on it. */
     }
 
     /* A directory is not a guest ELF. Handing over the assets folder is an easy

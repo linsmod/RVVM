@@ -760,6 +760,12 @@ typedef struct rvvm_userland {
     uint32_t                      userland_exit_reported;
     uint32_t                      userland_suspend;
     uint32_t                      userland_parked;
+    // Set once the guest is past jump_start()'s console reset, i.e. actually
+    // running. A host that feeds the console from outside the guest thread (the
+    // Win32 stdin pump) waits for it: bytes delivered earlier are erased by
+    // that reset, which is deliberately a fresh console rather than a
+    // type-ahead buffer carried over from the previous guest.
+    uint32_t                      userland_started;
 
     // --- Guest signal delivery ---
     // One process-wide pending signal (console ^C with a handler registered
@@ -3141,6 +3147,17 @@ PUBLIC bool rvvm_user_is_parked(rvvm_machine_t* machine)
     return parked >= total;
 }
 
+// True once the guest is past jump_start()'s console reset, i.e. actually
+// running its own code. A host that feeds this guest's console from a thread of
+// its own (the Win32 stdin pump) waits for it before delivering anything: that
+// reset deliberately wipes the console state, type-ahead in the ring included,
+// so bytes handed over earlier are discarded rather than queued.
+PUBLIC bool rvvm_user_is_started(rvvm_machine_t* machine)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    return ctx && atomic_load_uint32(&ctx->userland_started) != 0;
+}
+
 // Push/pop the calling guest thread onto its instance's registry. Called from
 // the guest threads themselves, so the context comes from the TLS binding.
 static void userland_thread_register(rvvm_user_thread_t* thread)
@@ -5426,6 +5443,7 @@ static void jump_start(size_t entry, size_t stack_top)
 #else
     rvvm_userland_t* ctx = uctx();
     atomic_store_uint32(&ctx->userland_exit_reported, 0);
+    atomic_store_uint32(&ctx->userland_started, 0);
     // A new guest starts running: the launcher boots several in one process,
     // so a suspend left over from the previous one must not carry over.
     atomic_store_uint32(&ctx->userland_suspend, 0);
@@ -5442,6 +5460,10 @@ static void jump_start(size_t entry, size_t stack_top)
     ctx->tty_in_eof      = false;
     ctx->tty_lflag       = TTY_LFLAG_DEFAULT;
     spin_unlock(&ctx->tty_in_lock);
+
+    // Past the reset above, so a host may feed this guest's console from now
+    // on (rvvm_user_is_started() is what it waits for).
+    atomic_store_uint32(&ctx->userland_started, 1);
 
     rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
     thread->cpu = rvvm_create_user_thread(ctx->machine);

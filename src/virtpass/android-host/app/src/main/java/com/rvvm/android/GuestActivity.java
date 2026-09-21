@@ -804,6 +804,53 @@ public class GuestActivity extends Activity {
     }
 
     /**
+     * Keys the console did not take belong to the guest's GameActivity input
+     * queue - that is how a game guest (one polling
+     * {@code android_app_swap_input_buffers()}) gets its keyboard, the same way
+     * the Win32 host feeds {@code WM_KEYDOWN} there.
+     *
+     * The console's own target is a focused {@link TtyEditText}, and whatever it
+     * (or any other view) consumes is already gone by the time {@code super}
+     * returns false - so one keystroke never lands in both places. System keys
+     * are left alone: volume and power belong to the device, and Back keeps its
+     * "background the task" meaning (see onBackPressed) rather than becoming a
+     * guest key.
+     */
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (super.dispatchKeyEvent(event)) {
+            return true;
+        }
+        if (!isSystemKey(event.getKeyCode())) {
+            postKeyEventToGuest(event);
+            return true;
+        }
+        return false;
+    }
+
+    private static boolean isSystemKey(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_VOLUME_UP:
+            case KeyEvent.KEYCODE_VOLUME_DOWN:
+            case KeyEvent.KEYCODE_VOLUME_MUTE:
+            case KeyEvent.KEYCODE_POWER:
+            case KeyEvent.KEYCODE_BACK:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private void postKeyEventToGuest(KeyEvent event) {
+        if (event == null || guestId < 0) return;
+        if (!RvvmNative.nativeIsGuestRunning(guestId)) return;
+        RvvmNative.nativePostKeyEvent(guestId,
+                event.getKeyCode(), event.getAction(), event.getMetaState(),
+                event.getRepeatCount(), event.getSource(), event.getDeviceId(),
+                event.getEventTime() * 1000000L);
+    }
+
+    /**
      * Called when the Activity is destroyed. The guest is stopped and
      * resources are cleaned up. If the guest was suspended (paused),
      * it is resumed first so it can unwind its normal exit path, then

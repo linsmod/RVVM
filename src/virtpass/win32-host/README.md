@@ -76,7 +76,7 @@ Win32 message mapping:
 | `APP_CMD_TERM_WINDOW` | `WM_DESTROY` |
 | guest exit | `sys_exit`/`sys_exit_group` -> `host_guest_exit_cb()` (rvvm exit callback) records the code; once the guest thread unwinds, `WM_APP_GUEST_EXIT` -> teardown lifecycle + launcher returns to the picker (host mode exits with the guest's code). The callback must stay registered: rvvm_user.c otherwise `_Exit()`s the whole process from the guest thread |
 | `AMOTION_EVENT_ACTION_DOWN/MOVE/UP` | `WM_LBUTTONDOWN / WM_MOUSEMOVE(+MK_LBUTTON) / WM_LBUTTONUP`, client coords mapped to surface coords |
-| key events | `WM_KEYDOWN / WM_KEYUP` (logged; VK->AKEYCODE mapping + key-event queueing is future work) |
+| key events | `WM_KEYDOWN / WM_KEYUP` reach the guest twice over: the console (fd 0, via `WM_CHAR` / `tty_input()`) and the GameActivity queue (`cmdpost_queue_key_event()`, `AKEYCODE_*` from `akeycode_from_vk()`) |
 
 ## Build (top-level Makefile)
 
@@ -111,18 +111,28 @@ Build the guests first (`mingw32-make android-assets`, zig/musl - see
 `src/virtpass/README.md`); they land in the APK assets directory, then:
 
 ```powershell
-.\release.windows.x86_64\rvvm_winhost_x86_64.exe `
+# one specific guest
+.\release.windows.x86_64\rvvm_winhost_x86_64.exe --guest `
     src\virtpass\android-host\app\src\main\assets\test_render.exe
+
+# the picker
+.\release.windows.x86_64\rvvm_winhost_x86_64.exe --launcher
 
 .\release.windows.x86_64\rvvm_winhost_x86_64.exe --help   # options + environment
 ```
 
+The target is named with `--launcher` / `--guest`, and options come before it -
+so a guest argument can never be read as a host option. The older implicit forms
+are equivalent: a first non-option argument means `--guest`, none at all means
+`--launcher`, and a directory does too (it becomes the picker's guest folder).
+
 ### Scripted runs (non-interactive)
 
-A guest and its arguments go on the command line - the counterpart of the Android
-host's `--es guest` / `--esa argv`, the launcher being only the no-argument case.
-The host exits with the **guest's** exit code, so a check needs nothing more than
-to wait on the process:
+The host is a **console application**: its stdout carries the guest's console
+output and its stdin is pumped into the guest's console (see "Interactive
+console"), so a run can be driven through either the guest's argv or its
+console. The host exits with the **guest's** exit code, so a check needs nothing
+more than to wait on the process:
 
 ```powershell
 $p = Start-Process -FilePath .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
@@ -131,6 +141,26 @@ $p = Start-Process -FilePath .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
      -NoNewWindow -PassThru -RedirectStandardOutput guest.log
 $p | Wait-Process -Timeout 45
 $p.ExitCode        # the guest's own code
+```
+
+A guest that reads its console can be scripted the same way through stdin - the
+same guest, driven by its line protocol instead of its argv:
+
+```powershell
+$in = Join-Path $PWD t_in.txt
+[IO.File]::WriteAllText($in, "ls /`ncalc 6 * 7`nexit`n", [Text.Encoding]::ASCII)
+$p = Start-Process -FilePath .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
+     -ArgumentList '--guest','src\virtpass\android-host\app\src\main\assets\test_cli.exe' `
+     -NoNewWindow -PassThru -RedirectStandardInput $in -RedirectStandardOutput guest.log
+$p | Wait-Process -Timeout 45
+$p.ExitCode        # 0: every command in the script succeeded
+```
+
+Or straight through a shell pipe:
+
+```powershell
+"calc 6 + 7`nexit`n" | .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
+    --guest src\virtpass\android-host\app\src\main\assets\test_cli.exe
 ```
 
 Guest output arrives on the host's stdout unprefixed and as it is written; the
@@ -142,6 +172,87 @@ are the process's own stdout and exit status.
 
 The one prerequisite is an interactive desktop session - the host always creates
 its window, guest or not.
+
+### Interactive console
+
+A guest that reads its console (`test_cli`) is typed into directly in the
+window. The keyboard goes to the guest's fd 0 through `rvvm_user_tty_input()`
+- the same entry point the Android host's console tab uses - and the VTerm the
+guest writes to is what `WM_PAINT` renders, so output and the echo of typing
+share one screen. The window takes focus when a guest is booted, and again
+whenever the client area is clicked (the picker's combo box would otherwise
+keep it, see below).
+
+```powershell
+.\release.windows.x86_64\rvvm_winhost_x86_64.exe --assets src\virtpass\android-host\app\src\main\assets
+# pick test_cli, Run, then type into the window:
+#   vp> ls /
+#   vp> calc 6 * 7
+```
+
+Key mapping (the bytes a terminal sends, which is what the core's line
+discipline expects):
+
+| Key | Bytes |
+|---|---|
+| printable ASCII | the character, UTF-8 |
+| Enter | `CR` (0x0D; ICRNL turns it into NL) |
+| Backspace | `DEL` (0x7F) - the window reports ASCII BS (0x08), mapped in `WM_CHAR` |
+| Ctrl-C / Ctrl-D / Ctrl-Z | 0x03 / 0x04 / 0x1A |
+| Tab | 0x09 |
+| ↑ ↓ → ← Home End Delete | `ESC [ A` / `B` / `C` / `D`, `ESC [ H`, `ESC [ F`, `ESC [ 3 ~` |
+
+Three host-side details worth knowing:
+
+- The line discipline lives in `rvvm_user.c`, so the guest's own `termios`
+  decides what Enter, Backspace and ^C mean - the host only supplies the bytes.
+- Typing is echoed into the VTerm by that same path, which is *not* guest fd 1/2
+  output, so `host_tty_cb()` never fires for it: `tty_input()` in
+  `win32_cmdpost_bridge.c` flags the layer dirty and repaints itself, otherwise a
+  shell sitting in `read(0)` would look dead until the guest printed something.
+- The window is not the console's only source: the host's own stdin is pumped
+  into the same line discipline by `stdin_pump_thread()`, which is what makes a
+  run scriptable (see "Scripted runs"). It is started per run and **waits for
+  `rvvm_user_is_started()` before reading**: `jump_start()` wipes the console
+  state as it spins the vCPU up ("no type-ahead left in the ring"), so bytes
+  delivered earlier are discarded - and a file or pipe only yields its bytes
+  once. A console stdin is switched to raw first (no line mode, no echo), so the
+  guest's discipline is the only one assembling lines, and it echoes them into
+  the window rather than into the console.
+
+In launcher mode the picker's combo and buttons stay visible while a guest runs,
+and the console is drawn below them; the guest's own panel is still composited
+underneath (the controls are child windows, the parent never paints over them).
+
+### GameActivity keys
+
+The same keystrokes also land in the GameActivity input queue, so a guest that
+polls `android_app_swap_input_buffers()` receives them: a shell reads its
+console, a game reads these, and neither path disturbs the other.
+`akeycode_from_vk()` maps letters, digits, F1-F12, the arrows, the modifiers,
+Enter / Escape / Backspace / Tab / space / Home / End / PageUp / PageDown /
+Insert / Delete and the punctuation keys onto the `AKEYCODE_*` values VirtPass
+carries (`virtpass/vp_android.h`); a key with no AKEYCODE is dropped.
+`metaState` reports the Shift/Ctrl/Alt state from `GetKeyState()`, and
+`repeatCount` is Win32's repeat count minus one (Android counts the first press
+as 0).
+
+`test_game_activity` prints every key event it is handed, which is the quickest
+end-to-end check of the path:
+
+```powershell
+.\release.windows.x86_64\rvvm_winhost_x86_64.exe `
+    src\virtpass\android-host\app\src\main\assets\test_game_activity.exe
+# focus the window and press a key:
+# GameActivity: key event 0 action=0 keyCode=29 metaState=0x0 repeat=0
+```
+
+On Android the same queue is fed from Java instead of from VK: the activity's
+`dispatchKeyEvent()` hands over whatever its views did not consume
+(`nativePostKeyEvent` -> `cmdpost_queue_key_event()`), so the console's
+`TtyEditText` keeps its own keys and a game guest gets the rest. Volume, power
+and Back stay with the device - Back keeps its "background the task" meaning
+rather than becoming a guest key.
 
 ### Launcher (Android-style picker)
 
@@ -238,15 +349,10 @@ Debug switches:
    startup; that fails on the host mmap layer and the guest exits 127. See
    `src/virtpass/README.md`.
 
-3. **Keyboard input is logged, not delivered.** The guest input buffer swap
-   path only carries motion events today; add a key-event queue to vp_cmdpost
-   (struct layout already exists: `cmdpost_GameActivityKeyEvent`) plus a
-   VK->AKEYCODE table in the bridge.
-
-4. **Sensors are stubs.** Fixed values pushed on a timer; wire up
+3. **Sensors are stubs.** Fixed values pushed on a timer; wire up
    `Windows.Devices.Sensors` (WinRT) for real data.
 
-5. **Assets.** The host mounts its assets directory - the same tree the picker
+4. **Assets.** The host mounts its assets directory - the same tree the picker
    lists guests from (`--assets DIR` / `RVVM_ASSETS`, default
    `src\virtpass\android-host\app\src\main\assets`) - at `/assets`, and the
    guest's `AAssetManager_*` calls are a shell over that mount. Because the tree

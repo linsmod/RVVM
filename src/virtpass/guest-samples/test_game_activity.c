@@ -335,6 +335,23 @@ static void on_frame_callback(long frame_time_nanos, void* data)
         android_app_clear_key_events(app);
     }
 
+    /* 2b. Key events: the same swap filled the buffer's other array, so they
+     * are read from inputBuffer.keyEvents and drained with
+     * android_app_clear_key_events(). Printing them is what makes a keystroke
+     * verifiable from the guest's own output - focus the window, press a key,
+     * and the AKEYCODE the host produced shows up here. */
+    {
+        int32_t key_count = app->inputBuffer.keyEventsCount;
+        for (int32_t i = 0; i < key_count && i < 16; i++) {
+            GameActivityKeyEvent* ke = &app->inputBuffer.keyEvents[i];
+            printf("GameActivity: key event %d action=%d keyCode=%d metaState=0x%x repeat=%d\n",
+                   i, ke->action, ke->keyCode, ke->metaState, ke->repeatCount);
+        }
+        if (key_count > 0) {
+            android_app_clear_key_events(app);
+        }
+    }
+
     /* 3. Render one frame.
      *
      * The frame callback always re-arms (step 4), so the guest keeps drawing

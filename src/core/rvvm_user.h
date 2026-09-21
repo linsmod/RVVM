@@ -374,6 +374,14 @@ bool rvvm_user_is_suspended(rvvm_machine_t* machine);
 // an audio device, ...) should gate on this, not on the request.
 bool rvvm_user_is_parked(rvvm_machine_t* machine);
 
+// True once the guest is past the console reset jump_start() performs while it
+// spins the vCPU up, i.e. actually running its own code. A host that feeds this
+// guest's console from a thread of its own (the Win32 stdin pump) waits for it
+// before delivering anything: that reset deliberately drops the console state -
+// type-ahead in the ring included - so bytes handed over earlier are erased
+// rather than queued.
+bool rvvm_user_is_started(rvvm_machine_t* machine);
+
 // Translate a guest virtual address into a host pointer.
 //
 // Guest memory is a private buffer of the userland machine, so a guest address

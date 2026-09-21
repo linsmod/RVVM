@@ -1091,6 +1091,53 @@ public class MainActivity extends Activity {
     }
 
     /** Forward text to the guest as UTF-8. */
+    /**
+     * Keys no view consumed belong to the guest's GameActivity input queue -
+     * the input path a game guest (one polling
+     * {@code android_app_swap_input_buffers()}) reads, mirroring what the Win32
+     * host does with {@code WM_KEYDOWN}.
+     *
+     * The console keeps priority: its {@link TtyEditText} takes Enter,
+     * Backspace, Tab, the arrows and Ctrl combinations itself, and anything
+     * the view hierarchy consumes is already gone when {@code super} returns
+     * false - so one keystroke never lands in both the guest's console and its
+     * key queue. System keys stay with the device: volume and power are not
+     * the guest's to take, and Back keeps its own meaning here.
+     */
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (super.dispatchKeyEvent(event)) {
+            return true;
+        }
+        if (!isSystemKey(event.getKeyCode())) {
+            postKeyEventToGuest(event);
+            return true;
+        }
+        return false;
+    }
+
+    private static boolean isSystemKey(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_VOLUME_UP:
+            case KeyEvent.KEYCODE_VOLUME_DOWN:
+            case KeyEvent.KEYCODE_VOLUME_MUTE:
+            case KeyEvent.KEYCODE_POWER:
+            case KeyEvent.KEYCODE_BACK:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private void postKeyEventToGuest(KeyEvent event) {
+        if (event == null || activeGuestId < 0) return;
+        if (!RvvmNative.nativeIsGuestRunning(activeGuestId)) return;
+        RvvmNative.nativePostKeyEvent(activeGuestId,
+                event.getKeyCode(), event.getAction(), event.getMetaState(),
+                event.getRepeatCount(), event.getSource(), event.getDeviceId(),
+                event.getEventTime() * 1000000L);
+    }
+
     private void sendTtyText(CharSequence text) {
         if (text == null || text.length() == 0) return;
         sendTtyBytes(text.toString().getBytes(StandardCharsets.UTF_8));

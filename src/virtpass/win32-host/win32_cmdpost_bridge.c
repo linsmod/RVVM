@@ -1032,6 +1032,243 @@ static void log_key(const char* what, UINT vk, LPARAM lp)
                 (unsigned)(lp & 0xFFFF));
 }
 
+/*
+ * Guest TTY keyboard.
+ *
+ * WM_PAINT blits the guest's console (the libvterm layer) into the window, so
+ * the keyboard has to feed the other half of that console: fd 0. rvvm_user
+ * takes the payload a real terminal sends - printable UTF-8, CR for Enter,
+ * 0x7F for Backspace, 0x03/0x04 for ^C/^D, CSI sequences for the arrow keys -
+ * runs it through the line discipline the guest's termios advertises, and the
+ * cooked result is what guest read(0) returns. Same entry point the Android
+ * console uses (nativeTtyInput -> rvvm_user_tty_input); here the source is the
+ * Win32 message queue.
+ *
+ * Two things the core does not do for us:
+ *  - Repaint. Typing is echoed into the same VTerm the renderer reads, but
+ *    that echo is not guest fd 1/2 output, so host_tty_cb() - which normally
+ *    flags the layer dirty - never fires. Without flagging it here a shell
+ *    sitting in read(0) would show nothing until the guest printed something.
+ *    g_tty_seen is raised for the same reason: it is what gates the TTY layer
+ *    in WM_PAINT, and a guest that has not printed yet has not raised it.
+ *  - Nothing else: the BS -> DEL mapping lives in the WM_CHAR handler, which
+ *    is where the terminal contract is spelled out.
+ *
+ * No-op while no guest is booted (g_guest_machine is NULL between runs), so
+ * keystrokes in the picker are ignored instead of piling up in a dead console.
+ */
+static void tty_input(const void* buf, size_t len)
+{
+    if (!g_guest_machine || !g_tty) {
+        return;
+    }
+    rvvm_user_tty_input(g_guest_machine, buf, len);
+    g_tty_seen  = true;
+    g_tty_dirty = true;
+    if (g_hwnd) {
+        InvalidateRect(g_hwnd, NULL, FALSE);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* stdin pump                                                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The host is a console-subsystem binary, so it always has a real stdin: the
+ * console it owns when started from a shell, or a pipe / file when redirected.
+ * Feeding it into the guest's console is what makes a run scriptable -
+ *
+ *     printf 'ls /; exit\n' | rvvm_winhost.exe start guest test_cli.exe
+ *
+ * - and it is complementary to the window keyboard (WM_CHAR), which stays the
+ * interactive path. Both ends simply hand bytes to the same line discipline.
+ *
+ * Bytes that arrive before a guest is booted are dropped rather than buffered:
+ * there is no run for them to belong to. That is also why the pump is started
+ * from win32_host_start_guest() and not at init - a redirected stdin may hold
+ * its input already, and reading it before the guest exists would throw it
+ * away.
+ *
+ * The thread is never joined: it is normally parked in ReadFile() and the
+ * process exits without it.
+ */
+static DWORD WINAPI stdin_pump_thread(LPVOID param)
+{
+    char buf[512];
+    DWORD got = 0;
+
+    (void)param;
+    for (;;) {
+        unsigned waited_ms = 0;
+        /* Do not consume stdin before the guest is actually running:
+         * jump_start() wipes the console state as it spins the vCPU up ("no
+         * type-ahead left in the ring"), so anything delivered before that
+         * point is discarded - and a file or pipe only yields its bytes once.
+         * Waiting costs nothing: the input simply stays in stdin. */
+        while (g_guest_machine && !rvvm_user_is_started(g_guest_machine)) {
+            Sleep(1);
+            if (++waited_ms > 5000) {
+                break; /* never wedge the pump on a guest that never starts */
+            }
+        }
+        if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), buf, sizeof(buf), &got, NULL) || got == 0) {
+            return 0; /* EOF, or a broken pipe: nothing more will arrive */
+        }
+        tty_input(buf, (size_t)got);
+    }
+}
+
+/* Start the pump once per process, if there is a stdin to read at all. */
+static void stdin_pump_start(void)
+{
+    static bool started = false;
+    HANDLE hin = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD type;
+
+    if (started || !hin || hin == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    type = GetFileType(hin);
+    if (type == FILE_TYPE_UNKNOWN && GetLastError() != NO_ERROR) {
+        return; /* no stdin at all (e.g. launched without a console) */
+    }
+
+    if (type == FILE_TYPE_CHAR) {
+        /* A console: read it raw and without its own echo. The guest's line
+         * discipline is the one that assembles lines and echoes them into the
+         * console window, so leaving the console's line mode on would deliver
+         * input only after Enter (and echo every keystroke a second time, in
+         * the wrong window). Ctrl+C stays processed: it is the graceful
+         * shutdown the console handler owns. */
+        DWORD mode = 0;
+        if (GetConsoleMode(hin, &mode)) {
+            SetConsoleMode(hin, (mode & ~(DWORD)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT))
+                                    | ENABLE_VIRTUAL_TERMINAL_INPUT);
+        }
+    }
+
+    if (CreateThread(NULL, 0, stdin_pump_thread, NULL, 0, NULL) == NULL) {
+        winhost_log("stdin pump: CreateThread failed, input stays window-only");
+        return;
+    }
+    started = true;
+    winhost_log("stdin pump: started (stdin type %lu)", (unsigned long)type);
+}
+
+/* VK -> terminal byte sequence, for the keys that never produce a WM_CHAR.
+ * The window is an ANSI one (RegisterClassA), so WM_CHAR carries single bytes
+ * of the host code page and cannot express these. */
+static const char* tty_key_seq(UINT vk)
+{
+    switch (vk) {
+    case VK_UP:     return "\x1b[A";
+    case VK_DOWN:   return "\x1b[B";
+    case VK_RIGHT:  return "\x1b[C";
+    case VK_LEFT:   return "\x1b[D";
+    case VK_HOME:   return "\x1b[H";
+    case VK_END:    return "\x1b[F";
+    case VK_DELETE: return "\x1b[3~";
+    default:        return NULL;
+    }
+}
+
+/* VK -> AKEYCODE for the GameActivity input queue. Only the keys VirtPass
+ * carries (see virtpass/vp_android.h) - 0 means this key has no AKEYCODE and
+ * the caller drops the event. */
+static int32_t akeycode_from_vk(UINT vk)
+{
+    if (vk >= 'A' && vk <= 'Z') {
+        return AKEYCODE_A + (int32_t)(vk - 'A');
+    }
+    if (vk >= '0' && vk <= '9') {
+        return AKEYCODE_0 + (int32_t)(vk - '0');
+    }
+    if (vk >= VK_F1 && vk <= VK_F12) {
+        return AKEYCODE_F1 + (int32_t)(vk - VK_F1);
+    }
+
+    switch (vk) {
+    case VK_RETURN:     return AKEYCODE_ENTER;
+    case VK_ESCAPE:     return AKEYCODE_ESCAPE;
+    case VK_BACK:       return AKEYCODE_DEL;
+    case VK_TAB:        return AKEYCODE_TAB;
+    case VK_SPACE:      return AKEYCODE_SPACE;
+    case VK_LEFT:       return AKEYCODE_DPAD_LEFT;
+    case VK_RIGHT:      return AKEYCODE_DPAD_RIGHT;
+    case VK_UP:         return AKEYCODE_DPAD_UP;
+    case VK_DOWN:       return AKEYCODE_DPAD_DOWN;
+    case VK_HOME:       return AKEYCODE_MOVE_HOME;
+    case VK_END:        return AKEYCODE_MOVE_END;
+    case VK_PRIOR:      return AKEYCODE_PAGE_UP;
+    case VK_NEXT:       return AKEYCODE_PAGE_DOWN;
+    case VK_INSERT:     return AKEYCODE_INSERT;
+    case VK_DELETE:     return AKEYCODE_FORWARD_DEL;
+    case VK_SHIFT:
+    case VK_LSHIFT:     return AKEYCODE_SHIFT_LEFT;
+    case VK_RSHIFT:     return AKEYCODE_SHIFT_RIGHT;
+    case VK_CONTROL:
+    case VK_LCONTROL:   return AKEYCODE_CTRL_LEFT;
+    case VK_RCONTROL:   return AKEYCODE_CTRL_RIGHT;
+    case VK_MENU:
+    case VK_LMENU:      return AKEYCODE_ALT_LEFT;
+    case VK_RMENU:      return AKEYCODE_ALT_RIGHT;
+    case VK_LWIN:       return AKEYCODE_META_LEFT;
+    case VK_RWIN:       return AKEYCODE_META_RIGHT;
+    case VK_CAPITAL:    return AKEYCODE_CAPS_LOCK;
+    case VK_SNAPSHOT:   return AKEYCODE_SYSRQ;
+    case VK_APPS:       return AKEYCODE_MENU;
+    case VK_OEM_COMMA:  return AKEYCODE_COMMA;
+    case VK_OEM_PERIOD: return AKEYCODE_PERIOD;
+    case VK_OEM_MINUS:  return AKEYCODE_MINUS;
+    case VK_OEM_PLUS:   return AKEYCODE_EQUALS;
+    case VK_OEM_1:      return AKEYCODE_SEMICOLON;
+    case VK_OEM_2:      return AKEYCODE_SLASH;
+    case VK_OEM_3:      return AKEYCODE_GRAVE;
+    case VK_OEM_4:      return AKEYCODE_LEFT_BRACKET;
+    case VK_OEM_5:      return AKEYCODE_BACKSLASH;
+    case VK_OEM_6:      return AKEYCODE_RIGHT_BRACKET;
+    case VK_OEM_7:      return AKEYCODE_APOSTROPHE;
+    default:            return 0;
+    }
+}
+
+/* Modifier state as the GameActivity ABI reports it. */
+static int32_t akey_meta_state(void)
+{
+    int32_t meta = 0;
+    if (GetKeyState(VK_SHIFT)   & 0x8000) meta |= AMETA_SHIFT_ON;
+    if (GetKeyState(VK_CONTROL) & 0x8000) meta |= AMETA_CTRL_ON;
+    if (GetKeyState(VK_MENU)    & 0x8000) meta |= AMETA_ALT_ON;
+    return meta;
+}
+
+/* Hand one key event to the guest's GameActivity input queue - the path a game
+ * guest polls through android_app_swap_input_buffers(), not the console. The
+ * two consumers coexist: a shell reads fd 0, a GameActivity guest reads these,
+ * and neither notices the other. */
+static void queue_key_event(int32_t action, UINT vk, LPARAM lp)
+{
+    cmdpost_GameActivityKeyEvent ev;
+    int32_t code = akeycode_from_vk(vk);
+    UINT repeat = (UINT)(lp & 0xFFFF);
+
+    if (!g_cmdpost || !g_guest_machine || code == 0) {
+        return;
+    }
+    memset(&ev, 0, sizeof(ev));
+    ev.eventTime   = (int64_t)GetTickCount64() * 1000000LL;
+    ev.deviceId    = 0;
+    ev.source      = AINPUT_SOURCE_KEYBOARD;
+    ev.action      = action;
+    ev.keyCode     = code;
+    ev.scanCode    = (int32_t)((lp >> 16) & 0xFF);
+    ev.metaState   = akey_meta_state();
+    /* Android counts the first press as 0, Win32 as 1. */
+    ev.repeatCount = (int32_t)(repeat > 0 ? repeat - 1 : 0);
+    cmdpost_queue_key_event(g_cmdpost, &ev);
+}
+
 /* ------------------------------------------------------------------ */
 /* Lifecycle mapping                                                   */
 /* ------------------------------------------------------------------ */
@@ -1341,6 +1578,11 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK:
+        /* Clicking the picture takes the keyboard back. The picker's combo and
+         * buttons are child windows and keep focus once used, so without this
+         * the window would never see WM_CHAR again and the guest console would
+         * look deaf. */
+        SetFocus(hwnd);
         SetCapture(hwnd);
         queue_mouse_motion(AMOTION_EVENT_ACTION_DOWN, lParam);
         return 0;
@@ -1356,13 +1598,63 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         queue_mouse_motion(AMOTION_EVENT_ACTION_UP, lParam);
         return 0;
 
-    case WM_KEYDOWN:
-        log_key("down", (UINT)wParam, lParam);
+    case WM_KEYDOWN: {
+        UINT vk = (UINT)wParam;
+        const char* seq = tty_key_seq(vk);
+        log_key("down", vk, lParam);
+        /* One keystroke, two consumers: the console (fd 0) and the GameActivity
+         * input queue. A guest reads one of them - a shell its console, a game
+         * android_app_swap_input_buffers() - so neither path disturbs the
+         * other. */
+        queue_key_event(AKEY_EVENT_ACTION_DOWN, vk, lParam);
+        /* Only the keys with a fixed escape sequence are handled here; every
+         * printable character and the plain control codes come through WM_CHAR
+         * instead. A held key repeats WM_KEYDOWN, which is what a terminal
+         * does too. */
+        if (seq) {
+            tty_input(seq, strlen(seq));
+        }
         return 0;
+    }
 
     case WM_KEYUP:
         log_key("up", (UINT)wParam, lParam);
+        queue_key_event(AKEY_EVENT_ACTION_UP, (UINT)wParam, lParam);
         return 0;
+
+    case WM_CHAR: {
+        /* TranslateMessage() in the message loop turns the key messages into
+         * characters, so this carries everything a console produces: printable
+         * ASCII, Enter (0x0D), Tab (0x09), ^C (0x03), ^D (0x04), ^Z (0x1A), ...
+         * Everything is forwarded as-is - the line discipline behind
+         * rvvm_user_tty_input() is the party that decides what is data and what
+         * is a control character, exactly as a real tty does.
+         *
+         * Backspace is the one translation that has to happen here: a console
+         * reports the ASCII BS (0x08), while a terminal sends DEL (0x7F) and
+         * that is the byte the line discipline erases on. */
+        static bool warned_non_ascii = false;
+        unsigned char c = (unsigned char)wParam;
+        if (c >= 0x80) {
+            /* The window is ANSI (RegisterClassA), so this is a host code page
+             * byte - a lone lead byte of a DBCS pair as often as not, and never
+             * the UTF-8 the TTY speaks. Injecting it would put invalid UTF-8 in
+             * the terminal; dropping it keeps the console honest.
+             * TODO: type non-ASCII by moving the class/window to Unicode
+             * (WM_CHAR then carries a UTF-16 unit) or by assembling CP_ACP
+             * lead/trail pairs here and encoding the result as UTF-8. */
+            if (!warned_non_ascii) {
+                warned_non_ascii = true;
+                winhost_log("keyboard: non-ASCII input is not wired (see WM_CHAR)");
+            }
+            return 0;
+        }
+        if (c == 0x08) {
+            c = 0x7F;
+        }
+        tty_input(&c, 1);
+        return 0;
+    }
 
     case WM_TIMER:
         if (wParam == SENSOR_TIMER_ID) {
@@ -1441,6 +1733,7 @@ static LRESULT CALLBACK win_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
          * launch queues a fresh startup sequence. */
         cmdpost_clear_lifecycle_cmds(g_cmdpost);
         cmdpost_clear_motion_events(g_cmdpost);
+        cmdpost_clear_key_events(g_cmdpost);
         if (g_launcher) {
             /* Launcher mode: do NOT close the window. Reset the guest-owned
              * surface and re-show the picker so another guest can be booted
@@ -1839,13 +2132,19 @@ static void tty_layer_render(void)
  * the VTerm at the same time. */
 static void tty_paint(HDC cdc)
 {
+    /* In launcher mode the picker's combo and buttons stay on screen while a
+     * guest runs, and child windows are excluded from the parent's painting
+     * (WS_CLIPCHILDREN), so the console has to start below them: at (0,0) its
+     * first rows - the shell prompt among them - would be covered. */
+    int y = g_launcher ? (LAUNCH_BTN_Y + LAUNCH_CTRL_H + LAUNCH_CTRL_GAP) : 0;
+
     if (g_tty_dirty) {
         tty_layer_render();
     }
     if (g_tty_layer_ok && g_tty_layer_dc) {
         /* The layer bitmap stays selected into g_tty_layer_dc from
          * tty_layer_render; a plain blit needs no per-frame selection. */
-        BitBlt(cdc, 0, 0, g_tty_layer_w, g_tty_layer_h,
+        BitBlt(cdc, 0, y, g_tty_layer_w, g_tty_layer_h,
                g_tty_layer_dc, 0, 0, SRCCOPY);
     }
 }
@@ -2189,6 +2488,7 @@ static void launcher_launch_sel(int sel)
      * DESTROY reaching the new guest makes it exit before it ever renders. */
     cmdpost_clear_lifecycle_cmds(g_cmdpost);
     cmdpost_clear_motion_events(g_cmdpost);
+    cmdpost_clear_key_events(g_cmdpost);
 
     /* Android GameActivity startup sequence. The WM_CREATE path is skipped
      * while the launcher is idle, so it is queued here - before the guest
@@ -2653,6 +2953,19 @@ bool win32_host_start_guest(int argc, char** argv)
 
     set_title("guest running");
     winhost_log("guest launched: %s", argv[0]);
+
+    /* The guest's console is what the keyboard belongs to from here on (see
+     * WM_CHAR), so take focus now: in launcher mode the click that started
+     * this run landed on the Run button, and without this the first keystrokes
+     * would go to the picker instead of the guest. */
+    if (g_hwnd) {
+        SetFocus(g_hwnd);
+    }
+
+    /* From here the host's own stdin feeds the same guest console (see the
+     * stdin pump). Started per run on purpose: a redirected stdin may hold its
+     * input already, and reading it before a guest exists would drop it. */
+    stdin_pump_start();
     return true;
 }
 

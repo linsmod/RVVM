@@ -143,6 +143,28 @@ public class RvvmNative {
                                                     int pointerCount, int action, long eventTime);
 
     /**
+     * Post a key event to a guest's GameActivity input queue - the path a guest
+     * that polls {@code android_app_swap_input_buffers()} reads (a game), as
+     * opposed to {@link #nativeTtyInput}, which types into its console.
+     *
+     * {@code keyCode} is an Android {@code KeyEvent.KEYCODE_*} value, which is
+     * exactly what the guest ABI carries - neither side translates it, and the
+     * Win32 host maps its VK_* onto the same space.
+     *
+     * @param guestId guest to deliver to, or -1 for the active one
+     * @param keyCode Android key code (KeyEvent.getKeyCode())
+     * @param action AKEY_EVENT_ACTION_DOWN / _UP (KeyEvent.getAction())
+     * @param metaState Modifier state (KeyEvent.getMetaState())
+     * @param repeatCount Repeat count (KeyEvent.getRepeatCount())
+     * @param source Input source (KeyEvent.getSource()); 0 means keyboard
+     * @param deviceId Device id (KeyEvent.getDeviceId())
+     * @param eventTime Event timestamp in nanoseconds
+     */
+    public static native void nativePostKeyEvent(int guestId, int keyCode, int action,
+                                                 int metaState, int repeatCount,
+                                                 int source, int deviceId, long eventTime);
+
+    /**
      * Run a RISC-V ELF program in the given guest's machine.
      * @param guestId guest to run the ELF in, or -1 for the active one
      * @param elfPath Path to the ELF file

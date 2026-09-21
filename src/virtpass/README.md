@@ -16,8 +16,9 @@ backend behind each callback differs.
 
 ## Shared layer (`src/virtpass`)
 
-- `vp_cmdpost.c/.h` — the ABI proxy core: lifecycle/input queues, the GL/EGL
-  and AAudio entries, and the callback registration points every host fills in.
+- `vp_cmdpost.c/.h` — the ABI proxy core: the lifecycle, motion and key event
+  queues the guest drains through GameActivity, the GL/EGL and AAudio entries,
+  and the callback registration points every host fills in.
 - `vp_sensor.c/.h` — the host-side sensor subsystem: it caches the device
   descriptors, owns the event queues with their bounded staging FIFO and the
   Looper wake fd, and exposes one `vp_sensor_ops_t` for a platform backend to
@@ -45,8 +46,22 @@ backend behind each callback differs.
 
 ## Windows (`win32-host/`)
 
-- Entry: `rvvm_winhost.exe` (`win32_main.c`) — message pump, launcher UI,
-  `--display WxH@PPI`, `--assets DIR` (or `RVVM_ASSETS`).
+- Entry: `rvvm_winhost.exe` (`win32_main.c`) — console application: message
+  pump, launcher UI, `--display WxH@PPI`, `--assets DIR` (or `RVVM_ASSETS`), and
+  the launch target `--launcher` / `--guest <elf> [args...]` (a bare first
+  non-option argument means `--guest`, none at all means `--launcher`).
+- Console keyboard: `WM_CHAR` plus the arrow / Home / End / Delete keys are
+  routed to the guest's fd 0 through `rvvm_user_tty_input()`, the same call the
+  Android console tab makes. The line discipline stays in the core
+  (`rvvm_user.c`), and the VTerm the guest writes to is what the window renders,
+  so a guest like `test_cli` runs as an interactive shell in the window. The
+  host's own stdin feeds the same discipline (`stdin_pump_thread()`, which waits
+  for `rvvm_user_is_started()` before reading), which is what makes a run
+  scriptable: `printf 'ls /\nexit\n' | rvvm_winhost.exe --guest test_cli.exe`.
+- GameActivity keys: the same keystrokes are also queued for
+  `android_app_swap_input_buffers()` - `cmdpost_queue_key_event()` with the VK
+  mapped to an `AKEYCODE_*` value. The queue lives in the shared
+  `vp_cmdpost.c`; the guest stub already drained it.
 - `win32_cmdpost_bridge.c` — window/config/lifecycle/input callbacks and the
   two-layer display model: layer 1 is the host-owned virtual panel the guest
   observes, layer 2 is the OS window (a pure viewport). CPU rendering is
@@ -87,6 +102,13 @@ backend behind each callback differs.
   looper thread; no sensor data crosses Java.
 - Vsync: a dedicated thread owns the per-thread AChoreographer and publishes
   frame times; guests consume them via Looper fd wakeup or a blocking wait.
+- Keyboard: one keystroke stream, two destinations. The console's
+  `TtyEditText` consumes what it needs (Enter, Backspace, Tab, arrows, Ctrl
+  combinations) and feeds `nativeTtyInput`; the activity's `dispatchKeyEvent()`
+  hands everything the views did not consume to the GameActivity queue
+  (`nativePostKeyEvent` -> `cmdpost_queue_key_event()`), which a game guest
+  reads through `android_app_swap_input_buffers()`. So the same key never lands
+  in both places. Volume, power and Back stay with the device.
 - Diagnostics: guest stdout/stderr (write and writev) land in logcat under the
   `RVVM-GUEST` tag; GL calls trace under `RVVM-GL` with `RVVM_GL_TRACE`.
   The guest console is also parsed into the virtual TTY layer (the console

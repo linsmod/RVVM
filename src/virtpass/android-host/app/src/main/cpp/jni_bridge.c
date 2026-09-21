@@ -2388,6 +2388,47 @@ Java_com_rvvm_android_RvvmNative_nativePostMotionEvent(JNIEnv* env, jobject thiz
          (int)count, (unsigned)action, xbuf[0], ybuf[0]);
 }
 
+/* Host keyboard -> guest GameActivity input queue.
+ *
+ * The other half of the console keyboard: a guest that polls
+ * android_app_swap_input_buffers() (a game) reads its keys from here, while a
+ * guest that reads its console gets them through nativeTtyInput(). Java decides
+ * which keystroke goes where - see GuestActivity.dispatchKeyEvent(), which
+ * forwards whatever its views did not consume - so this side only has to fill
+ * in the ABI struct. The AKEYCODE_* space is Android's own (see
+ * virtpass/vp_android.h), which is also what the Win32 host maps its VK_* onto,
+ * so a guest behaves the same on either host. */
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativePostKeyEvent(JNIEnv* env, jobject thiz,
+                                                    jint guestId, jint keyCode,
+                                                    jint action, jint metaState,
+                                                    jint repeatCount, jint source,
+                                                    jint deviceId, jlong eventTime)
+{
+    struct android_run* run = android_run_for_call(guestId);
+    vp_cmdpost_t* cmdpost = run ? run->cmdpost : NULL;
+    cmdpost_GameActivityKeyEvent ev;
+
+    (void)env;
+    (void)thiz;
+
+    if (!cmdpost) {
+        return;
+    }
+
+    memset(&ev, 0, sizeof(ev));
+    ev.eventTime   = (int64_t)eventTime;
+    ev.deviceId    = (int32_t)deviceId;
+    ev.source      = source ? (int32_t)source : 0x00000101; /* AINPUT_SOURCE_KEYBOARD */
+    ev.action      = (int32_t)action;
+    ev.keyCode     = (int32_t)keyCode;
+    ev.scanCode    = 0;  /* nothing in the guest ABI reads it */
+    ev.metaState   = (int32_t)metaState;
+    ev.repeatCount = (int32_t)repeatCount;
+
+    cmdpost_queue_key_event(cmdpost, &ev);
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint guestId,
                                               jstring elfPath, jobjectArray args)

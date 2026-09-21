@@ -103,6 +103,7 @@ void cmdpost_destroy(vp_cmdpost_t* inst);
  * ============================================================ */
 #define CMDPOST_MAX_NUM_POINTERS_IN_MOTION_EVENT 16
 #define CMDPOST_MAX_MOTION_EVENTS 16
+#define CMDPOST_MAX_KEY_EVENTS 16
 #define CMDPOST_MAX_LIFECYCLE_CMDS 32
 
 typedef struct {
@@ -161,6 +162,11 @@ void cmdpost_queue_lifecycle_cmd(vp_cmdpost_t* inst, int32_t cmd);
 
 /* Queue a motion event from the host side (called from JNI/Java) */
 void cmdpost_queue_motion_event(vp_cmdpost_t* inst, const cmdpost_GameActivityMotionEvent* ev);
+
+/* Queue a key event from the host side. Symmetric to the motion queue: the
+ * guest drains both through SYS_ANDROID_GAME_SWAP_INPUT, and keyCode carries
+ * an AKEYCODE_* value the host produced (see virtpass/vp_android.h). */
+void cmdpost_queue_key_event(vp_cmdpost_t* inst, const cmdpost_GameActivityKeyEvent* ev);
 
 /* Clear queued host events */
 void cmdpost_clear_lifecycle_cmds(vp_cmdpost_t* inst);
