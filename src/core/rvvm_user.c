@@ -649,6 +649,19 @@ typedef struct {
  * behaves as if the table did not exist: whoever closes it, closes it. */
 #define USERLAND_FD_TABLE_MAX 4096
 
+/* Descriptors this userland serves from its own objects rather than a host fd
+ * (a pty end, a /dev entry). The fd table's close path needs to know, and it
+ * comes long before the implementations (see the pty section). */
+struct userland_pty;
+static bool userland_pty_by_fd(int fd, struct userland_pty** out_pty, bool* out_master);
+static void userland_pty_ref(struct userland_pty* pty, bool master);
+static void userland_pty_release(struct userland_pty* pty, bool master);
+static bool userland_pty_readable(struct userland_pty* pty, bool master);
+static int  userland_pty_open_master(void);
+static int  userland_pty_open_slave(uint32_t index);
+static bool userland_dev_by_fd(int fd, int* out_dev);
+static int  userland_dev_fd(int dev);
+
 /* One slot of a process's fd table: the host fd it rides on, plus the flags that
  * belong to the slot rather than to what it points at.
  *
@@ -878,6 +891,16 @@ typedef struct rvvm_userland {
     uint32_t     tty_iflag;        // c_iflag from the last TCSETS (ICRNL is acted on)
     uint32_t     tty_eof_pending;  // Ctrl-D delivered: next read returns 0
     bool         tty_in_eof;       // teardown: unblock reads that are waiting
+
+    // --- Guest timers ---
+    // The state behind the guest's ITIMER_REAL (see userland_setitimer_real);
+    // NULL until the guest first arms one.
+    struct userland_itimer* itimer;
+
+    // --- Guest pseudo-terminals ---
+    // The open pairs live in a process-wide table, not here: an in-process
+    // fork() hands the child the same pty fd, and both address spaces have to
+    // reach the same pair (see userland_pty_*).
 } rvvm_userland_t;
 
 // Context attached to a userland machine, NULL for a non-userland machine
@@ -1473,6 +1496,15 @@ static void user_tty_vt_write(rvvm_userland_t* ctx, const char* buf, size_t len)
 #define UAPI_TCSETSF    0x5404
 #define UAPI_TIOCGWINSZ 0x5413
 #define UAPI_TIOCSWINSZ 0x5414
+/* The pty-master ioctls (asm-generic): ptsname() and grantpt()/unlockpt() are
+ * nothing but these two. */
+#define UAPI_TIOCGPTN    0x80045430
+#define UAPI_TIOCSPTLCK  0x40045431
+/* Session and process-group ioctls a shell asks its controlling terminal. */
+#define UAPI_TIOCGPGRP   0x540F
+#define UAPI_TIOCSPGRP   0x5410
+#define UAPI_TIOCSCTTY   0x540E
+#define UAPI_FIONREAD    0x541B
 #define UAPI_SIGINT     2
 #define UAPI_SIGWINCH   28
 
@@ -3287,6 +3319,9 @@ static int userland_fd_host(rvvm_userland_t* ctx, int fd)
 /* close(2) for a tracked descriptor. Returns false when it is not one of ours,
  * so the caller falls back to the host close (and its error reporting).
  *
+ * A slot riding on an emulator object rather than a host descriptor (a pty end)
+ * is released here instead of being closed - there is no host fd behind it.
+ *
  * A slot inherited without a copy of its own (see userland_fd_table_inherit) is
  * dropped without the host close: the host fd is the parent's as well. */
 static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
@@ -3294,7 +3329,12 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
     if (!userland_fd_tracked(ctx, fd)) {
         return false;
     }
-    if (!ctx->fds[fd].shared) {
+    struct userland_pty* pty = NULL;
+    bool master = false;
+    if (userland_pty_by_fd(ctx->fds[fd].fd, &pty, &master)) {
+        userland_pty_release(pty, master);
+    } else if (!ctx->fds[fd].shared && !userland_dev_by_fd(ctx->fds[fd].fd, NULL)) {
+        /* A device descriptor is just a number: nothing was opened for it. */
         close(ctx->fds[fd].fd);
     }
     ctx->fds[fd].used = false;
@@ -3335,6 +3375,38 @@ static int userland_fd_dup(rvvm_userland_t* ctx, int host_fd, int min_fd, bool c
     return guest_fd;
 }
 
+/* A copy of a descriptor this userland owns (a pty end, a /dev entry): the same
+ * object with one more reference, at a guest slot of this table's choosing.
+ * There is no host fd to dup, which is why dup(2)/dup3(2)/F_DUPFD cannot simply
+ * call the host for it. Returns the guest fd, -1 when the table is full, or -2
+ * when @host_fd is an ordinary host descriptor and the caller should dup it
+ * itself. */
+static int userland_own_fd_dup(rvvm_userland_t* ctx, int host_fd, int min_fd, bool cloexec)
+{
+    struct userland_pty* pty = NULL;
+    bool master = false;
+    int  dev = -1;
+
+    if (userland_pty_by_fd(host_fd, &pty, &master)) {
+        int guest_fd = userland_fd_slot_alloc(ctx, min_fd);
+        if (guest_fd < 0) {
+            return -1;
+        }
+        userland_pty_ref(pty, master);
+        userland_fd_install(ctx, guest_fd, host_fd, cloexec);
+        return guest_fd;
+    }
+    if (userland_dev_by_fd(host_fd, &dev)) {
+        int guest_fd = userland_fd_slot_alloc(ctx, min_fd);
+        if (guest_fd < 0) {
+            return -1;
+        }
+        userland_fd_install(ctx, guest_fd, host_fd, cloexec);
+        return guest_fd;
+    }
+    return -2;
+}
+
 /* F_GETFD / F_SETFD: the guest's FD_CLOEXEC, which the host fd does not carry. */
 static bool userland_fd_get_cloexec(rvvm_userland_t* ctx, int fd)
 {
@@ -3358,10 +3430,10 @@ static void userland_fd_exec_close(rvvm_userland_t* ctx)
     }
     for (int fd = 0; fd < USERLAND_FD_TABLE_MAX; ++fd) {
         if (ctx->fds[fd].used && ctx->fds[fd].cloexec) {
-            if (!ctx->fds[fd].shared) {
-                close(ctx->fds[fd].fd);
-            }
-            ctx->fds[fd].used = false;
+            /* Through close(2)'s own path: what the slot rides on may be a host
+             * descriptor, or one of this userland's own objects (a pty end),
+             * and only that path knows which. */
+            userland_fd_close(ctx, fd);
         }
     }
 }
@@ -3375,10 +3447,9 @@ static void userland_fd_table_free(rvvm_userland_t* ctx)
     }
     for (int fd = 0; fd < USERLAND_FD_TABLE_MAX; ++fd) {
         if (ctx->fds[fd].used) {
-            if (!ctx->fds[fd].shared) {
-                close(ctx->fds[fd].fd);
-            }
-            ctx->fds[fd].used = false;
+            /* Through close(2)'s own path: a slot may ride on a host descriptor
+             * or on one of this userland's own objects. */
+            userland_fd_close(ctx, fd);
         }
     }
 }
@@ -3420,9 +3491,20 @@ static void userland_fd_table_init(rvvm_userland_t* ctx)
  * ride on the parent's host fd instead - marked shared, so it never closes it. */
 static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* parent)
 {
+    struct userland_pty* child_pty = NULL;
+    bool                 child_master = false;
+
     for (int fd = 0; fd < USERLAND_FD_TABLE_MAX; ++fd) {
         child->fds[fd] = parent->fds[fd];
         if (!parent->fds[fd].used) {
+            continue;
+        }
+        if (userland_pty_by_fd(parent->fds[fd].fd, &child_pty, &child_master)) {
+            /* An emulator object, not a host descriptor: there is nothing to
+             * dup, and the child shares the pair (its reference is counted, so
+             * the pair outlives both of them). */
+            userland_pty_ref(child_pty, child_master);
+            child->fds[fd].shared = false;
             continue;
         }
         if (parent->fds[fd].shared) {
@@ -4555,6 +4637,30 @@ typedef struct {
  * descriptor the host knows as userland_fd_host(i). A descriptor past the host's
  * own FD_SETSIZE cannot be watched at all - the bit is dropped rather than
  * reported ready for something that was never polled. */
+/* Is this a descriptor the host cannot watch - one of ours (a pty end, a /dev
+ * entry), or the console? The console is a host fd, so only the first kind
+ * needs handling here. */
+static bool userland_own_fd(int host_fd)
+{
+    struct userland_pty* pty = NULL;
+    bool master = false;
+    int dev = -1;
+    return userland_pty_by_fd(host_fd, &pty, &master) || userland_dev_by_fd(host_fd, &dev);
+}
+
+/* Ready right now, for the direction being watched. A /dev entry never blocks
+ * either way; a pty is ready when the ring has data (or the far end is gone). */
+static bool userland_own_ready(int host_fd, bool write)
+{
+    struct userland_pty* pty = NULL;
+    bool master = false;
+    int dev = -1;
+    if (userland_pty_by_fd(host_fd, &pty, &master)) {
+        return write || userland_pty_readable(pty, master);
+    }
+    return userland_dev_by_fd(host_fd, &dev);
+}
+
 static bool uapi_fdset_to_host(rvvm_userland_t* ctx, int nfds, rvvm_addr_t guest_set, fd_set* host_set)
 {
     if (!guest_set) {
@@ -4570,7 +4676,9 @@ static bool uapi_fdset_to_host(rvvm_userland_t* ctx, int nfds, rvvm_addr_t guest
             continue;
         }
         int host_fd = userland_fd_host(ctx, fd);
-        if (host_fd >= 0 && host_fd < FD_SETSIZE) {
+        /* A descriptor of ours is not a host descriptor: it cannot go into the
+         * set the host watches, and is answered from its own state instead. */
+        if (host_fd >= 0 && host_fd < FD_SETSIZE && !userland_own_fd(host_fd)) {
             FD_SET(host_fd, host_set);
         }
     }
@@ -4590,11 +4698,42 @@ static bool uapi_fdset_from_host(rvvm_userland_t* ctx, int nfds, rvvm_addr_t gue
     memset(gset, 0, sizeof(*gset));
     for (int fd = 0; fd < nfds && fd < UAPI_FD_SETSIZE; ++fd) {
         int host_fd = userland_fd_host(ctx, fd);
-        if (host_fd >= 0 && host_fd < FD_SETSIZE && FD_ISSET(host_fd, host_set)) {
+        if (host_fd < 0) {
+            continue;
+        }
+        if (userland_own_fd(host_fd)) {
+            continue;   // handled by the caller, which knows the direction
+        }
+        if (host_fd < FD_SETSIZE && FD_ISSET(host_fd, host_set)) {
             gset->bits[fd >> 6] |= 1ULL << (fd & 63);
         }
     }
     return true;
+}
+
+/* Mark in the guest's set every one of our own descriptors that is ready in the
+ * given direction, and return how many there were. */
+static int uapi_own_set_ready(rvvm_userland_t* ctx, int nfds, rvvm_addr_t guest_set, bool write)
+{
+    if (!guest_set) {
+        return 0;
+    }
+    uapi_fd_set* gset = to_ptr_sz(guest_set, sizeof(*gset));
+    if (!gset) {
+        return 0;
+    }
+    int ready = 0;
+    for (int fd = 0; fd < nfds && fd < UAPI_FD_SETSIZE; ++fd) {
+        if (!(gset->bits[fd >> 6] & (1ULL << (fd & 63)))) {
+            continue;
+        }
+        int host_fd = userland_fd_host(ctx, fd);
+        if (host_fd >= 0 && userland_own_fd(host_fd) && userland_own_ready(host_fd, write)) {
+            /* The bit is already the guest's fd: it stays set, and counts. */
+            ready++;
+        }
+    }
+    return ready;
 }
 
 static int rvvm_sys_select_time32(int nfds, rvvm_addr_t rfds, rvvm_addr_t wfds, rvvm_addr_t efds,
@@ -4611,19 +4750,61 @@ static int rvvm_sys_select_time32(int nfds, rvvm_addr_t rfds, rvvm_addr_t wfds, 
     fd_set* hefds = efds ? safe_new_obj(fd_set) : NULL;
 
     if (nfds < 0) {
-        ret = -UAPI_EINVAL;
-    } else if (!uapi_fdset_to_host(ctx, nfds, rfds, hrfds) ||
-               !uapi_fdset_to_host(ctx, nfds, wfds, hwfds) ||
-               !uapi_fdset_to_host(ctx, nfds, efds, hefds)) {
-        ret = -UAPI_EFAULT;
-    } else {
-        ret = errno_ret(select(nfds, hrfds, hwfds, hefds, uapi_ts32_to_timeval(&tv, ts32)));
-        if (ret >= 0) {
-            uapi_fdset_from_host(ctx, nfds, rfds, hrfds);
-            uapi_fdset_from_host(ctx, nfds, wfds, hwfds);
-            uapi_fdset_from_host(ctx, nfds, efds, hefds);
+        free(hrfds); free(hwfds); free(hefds);
+        return -UAPI_EINVAL;
+    }
+    if (!uapi_fdset_to_host(ctx, nfds, rfds, hrfds) ||
+        !uapi_fdset_to_host(ctx, nfds, wfds, hwfds) ||
+        !uapi_fdset_to_host(ctx, nfds, efds, hefds)) {
+        free(hrfds); free(hwfds); free(hefds);
+        return -UAPI_EFAULT;
+    }
+
+    int timeout_ms = -1;
+    if (ts32) {
+        struct timeval* t = uapi_ts32_to_timeval(&tv, ts32);
+        timeout_ms = t ? (int)(t->tv_sec * 1000 + t->tv_usec / 1000) : 0;
+    }
+
+    for (;;) {
+        struct timeval wait = {0};
+        int own = uapi_own_set_ready(ctx, nfds, rfds, false) +
+                  uapi_own_set_ready(ctx, nfds, wfds, true) +
+                  uapi_own_set_ready(ctx, nfds, efds, false);
+        /* Our own descriptors are answered here, so the host is only ever asked
+         * with a short timeout - the loop comes back to re-check them. */
+        int slice = own ? 0 : (timeout_ms < 0 ? 20 : (timeout_ms > 20 ? 20 : timeout_ms));
+        wait.tv_sec  = slice / 1000;
+        wait.tv_usec = (slice % 1000) * 1000;
+
+        ret = errno_ret(select(nfds, hrfds, hwfds, hefds, &wait));
+        if (ret < 0) {
+            break;
+        }
+        /* The host's answer first (which clears the sets and re-marks what it
+         * watched), then ours on top. */
+        uapi_fdset_from_host(ctx, nfds, rfds, hrfds);
+        uapi_fdset_from_host(ctx, nfds, wfds, hwfds);
+        uapi_fdset_from_host(ctx, nfds, efds, hefds);
+        ret += uapi_own_set_ready(ctx, nfds, rfds, false) +
+               uapi_own_set_ready(ctx, nfds, wfds, true) +
+               uapi_own_set_ready(ctx, nfds, efds, false);
+        if (ret > 0 || timeout_ms == 0) {
+            break;
+        }
+        if (timeout_ms > 0) {
+            timeout_ms -= slice;
+            if (timeout_ms <= 0) {
+                ret = 0;
+                break;
+            }
+        } else if (!slice) {
+            /* Nothing of ours was ready and the host had nothing to wait on
+             * either: do not spin. */
+            sleep_ms(1);
         }
     }
+
     free(hrfds);
     free(hwfds);
     free(hefds);
@@ -4635,7 +4816,7 @@ static int rvvm_sys_poll_time32(rvvm_addr_t pfds, size_t npfds, const struct uap
     rvvm_userland_t* ctx = uctx();
     int timeout = -1;
     if (ts32) {
-        timeout = (ts32->tv_sec * 1000) + (ts32->tv_nsec / 1000000);
+        timeout = (int)((ts32->tv_sec * 1000) + (ts32->tv_nsec / 1000000));
     }
     if (!pfds) {
         return npfds ? -UAPI_EFAULT : 0;
@@ -4644,21 +4825,79 @@ static int rvvm_sys_poll_time32(rvvm_addr_t pfds, size_t npfds, const struct uap
     if (!gfds) {
         return -UAPI_EFAULT;
     }
+
     /* The layout matches the host's (int + two shorts), but the fd inside does
-     * not: poll() is fed a copy carrying the host's numbers. */
-    struct pollfd* hfds = safe_new_arr(struct pollfd, npfds ? npfds : 1);
-    for (size_t i = 0; i < npfds; ++i) {
-        hfds[i].fd      = userland_fd_host(ctx, gfds[i].fd);
-        hfds[i].events  = gfds[i].events;
-        hfds[i].revents = 0;
-    }
-    int ret = errno_ret(poll(hfds, npfds, timeout));
-    if (ret > 0) {
+     * not: poll() is fed a copy carrying the host's numbers - and only the
+     * descriptors the host can watch go in at all, since a pty end or a /dev
+     * entry is answered from its own state. */
+    struct pollfd* hfds  = safe_new_arr(struct pollfd, npfds ? npfds : 1);
+    size_t*        hmap  = safe_new_arr(size_t, npfds ? npfds : 1);
+    int            ret   = 0;
+
+    for (;;) {
+        size_t hn = 0;
+        int    own = 0;
+
         for (size_t i = 0; i < npfds; ++i) {
-            gfds[i].revents = hfds[i].revents;
+            short want = gfds[i].events;
+            gfds[i].revents = 0;
+            int hfd = userland_fd_host(ctx, gfds[i].fd);
+            if (userland_own_fd(hfd)) {
+                short got = 0;
+                if ((want & POLLIN) && userland_own_ready(hfd, false))  got |= POLLIN;
+                if ((want & POLLOUT) && userland_own_ready(hfd, true))  got |= POLLOUT;
+                gfds[i].revents = got;
+                if (got) {
+                    own++;
+                }
+                continue;
+            }
+            hfds[hn].fd      = hfd;
+            hfds[hn].events  = want;
+            hfds[hn].revents = 0;
+            hmap[hn]         = i;
+            hn++;
+        }
+
+        /* With no host descriptor to wait on there is nothing to hand poll():
+         * the slice is what this loop sleeps, so it has to be one millisecond -
+         * otherwise the timeout would be consumed at CPU speed and the call
+         * would return long before anything had a chance to arrive. */
+        int slice = own ? 0 : (hn ? (timeout < 0 ? 20 : (timeout > 20 ? 20 : timeout)) : 1);
+        int hret  = hn ? errno_ret(poll(hfds, hn, slice)) : 0;
+        if (hret < 0) {
+            ret = hret;
+            break;
+        }
+        int ready = own;
+        if (hret > 0) {
+            for (size_t k = 0; k < hn; ++k) {
+                if (hfds[k].revents) {
+                    gfds[hmap[k]].revents = hfds[k].revents;
+                    ready++;
+                }
+            }
+        }
+        if (ready > 0 || timeout == 0) {
+            ret = ready;
+            break;
+        }
+        if (timeout > 0) {
+            timeout -= slice;
+            if (timeout <= 0) {
+                ret = 0;
+                break;
+            }
+        }
+        if (!hn) {
+            /* Every descriptor is ours and none is ready: hand the CPU over
+             * for the slice instead of spinning through the timeout. */
+            sleep_ms(slice);
         }
     }
+
     free(hfds);
+    free(hmap);
     return ret;
 }
 
@@ -5002,6 +5241,26 @@ static bool userland_deliver_signal(rvvm_userland_t* ctx, uint32_t sig)
     return false;  // default disposition
 }
 
+/* End one process of this address space, the way a signal with the default
+ * disposition does: its threads unwind, its parent sees the status through the
+ * registry, and - when it is the process the host started - the run ends.
+ *
+ * A signal aimed at a *child* must end that child: this is what makes
+ * `kill(child, SIGKILL)` a cleanup rather than suicide. */
+static void userland_kill_process(rvvm_userland_t* ctx, rvvm_process_t* proc, int sig)
+{
+    int status = 128 + sig;
+
+    if (proc->run_root) {
+        userland_exit_process(ctx, status, NULL);
+        return;
+    }
+    userland_proc_exit(proc, userland_exit_status(status));
+    /* The caller belongs to another process and is not exempt from anything:
+     * NULL means every thread of @proc unwinds. */
+    userland_finish_threads(ctx, proc, NULL);
+}
+
 /* Route a signal at @pid (0 or negative means "ourselves": process groups are not
  * modeled) and return the guest errno to hand back, 0 on success.
  *
@@ -5024,8 +5283,9 @@ static rvvm_addr_t userland_signal_pid(rvvm_userland_t* ctx, rvvm_user_thread_t*
         return -UAPI_EINVAL;
     }
 
+    rvvm_process_t* target = NULL;
     if (pid > 0) {
-        rvvm_process_t* target = userland_proc_find(ctx, (uint32_t)pid);
+        target = userland_proc_find(ctx, (uint32_t)pid);
         if (!target) {
             return -UAPI_ESRCH;
         }
@@ -5034,14 +5294,29 @@ static rvvm_addr_t userland_signal_pid(rvvm_userland_t* ctx, rvvm_user_thread_t*
             userland_proc_unref(target);
             return errno_ret(kill((pid_t)host_pid, (int)sig));
         }
-        userland_proc_unref(target);
     }
 
     if (sig == 0) {
-        return 0;   // kill(pid, 0) is a liveness probe, not a signal
+        // kill(pid, 0) is a liveness probe, not a signal
+        if (target) {
+            userland_proc_unref(target);
+        }
+        return 0;
     }
 
-    if (!userland_deliver_signal(ctx, sig)) {
+    if (userland_deliver_signal(ctx, sig)) {
+        if (target) {
+            userland_proc_unref(target);
+        }
+        return 0;
+    }
+
+    /* Default disposition: no handler can run for it, so the process the signal
+     * named ends. With no pid at all, that is the caller's own. */
+    if (target) {
+        userland_kill_process(ctx, target, (int)sig);
+        userland_proc_unref(target);
+    } else {
         userland_exit_process(ctx, 128 + (int)sig, self);
     }
     return 0;
@@ -5068,6 +5343,877 @@ static rvvm_addr_t userland_signal_tid(rvvm_userland_t* ctx, rvvm_user_thread_t*
         }
     }
     return userland_signal_pid(ctx, self, (int32_t)pid, sig);
+}
+
+/* ============================================================
+ * setitimer(2) and the SIGALRM it feeds
+ *
+ * The interval is not the host's to keep. A host setitimer() would expire as a
+ * SIGALRM on *this* process, where rt_sigaction() installed a shim that does
+ * nothing but log - the guest's handler only ever runs because the emulator
+ * queues the signal and the vCPU injects it at an instruction boundary (see
+ * userland_deliver_signal). Serving ITIMER_REAL from a thread of our own is
+ * therefore both the only way on win32 (no setitimer() there at all: the shim's
+ * is an ENOSYS stub), and the only way the guest's handler ever runs on the
+ * others.
+ *
+ * Only ITIMER_REAL is served: the CPU-time timers (ITIMER_VIRTUAL/PROF) need
+ * per-thread CPU accounting this userland does not keep, so they report EINVAL
+ * rather than pretending to run.
+ *
+ * The state is per address space, which is what it has to be: an in-process
+ * fork() gives the child its own context and therefore its own timer.
+ * ============================================================ */
+#define UAPI_ITIMER_REAL 0
+#define UAPI_SIGALRM     14
+
+/* Monotonic nanoseconds. Every wait this file does is measured with it, so it
+ * is defined for every host, not only the one without setitimer(). */
+static uint64_t userland_monotonic_ns(void)
+{
+    struct timespec ts = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts)) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Sleep until @deadline. Returns 0 when the sleep completed, or the nanoseconds
+ * still left when a signal ended it - which is what nanosleep(2) reports in
+ * @rem, and what its callers restart with.
+ *
+ * The emulator's own blocking calls have to be interruptible: a signal is
+ * injected at the vCPU's next instruction boundary, and a guest parked inside
+ * one of these never reaches one. Delivering only after the sleep returned on
+ * its own is how an alarm half a second late - or never - happens.
+ *
+ * The remainder has to be honest: a libc that retries on EINTR (musl's
+ * nanosleep loop) would otherwise restart the *full* interval every time and
+ * never make progress against a repeating signal. */
+static uint64_t userland_sleep_until(uint64_t deadline_ns)
+{
+    rvvm_userland_t* ctx = uctx();
+
+    for (;;) {
+        uint64_t now = userland_monotonic_ns();
+        if (atomic_load_uint32(&ctx->sig_pending)) {
+            return now < deadline_ns ? (deadline_ns - now) : 1;
+        }
+        if (now >= deadline_ns) {
+            return 0;
+        }
+        /* userland_deliver_signal() wakes this event, which is what makes the
+         * wait end the moment a signal is queued rather than at the next
+         * poll boundary. Any other wake just re-loops. */
+        rvvm_event_wait(&ctx->tty_in_event, deadline_ns - now);
+    }
+}
+
+typedef struct userland_itimer {
+    rvvm_userland_t* ctx;
+    rvvm_thread_t*   thread;
+    spinlock_t       lock;
+    rvvm_event_t     wake;       // armed / disarmed / stopped
+    uint64_t         deadline_ns;// 0 = disarmed
+    uint64_t         interval_ns;// 0 = one-shot
+    uint32_t         stopped;
+    bool             started;
+} userland_itimer_t;
+
+static void* userland_itimer_thread(void* arg)
+{
+    userland_itimer_t* it = arg;
+
+    while (!atomic_load_uint32(&it->stopped)) {
+        uint64_t deadline, interval;
+
+        spin_lock(&it->lock);
+        deadline = it->deadline_ns;
+        interval = it->interval_ns;
+        spin_unlock(&it->lock);
+
+        if (!deadline) {
+            /* Disarmed: sleep until something arms us again. */
+            rvvm_event_wait(&it->wake, RVVM_EVENT_INFINITE);
+            continue;
+        }
+
+        uint64_t now = userland_monotonic_ns();
+        if (now < deadline) {
+            rvvm_event_wait(&it->wake, deadline - now);
+            continue;
+        }
+
+        spin_lock(&it->lock);
+        /* Rearm before delivering, so a handler that sets a new timer is not
+         * overwritten by the expiry it is running in. */
+        it->deadline_ns = interval ? (now + interval) : 0;
+        spin_unlock(&it->lock);
+
+        /* pid 0: the signal is for whoever is running here, which is the only
+         * process a timer can mean. Undeliverable (no handler) means the
+         * default disposition, exactly as kill(2) reports it. */
+        userland_signal_pid(it->ctx, it->ctx->userland_main_thread, 0, UAPI_SIGALRM);
+    }
+    return NULL;
+}
+
+/* setitimer(ITIMER_REAL, @newval, @oldval) in guest errno terms. */
+static rvvm_addr_t userland_setitimer_real(rvvm_userland_t* ctx,
+                                           const struct uapi_itimerval* newval,
+                                           struct uapi_itimerval* oldval)
+{
+    if (!ctx->itimer) {
+        ctx->itimer = safe_new_obj(userland_itimer_t);
+        if (!ctx->itimer) {
+            return -UAPI_ENOMEM;
+        }
+        ctx->itimer->ctx = ctx;
+        rvvm_lock_init(&ctx->itimer->lock);
+        rvvm_event_init(&ctx->itimer->wake);
+    }
+
+    userland_itimer_t* it = ctx->itimer;
+    uint64_t now = userland_monotonic_ns();
+    bool     start = false;
+
+    spin_lock(&it->lock);
+    if (oldval) {
+        memset(oldval, 0, sizeof(*oldval));
+        if (it->deadline_ns > now) {
+            uint64_t left = it->deadline_ns - now;
+            oldval->it_value.tv_sec  = left / 1000000000ULL;
+            oldval->it_value.tv_usec = (left / 1000ULL) % 1000000ULL;
+        }
+        oldval->it_interval.tv_sec  = it->interval_ns / 1000000000ULL;
+        oldval->it_interval.tv_usec = (it->interval_ns / 1000ULL) % 1000000ULL;
+    }
+    uint64_t value_ns = 0, interval_ns = 0;
+    if (newval) {
+        value_ns    = (uint64_t)newval->it_value.tv_sec * 1000000000ULL +
+                      (uint64_t)newval->it_value.tv_usec * 1000ULL;
+        interval_ns = (uint64_t)newval->it_interval.tv_sec * 1000000000ULL +
+                      (uint64_t)newval->it_interval.tv_usec * 1000ULL;
+    }
+    it->interval_ns = value_ns ? interval_ns : 0;
+    it->deadline_ns = value_ns ? (now + value_ns) : 0;
+    if (value_ns && !it->started) {
+        it->started = true;
+        start = true;
+    }
+    spin_unlock(&it->lock);
+
+    rvvm_event_wake(&it->wake);
+
+    if (start) {
+        it->thread = rvvm_thread_create(userland_itimer_thread, it);
+        if (!it->thread) {
+            it->started = false;
+            return -UAPI_EAGAIN;
+        }
+    }
+    return 0;
+}
+
+/* The run is over: the timer thread holds a pointer to this context, so it has
+ * to be gone before the context is. */
+static void userland_itimer_stop(rvvm_userland_t* ctx)
+{
+    userland_itimer_t* it = ctx->itimer;
+    if (!it) {
+        return;
+    }
+    atomic_store_uint32(&it->stopped, 1);
+    rvvm_event_wake(&it->wake);
+    if (it->thread) {
+        rvvm_thread_join(it->thread);
+    }
+    free(it);
+    ctx->itimer = NULL;
+}
+
+/* ============================================================
+ * Pseudo-terminals
+ *
+ * A pty is a pair of descriptors with a line discipline between them: what the
+ * master writes is what the slave reads (through the input rules - ICRNL,
+ * canonical line assembly, echo), and what the slave writes is what the master
+ * reads (through the output rules - ONLCR). It is what makes a login session
+ * possible at all: the shell a server execs is given the *slave* as its stdin,
+ * stdout and stderr, and the server ships bytes between the master and its
+ * client. Without one, an interactive session over a socket has nothing to run
+ * on.
+ *
+ * On a Linux or Android host a guest open of /dev/ptmx reaches the real kernel
+ * one: /dev is one of the paths that bypass the prefix mapping entirely (see
+ * path_bypass()), and the ioctls on its fd are forwarded to the host. Windows
+ * has no /dev at all, so the pair is made here instead - two fds from a
+ * reserved range, no host descriptor behind either, with the discipline the
+ * console input path already implements (which is why the two share its termios
+ * handling).
+ * ============================================================ */
+#define USERLAND_PTY_MAX   16
+#define USERLAND_PTY_RING  4096
+
+/* Where a pty's two fds live: far above any host fd, and clear of the asset
+ * mount's synthetic ones. Even index is a master, odd its slave. */
+#define RVVM_PTY_FD_BASE   0x7B000000
+
+/* c_oflag / c_cflag bit the output side acts on (asm-generic values). */
+#define UAPI_TTY_OPOST 0x1
+#define UAPI_TTY_ONLCR 0x4
+
+typedef struct {
+    uint8_t buf[USERLAND_PTY_RING];
+    size_t  head;
+    size_t  len;
+} userland_pty_ring;
+
+struct userland_pty {
+    uint32_t     index;            // N of /dev/pts/N
+    spinlock_t   lock;
+    rvvm_event_t event;            // wakes a reader parked on an empty ring
+    userland_pty_ring to_slave;    // written by the master, read by the slave
+    userland_pty_ring to_master;   // written by the slave, read by the master
+    uint8_t      slave_line[TTY_IN_LINE];
+    size_t       slave_line_len;   // canonical line under construction
+    uint32_t     lflag;            // c_lflag: ICANON, ECHO
+    uint32_t     iflag;            // c_iflag: ICRNL
+    uint32_t     oflag;            // c_oflag: ONLCR
+    uint32_t     rows;
+    uint32_t     cols;
+    bool         locked;           // TIOCSPTLCK: a slave may not be opened yet
+    bool         slave_eof;        // master wrote VEOF on an empty line
+    /* How many descriptors hold each end: an in-process fork() hands the child
+     * a copy of the same fd, and the pair outlives the last of them. */
+    uint32_t     refs[2];          // [0] master, [1] slave
+};
+
+static bool userland_pty_end_open(struct userland_pty* pty, bool master)
+{
+    return pty->refs[master ? 0 : 1] != 0;
+}
+
+/* The pairs are emulator-wide, not per address space: an in-process fork()
+ * hands the child the same pty fd, and both sides have to reach the same pair -
+ * that is what inheriting one from a real kernel means. Their lifetime is the
+ * two descriptors', not any one machine's. */
+static spinlock_t           userland_pty_lock = RVVM_LOCK_INIT;
+static struct userland_pty* userland_ptys[USERLAND_PTY_MAX];
+
+static int userland_pty_master_fd(uint32_t index)
+{
+    return (int)(RVVM_PTY_FD_BASE + index * 2);
+}
+
+static int userland_pty_slave_fd(uint32_t index)
+{
+    return (int)(RVVM_PTY_FD_BASE + index * 2 + 1);
+}
+
+/* Decode a descriptor the fd table is carrying: a pty fd is a number from the
+ * reserved range, and the low bit says which end it is. */
+static bool userland_pty_by_fd(int fd, struct userland_pty** out_pty, bool* out_master)
+{
+    if (fd < 0 || (uint32_t)fd < RVVM_PTY_FD_BASE) {
+        return false;
+    }
+    uint32_t slot = ((uint32_t)fd - RVVM_PTY_FD_BASE);
+    uint32_t index = slot / 2;
+    if (index >= USERLAND_PTY_MAX) {
+        return false;
+    }
+    spin_lock(&userland_pty_lock);
+    struct userland_pty* pty = userland_ptys[index];
+    spin_unlock(&userland_pty_lock);
+    if (!pty) {
+        return false;
+    }
+    if (out_pty) {
+        *out_pty = pty;
+    }
+    if (out_master) {
+        *out_master = (slot & 1) == 0;
+    }
+    return true;
+}
+
+/* A new pair, with its master open. -1 when they are all taken. */
+static int userland_pty_alloc(void)
+{
+    spin_lock(&userland_pty_lock);
+    int index = -1;
+    for (uint32_t i = 0; i < USERLAND_PTY_MAX; ++i) {
+        if (!userland_ptys[i]) {
+            index = (int)i;
+            break;
+        }
+    }
+    /* Claim the slot under the lock so two threads cannot both get it. */
+    if (index >= 0) {
+        userland_ptys[index] = (struct userland_pty*)(size_t)-1;
+    }
+    spin_unlock(&userland_pty_lock);
+    if (index < 0) {
+        return -1;
+    }
+
+    struct userland_pty* pty = safe_new_obj(struct userland_pty);
+    if (!pty) {
+        spin_lock(&userland_pty_lock);
+        userland_ptys[index] = NULL;
+        spin_unlock(&userland_pty_lock);
+        return -1;
+    }
+    pty->index       = (uint32_t)index;
+    pty->lflag       = TTY_LFLAG_DEFAULT;
+    pty->iflag       = TTY_IFLAG_DEFAULT;
+    pty->oflag       = UAPI_TTY_OPOST | UAPI_TTY_ONLCR;
+    pty->rows        = 24;
+    pty->cols        = 80;
+    pty->locked      = true;   // a slave is opened only after TIOCSPTLCK
+    pty->refs[0]     = 1;      // the master this allocation is for
+    rvvm_lock_init(&pty->lock);
+    rvvm_event_init(&pty->event);
+
+    spin_lock(&userland_pty_lock);
+    userland_ptys[index] = pty;
+    spin_unlock(&userland_pty_lock);
+    return index;
+}
+
+/* Another descriptor for an end that already exists: opening /dev/pts/N a
+ * second time, or a fork()ed child inheriting one. */
+static void userland_pty_ref(struct userland_pty* pty, bool master)
+{
+    spin_lock(&pty->lock);
+    pty->refs[master ? 0 : 1]++;
+    spin_unlock(&pty->lock);
+}
+
+/* One descriptor for an end is gone. The pair itself goes with the last of
+ * them - and only then, since a fork()ed child still reading the slave has to
+ * keep seeing it. */
+static void userland_pty_release(struct userland_pty* pty, bool master)
+{
+    uint32_t left;
+
+    spin_lock(&pty->lock);
+    if (pty->refs[master ? 0 : 1]) {
+        pty->refs[master ? 0 : 1]--;
+    }
+    left = pty->refs[0] + pty->refs[1];
+    spin_unlock(&pty->lock);
+
+    if (!left) {
+        spin_lock(&userland_pty_lock);
+        if (userland_ptys[pty->index] == pty) {
+            userland_ptys[pty->index] = NULL;
+        }
+        spin_unlock(&userland_pty_lock);
+        free(pty);
+    }
+    /* A reader parked on the other end has to notice the hangup. */
+    rvvm_event_wake(&pty->event);
+}
+
+static size_t pty_ring_put(userland_pty_ring* ring, const uint8_t* src, size_t len)
+{
+    size_t room = USERLAND_PTY_RING - ring->len;
+    size_t n = len > room ? room : len;
+    for (size_t i = 0; i < n; ++i) {
+        ring->buf[(ring->head + ring->len + i) % USERLAND_PTY_RING] = src[i];
+    }
+    ring->len += n;
+    return n;
+}
+
+static size_t pty_ring_get(userland_pty_ring* ring, uint8_t* dst, size_t len)
+{
+    size_t n = len > ring->len ? ring->len : len;
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = ring->buf[(ring->head + i) % USERLAND_PTY_RING];
+    }
+    ring->head = (ring->head + n) % USERLAND_PTY_RING;
+    ring->len -= n;
+    return n;
+}
+
+/* The slave wrote: ONLCR turns its bare LF into the CRLF a terminal expects,
+ * and the result is what the master reads. */
+static size_t userland_pty_slave_put(struct userland_pty* pty, const uint8_t* src, size_t len)
+{
+    spin_lock(&pty->lock);
+    size_t done = 0;
+    if (pty->oflag & UAPI_TTY_ONLCR) {
+        for (size_t i = 0; i < len; ++i) {
+            if (src[i] == '\n') {
+                const uint8_t crlf[2] = {'\r', '\n'};
+                done += pty_ring_put(&pty->to_master, crlf, 2);
+            } else {
+                done += pty_ring_put(&pty->to_master, src + i, 1);
+            }
+        }
+    } else {
+        done = pty_ring_put(&pty->to_master, src, len);
+    }
+    spin_unlock(&pty->lock);
+    rvvm_event_wake(&pty->event);
+    return done;
+}
+
+/* The master wrote: these are the bytes a terminal would have typed, so they go
+ * through the input discipline - ICRNL, canonical line assembly with erase, and
+ * echo back at whoever is on the other end. */
+static void userland_pty_master_put(struct userland_pty* pty, const uint8_t* src, size_t len)
+{
+    uint8_t echo[USERLAND_PTY_RING];
+    size_t  echo_len = 0;
+
+    spin_lock(&pty->lock);
+    bool canon = (pty->lflag & TTY_LFLAG_ICANON) != 0;
+    bool icrnl = (pty->iflag & TTY_IFLAG_ICRNL) != 0;
+    bool echo_on = (pty->lflag & TTY_LFLAG_ECHO) != 0;
+
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t c = src[i];
+        if (icrnl && c == '\r') {
+            c = '\n';
+        }
+        if (!canon) {
+            pty_ring_put(&pty->to_slave, &c, 1);
+            if (echo_on && echo_len < sizeof(echo)) {
+                echo[echo_len++] = c;
+            }
+            continue;
+        }
+        if (c == TTY_CC_ERASE) {
+            /* One Backspace takes one character out of the line under
+             * construction, however many bytes of UTF-8 it took to type. */
+            if (pty->slave_line_len) {
+                size_t n = pty->slave_line_len;
+                while (n > 1 && (pty->slave_line[n - 1] & 0xC0) == 0x80) {
+                    n--;
+                }
+                pty->slave_line_len = n - 1;
+                if (echo_on && echo_len + 3 < sizeof(echo)) {
+                    echo[echo_len++] = '\b';
+                    echo[echo_len++] = ' ';
+                    echo[echo_len++] = '\b';
+                }
+            }
+            continue;
+        }
+        if (c == TTY_CC_VEOF) {
+            /* Ctrl-D: the pending line goes as it stands; on an empty line it
+             * is end-of-file, which read() reports as 0. */
+            if (pty->slave_line_len) {
+                pty_ring_put(&pty->to_slave, pty->slave_line, pty->slave_line_len);
+                pty->slave_line_len = 0;
+            } else {
+                pty->slave_eof = true;
+            }
+            continue;
+        }
+        if (c == '\n') {
+            if (pty->slave_line_len) {
+                pty_ring_put(&pty->to_slave, pty->slave_line, pty->slave_line_len);
+                pty->slave_line_len = 0;
+            }
+            pty_ring_put(&pty->to_slave, &c, 1);
+            if (echo_on && echo_len + 2 <= sizeof(echo)) {
+                echo[echo_len++] = '\r';
+                echo[echo_len++] = '\n';
+            }
+            continue;
+        }
+        if (pty->slave_line_len < sizeof(pty->slave_line)) {
+            pty->slave_line[pty->slave_line_len++] = c;
+            if (echo_on && echo_len < sizeof(echo)) {
+                echo[echo_len++] = c;
+            }
+        }
+    }
+    spin_unlock(&pty->lock);
+
+    /* Echo lands in the master's read side, which is where a terminal would
+     * have shown it - and it is what lets the far end of an ssh session see
+     * what it typed. */
+    if (echo_len) {
+        spin_lock(&pty->lock);
+        pty_ring_put(&pty->to_master, echo, echo_len);
+        spin_unlock(&pty->lock);
+    }
+    rvvm_event_wake(&pty->event);
+}
+
+/* Readable: data waiting, or a hangup / EOF the read has to report. */
+static bool userland_pty_readable(struct userland_pty* pty, bool master)
+{
+    bool ready;
+    spin_lock(&pty->lock);
+    if (master) {
+        ready = pty->to_master.len || !pty->refs[1];
+    } else {
+        ready = pty->to_slave.len || pty->slave_eof || !pty->refs[0];
+    }
+    spin_unlock(&pty->lock);
+    return ready;
+}
+
+/* ============================================================
+ * /dev entries the userland serves itself
+ *
+ * /dev bypasses the prefix mapping (see path_bypass()), which is what lets a
+ * guest reach a real /dev/ptmx on a Linux or Android host. Windows has no /dev
+ * at all, so the few devices a session cannot start without are answered here
+ * with descriptors of the same kind the pty pair uses: numbers from a reserved
+ * range, no host fd behind them.
+ * ============================================================ */
+#define RVVM_DEV_FD_BASE  0x7C000000
+
+#define DEV_NULL          0
+#define DEV_ZERO          1
+#define DEV_RANDOM        2
+
+static bool userland_dev_by_fd(int fd, int* out_dev)
+{
+    if (fd < 0 || (uint32_t)fd < RVVM_DEV_FD_BASE) {
+        return false;
+    }
+    uint32_t dev = (uint32_t)fd - RVVM_DEV_FD_BASE;
+    if (dev > DEV_RANDOM) {
+        return false;
+    }
+    if (out_dev) {
+        *out_dev = (int)dev;
+    }
+    return true;
+}
+
+static int userland_dev_fd(int dev)
+{
+    return (int)(RVVM_DEV_FD_BASE + (uint32_t)dev);
+}
+
+static int64_t userland_dev_read(int dev, void* buf, size_t count)
+{
+    if (!buf) {
+        return -UAPI_EFAULT;
+    }
+    switch (dev) {
+        case DEV_NULL:  return 0;                       // EOF, always
+        case DEV_ZERO:  memset(buf, 0, count); return (int64_t)count;
+        case DEV_RANDOM: rvvm_randombytes(buf, count); return (int64_t)count;
+    }
+    return -UAPI_EINVAL;
+}
+
+static int64_t userland_dev_write(int dev, const void* buf, size_t count)
+{
+    if (!buf) {
+        return -UAPI_EFAULT;
+    }
+    (void)dev;   // /dev/null and /dev/zero both swallow everything
+    return (int64_t)count;
+}
+
+/* The guest path names one of the devices above. */
+static bool guest_dev_device(char* abs, size_t size, const char* path)
+{
+    if (!guest_path_absolutize(abs, size, path)) {
+        return false;
+    }
+    if (!strcmp(abs, "/dev/ptmx") || !strcmp(abs, "/dev/pts/ptmx")) {
+        return true;
+    }
+    if (!strncmp(abs, "/dev/pts/", 9)) {
+        const char* num = abs + 9;
+        if (!*num) {
+            return false;   // "/dev/pts" itself is a directory, not a device
+        }
+        for (const char* p = num; *p; ++p) {
+            if (*p < '0' || *p > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+    return !strcmp(abs, "/dev/urandom") || !strcmp(abs, "/dev/random") ||
+           !strcmp(abs, "/dev/null")    || !strcmp(abs, "/dev/zero");
+}
+
+/* openat() on one of them, in host errno terms (the dispatch converts). */
+static int userland_dev_open(const char* abs, int flags)
+{
+    (void)flags;   // every device here answers reads and writes alike
+
+    if (!strcmp(abs, "/dev/ptmx") || !strcmp(abs, "/dev/pts/ptmx")) {
+        return userland_pty_open_master();
+    }
+    if (!strncmp(abs, "/dev/pts/", 9)) {
+        unsigned long index = 0;
+        for (const char* p = abs + 9; *p; ++p) {
+            index = index * 10 + (unsigned long)(*p - '0');
+            if (index > 0xFFFFFF) {
+                break;
+            }
+        }
+        return userland_pty_open_slave((uint32_t)index);
+    }
+    if (!strcmp(abs, "/dev/urandom") || !strcmp(abs, "/dev/random")) {
+        return userland_dev_fd(DEV_RANDOM);
+    }
+    if (!strcmp(abs, "/dev/null")) {
+        return userland_dev_fd(DEV_NULL);
+    }
+    if (!strcmp(abs, "/dev/zero")) {
+        return userland_dev_fd(DEV_ZERO);
+    }
+    errno = ENOENT;
+    return -1;
+}
+
+/* read(2) on either end: the byte count, 0 for EOF, or a negative errno. */
+static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* buf, size_t count, bool block)
+{
+    rvvm_userland_t* ctx = uctx();
+    if (!buf) {
+        return -UAPI_EFAULT;
+    }
+    if (!count) {
+        return 0;
+    }
+
+    for (;;) {
+        if (atomic_load_uint32(&ctx->sig_pending)) {
+            /* A signal arrived while the guest was parked here: -EINTR gets the
+             * vCPU to the delivery boundary, where the handler runs first. */
+            return -UAPI_EINTR;
+        }
+
+        spin_lock(&pty->lock);
+        userland_pty_ring* ring = master ? &pty->to_master : &pty->to_slave;
+        if (ring->len) {
+            size_t n = pty_ring_get(ring, buf, count);
+            spin_unlock(&pty->lock);
+            return (int64_t)n;
+        }
+        if (master) {
+            if (!pty->refs[1]) {
+                spin_unlock(&pty->lock);
+                /* EIO is what a real master reports once its slave is gone, and
+                 * it is how a server learns the session ended. */
+                return -UAPI_EIO;
+            }
+        } else {
+            if (pty->slave_eof) {
+                pty->slave_eof = false;
+                spin_unlock(&pty->lock);
+                return 0;
+            }
+            if (!pty->refs[0]) {
+                spin_unlock(&pty->lock);
+                return 0;   // the terminal hung up: EOF for the session
+            }
+        }
+        spin_unlock(&pty->lock);
+
+        if (!block) {
+            return 0;
+        }
+        /* Wake on new bytes or a hangup; the timeout is only so a signal
+         * arriving while we wait is noticed. */
+        rvvm_event_wait(&pty->event, 5000000ULL);
+    }
+}
+
+static int64_t userland_pty_write(struct userland_pty* pty, bool master, const void* buf, size_t count)
+{
+    if (!buf) {
+        return -UAPI_EFAULT;
+    }
+    if (!count) {
+        return 0;
+    }
+    if (master) {
+        userland_pty_master_put(pty, buf, count);
+        return (int64_t)count;
+    }
+    size_t n = userland_pty_slave_put(pty, buf, count);
+    /* A short write is only the ring filling up; the caller writes again. */
+    return (int64_t)n;
+}
+
+/* The ioctls a pty exists for. Everything else is ENOTTY, which is what a
+ * non-terminal descriptor answers - and what tells isatty() that this is one. */
+static int64_t userland_pty_ioctl(struct userland_pty* pty, bool master, uint64_t cmd, void* arg,
+                                  int32_t caller_pid)
+{
+    switch (cmd) {
+        case UAPI_TIOCGPTN: {   // the N of /dev/pts/N, for ptsname()
+            if (!master || !arg) {
+                return -UAPI_EINVAL;
+            }
+            int n = (int)pty->index;
+            memcpy(arg, &n, sizeof(n));
+            return 0;
+        }
+        case UAPI_TIOCSPTLCK: { // grantpt()/unlockpt(): the slave may be opened
+            if (!master) {
+                return -UAPI_ENOTTY;
+            }
+            int lock = 0;
+            if (arg) {
+                memcpy(&lock, arg, sizeof(lock));
+            }
+            spin_lock(&pty->lock);
+            pty->locked = lock != 0;
+            spin_unlock(&pty->lock);
+            return 0;
+        }
+        case UAPI_TCGETS: {
+            if (!arg) {
+                return -UAPI_EINVAL;
+            }
+            uapi_termios_t t;
+            memset(&t, 0, sizeof(t));
+            spin_lock(&pty->lock);
+            t.c_iflag = pty->iflag;
+            t.c_oflag = pty->oflag;
+            t.c_lflag = pty->lflag;
+            spin_unlock(&pty->lock);
+            t.c_cflag = 0x30 | 0x80 | 0xF;  // CS8 | CREAD | B38400, as the console reports
+            t.c_cc[6] = 1;                  // VMIN
+            t.c_ispeed = t.c_ospeed = 0xF;  // B38400
+            memcpy(arg, &t, sizeof(t));
+            return 0;
+        }
+        case UAPI_TCSETS:
+        case UAPI_TCSETSW:
+        case UAPI_TCSETSF:
+            /* The guest's modes are honoured for the flags that shape both
+             * directions: ICANON / ECHO / ECHOE on input, ONLCR on output. The
+             * rest is fixed, matching TCGETS above. */
+            if (arg) {
+                const uapi_termios_t* t = arg;
+                spin_lock(&pty->lock);
+                pty->lflag = t->c_lflag;
+                pty->iflag = t->c_iflag;
+                pty->oflag = t->c_oflag;
+                spin_unlock(&pty->lock);
+            }
+            return 0;
+        case UAPI_TIOCGWINSZ: {
+            if (!arg) {
+                return -UAPI_EINVAL;
+            }
+            uapi_winsize_t ws = {0};
+            spin_lock(&pty->lock);
+            ws.ws_row = (uint16_t)pty->rows;
+            ws.ws_col = (uint16_t)pty->cols;
+            spin_unlock(&pty->lock);
+            memcpy(arg, &ws, sizeof(ws));
+            return 0;
+        }
+        case UAPI_TIOCSWINSZ:
+            /* Here the grid is the *session's*, not the host's: there is no
+             * viewport behind a pty, so what the server sets is what the guest
+             * inside it gets. A resize is also what SIGWINCH is for. */
+            if (arg) {
+                const uapi_winsize_t* ws = arg;
+                spin_lock(&pty->lock);
+                if (ws->ws_row) pty->rows = ws->ws_row;
+                if (ws->ws_col) pty->cols = ws->ws_col;
+                spin_unlock(&pty->lock);
+            }
+            return 0;
+        case UAPI_TIOCGPGRP: {
+            /* No process groups are modelled, so the foreground group is the
+             * caller: a shell compares this answer with getpgrp() and moves
+             * into the foreground when the two agree, and with two different
+             * answers it would signal itself round and round instead. */
+            if (!arg) {
+                return -UAPI_EINVAL;
+            }
+            memcpy(arg, &caller_pid, sizeof(caller_pid));
+            return 0;
+        }
+        case UAPI_TIOCSPGRP:
+        case UAPI_TIOCSCTTY:
+            return 0;   // accepted: the pair is already the session's terminal
+        case UAPI_FIONREAD: {
+            if (!arg) {
+                return -UAPI_EINVAL;
+            }
+            int count = 0;
+            spin_lock(&pty->lock);
+            count = (int)(master ? pty->to_master.len : pty->to_slave.len);
+            spin_unlock(&pty->lock);
+            memcpy(arg, &count, sizeof(count));
+            return 0;
+        }
+    }
+    return -UAPI_ENOTTY;
+}
+
+/* fstat(2) and stat() on either end: a character device, which is what makes
+ * S_ISCHR() - and therefore isatty()-style checks in a guest libc - true. */
+static void userland_pty_fill_stat(struct userland_pty* pty, bool master, struct stat* st)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_mode    = S_IFCHR | (master ? 0620 : 0666);
+    st->st_rdev    = (136ULL << 8) | (pty ? (pty->index & 0xFF) : 0);  // Linux's /dev/pts major
+    st->st_nlink   = 1;
+    st->st_blksize = 4096;
+}
+
+/* The same shape for /dev/null, /dev/zero and /dev/urandom: character devices
+ * with no pair behind them. */
+static void userland_dev_fill_stat(struct stat* st)
+{
+    userland_pty_fill_stat(NULL, true, st);
+}
+
+/* openat() on /dev/ptmx: a new pair, with the master as the descriptor the
+ * guest gets back. -1 (with errno) when there is no pair left. */
+static int userland_pty_open_master(void)
+{
+    int index = userland_pty_alloc();
+    if (index < 0) {
+        errno = EMFILE;
+        return -1;
+    }
+    return userland_pty_master_fd((uint32_t)index);
+}
+
+/* openat() on /dev/pts/N: the slave of pair N. */
+static int userland_pty_open_slave(uint32_t index)
+{
+    if (index >= USERLAND_PTY_MAX) {
+        errno = ENOENT;
+        return -1;
+    }
+    spin_lock(&userland_pty_lock);
+    struct userland_pty* pty = userland_ptys[index];
+    /* Refd while the table is held: the pair is freed the moment its last
+     * descriptor goes, which cannot happen in between. */
+    if (pty) {
+        userland_pty_ref(pty, false);
+    }
+    spin_unlock(&userland_pty_lock);
+    if (!pty) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (pty->locked) {
+        /* Still locked: Linux answers EIO here, which is what tells a caller it
+         * forgot unlockpt(). */
+        userland_pty_release(pty, true);
+        errno = EIO;
+        return -1;
+    }
+    return userland_pty_slave_fd(index);
 }
 
 /* Resize the guest's console and tell it so.
@@ -5335,6 +6481,13 @@ static void* rvvm_user_thread_wrap(void* arg)
 #endif
                 case 23: { // dup
                     rvvm_info("sys_dup(%ld)", a0);
+                    /* A descriptor of ours (a pty end) has no host fd to copy:
+                     * the copy is another reference to the same object. */
+                    int own = userland_own_fd_dup(uctx(), userland_fd_host(uctx(), (int)a0), 0, false);
+                    if (own != -2) {
+                        a0 = own >= 0 ? (rvvm_addr_t)own : (rvvm_addr_t)-UAPI_EMFILE;
+                        break;
+                    }
                     /* The copy is the host's to make; the number the guest sees
                      * is this table's, because the host's number for the copy
                      * means nothing here - it may already be one of the guest's
@@ -5369,9 +6522,29 @@ static void* rvvm_user_thread_wrap(void* arg)
                         }
                         break;
                     }
+                    int host_old = userland_fd_host(uctx(), oldfd);
+
+                    /* A descriptor this userland owns (a pty end, a /dev entry)
+                     * has no host fd to duplicate: the copy is another
+                     * reference to the same object. The reference is taken
+                     * before whatever sat on @newfd is released, so the object
+                     * cannot go away in between. */
+                    if (userland_own_fd(host_old)) {
+                        struct userland_pty* pty = NULL;
+                        bool master = false;
+                        int  dev = -1;
+                        if (userland_pty_by_fd(host_old, &pty, &master)) {
+                            userland_pty_ref(pty, master);
+                        }
+                        (void)dev;   // a /dev entry is the number itself
+                        userland_fd_close(uctx(), newfd);
+                        userland_fd_install(uctx(), newfd, host_old, (a2 & UAPI_O_CLOEXEC) != 0);
+                        a0 = newfd;
+                        break;
+                    }
                     /* The copy is made first: a failing dup2(2) must leave
                      * whatever sits on @newfd alone. */
-                    int host_new = dup(userland_fd_host(uctx(), oldfd));
+                    int host_new = dup(host_old);
                     if (host_new < 0) {
                         a0 = errno_ret(-1);
                         break;
@@ -5405,7 +6578,18 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = 0;
                         break;
                     }
-                    a0 = errno_ret(fcntl(userland_fd_host(uctx(), (int)a0), a1, a2));
+                    int fcntl_host = userland_fd_host(uctx(), (int)a0);
+                    if (a1 == UAPI_F_DUPFD || a1 == UAPI_F_DUPFD_CLOEXEC) {
+                        /* A descriptor of ours again: the copy is a reference,
+                         * not a host dup. */
+                        int own = userland_own_fd_dup(uctx(), fcntl_host, (int)a2,
+                                                      a1 == UAPI_F_DUPFD_CLOEXEC);
+                        if (own != -2) {
+                            a0 = own >= 0 ? (rvvm_addr_t)own : (rvvm_addr_t)-UAPI_EMFILE;
+                            break;
+                        }
+                    }
+                    a0 = errno_ret(fcntl(fcntl_host, a1, a2));
                     if (a0 >= 0 && (a1 == UAPI_F_DUPFD || a1 == UAPI_F_DUPFD_CLOEXEC)) {
                         /* The host picked a number at or above @a2 of its own;
                          * the guest gets a slot of its own, also at or above
@@ -5433,7 +6617,17 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = user_tty_ioctl(a1, a2 ? to_ptr(a2) : NULL);
                         break;
                     }
-                    a0 = errno_ret(ioctl(userland_fd_host(uctx(), (int)a0), a1, a2));
+                    {
+                        int hfd = userland_fd_host(uctx(), (int)a0);
+                        struct userland_pty* pty = NULL;
+                        bool master = false;
+                        if (userland_pty_by_fd(hfd, &pty, &master)) {
+                            a0 = (rvvm_addr_t)userland_pty_ioctl(pty, master, a1, a2 ? to_ptr(a2) : NULL,
+                                                                 (int32_t)(thread->proc ? thread->proc->pid : 0));
+                        } else {
+                            a0 = errno_ret(ioctl(hfd, a1, a2));
+                        }
+                    }
                     break;
                 case 32: // flock
                     rvvm_info("sys_flock(%ld, %lx)", a0, a1);
@@ -5577,6 +6771,36 @@ static void* rvvm_user_thread_wrap(void* arg)
                             /* Not tracked: the mount sweeps its own descriptors
                              * when the run ends (see the note on
                              * rvvm_asset_ops_t). */
+                        } else if (path && guest_dev_device(abs, sizeof(abs), path)) {
+                            /* /dev is one of the paths that bypass the prefix
+                             * mapping entirely, so on a host with no /dev of its
+                             * own the devices a session cannot do without are
+                             * answered here - a pty pair above all.
+                             *
+                             * The object's own number lives far above any host
+                             * fd, so the *guest* number is an ordinary slot of
+                             * the table, which is what makes close(2), fork(2)
+                             * and the reference counting work on it at all. */
+                            int obj = userland_dev_open(abs, (int)a2);
+                            if (obj >= 0) {
+                                int guest_fd = userland_fd_slot_alloc(uctx(), 0);
+                                if (guest_fd >= 0) {
+                                    userland_fd_install(uctx(), guest_fd, obj,
+                                                        (a2 & UAPI_O_CLOEXEC) != 0);
+                                    a0 = guest_fd;
+                                } else {
+                                    /* No slot: the descriptor cannot be handed
+                                     * over, so the object goes back. */
+                                    struct userland_pty* pty = NULL;
+                                    bool master = false;
+                                    if (userland_pty_by_fd(obj, &pty, &master)) {
+                                        userland_pty_release(pty, master);
+                                    }
+                                    a0 = -UAPI_EMFILE;
+                                }
+                            } else {
+                                a0 = errno_ret(-1);
+                            }
                         } else {
                             /* NULL path with AT_EMPTY_PATH refers to the dirfd */
                             const char* host_path = wrap_guest_path(path_buf, (int)a0, path);
@@ -5656,7 +6880,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -UAPI_EISDIR;
                         break;
                     }
-                    a0 = errno_ret(read(userland_fd_host(uctx(), (int)a0), buf, a2));
+                    {
+                        int hfd = userland_fd_host(uctx(), (int)a0);
+                        struct userland_pty* pty = NULL;
+                        bool master = false;
+                        int dev = -1;
+                        if (userland_pty_by_fd(hfd, &pty, &master)) {
+                            a0 = (rvvm_addr_t)userland_pty_read(pty, master, buf, a2, true);
+                        } else if (userland_dev_by_fd(hfd, &dev)) {
+                            a0 = (rvvm_addr_t)userland_dev_read(dev, buf, a2);
+                        } else {
+                            a0 = errno_ret(read(hfd, buf, a2));
+                        }
+                    }
                     break;
                 }
                 case 64: { // write
@@ -5681,14 +6917,23 @@ static void* rvvm_user_thread_wrap(void* arg)
                         // io_callback instead of leaning on this path.
                         user_tty_write(uctx(), a0, wbuf, a2);
                     }
-                    if (uctx()->io_callback) {
-                        /* The sink recognizes the host's 1/2 and writes every
-                         * other fd through to the host itself, so it is handed
-                         * the host number rather than the guest's. */
-                        ssize_t ret = uctx()->io_callback(host_fd, wbuf, a2);
-                        a0 = errno_ret(ret);
-                    } else {
-                        a0 = errno_ret(write(host_fd, wbuf, a2));
+                    {
+                        struct userland_pty* pty = NULL;
+                        bool master = false;
+                        int dev = -1;
+                        if (userland_pty_by_fd(host_fd, &pty, &master)) {
+                            a0 = (rvvm_addr_t)userland_pty_write(pty, master, wbuf, a2);
+                        } else if (userland_dev_by_fd(host_fd, &dev)) {
+                            a0 = (rvvm_addr_t)userland_dev_write(dev, wbuf, a2);
+                        } else if (uctx()->io_callback) {
+                            /* The sink recognizes the host's 1/2 and writes
+                             * every other fd through to the host itself, so it
+                             * is handed the host number, not the guest's. */
+                            ssize_t ret = uctx()->io_callback(host_fd, wbuf, a2);
+                            a0 = errno_ret(ret);
+                        } else {
+                            a0 = errno_ret(write(host_fd, wbuf, a2));
+                        }
                     }
                     break;
                 }
@@ -5712,7 +6957,50 @@ static void* rvvm_user_thread_wrap(void* arg)
                     int  iov_fd      = userland_fd_host(uctx(), (int)a0);
                     bool iov_console = (a0 == 0 || a0 == 1 || a0 == 2) &&
                                        !userland_fd_tracked(uctx(), (int)a0);
-                    if (a7 == 65) {
+                    /* A pty end or a /dev device is served here too: the host
+                     * has no descriptor behind either. */
+                    struct userland_pty* iov_pty = NULL;
+                    bool iov_master = false;
+                    int  iov_dev    = -1;
+                    bool iov_own    = userland_pty_by_fd(iov_fd, &iov_pty, &iov_master) ||
+                                      userland_dev_by_fd(iov_fd, &iov_dev);
+
+                    if (a7 == 65 && iov_own) {
+                        /* The first non-empty segment blocks, the rest drain
+                         * what is already there - the console's rule, so a
+                         * multi-segment read returns as soon as it drained
+                         * instead of blocking again. */
+                        ssize_t total = 0;
+                        for (int i = 0; i < (int)a2; i++) {
+                            if (!hiov[i].iov_len) {
+                                continue;
+                            }
+                            ssize_t r = iov_pty
+                                ? (ssize_t)userland_pty_read(iov_pty, iov_master,
+                                                             hiov[i].iov_base, hiov[i].iov_len, total == 0)
+                                : (ssize_t)userland_dev_read(iov_dev, hiov[i].iov_base, hiov[i].iov_len);
+                            if (r < 0) {
+                                total = total ? total : r;
+                                break;
+                            }
+                            if (r == 0) {
+                                break;
+                            }
+                            total += r;
+                        }
+                        a0 = errno_ret(total);
+                    } else if (a7 == 66 && iov_own) {
+                        ssize_t total = 0;
+                        for (int i = 0; i < (int)a2; i++) {
+                            ssize_t r = iov_pty
+                                ? (ssize_t)userland_pty_write(iov_pty, iov_master,
+                                                              hiov[i].iov_base, hiov[i].iov_len)
+                                : (ssize_t)userland_dev_write(iov_dev, hiov[i].iov_base, hiov[i].iov_len);
+                            if (r < 0) { total = r; break; }
+                            total += r;
+                        }
+                        a0 = errno_ret(total);
+                    } else if (a7 == 65) {
                         if (a0 == 0 && uctx()->tty && iov_console) {
                             // fd 0 is the virtual TTY: serve readv() from the
                             // keyboard queue. The first non-empty segment blocks
@@ -5865,7 +7153,21 @@ static void* rvvm_user_thread_wrap(void* arg)
                         asset_dir_fill_stat(&st);
                         a0 = 0;
                     } else {
-                        a0 = errno_ret(fstat(userland_fd_host(uctx(), (int)fd), &st));
+                        int hfd = userland_fd_host(uctx(), (int)fd);
+                        struct userland_pty* pty = NULL;
+                        bool master = false;
+                        int dev = -1;
+                        if (userland_pty_by_fd(hfd, &pty, &master)) {
+                            /* A character device, which is what makes a guest
+                             * libc's isatty()-style check true for it. */
+                            userland_pty_fill_stat(pty, master, &st);
+                            a0 = 0;
+                        } else if (userland_dev_by_fd(hfd, &dev)) {
+                            userland_dev_fill_stat(&st);
+                            a0 = 0;
+                        } else {
+                            a0 = errno_ret(fstat(hfd, &st));
+                        }
                     }
                     rvvm_warn("DBG newfstat fd=%ld ret=%ld host_size=%lld", fd, (long)a0, (long long)st.st_size);
                     uapi_stat_convert(out, &st);
@@ -5932,7 +7234,20 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -UAPI_EFAULT;
                         break;
                     }
-                    a0 = errno_ret(nanosleep(&req, grem ? &rem : NULL));
+                    /* The sleep is the emulator's, not the host's: a guest
+                     * parked here has to be reachable by a signal (see
+                     * userland_sleep_until), and only an emulator-side sleep
+                     * can be. */
+                    uint64_t left = userland_sleep_until(userland_monotonic_ns() +
+                                                         (uint64_t)req.tv_sec * 1000000000ULL +
+                                                         (uint64_t)req.tv_nsec);
+                    if (left) {
+                        rem.tv_sec  = (time_t)(left / 1000000000ULL);
+                        rem.tv_nsec = (long)(left % 1000000000ULL);
+                        a0 = -UAPI_EINTR;
+                    } else {
+                        a0 = 0;
+                    }
                     // rem is only filled in when the sleep is interrupted, but
                     // the guest gets it either way
                     if (grem) {
@@ -5946,11 +7261,16 @@ static void* rvvm_user_thread_wrap(void* arg)
                     struct uapi_itimerval* gnew = to_ptr(a1);
                     struct uapi_itimerval* gold = to_ptr(a2);
                     rvvm_info("sys_setitimer(%lx, %lx, %lx)", a0, a1, a2);
-                    uapi_itimerval_to_host(&newval, gnew);
-                    a0 = errno_ret(setitimer(a0, gnew ? &newval : NULL, gold ? &oldval : NULL));
-                    if (gold) {
-                        uapi_itimerval_from_host(gold, &oldval);
+                    /* ITIMER_REAL is ours (see userland_setitimer_real). The
+                     * CPU-time timers would need per-thread accounting this
+                     * userland does not keep, and an EINVAL is what a guest can
+                     * act on - an ENOSYS (what the host's stub answers on win32)
+                     * it cannot. */
+                    if (a0 == UAPI_ITIMER_REAL) {
+                        a0 = userland_setitimer_real(uctx(), gnew, gold);
+                        break;
                     }
+                    a0 = -UAPI_EINVAL;
                     break;
                 }
                 case 113: // clock_gettime
@@ -5994,7 +7314,33 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -UAPI_EFAULT;
                         break;
                     }
-                    a0 = errno_ret(clock_nanosleep(a0, a1, &req, grem ? &rem : NULL));
+                    /* Same reason as nanosleep: the wait has to be reachable by
+                     * a signal, so it is the emulator's own. */
+                    uint64_t ns = (uint64_t)req.tv_sec * 1000000000ULL + (uint64_t)req.tv_nsec;
+                    uint64_t deadline = userland_monotonic_ns() + ns;
+                    if (a1 & 0x1) {
+                        /* TIMER_ABSTIME: the target is on the guest's clock,
+                         * which is not the one the wait is measured with. */
+                        struct timespec rt = {0}, mo = {0};
+                        clock_gettime(CLOCK_REALTIME, &rt);
+                        clock_gettime(CLOCK_MONOTONIC, &mo);
+                        int64_t offset = (int64_t)((uint64_t)mo.tv_sec * 1000000000ULL + mo.tv_nsec) -
+                                         (int64_t)((uint64_t)rt.tv_sec * 1000000000ULL + rt.tv_nsec);
+                        deadline = (uint64_t)((int64_t)ns + offset);
+                    }
+                    uint64_t left = userland_sleep_until(deadline);
+                    if (left) {
+                        if (!(a1 & 0x1)) {
+                            /* Only the relative form reports what is left - an
+                             * absolute one is asked for a deadline, not for a
+                             * duration. */
+                            rem.tv_sec  = (time_t)(left / 1000000000ULL);
+                            rem.tv_nsec = (long)(left % 1000000000ULL);
+                        }
+                        a0 = -UAPI_EINTR;
+                    } else {
+                        a0 = 0;
+                    }
                     if (grem) {
                         uapi_ts_from_host(grem, &rem);
                     }
@@ -6111,11 +7457,48 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_rt_sigprocmask(%ld, %lx, %lx, %lx)", a0, a1, a2, a3);
                     a0 = errno_ret(sigprocmask(a0, to_ptr(a1), to_ptr(a2)));
                     break;
-                case 137: // rt_sigtimedwait_time32
-                    // TODO: Signal handling
-                    sleep_ms(-1);
-                    a0 = 0;
+                case 137: { // rt_sigtimedwait_time32
+                    /* The one process-wide pending slot is the whole signal
+                     * queue here (see userland_deliver_signal), so this waits
+                     * for that slot and hands the signal to the caller instead
+                     * of to a handler - which is what a program blocking in
+                     * sigwait()/sigtimedwait() is asking for. */
+                    rvvm_userland_t* ctx = uctx();
+                    const uint64_t* set = to_ptr(a0);
+                    void* info = to_ptr(a1);
+                    const struct uapi_timespec32* tmo = to_ptr(a2);
+                    uint64_t deadline = 0;
+                    bool     timed = tmo != NULL;
+                    if (timed) {
+                        deadline = userland_monotonic_ns() +
+                                   (uint64_t)tmo->tv_sec * 1000000000ULL +
+                                   (uint64_t)tmo->tv_nsec;
+                    }
+                    a0 = -UAPI_EAGAIN;
+                    for (;;) {
+                        uint32_t sig = atomic_load_uint32(&ctx->sig_pending);
+                        if (sig && (!set || (set[sig >> 6] & (1ULL << (sig & 63))))) {
+                            atomic_store_uint32(&ctx->sig_pending, 0);
+                            if (info) {
+                                memset(info, 0, 128);
+                                *(int32_t*)info = (int32_t)sig;
+                            }
+                            a0 = sig;
+                            break;
+                        }
+                        uint64_t now = userland_monotonic_ns();
+                        if (timed && now >= deadline) {
+                            break;   // -EAGAIN, as the timeout reports
+                        }
+                        rvvm_event_wait(&ctx->tty_in_event,
+                                        timed ? (deadline - now) : RVVM_EVENT_INFINITE);
+                        if (atomic_load_uint32(&ctx->userland_suspend) ||
+                            atomic_load_uint32(&ctx->tty_in_eof)) {
+                            break;
+                        }
+                    }
                     break;
+                }
                 case 139: { // rt_sigreturn
                     // The trampoline inside the signal frame issues this with
                     // SP on the frame. The restore itself happens at the
@@ -6176,19 +7559,30 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_times(%lx)", a0);
                     a0 = errno_ret(times(to_ptr(a0)));
                     break;
-#ifdef __linux__
                 case 154: // setpgid
+                    /* Process groups are not modelled, and saying so with an
+                     * error is what leaves a shell's job-control setup with
+                     * nothing to stand on: it then treats every pgrp question
+                     * as broken and gives up on the terminal. Accepting it is
+                     * the answer a session can work with - the group is the
+                     * process, which is what a fresh session gets anyway. */
                     rvvm_info("sys_setpgid(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(setpgid(a0, a1));
+                    a0 = 0;
                     break;
-                case 155: // getpgid
+                case 155: // getpgid - and getpgrp, which is the same call with pid 0
+                    /* The caller's own pid, which is also what tcgetpgrp(3) on
+                     * one of our ptys reports - a shell compares the two, and
+                     * two different answers would send it round the loop of
+                     * signalling itself. */
                     rvvm_info("sys_getpgid(%lx)", a0);
-                    a0 = errno_ret(getpgid(a0));
+                    a0 = a0 == 0 ? (thread->proc ? thread->proc->pid : 0) : a0;
                     break;
-#endif
                 case 157: // setsid
+                    /* No sessions either: the new id a shell needs is its own
+                     * pid, and it is what the shell uses to tell whether it is
+                     * a session leader. */
                     rvvm_info("sys_setsid()");
-                    a0 = errno_ret(setsid());
+                    a0 = thread->proc ? thread->proc->pid : 0;
                     break;
                 case 158: // getgroups
                     rvvm_warn("sys_getgroups(%lx, %lx)", a0, a1);
@@ -7503,8 +8897,12 @@ static void userland_destroy(rvvm_machine_t* machine)
     }
     machine->userdata = NULL;
     safe_free(ctx->prefix_owned);
+    /* The timer thread holds a pointer to this context, so it is joined before
+     * anything below is released. */
+    userland_itimer_stop(ctx);
     vector_free(ctx->userland_threads);
-    /* The descriptors this address space held close with it. */
+    /* The descriptors this address space held close with it - including its
+     * ends of any pty pair, which release their side here. */
     userland_fd_table_free(ctx);
     /* Every process record goes: nothing can reference them any more - the
      * threads are gone (see the wait above), so the references they held are not

@@ -483,6 +483,15 @@ int win_socket_create(int domain, int type, int protocol)
         wsock_set_errno();
         return -1;
     }
+    if (wd == AF_INET6) {
+        /* Windows defaults an IPv6 socket to v6-only, Linux to dual-stack: a
+         * guest that binds "::" (busybox nc, many servers) expects the latter,
+         * and with the Windows default its listener silently refuses every
+         * IPv4 connection. Best effort - a socket that will not take the
+         * option is still usable. */
+        DWORD off = 0;
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&off, sizeof(off));
+    }
     if (nonblock) {
         u_long nb = 1;
         if (ioctlsocket(s, FIONBIO, &nb) == SOCKET_ERROR) {
@@ -735,6 +744,15 @@ int win_socket_connect(int fd, const void* addr, int len)
         return -1;
     }
     if (connect(s, (struct sockaddr*)&st, wlen) == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        /* A non-blocking connect that is *in progress* is not a failure: Winsock
+         * reports WSAEWOULDBLOCK where POSIX says EINPROGRESS, and a guest that
+         * distinguishes the two - which is what makes connect() + poll() work -
+         * would take the EAGAIN for "try again later" and drop the attempt. */
+        if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS) {
+            errno = EINPROGRESS;
+            return -1;
+        }
         wsock_set_errno();
         return -1;
     }
