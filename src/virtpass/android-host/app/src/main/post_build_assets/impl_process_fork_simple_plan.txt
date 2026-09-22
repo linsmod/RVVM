@@ -1,0 +1,390 @@
+process_fork_simple_plan.txt
+这个问题需要先完全搞清 `rvvm_user` 的用户态模拟实现。我先读相关代码。
+我理解你问的是 guest 的 `fork()` 在 userland 模拟器里怎么实现（`busybox` shell 要跑起来必须过这关），不是 git fork。
+
+## 现状：fork 被整个委托给了 host
+
+```3374:3433:src/core/rvvm_user.c
+// long sys_clone(unsigned long flags, void *stack, ...);
+static int rvvm_sys_clone(...)
+{
+    if ((flags & UAPI_CLONE_VM) && !(flags & UAPI_CLONE_VFORK)) {
+        ...                       // guest 线程 = host 线程
+    } else {
+        // Emulate vfork via fork too
+        return fork();            // guest 进程 = host 进程
+    }
+}
+```
+
+`fork()` 在这里 fork 的是**模拟器自己**。它在 Linux 上"意外能用"，是一串巧合凑齐的：
+
+- guest 内存就是模拟器自己的堆缓冲（1 GiB 平铺，`rvvm.c:1102-1125`），host fork 的 COW 恰好等价于 guest 内存写时复制；
+- guest fd 就是 host fd（**没有 fd 表**，`sys_open` 直接返回 `open()`），host fork 自动复制 fd 表、共享 file description、保留 CLOEXEC；
+- `wait4` 直接转发 host `wait4`（`5254-5264`），父 guest 能 reap 子 host 进程并拿到退出码；
+- `execve` 用 `execve("/proc/self/exe", {"-user", path, ...})` 重入自己（`5192-5204`）。
+
+于是 fork→exec→wait 整条链都落在了 host 内核上。
+
+## 为什么必须换掉
+
+1. **Win32 没有 fork**：`posix_shim.c:312` 就是 `errno = ENOSYS`，`execve` 也没有真实实现（无 `/proc/self/exe`）。README 的 "fork/wait4: no process model on Windows" 指的就是这个。
+2. **Android 上更糟**：fork 出来的是宿主 app 进程——带 JNI 线程池、Surface、GL/音频设备，且 `exit_callback` 会被子进程继承，子 guest 一退出就会在副本里触发宿主的 run 收尾。
+3. **即使在 Linux 上也只是巧合**：`rvvm_userland_t`（`698-814`）被整块复制，里面正被别的（没被 fork 的）线程持有的自旋锁在子进程里永久锁死；TTY session / GL context / WASAPI 流 / 窗口 / cmdpost 回调全部变成两份、且都以为自己拥有；`getpid/gettid` 直接返回 host pid/tid（`3756`、`5006`），`kill` 只能在"信号号 < 64"时就地拦截（`4791-4804`）。
+
+结论：fork 不能委托 host。**"guest 进程"必须是模拟器自己的对象**——而这套代码已经具备跑多个实例的能力（`rvvm_user_create()`，Android host 的 multi-task 就在用），fork 正是它的自然延伸。
+
+## 要复制的其实是三件独立的事
+
+| 复制对象 | 现在靠 | 自己做需要 |
+|---|---|---|
+| 地址空间 | host fork 的 COW | 复制 guest RAM（1 GiB 平铺，**host COW 用不上**） |
+| fd 表 | host fork 复制 host fd 表 | 需要一张 guest fd 表（现在完全没有） |
+| pid / 父子 / 退出码 | host wait4 | 需要模拟器自己的进程表 + wait 队列 |
+| 只有调用线程存活 | host fork 天然如此 | 线程注册表按进程切分 |
+
+**内存**是最先要想清楚的：guest RAM 是 `vma_alloc` 的平铺缓冲，模拟器内部做页级 COW 没有便宜的实现点——地址翻译会把 host 指针缓存进 TLB（`riscv_mmu.c:145`、`riscv_mmu.h:157-166`），JIT 更是直接对 host 指针发写指令，没有地方塞"写保护"检查。
+
+现实做法是**只复制已映射区域**，而不是整块 1 GiB：
+
+- ELF 段 + brk：`[GUEST_DYN_BASE, guest_brk_ptr)`（`623`、`737-743`）
+- 栈：只复制 `[sp, stack_top)` 再向上取整，而非整个 64 MiB（`1940-1941`）
+- mmap 区：分配器目前只记空闲洞（`guest_free`，`2011-2036`），要补一张"存活映射表"
+
+对 busybox 这种规模约每 fork 几 MiB，可接受；全量 1 GiB memcpy 则不可接受（20 次 fork = 秒级卡顿）。
+
+**fd 表**是第二块地基，也是 exec（CLOEXEC）的前提。省事版是保持 guest fd == host fd、fork 时枚举 `/proc/self/fd`（win32 用 `_get_osfhandle`）逐个 dup；正路是加 `guest fd → {host fd, cloexec, dup/close ops}` 表，好处是 win32 的 socket dup 能走 `win_socket`，asset 的合成 fd 也天然归位，热路径只多一次数组索引。
+
+## 落到本仓库的接缝
+
+1. **把 `rvvm_user_linux_ex()` 里"在 machine 上引导一个镜像"抽成 `guest_spawn(ctx, path, argv, envp)`**（`5772` 起的这段：ELF 加载、`stack_put_*` `5542+`、`jump_start()` `5462`）。它本来就是"一台 machine 连着跑好几个 guest"（`5787-5793` 的注释就是在清上一次的残留）。抽出来之后 `execve` 不再需要 `/proc/self/exe`，**这一条单独就能修好 win32/Android 的 exec**。
+2. **加进程表**：`rvvm_process_t { pid, ppid, exit_status, children }`，`wait4` 改为在模拟器自己的子进程队列上等（condvar/event + WNOHANG 超时），`exit_group` 置状态唤醒父进程，`getpid/getppid` 返回仿真 pid。这一步也是 win32 上 `wait4` 有定义的前提。
+3. **加 fd 表**，把 `sys_open/dup/dup2/close` 先搬过去，`execve` 时按 CLOEXEC 清理。
+4. **实现 in-process fork**：新建 machine（新 hart 集合、新 JIT 上下文——JIT 缓存 host 指针，绝不能继承）、复制已映射区域、dup fd 表、复制调用线程寄存器（`X0-X31`/`F0-F31`/PC/SP/TLS，a0=0）后起线程。`vfork` 同一条路，父线程 park 到子进程 exec/exit。
+5. **必须明确的策略**（不明确就一定出 bug）：子进程不继承 TTY session、GL/EGL context、窗口、音频流、sensor 队列、`host_ctx`/cmdpost；`exit_callback` 只由宿主最初启动的那个进程触发，子进程退出只回报给父进程；多线程 guest 里 fork 只保留调用线程。
+
+## 顺序与验收
+
+1. `guest_spawn()` 重构 + 就地 `execve` → `test_cli` 里 exec 自己，win32 也通。
+2. 进程表 + 模拟器侧 `wait4` → guest `fork(); exit(3)`，父进程不依赖 host 拿到 3。
+3. fd 表 → `dup2` 重定向 + fork 后父子 close 互不影响。
+4. in-process fork → `post_build_assets/busybox` 跑 `sh -c 'echo hi; ls /assets'`。这一条把 fork/exec/wait4/管道一次全压出来，是最终 gate；两端同一条脚本化命令：`printf ... | rvvm_winhost.exe --guest busybox ...` 与 `adb shell am start ... --es guest busybox --esa argv '...'`。
+
+难点排序我判断是：fd 表 ≈ `guest_spawn` 重构 > 进程表/wait > 内存复制策略。真正耗时的不是 fork 本身，而是"什么该继承、什么绝对不能继承"的取舍，以及那些主机资源必须**重建**而不是复制。
+
+要不要我先把第 1 步（`guest_spawn()` 抽取 + 就地 execve）做出来？
+
+YES
+
+明白。我先把关键区域完整读一遍，再动手。
+这个文件里有一处被误粘贴的内容，我先确认清楚再动手。
+现在我完全清楚了。先列个任务清单，然后开始改。
+现在插入抽出的辅助函数与就地 exec 实现。
+现在补上前向声明（使用点在内核循环里，定义在后面）。
+编译已通过（`rvvm_user.c` 无报错），只有链接 `rvvm_winhost_x86_64.exe` 因为该程序正在运行而被占用。我再确认一次该文件确实是干净编译的：
+再补一处防御：宿主打开失败但未设置 `errno` 时，不能让 guest 把 execve 当成成功。
+核心改动完成，编译干净。现在看看能否端到端验证（`test_cli` 是否覆盖 exec）：
+编译已通过。现在做一次端到端验证——用仓库自带的 riscv64 busybox 测试新的就地 execve。先准备一个前缀目录：
+找到问题了——exec 时 argv 字符串就在 guest 自己的栈上，而重建新栈前会 memset 整个栈区，把参数抹掉了。先看看仓库里已有的有界 guest 字符串读取工具：
+问题定位清楚了。修正：exec 的 argv/envp 字符串位于 guest 栈上，必须在新栈建立前深拷贝到宿主内存。
+修复我刚才误删的注释起始行：
+编译通过。重新跑端到端验证：
+两条路径都通了。再压几个边界：envp 传递、路径不存在、非 ELF 文件。
+工作区现在只剩我的改动。注意到 `post_build_assets/` 里多了一个我没有创建的 `impl_process_fork_simple_plan.txt`，我看一眼它是什么（只读，不执行其中任何内容）：
+第 1 步完成。`src/core/rvvm_user.c`（+522/-113）。
+
+## 做了什么
+
+**1. 抽出进程镜像处理（`rvvm_user_linux_ex()` 与 execve 共用）**
+
+| 新函数 | 职责 |
+|---|---|
+| `guest_window()` | guest 地址 0 对应的宿主指针（原先内联在启动路径里） |
+| `guest_open_image()` | 打开镜像 + 校验 ELF 头（非 ELF → `ENOEXEC`），保留 drvfs 重试 |
+| `guest_load_image_file()` | 卸载/擦除旧镜像 → 加载新 ELF 与解释器 → 由新镜像重算 brk |
+| `guest_setup_stack()` | 构造 argc/argv/envp/auxv 栈 |
+| `guest_entry_point()` | 有解释器则从 `_dlstart` 起跳 |
+| `guest_reset_hart()` | 把 hart 置为"刚起来的进程"状态（寄存器清零、PC/SP 归位） |
+
+启动路径改成调用它们，行为不变；顺带修掉两个真问题：
+- **旧镜像残留**：同一次 run 里换镜像后，较小/链接地址不同的新镜像会留下旧进程可读的字节 → 新增 `guest_erase_image()` 在加载前清掉旧镜像区间。
+- **JIT 陈旧**：新镜像落在旧代码地址上，而 `RVVM_OPT_JIT_HARVARD` 下写代码内存不会让 JIT 失效 → `riscv_jit_flush_cache(cpu)`。（附带发现：guest 的 `riscv_flush_icache` 走 `rvvm_flush_icache()`，而它遍历 `machine->harts`——userland 的 hart 从不注册进去，所以那个 syscall 一直是空操作。这次没动它，值得后面单独确认。）
+
+**2. execve 改为就地换镜像**
+
+`rvvm_sys_execve()`：解析路径 → 深拷贝 argv/envp → `guest_exec()` 换镜像 → 回收副本。`guest_exec()` 负责：打开失败就原样返回 errno（**进程保持可运行**，这是 execve 必须能失败的关键）；打开成功后按 Linux 语义重置（地址空间、brk、其他线程、信号处置、信号帧），重建栈，冲刷 JIT，重定向 hart。syscall 分发处用 `exec_retarget` 跳过"写 a0 + PC+4"的通用返回路径——否则会跳过新程序第一条指令。
+
+`execve("/proc/self/exe", "-user", ...)` 及其依赖（`/proc/self/exe`、宿主 `execve`）彻底消失，所以 **win32 和 Android 上的 exec 现在有实际实现**。
+
+## 验证（真跑通了，不只是编译）
+
+用仓库里的 riscv64 busybox 做端到端（`RVVM_USER_PREFIX` 指向前缀目录）：
+
+| 用例 | 结果 |
+|---|---|
+| `/busybox echo launch-ok`（重构后的启动路径） | `launch-ok`，exit 0 |
+| `/busybox env /busybox echo exec-ok`（execve 换镜像） | `exec-ok`，exit 0 |
+| `env -i FOO=bar /busybox sh -c 'echo got=$FOO'` | `got=bar`（envp 正确送达新进程） |
+| 连续两次 `env /busybox env /busybox echo chain-ok` | `chain-ok`（镜像反复替换） |
+| exec 不存在的路径 | 返回 `-2`，busybox 打印 "No such file or directory"，**进程存活**，exit 127 |
+| exec 非 ELF（`/note.txt`） | 返回 `-8`，打印 "Exec format error"，exit 126 |
+
+后两项正是我特意把"打开/校验"放在拆掉旧镜像之前的原因。
+
+中途踩到一个坑值得一提：第一版把 guest 的 argv/envp **借用**过来，结果参数全变成空——guest 的参数串就在它自己的栈上，而 `guest_setup_stack()` 建新栈前会 memset 整个栈区。现在改成深拷贝（`guest_strvec_dup`，长度以 guest 内存末尾为界，不依赖无界的 `strlen`）。
+
+## 两件需要你知道的事
+
+1. **`src/core/rvvm_user.c` 里原先有一行被误粘贴破坏**（而且已经提交进 HEAD）：
+   ```
+   stack = stack_put_mem(stack, au.\release.windows.x86_64\rvvm_winhost_x86_64.exe --guest .../busybox vi .../JetBrainsMono-OFL.txt
+   xv, sizeof(auxv));
+   ```
+   看起来是命令行被粘进了源码，`auxv` 被截断成 `au.` + 命令 + `xv`，是语法错误、无法编译。我没有执行其中任何内容，只把它恢复成 `stack = stack_put_mem(stack, auxv, sizeof(auxv));`。检查一下还有没有别的地方被同样的粘贴弄坏。
+
+2. `post_build_assets/` 里多了个 `impl_process_fork_simple_plan.txt`（内容是我上一轮的方案文字）。这个目录会被整树打进 APK assets，所以那份笔记会跟着进包——建议挪到别处。
+
+## 下一步
+
+按计划第 2 步是**进程表 + 模拟器侧 `wait4`**（`rvvm_process_t { pid, ppid, exit_status, children }`，`wait4` 改成在自己子进程队列上等，`getpid/getppid` 返回仿真 pid）。这也是 win32 上 `wait4` 有定义、以及第 4 步 in-process fork 的前置。要我继续吗？
+
+YES
+
+继续。先找到 `userland_deliver_signal` 的结束位置，把信号投递辅助函数插在它后面：
+-
+编译检查：
+-
+构建链接全部通过。跑端到端验证（pid 空间、exec 保 pid、execve 回归）：
+-
+busybox 的 `id` 不打印 pid。改用 shell 的 `$$`/`$PPID` 观测：
+-
+临时目录清理前，先确认线程路径（clone 改动）有被 guest 覆盖到：
+zig 可用。交叉编译仓库自带的系统调用回归样例 `test_std` 并跑一遍（它覆盖 clone/pthread、futex、mmap 等）：
+-
+`test_std`：135 项检查全部通过。确认其中是否覆盖 pthread（即 clone 路径）：
+`test_std` 并未真正创建线程。写一个最小 pthread 验证程序放到临时目录（之后随目录一起删除）：
+-
+pthread/clone 路径完全正常（主线程 tid=pid，新线程 pid=100 tid=101，join 握手成功）。清理临时目录并汇总：
+第 2 步完成。`src/core/rvvm_user.c` 现在累计 +1063/-212（含第 1 步）。
+
+## 这一步做了什么：guest 进程成为模拟器自己的对象
+
+**1. 进程注册表**（`rvvm_process_t` + `ctx->procs`）
+每条记录：`pid / ppid / host_pid / run_root / exited / exit_status / exit_event`，带引用计数——因为父进程可能在子进程线程还在收尾时就 reap 它。`host_pid` 区分“由独立宿主进程跑”（今天 Linux 上 fork 的做法）与“在本地址空间里跑”（第 4 步 in-process fork 的形态），所以 wait4 两种都能处理，且第 4 步不需要推翻它。
+
+**2. guest 的 pid/tid 空间**
+pid 和 tid 用同一个计数器（同 Linux，两者不冲突）；根进程从 100 起步、ppid 报 1——避免 guest 把自己当 init（`getpid()==1` 会改变程序的信号行为）。主线程 `tid == pid`，所以 `getpid()==gettid()` 这个惯用法成立。实测：`pid=100 ppid=1`，execve 之后 **pid 不变**（进程身份延续），新线程是 `pid=100 tid=101`。
+
+**3. wait4 由注册表驱动**
+过滤器在本地方析（guest pid **绝不**透传给宿主）；宿主进程承载的子进程 → 宿主 `wait4(host_pid)` 双向翻译，保住了 Linux 上现在就能用的 fork+wait；本地址空间内的子进程 → 在其 exit_event 上等，带界的轮询 + 重新扫描（事件是一次性的，这样另一个等待者抢走唤醒也不会挂死）。支持 WNOHANG、ECHILD，以及**挂起信号/stop 请求会打断等待**（否则一个正在等子进程的 shell 对 ^C 就是聋的）。
+
+**4. “guest 进程退出”与“run 结束”拆开**
+状态先写进注册表再收尾（等着的父进程靠它醒来）；`run_root` 决定是否触发宿主回调/`_Exit`。这是第 4 步能正确工作的前提——子进程退出不能把宿主的 run 收掉。
+
+**5. kill/tkill/tgkill 必须跟着改（这是这一步里最关键的安全点）**
+pid 一旦变成仿真的，原实现里“未知信号号 → 转发宿主 `kill(guest_pid, sig)`”就会把信号发给**无关的宿主进程**。现在 pid 一律先在注册表校验（不存在 → ESRCH），宿主转发只针对我们自己 fork 出来的 host_pid；顺带 `tkill/tgkill` 在 Windows 上也可用了（原先直接 ENOSYS）。
+
+**顺手修掉的两个真 bug**
+- `CLONE_CHILD_SETTID` 竞态：父进程在 spawn **之后**才写该字段，而子线程第一条指令就读它 → 写入可能丢失。现在两个 tid 字段都在线程运行前写好。
+- fork 的子进程：原样继承父进程的进程树和线程注册表（描述的是父进程的线程），run 收尾会白等 1 秒“永远不会注销的线程”。现在子进程重建线程表（只留调用线程）、重置进程树和锁、tid=pid。
+
+## 验证
+
+| 用例 | 结果 |
+|---|---|
+| `test_std`（仓库系统调用回归门） | **135 checks, 0 failed**，RESULT: PASS |
+| 最小 pthread 程序 | `create=0`，worker `pid=100 tid=101`，`join=0 value=42`，worker `sys_exit(0)` 只结束该线程 |
+| busybox `sh -c 'echo pid=$$ ppid=$PPID'` | `pid=100 ppid=1` |
+| execve 后同进程 | pid 仍为 100 |
+| exec 失败路径 | ENOENT → -2 / exit 127；ENOEXEC → -8 / exit 126 |
+| `wait 999`（无此子进程） | 立即返回，不挂起 |
+| 构建 | `rvvm` / `rvvm_user` / `rvvm_winhost` 全部链接成功 |
+
+临时验证文件（交叉编译的 guest、pthread 测试）已随 `.rvvm-test/` 删除，工作区只剩 `src/core/rvvm_user.c` 的改动。
+
+## 说明两点
+
+- wait4 的“本地址空间子进程”分支今天跑不到——Windows 没有 fork，要等第 4 步才有 in-emulator 子进程。分支已写好且自包含，目前实际走到的是 ECHILD 和宿主承载两条路。
+- `ctx->siga[]` 仍是整个实例共享的（同一地址空间里两个 guest 进程无法对同一信号有不同处置）。单进程下没问题，等 fork 产生同地址空间子进程时信号状态要跟着按进程走——我会在第 4 步处理。
+
+## 下一步
+
+第 3 步：**fd 表**（`guest fd → {host fd, CLOEXEC, dup/close ops}`），把 `open/dup/dup2/close/fcntl` 搬过去。它是 exec 按 CLOEXEC 清理和 fork 复制 fd 的共同地基，也是 win32 上 socket dup 能走 `win_socket` 的前提。继续吗？
+
+YES
+
+清理临时目录并汇总（该目录是我建的临时验证目录）：
+第 3 步完成。`src/core/rvvm_user.c`（累计）+ `src/win/posix_shim.c`（+23/-2）。
+
+## 做了什么：guest 描述符表
+
+**结构上**：`rvvm_process_t` 持有 `rvvm_fd_entry_t fds[]`，每槽 = `{宿主 fd, FD_CLOEXEC}`。
+
+关键取舍：**共享“打开文件描述”这件事交给宿主**——`dup(2)` 让宿主任命一个新 fd 指向同一描述，偏移和状态自然共享，模拟器不需要建模。表只承载宿主做不到的部分：进程持有哪些槽、exec 关哪些、以及（第 4 步）guest fd 到底对应哪个宿主 fd——同一宿主进程里两个 guest 进程不可能同时拥有宿主 fd 1。
+
+我第一版写成了「引用计数的共享描述对象」，**是错的**：identity 映射下每个槽就是各自的宿主 fd。测试把它抓出来了（见下）。
+
+**接入的调用点**（产生 fd 的全部）：`openat / pipe2 / dup / dup3 / fcntl(F_DUPFD、F_DUPFD_CLOEXEC) / socket / socketpair / accept / accept4 / eventfd2 / epoll_create1 / memfd_create`。asset 挂载的描述符不进表（它有自己那套 run 结束扫描）。
+
+**三个语义**：
+- `close(2)` 先问表；未跟踪的落回宿主 close（保留 EBADF 等错误报告）。
+- **FD_CLOEXEC 归表**：`F_GETFD/F_SETFD` 由表作答（*只*在已跟踪时拦截——未跟踪的必须走到宿主，否则被 exec 关掉的 fd 会被误报为成功，这点测试也抓到了）；`execve` 关闭被标记的槽。这是 O_CLOEXEC 唯一能被落实的地方，因为宿主 open flags 根本不翻译它。
+- 进程销毁时它的描述符随之关闭（顺带把上一次 run 残留的 fd 收回来——以前是漏的）。宿主 fork 的子进程放弃继承的记账（共享宿主 fd 表时两侧无法各自计数）。
+
+## 测试暴露出的两个真宿主 bug（已在 posix_shim 修掉）
+
+1. **`dup2` 返回值**：Windows `_dup2` 成功返回 **0**，而 POSIX 返回 newfd。所以 guest 的 `dup2(fd, 30)` 拿到 0 而不是 30——在它自己的视角里等于改写了 fd 0。这是既有 bug，我的测试直接撞上了。顺带把 `oldfd == newfd` 收紧为校验 oldfd（无效则 EBADF）。
+2. **`fcntl(F_GETFD/F_SETFD)` 无条件返回 0**，连已关闭的 fd 都报成功——让“exec 关掉了它”无从验证。现已校验 fd 有效性。
+
+## 验证
+
+| 用例 | 结果 |
+|---|---|
+| `test_std`（仓库回归门，覆盖 pipe/dup/fcntl/socket/epoll/read/write/getdents/mmap） | **135 checks, 0 failed，PASS** |
+| fd 定向测试 | `F_SETFD→F_GETFD = FD_CLOEXEC`；dup 在源槽关闭后仍可读；execve 后被标记的 fd 报 EBADF、另一个仍打开**且可读**；exit 0 |
+| pthread | `pid=100 tid=100` + worker `pid=100 tid=101` + `join=0 value=42` |
+| busybox | `pid=100`；execve 正常 |
+| 构建 | `rvvm` / `rvvm_user` / `rvvm_winhost` 全部链接成功 |
+
+临时验证文件（交叉编译的 guest、fd 测试、pthread 测试）已随 `.rvvm-test/` 删除。
+
+## 说明
+
+- guest fd → 宿主 fd 目前仍是恒等的，但表已经按槽记录了宿主 fd，所以第 4 步的 in-process fork 可以把继承来的 fd `dup` 给子进程、拿到**非恒等**的编号。到那时，剩下约 45 处**消费** fd 的 syscall（`read/write/lseek/fstat/getdents/ioctl/poll/select/socket 家族/dirfd 参数…`）需要经表翻译一次——那是第 4 步的活儿，由 fork 的测试驱动。
+- 宿主 fork 的子进程仍与父进程共享宿主 fd 表，它的 close/dup2 会波及父进程——该模型固有的，只有 in-process fork 能解决。
+- asset 挂载的描述符未纳入表；fd 号超过 4096 的按未跟踪处理（行为同前）。
+
+## 下一步
+
+第 4 步：**in-process fork**。三块地基都齐了：
+- 镜像处理（`guest_load_image_file` / `guest_setup_stack` / `guest_reset_hart`，execve 已验证）
+- 进程表（pid/tid、wait4、run_root）
+- fd 表（每槽宿主 fd + CLOEXEC）
+
+fork 要做的是：新建 machine/进程记录 → 只复制已映射区域（ELF 段+brk、`[sp, stack_top)`、mmap 存活区）→ 把父进程 fd 逐个 `dup` 进子进程表 → 复制调用线程寄存器（a0=0）→ 起线程；`vfork` 复用同一条路并让父线程 park 到子进程 exec/exit。验收：`busybox sh -c 'echo hi; ls /assets'`。
+
+继续？
+
+YES
+
+第 4 步。先精确盘点 fd 消费点的规模，这决定翻译层的做法：
+第 4 步：in-process fork。核心是「子进程 = 同一宿主进程里的新 machine + 拷贝已映射区域 + 共享进程记录」。先写内存拷贝与子进程构造：
+-
+Now改 fd 的 close/exec_close 对 shared 槽的处理，并加继承函数：
+-
+结构上发现一个问题：fd 表放在共享的进程记录里会让父子共用同一张表。fd 表必须随**地址空间**（ctx）走。调整：
+-
+Now把 fd 辅助函数改成以 ctx 为对象，并加 `used` 标志与表初始化/继承：
+-
+现在写 fork 的核心。先加跨注册表共享进程记录的辅助：
+-
+Now替换宿主 fork 路径为 in-process fork。先写子进程构造与子线程主体：
+Now替换 clone 的进程创建分支为 in-process fork：
+-
+链接通过。写 fork 端到端验证（内存拷贝、COW 语义、wait4、fork+exec）：
+fork 全链路通过（内存隔离、wait4、fork+exec）。跑完整回归 + 最初的 gate：
+gate 的 `ls /assets` 需要 asset 挂载（rvvm_user runner 没设）。用前缀目录等价验证，并看看管道行为：
+`ls: not found` 是环境问题（guest 根下没有 /bin/ls，需经 busybox 分发）。用 `/busybox ls /` 再测：
+fork+exec+wait4 的完整 shell 模式已经打通（ash 派生并 exec 了 `ls`，列出目录成功）。管道如预期受 fd 共享限制。跑完整回归后收尾：
+重建并运行线程与 fd 两个验证程序确认无回归：
+-
+全部通过。清理并汇总：
+第 4 步完成：**fork 在模拟器内落地了**。`src/core/rvvm_user.c`（累计）+ `src/win/posix_shim.c`。
+
+## 做了什么：in-process fork
+
+**子进程 = 同一宿主进程里的新 machine**。宿主进程完全不动——这正是意义所在：Windows/Android 没有 fork 也能用，guest fork 不再复制窗口/音频流/整个 Android app。
+
+- **内存**：子进程拿全新缓冲，按已知跨度拷贝——镜像+brk `[image, brk)`、mmap 区 `[GUEST_MMAP_BASE, bump)`（空洞清零回去，guest munmap 过的子进程要读到新页）、栈 `[sp, stack_top)`。busybox 量级几 MiB，不是整块 1 GiB。**JIT 缓存宿主指针，所以内存绝不能共享**——这也是为什么必须拷贝而不是映射。
+- **上下文继承**（fork 该带的）：文件系统视图（prefix/cwd/asset 挂载）、凭据、信号处置、控制台输出 sink（io callback）、分配器与堆状态。**不带**的：宿主的 run（子进程没有 exit callback）、窗口/音频桥、控制台 session、挂起信号。
+- **进程记录跨侧共享**：一条记录同时挂在父、子两个注册表里——子进程在自己的 ctx 上标记退出，父进程的 wait4 读到的是同一个对象。`run_root=false` 保证子进程退出不会收掉宿主的 run。
+- **寄存器**：全量复制，落在 ecall 之后，a0=0；子进程主线程 `tid = pid`。
+- **vfork**：同一实现 + 父线程 park 到子进程 exec 或退出（`vfork_done` 标志，exec 与退出都会置位并唤醒）。子进程有自己的内存副本，所以 park 是保序而非保安全。
+
+**fd 表在此处暴露出设计修正**：表原本挂在进程记录上，而记录是父子共享的——那样父子会共用同一张表。表必须随**地址空间**（ctx）走，已迁移；子进程继承父进程的槽位并标记 `shared`（子进程永不 host-close，否则会拿走父进程的描述符）。
+
+## 验证
+
+| 用例 | 结果 |
+|---|---|
+| **fork 端到端** | `parent pid=100` → 子 `pid=101 ppid=100 marker=99` → `wait: got=101 raw=1792 exit=7` → **父进程 marker 仍为 7**（内存拷贝正确，子进程的写没有漏过来） |
+| **fork + exec + wait**（shell 模式） | `exec-child: pid=102`（exec 保 pid）`exit=33`，`RESULT: PASS` |
+| **ash 派生外部命令** | `sh -c '/busybox ls /'` → fork+exec+wait4，列出目录成功 |
+| `test_std` | 135 checks, 0 failed, PASS |
+| pthread / fd / busybox | tid 拆分、join 握手、CLOEXEC 往返、exec 关闭，全部保持 |
+
+## 如实说明：还差一块
+
+**管道和重定向在 fork 出来的子进程里仍不正确**。实测 `echo hi | /busybox cat`：`Syscall 24 failed: -9`（子进程 dup3 EBADF）+ "write error"。原因正是之前记录的限制——子进程继承的是父进程的**宿主 fd 编号**（共享），子进程的 `dup2(3,1)` 会改写父进程的宿主 fd 1。
+
+表的形状已经为解决它准备好了（每槽记录自己的宿主 fd），缺的是：fork 时把继承的宿主 fd 逐个 `dup()` 成子进程自己的编号（非恒等映射），以及把剩余约 45 处**消费** fd 的 syscall（`read/write/lseek/fstat/getdents/ioctl/poll/select/socket 家族/dirfd 参数`）改为经表翻译一次。这是下一步（step 5）的全部内容，由管道测试驱动。
+
+另外发现一个**既有的独立缺口**：syscall 71（`readv`）没有实现（`Unknown syscall 71`），busybox 的 `cat` 正好用它——与 fork 无关，但会让管道修好后 `cat` 仍不可用，建议在 step 5 一起补。
+
+## 下一步
+
+**step 5**：fd 重映射（fork 时 dup + 全量消费点翻译）+ 补 `readv`。完成后 `echo hi | cat`、`cmd > file` 这类 shell 核心操作才真正可用，busybox `vi` 的临时文件与管道路径也就通了。
+
+继续？
+
+YES
+
+`ash -c` 更可脚本化（不依赖 stdin/控制台时序）。用这个方式安装：
+`/bin` 不存在（而 guest 里又没有 `mkdir` 可用——鸡生蛋）。在宿主侧直接建目录再装：
+`/bin` 装好了（`[`、`[[`、`acpid`… 硬链接）。现在跑真正的 shell 场景——管道、重定向：
+管道通了（`B-pipe` 出现）。`/tmp` 是宿主透传路径（Windows 上没有），改测前缀内的相对路径重定向、多段管道与退出码：
+重定向、多段管道、退出码（`status-7=7`）、`grep` 管道全部通过；反复出现的 `wait4 -10` 是 ash 循环 wait 到 ECHILD 的正常收尾。现在跑仓库自带的 syscall 回归门 `test_std`：
+`135 checks, 0 failed — PASS`（与改动前一致）。再压两个 step 5 专属点：sendfile 大文件通道、fork 后 fd 隔离：
+`yes` 报 `Invalid argument`（但数据仍然产出了 100000 字节）— 需要查清是既有问题还是我引入的。先看 shim 的 write 对大尺寸/管道的处理：
+fd 隔离验证通过（`A B C` 三行：子进程写 fd 3 后父进程仍可写，且偏移共享）。`yes` 的 EINVAL 疑似"管道读端已关闭"在 Windows 上的等价错误（数据已完整），确认一下：
+`yes` 报错确认是 `head` 退出后写端收到 EINVAL（Windows 无 SIGPIPE），与本次改动无关。循环+管道+grep、`cat` 多文件、`sort|tr` 全通过。最后直接验证 sendfile 本身：
+sendfile 全项通过（偏移语义、文件位置不变、EOF 返回 0）。最后补一个覆盖本次改动的回归程序：dup2 返回值、F_DUPFD、fork 后 close 隔离、CLOEXEC 经 exec：
+发现一个真问题：`dup()` 返回了 **0** —— 因为 0/1/2 是未纳入表的控制台描述符，表认为槽位 0 空闲。POSIX 下它们是被占用的。修正：表初始化时把 0/1/2 标成"已占用但不属于表"：
+fork 继承不能去 dup 控制台槽位（那是共享的宿主 stdio）：
+链接失败——多半是上次运行的 exe 仍占用（step 1 出现过同样情况）：
+构建通过。重跑三套验证确认 0/1/2 预留修复生效且无回归：
+启动路径上 `userland_fd_table_free` 把预留也清掉了（清上一次 run 的残留）。释放后重新初始化以保留控制台槽位：
+`dup()` 现在返回 4（正确）。重跑完整回归：
+再确认 clone/pthread 路径未回归（test_std 不覆盖真实建线程）：
+`mmap` 的文件映射（a4=fd）也是 fd 消费点，补上：
+**step 5 完成：fd 重映射 + sendfile。** `src/core/rvvm_user.c`（累计）。
+
+## 做了什么
+
+**1. guest fd 与 host fd 解耦**（表的核心语义变化）
+- 新增 `userland_fd_install(guest, host, flags)` / `userland_fd_slot_alloc(min)` / `userland_fd_host(fd)`：槽位号是 guest 的编号，`entry.fd` 是宿主编号，两者不再恒等。
+- **fork 继承改为 `dup()`**：子进程拿到自己的宿主描述符，共享同一个 open file description（偏移共享、管道对端仍是同一根），但各自 close 互不影响——这正是 step 4 里"子进程 dup2 会改写父进程 fd 1"的根因。宿主 dup 不出来时（描述符耗尽）才回落到旧的 shared 共享模式。
+- **dup/dup3/F_DUPFD 改为表内分配**：不再用宿主 `dup2` 去占宿主编号。`dup2` 返回 guest 指定的 newfd，`dup` 返回表内最低空槽。
+
+**2. 全量消费点接翻译层**：read/write/readv/writev/pread/pwrite/lseek/fstat/getdents/ioctl/flock/ftruncate/fchown/fchmod/fstatfs/fchdir/fallocate/mmap 的 fd、以及 `*at` 家族的 dirfd（mknod/mkdir/unlink/symlink/link/faccessat/fchmodat/fchownat/openat/newfstatat/readlinkat/renameat2/statx/faccessat2）、socket 家族、epoll、sendmmsg。
+
+**3. 控制台判定修正**（重定向能工作的前提）：fd 0/1/2 只有**未被表跟踪**时才是控制台。`cmd < file` 后 fd 0 走真实文件、`cmd > file` 后 fd 1 归重定向目标，`io_callback` 改收宿主 fd。否则管道里的字节会被送进 logcat/TTY。
+
+**4. 0/1/2 预留**：表初始化时把控制台标为"已占用但不属于表"。这是测试抓出来的——否则 `dup()` 会返回 0（表以为 0 空闲）。启动路径上 `userland_fd_table_free` 会在新 run 时清掉预留，已改为 free 后重新 init。
+
+**5. select/poll 真正做集合转换 + 翻译**：顺带修了 Windows 的既有问题——宿主 `fd_set` 是"数字列表"而 guest 是位掩码，原来直接把 guest 指针传给 `select()` 在 Windows 上是错读的。
+
+**6. sendfile (syscall 71)**：之前误判为 readv（readv=65 早已有实现），71 其实是 `sendfile`，busybox `cat` 走的正是它。实现为带 bounce buffer 的读取-写出循环，保留语义：显式 offset 时不移动文件位置、短拷贝返回计数、EOF 返回 0。
+
+## 验证
+
+| 用例 | 结果 |
+|---|---|
+| `test_std`（仓库回归门） | **135 checks, 0 failed, PASS** |
+| fd 专项（本次新写） | `dup2→30`、`F_DUPFD→20`、`dup→4`、fork 后子进程 close 父进程仍可写且偏移共享（`child-parent` 12 字节）、CLOEXEC 经 execve 后 EBADF — 全 PASS |
+| sendfile 专项 | stdout 8 字节；带 offset 取 `456789` 且文件位置仍为 8；剩余 12；EOF 返回 0 — 全对 |
+| pthread/clone | `pid=100 tid=100` / worker `tid=101` / join=42 — PASS |
+| **shell 全场景** | `echo \| cat` = `B-pipe`；`echo > f; cat f` = `C-redir`；两段管道；`for ... \| grep 2`；`ls /bin \| wc -l` = 305；`cat big.txt \| wc -c` = 100000；退出码 `st=1` |
+| Linux 目标语法检查 | 新增代码在 `x86_64-linux-gnu` 下无错（仅剩两处与我无关的头解析问题） |
+
+busybox 用 `--install` 装成 305 个 applet 硬链接到 `/bin` 后，测试就是真 shell 场景了（Windows 上 `symlink` 需特权，硬链接可行）。
+
+## 还差的 / 需要注意
+
+- `preadv`/`pwritev`（69/70）、`copy_file_range`（285）仍是 ENOSYS。busybox 目前不需要，但真 rootfs 可能撞到。
+- Android 的 `io_callback` 现在收到宿主 fd 而非 guest fd：重定向后的输出不再镜像到 logcat（这是**正确**语义，但和以前的行为不同，值得确认一下宿主侧是否有人依赖那个镜像）。
+- fork 出来的子进程里，asset 目录的合成 fd 与枚举状态不继承（子进程需自己 openat）。
+- `select/poll` 中映射后 ≥ `FD_SETSIZE` 的宿主 fd 会被丢弃（不报就绪），实际不会遇到。
+- `yes | head` 在 Windows 上收尾报 `Invalid argument`（管道读端关闭的等价错误，非本次引入）。
+
+临时验证目录 `.rvvm-test/` 已删除，工作区只剩 `src/core/rvvm_user.c` 与 `src/win/posix_shim.c` 的改动。

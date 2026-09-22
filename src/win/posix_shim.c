@@ -776,6 +776,13 @@ int dup(int fd)
 int dup2(int oldfd, int newfd)
 {
     if (oldfd == newfd) {
+        /* POSIX: the same descriptor is legal and yields newfd without touching
+         * anything, but oldfd has to be valid. The CRT has no no-op form for
+         * that, so validity is probed instead. */
+        if (_get_osfhandle(oldfd) == -1) {
+            errno = EBADF;
+            return -1;
+        }
         return newfd;
     }
     if (win_socket_is_fd(oldfd) || win_socket_is_fd(newfd)) {
@@ -785,7 +792,13 @@ int dup2(int oldfd, int newfd)
         errno = ENOSYS;
         return -1;
     }
-    return _dup2(oldfd, newfd);
+    /* _dup2() reports success as 0, while POSIX dup2() returns newfd - and the
+     * guest reads that value, so the number the contract promises is what the
+     * shim hands back. */
+    if (_dup2(oldfd, newfd) == -1) {
+        return -1;
+    }
+    return newfd;
 }
 
 int pipe(int fds[2])
@@ -834,8 +847,14 @@ int fcntl(int fd, int cmd, ...)
     case F_DUPFD_CLOEXEC:
         return _dup(fd);
     case F_GETFD:
-        return 0;
     case F_SETFD:
+        /* The flag itself is the guest's own business (the emulator's descriptor
+         * table keeps it), but an invalid descriptor still has to fail, or a
+         * guest probing a closed fd reads success back. */
+        if (fd < 0 || fd >= 4096 || _get_osfhandle(fd) == -1) {
+            errno = EBADF;
+            return -1;
+        }
         return 0;
     case F_GETFL:
         if (fd < 0 || fd >= 4096) {
