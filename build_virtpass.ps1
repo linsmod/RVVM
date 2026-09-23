@@ -169,7 +169,9 @@ function Invoke-Make {
 
 # Report one artifact per line, resolved relative to the repo root.
 function Write-ArtifactLine {
-    param([Parameter(Mandatory)][string]$Label, [Parameter(Mandatory)][string[]]$Paths)
+    # AllowEmptyCollection is required: a mandatory parameter rejects empty
+    # arrays at binding time, before the body's guard below ever runs.
+    param([Parameter(Mandatory)][string]$Label, [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Paths)
     if (-not $Paths -or $Paths.Count -eq 0) {
         Write-Host ("  {0}: not found" -f $Label) -ForegroundColor Yellow
         return
@@ -196,7 +198,7 @@ function Show-Artifacts {
         # guest-assets links every sample into the build tree's guest-assets/.
         # The APK carries no loose ELF at all: it boots apps out of
         # bundle/apps.tar.gz, which is packed from that directory.
-        $guest = @(Get-ChildItem -Path "$RVVM_ROOT\*\*\guest-assets\*.exe" -File -ErrorAction SilentlyContinue |
+        $guest = @(Get-ChildItem -Path "$RVVM_ROOT\*\guest-assets\*.exe" -File -ErrorAction SilentlyContinue |
             ForEach-Object { $_.FullName })
         Write-ArtifactLine 'guest ELFs' $guest
     }

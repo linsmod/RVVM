@@ -224,7 +224,10 @@ override recursive_wildcard = $(foreach wc,$1,$(call recursive_match,$(dir $(wc)
 override create_dirs = $(if $(if $(call paths_missing,$1),$(if $(HOST_POSIX),$(call shell_ex,mkdir -p $(call paths_missing,$1)),$(call shell_ex,md $(call paths_missing,$1) 2>&1))),)
 
 # Install file $1 at path $2 under permissions $3
-override install_file = $(if $(foreach dst,$(call path_wrap,$2),$(foreach src,$(call path_wrap,$1),$(call create_dirs,$(dir $(dst)))$(if $(call shell_ex,install -m $(firstword $3 0644) $(src) $(dst) 2>&1),$(call shell_ex,$(if $(HOST_POSIX),cp,copy) $(src) $(dst) 2>&1)))),)
+# NOTE: Uses Python instead of `install`/`cp`/`copy`: on stock Windows CMD, `install`
+# isn't a real command and blindly resolves to whatever install.* sits in PATH
+# (e.g. nvm-windows' interactive install.cmd, which hangs the build).
+override install_file = $(if $(foreach dst,$(call path_wrap,$2),$(foreach src,$(call path_wrap,$1),$(call create_dirs,$(dir $(dst)))$(call shell_ex,python $(CURDIR)/tools/install_file.py $(firstword $3 0644) $(src) $(dst) 2>&1))),)
 
 # Install string $1 as file $2
 override install_string = $(if $(foreach dst,$(call path_wrap,$2),$(call create_dirs,$(dir $(dst)))$(if $(HOST_POSIX),$(call shell_ex,printf $(call str_wrap,$1$(NEWLINE)) >$(dst)),$(file >$(dst),$1))),)
