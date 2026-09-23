@@ -1984,10 +1984,12 @@ static bool android_asset_to_file(const char* asset_name, const char* dest)
     int read;
 
     if (!g_asset_mgr) {
+        LOGE("bundle: no asset manager - %s not probed", asset_name);
         return false;
     }
     asset = AAssetManager_open(g_asset_mgr, asset_name, AASSET_MODE_STREAMING);
     if (!asset) {
+        LOGI("bundle: asset %s not openable", asset_name);
         return false;
     }
     size = AAsset_getLength64(asset);
@@ -1997,6 +1999,7 @@ static bool android_asset_to_file(const char* asset_name, const char* dest)
     }
     out = fopen(dest, "wb");
     if (!out) {
+        LOGE("bundle: fopen(%s) failed: %s", dest, strerror(errno));
         AAsset_close(asset);
         return false;
     }
@@ -2015,6 +2018,29 @@ static bool android_asset_to_file(const char* asset_name, const char* dest)
     return true;
 }
 
+/* Unpack one bundle archive out of the APK into @dest. The tree stages it as
+ * bundle/apps.tar.gz, but aapt2 decompresses *.gz assets while packaging (an
+ * APK entry is deflated once already) and strips the suffix, so inside the APK
+ * the name may be bundle/apps.tar. The staged name is probed first, then the
+ * de-gz'd one; whichever lands is read fine either way, since vp_rootfs
+ * inflates through zlib and gzread reads uncompressed files transparently. */
+static bool android_asset_unpack(const char* archive_name, const char* dest)
+{
+    char degz[64];
+    size_t len = strlen(archive_name);
+
+    if (android_asset_to_file(archive_name, dest)) {
+        return true;
+    }
+    if (len > 3 && !strcmp(archive_name + len - 3, ".gz")) {
+        snprintf(degz, sizeof(degz), "%.*s", (int)(len - 3), archive_name);
+        if (android_asset_to_file(degz, dest)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void android_bundle_prepare(const char* files_dir)
 {
     char dir[ANDROID_BUNDLE_PATH];
@@ -2028,11 +2054,11 @@ static void android_bundle_prepare(const char* files_dir)
     snprintf(g_bundle_rootfs, sizeof(g_bundle_rootfs), "%s/%s", dir, VP_ROOTFS_TAR_GZ);
     snprintf(g_bundle_apps, sizeof(g_bundle_apps), "%s/%s", dir, VP_APPS_TAR_GZ);
 
-    if (!android_asset_to_file("bundle/" VP_ROOTFS_TAR_GZ, g_bundle_rootfs)) {
+    if (!android_asset_unpack("bundle/" VP_ROOTFS_TAR_GZ, g_bundle_rootfs)) {
         LOGI("bundle: no rootfs archive in this APK - guests run without one");
         g_bundle_rootfs[0] = 0;
     }
-    if (!android_asset_to_file("bundle/" VP_APPS_TAR_GZ, g_bundle_apps)) {
+    if (!android_asset_unpack("bundle/" VP_APPS_TAR_GZ, g_bundle_apps)) {
         LOGI("bundle: no apps archive in this APK - the list falls back to the assets");
         g_bundle_apps[0] = 0;
     }

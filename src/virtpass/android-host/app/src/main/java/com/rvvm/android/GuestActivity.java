@@ -254,17 +254,25 @@ public class GuestActivity extends Activity {
 
         isInitialized = true;
 
-        // Copy the ELF from assets to internal storage
-        File elfFile = new File(getFilesDir(), appName);
-        try {
-            copyAssetToFile(appName, elfFile);
-            elfPath = elfFile.getAbsolutePath();
-        } catch (IOException e) {
-            Log.e(TAG, "Failed to copy ELF: " + appName, e);
-            Toast.makeText(this, "Failed to copy ELF: " + e.getMessage(),
-                    Toast.LENGTH_SHORT).show();
-            finish();
-            return;
+        // Bundle build: boot the app by its guest path (/data/app/<id>/<entry>
+        // from the manifest), no ELF is ever copied out of the APK. Bundle-less
+        // build: the old path - copy the loose .exe from the assets to
+        // internal storage (always refreshed so an updated build takes effect).
+        String guestEntry = RvvmNative.nativeAppEntryPath(appName);
+        if (guestEntry != null && !guestEntry.isEmpty()) {
+            elfPath = guestEntry;
+        } else {
+            File elfFile = new File(getFilesDir(), appName);
+            try {
+                copyAssetToFile(appName, elfFile);
+                elfPath = elfFile.getAbsolutePath();
+            } catch (IOException e) {
+                Log.e(TAG, "Failed to copy ELF: " + appName, e);
+                Toast.makeText(this, "Failed to copy ELF: " + e.getMessage(),
+                        Toast.LENGTH_SHORT).show();
+                finish();
+                return;
+            }
         }
 
         // Create the guest (native)

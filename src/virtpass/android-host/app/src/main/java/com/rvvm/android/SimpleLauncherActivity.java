@@ -39,8 +39,9 @@ public class SimpleLauncherActivity extends Activity {
     private Button homeButton, recentAppsButton, backButton;
     private ArrayAdapter<String> appAdapter;
 
-    /** The apps to launch are the *.exe files in assets - exactly what MainActivity
-      * reads into guestApps[]. This avoids duplication. */
+    /** The apps to launch, by id from the bundle's apps.tar.gz - the same list
+      * MainActivity shows. A bundle-less build falls back to the loose *.exe
+      * files in assets (how the samples ran before the app model). */
     private String[] guestApps;
 
     @Override
@@ -129,8 +130,27 @@ public class SimpleLauncherActivity extends Activity {
         menu.show();
     }
 
-    /** Load the guest apps from assets. */
+    /** Load the guest apps: the bundle's apps.tar.gz declares them by id, but
+      * that archive is unpacked by nativeInit - so the host must be acquired
+      * before the list can be read. Ref-counted acquire here, matched release
+      * below; a guest Activity (or MainActivity) holds its own reference for
+      * the actual run. Without a bundle this falls back to the loose .exe
+      * files in assets - exactly what MainActivity.populateGuestApps() does. */
     private void loadGuestApps() {
+        RvvmHost host = RvvmHost.getInstance();
+        host.acquire();
+        try {
+            String[] apps = RvvmNative.nativeListApps();
+            if (apps != null && apps.length > 0) {
+                guestApps = apps;
+                Log.i(TAG, "Guest apps from the bundle: " + apps.length);
+                return;
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to list the bundle's apps", t);
+        } finally {
+            host.release();
+        }
         try {
             String[] assets = getAssets().list("");
             ArrayList<String> exeList = new ArrayList<>();

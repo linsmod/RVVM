@@ -1745,10 +1745,16 @@ public class MainActivity extends Activity {
             return false;
         }
         requested = requested.trim();
-        // Accept both "test_render" and "test_render.exe".
+        // Accept "test_render", "test_render.exe" - and the reverse direction:
+        // bundle app ids carry no ".exe" (the old loose-asset names did), so
+        // "test_cli.exe" must also match the id "test_cli".
         String withSuffix = requested.endsWith(".exe") ? requested : requested + ".exe";
+        String withoutSuffix = requested.endsWith(".exe")
+                ? requested.substring(0, requested.length() - 4) : requested;
         for (int i = 0; i < guestApps.length; i++) {
-            if (guestApps[i].equalsIgnoreCase(requested) || guestApps[i].equalsIgnoreCase(withSuffix)) {
+            if (guestApps[i].equalsIgnoreCase(requested)
+                    || guestApps[i].equalsIgnoreCase(withSuffix)
+                    || guestApps[i].equalsIgnoreCase(withoutSuffix)) {
                 selectedGuestApp = guestApps[i];
                 statusText.setText("Selected guest: " + guestApps[i]);
                 Log.i(TAG, "Intent selected guest app: " + guestApps[i]);
