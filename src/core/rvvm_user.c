@@ -124,6 +124,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #endif
 
 #include "rvvm_user.h" // rvvm_user_io_callback typedef (this file's own public header)
+#include "virtpass/vp_shadow.h" // guest rootfs "shape" index (rvvm_user_set_shadow)
 #include "rvvmlib.h"
 #include "elf_load.h"
 #include "mem_ops.h"
@@ -741,7 +742,9 @@ typedef struct {
 /* DT_* values, as getdents64 callers expect them. DT_UNKNOWN leaves the type to
  * the reader, which the mount answers through stat(). */
 #define RVVM_DT_UNKNOWN 0
+#define RVVM_DT_CHR     2
 #define RVVM_DT_DIR     4
+#define RVVM_DT_LNK     10
 
 typedef struct {
     int      fd;            /* synthetic fd the guest holds; 0 = free slot      */
@@ -752,6 +755,37 @@ typedef struct {
     bool     has_pending;   /* pending holds an entry already pulled from the host */
     char     pending[RVVM_ASSET_DIR_NAME_MAX];
 } rvvm_asset_dir_t;
+
+/* ============================================================
+ * Guest rootfs shadow: directory replay
+ *
+ * A directory in the guest rootfs is a real host directory *plus* the archive's
+ * symlinks, which no host directory can hold (Windows needs a privilege to
+ * create one, and a minirootfs has 335 of them). The guest's fd stays the host's
+ * own directory fd - so lseek()/fstat()/fchdir() need no synthetic branch at
+ * all - and this table only remembers how much of the shadow's part of the
+ * listing has been handed out. Emitting it before the host walk is what makes
+ * "ls /bin" show the applet links.
+ * ============================================================ */
+#define RVVM_SHADOW_DIR_MAX      8
+#define RVVM_SHADOW_DIR_NAME_MAX 256
+
+typedef struct {
+    int      fd;           /* host dir fd the guest holds; 0 = free slot       */
+    uint32_t dir_index;    /* shadow entry index of the directory              */
+    uint32_t next_child;   /* shadow child to consider next                    */
+    /* A directory whose listing the core supplies by itself, rather than one the
+     * archive knows - /dev, whose devices are synthesized and so exist nowhere
+     * in the host tree. NULL for an archive directory. */
+    const char* const* names;
+    uint32_t name_count;
+    uint32_t name_next;
+    uint64_t ino;          /* handed out as d_ino/d_off                        */
+    bool     links_done;   /* the core's part is exhausted, the host owns the rest */
+    bool     has_pending;  /* pending holds a name already pulled from the index */
+    uint8_t  pending_type;
+    char     pending[RVVM_SHADOW_DIR_NAME_MAX];
+} rvvm_shadow_dir_t;
 
 // Virtual TTY input ring (cooked bytes waiting for the guest) and the
 // canonical line buffer under construction. Both are small: this is an
@@ -793,6 +827,14 @@ typedef struct rvvm_userland {
     rvvm_asset_dir_t         asset_dirs[RVVM_ASSET_DIR_MAX];
     // Descriptors the mount handed out, for the run-end sweep. 0 = free slot.
     int                      asset_fds[RVVM_ASSET_FD_MAX];
+
+    // The archive "shape" of the guest's rootfs (rvvm_user_set_shadow). The host
+    // materializes the regular files into prefix_path and hands the index over
+    // here; what the host directory cannot express - symlinks above all - is
+    // answered from it. NULL when the host mounts no archive.
+    vp_shadow_t*             shadow;
+    // Real host directory fds whose listing must also carry the shadow's links.
+    rvvm_shadow_dir_t        shadow_dirs[RVVM_SHADOW_DIR_MAX];
 
     // --- Guest virtual memory allocator (group B) ---
     spinlock_t    guest_lock;
@@ -839,6 +881,9 @@ typedef struct rvvm_userland {
     vector_t(rvvm_process_t*) procs;
     // Next pid/tid to hand out; reset by every launch (see userland_procs_reset)
     uint32_t                  next_task_id;
+    // The launched image is an init, so the run root is pid 1 (see
+    // userland_image_is_init()). Set per launch, like next_task_id.
+    bool                      init_pid1;
 
     // --- Descriptors of the process this address space runs ---
     // The slot number is the guest fd, the entry carries the host fd it rides on.
@@ -2389,6 +2434,17 @@ PUBLIC void rvvm_user_set_assets(rvvm_machine_t* machine, const rvvm_asset_ops_t
     }
 }
 
+PUBLIC void rvvm_user_set_shadow(rvvm_machine_t* machine, vp_shadow_t* shadow)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    if (ctx) {
+        ctx->shadow = shadow;
+        /* A new index is a new namespace: any directory replay from a previous
+         * one would list names that no longer exist. */
+        memset(ctx->shadow_dirs, 0, sizeof(ctx->shadow_dirs));
+    }
+}
+
 static bool proc_mem_readable(const void* addr, size_t size)
 {
     static int fd = 0;
@@ -2506,12 +2562,22 @@ static bool path_has_prefix(const char* path, const char* prefix)
 static bool path_bypass(const char* path)
 {
     const char* prefix = uctx()->prefix_path;
-    return prefix == NULL
-        || path_has_prefix(path, "/dev")
-        || path_has_prefix(path, "/sys")
-        || path_has_prefix(path, "/proc")
-        || path_has_prefix(path, "/tmp")
-        || path_has_prefix(path, "/var/tmp");
+    if (prefix == NULL) {
+        return true;
+    }
+    if (path_has_prefix(path, "/dev")  || path_has_prefix(path, "/sys") ||
+        path_has_prefix(path, "/proc") || path_has_prefix(path, "/tmp") ||
+        path_has_prefix(path, "/var/tmp")) {
+        /* These five still bypass the prefix, because on the host they are the
+         * session's own devices and scratch space. But when the guest runs on an
+         * archive that *has* them - a minirootfs ships /dev, /proc, /sys, /tmp
+         * and /var/tmp as (empty) directories - the guest's own rootfs wins:
+         * bypassing those would send it to the host's root, where they do not
+         * exist (Windows has no C:\dev), and the guest would lose directories it
+         * can see in its own listing. The mount table replaces this rule. */
+        return uctx()->shadow == NULL || vp_shadow_lookup(uctx()->shadow, path) == NULL;
+    }
+    return false;
 }
 
 static bool path_wrapped(const char* path)
@@ -2522,14 +2588,219 @@ static bool path_wrapped(const char* path)
         || path_bypass(path);
 }
 
+/* ============================================================
+ * Guest rootfs shadow
+ *
+ * A host that runs the guest on an Alpine archive materializes the regular
+ * files into `prefix_path` and hands the archive's *shape* over with
+ * rvvm_user_set_shadow(). Everything the host directory cannot express is
+ * answered from the index here, so the guest sees one coherent namespace:
+ *
+ *   - a path that is an archive symlink resolves to its target in the *guest*
+ *     namespace, before the prefix is concatenated: /bin/sh -> /bin/busybox has
+ *     to land in the guest's own /bin, never on the host's root;
+ *   - lstat()/readlink() report the link itself, with the archive's mode, size
+ *     and mtime and a synthetic inode that stays the same across lookups;
+ *   - getdents64() of a real host directory also lists the archive's links,
+ *     which a host directory cannot have;
+ *   - unlinking an archive-only entry records it as hidden - there was never a
+ *     host file to remove.
+ *
+ * Regular files and directories stay *host* answers: they were materialized, so
+ * the host is authoritative for their mode, size and mtime, and a guest that
+ * deletes one deletes the run's own copy.
+ * ============================================================ */
+
+/* How many symlinks one lookup follows before giving up (ELOOP). */
+#define RVVM_SHADOW_MAX_FOLLOW 8
+
+/* The st_dev every shadow entry reports. Synthetic on purpose: the archive is
+ * one device in the guest's view, while the host's own device numbers differ
+ * between Linux, Windows and Android. */
+#define RVVM_SHADOW_DEV 0x52565348u
+
+/* MinGW's sys/stat.h leaves S_IFLNK out (S_IFDIR/S_IFREG it does define). The
+ * guest sees Linux bit values either way, since the stat is converted by
+ * uapi_stat_convert() - this is only the internal mode word. */
+#ifndef S_IFLNK
+#define S_IFLNK 0120000
+#endif
+
+/* Resolve @target of a symlink at @link_path in the guest namespace: an
+ * absolute target replaces the path, a relative one is resolved against the
+ * link's own directory. */
+static bool shadow_link_target(char* out, size_t size, const char* link_path, const char* target)
+{
+    char joined[UAPI_PATH_MAX];
+    size_t len = rvvm_strlen(link_path);
+    size_t dir_len = 0;
+    size_t target_len = rvvm_strlen(target);
+
+    if (target[0] == '/') {
+        return vp_shadow_normalize(out, size, target);
+    }
+    if (len >= sizeof(joined) || target_len >= sizeof(joined)) {
+        return false;
+    }
+    memcpy(joined, link_path, len + 1);
+    /* Drop the last component: "/bin/sh" -> "/bin", "/sh" -> "" */
+    for (size_t i = len; i > 0; --i) {
+        if (joined[i - 1] == '/') {
+            dir_len = i - 1;
+            break;
+        }
+    }
+    joined[dir_len] = 0;
+    if (dir_len + 1 + target_len + 1 > sizeof(joined)) {
+        return false;
+    }
+    joined[dir_len] = '/';
+    memcpy(joined + dir_len + 1, target, target_len + 1);
+    return vp_shadow_normalize(out, size, joined);
+}
+
+/* Follow the archive's symlinks along @abs (an absolute guest path, already
+ * normalized) until it names something else. Returns true and fills @out when
+ * the path was rewritten, false when the index has nothing to say about it -
+ * which is the common case, and the signal to leave the path alone. */
+static bool shadow_follow_path(char* out, size_t size, const char* abs)
+{
+    vp_shadow_t* shadow = uctx()->shadow;
+    char current[UAPI_PATH_MAX];
+    size_t len = rvvm_strlen(abs);
+    bool touched = false;
+
+    if (!shadow || len >= sizeof(current)) {
+        return false;
+    }
+    memcpy(current, abs, len + 1);
+
+    for (int hop = 0; hop < RVVM_SHADOW_MAX_FOLLOW; ++hop) {
+        const vp_shadow_entry_t* entry = vp_shadow_lookup(shadow, current);
+        if (!entry || entry->kind != VP_SHADOW_LINK || !entry->target || !*entry->target) {
+            break;
+        }
+        if (!shadow_link_target(current, sizeof(current), current, entry->target)) {
+            break; // too long to resolve: let the host syscall report it
+        }
+        touched = true;
+    }
+
+    len = rvvm_strlen(current);
+    if (!touched || len + 1 > size) {
+        return false;
+    }
+    memcpy(out, current, len + 1);
+    return true;
+}
+
+/* Resolve @abs *without* dereferencing a final symlink: the directory part goes
+ * through the shadow, the last component is left as it stands. That is what
+ * unlink()/rmdir()/lstat()/rename() need - Linux does not follow the last
+ * component for them, and following it here would delete or rename the *target*
+ * of a symlink instead of the link. */
+static bool shadow_resolve_parent(char* out, size_t size, const char* abs)
+{
+    char dir[UAPI_PATH_MAX];
+    const char* slash = NULL;
+    const char* name;
+    size_t len = rvvm_strlen(abs);
+    size_t dir_len = 0;
+    size_t name_len;
+
+    for (size_t i = 0; i < len; ++i) {
+        if (abs[i] == '/') {
+            slash = abs + i;
+        }
+    }
+    if (!slash || !slash[1]) {
+        return false; // "/" or "/name": the parent is the root, which holds no link
+    }
+    name = slash + 1;
+    dir_len = (size_t)(slash - abs);
+    if (!dir_len || dir_len + 1 > sizeof(dir)) {
+        return false;
+    }
+    memcpy(dir, abs, dir_len);
+    dir[dir_len] = 0;
+    if (!shadow_follow_path(dir, sizeof(dir), dir)) {
+        return false;
+    }
+    dir_len = rvvm_strlen(dir);
+    name_len = rvvm_strlen(name);
+    if (dir_len + 1 + name_len + 1 > size) {
+        return false;
+    }
+    memcpy(out, dir, dir_len);
+    out[dir_len] = '/';
+    memcpy(out + dir_len + 1, name, name_len + 1);
+    return true;
+}
+
+/* What an archive entry looks like to stat(): its own mode, size and mtime, the
+ * synthetic device and inode, and the guest's fake credentials. */
+static void shadow_fill_stat(struct stat* st, const vp_shadow_entry_t* entry)
+{
+    rvvm_userland_t* ctx = uctx();
+    mode_t type = S_IFREG;
+    if (entry->kind == VP_SHADOW_DIR) {
+        type = S_IFDIR;
+    } else if (entry->kind == VP_SHADOW_LINK) {
+        type = S_IFLNK;
+    }
+    memset(st, 0, sizeof(*st));
+    st->st_mode  = type | (mode_t)(entry->mode & 07777);
+    st->st_nlink = (entry->kind == VP_SHADOW_DIR) ? 2 : 1;
+    st->st_size  = (off_t)entry->size;
+    st->st_atime = st->st_mtime = st->st_ctime = (time_t)entry->mtime;
+    st->st_uid   = (unsigned)ctx->fake_uid;
+    st->st_gid   = (unsigned)ctx->fake_gid;
+    st->st_ino   = (ino_t)entry->ino;
+    st->st_dev   = (dev_t)RVVM_SHADOW_DEV;
+}
+
+/* Hide @abs and, when it is an archive directory, everything under it: the host
+ * rmdir removed a real (empty) directory, and the index must stop reporting the
+ * names it held. */
+static void shadow_hide_tree(const char* abs)
+{
+    vp_shadow_t* shadow = uctx()->shadow;
+    uint32_t index;
+
+    if (!shadow || !vp_shadow_hide(shadow, abs)) {
+        return;
+    }
+    index = vp_shadow_index(shadow, abs);
+    if (index != VP_SHADOW_NONE) {
+        for (uint32_t child = vp_shadow_first_child(shadow, index); child != VP_SHADOW_NONE;
+             child = vp_shadow_entry(shadow, child)->next) {
+            /* Recursing through the public API keeps this a tree walk of the
+             * index rather than of a path string. */
+            char path[UAPI_PATH_MAX];
+            const vp_shadow_entry_t* entry = vp_shadow_entry(shadow, child);
+            size_t len = rvvm_strlen(entry->path);
+            if (len + 1 <= sizeof(path)) {
+                memcpy(path, entry->path, len + 1);
+                shadow_hide_tree(path);
+            }
+        }
+    }
+}
+
 /* Map an already-absolute guest path into the host namespace: "<prefix><path>",
  * with the path_bypass() directories left alone.
  *
  * A relative path is returned untouched. This is the entry point for paths that
  * do NOT come from a syscall argument - the guest ELF named on the command
  * line, a symlink target - so the guest cwd has nothing to do with them. Guest
- * syscalls must go through wrap_guest_path(). */
-static const char* map_abs_path(char* buffer, const char* path)
+ * syscalls must go through wrap_guest_path().
+ *
+ * @follow_final is the difference between open("/bin/sh") and rm("/bin/sh"):
+ * the first resolves the archive's symlink in the guest namespace before the
+ * prefix is concatenated (otherwise "/bin/sh -> /bin/busybox" would name the
+ * host's /bin), the second must NOT - dereferencing there would delete the
+ * target instead of the link. */
+static const char* map_abs_path_ex(char* buffer, const char* path, bool follow_final)
 {
     const char* prefix = uctx()->prefix_path;
     if (prefix && path) {
@@ -2538,7 +2809,13 @@ static const char* map_abs_path(char* buffer, const char* path)
         }
 
         if (rvvm_strfind(path, "/") == path) {
-            size_t prefix_len = rvvm_strlcpy(buffer, prefix, UAPI_PATH_MAX);
+            char followed[UAPI_PATH_MAX];
+            size_t prefix_len;
+            if (follow_final ? shadow_follow_path(followed, sizeof(followed), path)
+                             : shadow_resolve_parent(followed, sizeof(followed), path)) {
+                path = followed;
+            }
+            prefix_len = rvvm_strlcpy(buffer, prefix, UAPI_PATH_MAX);
             /* "/" is the prefix directory itself. Appending it would leave a
              * trailing separator, which the host's stat()/open() may refuse
              * (MinGW is strict about this, and "cd .." lands exactly here). */
@@ -2550,6 +2827,12 @@ static const char* map_abs_path(char* buffer, const char* path)
         }
     }
     return path;
+}
+
+/* The common case: everything that names a file to act *on* follows links. */
+static const char* map_abs_path(char* buffer, const char* path)
+{
+    return map_abs_path_ex(buffer, path, true);
 }
 
 // Deepest path guest_path_absolutize() will normalize. A deeper one is refused
@@ -2647,7 +2930,7 @@ static bool guest_path_absolutize(char* out, size_t size, const char* path)
  *
  * A path that will not normalize (absurdly deep) is passed on as-is, so the
  * host syscall reports the failure itself. */
-static const char* wrap_guest_path(char* buffer, int dirfd, const char* path)
+static const char* wrap_guest_path_ex(char* buffer, int dirfd, const char* path, bool follow_final)
 {
     if (!path) {
         return NULL;
@@ -2655,10 +2938,18 @@ static const char* wrap_guest_path(char* buffer, int dirfd, const char* path)
     if (path[0] == '/' || dirfd == UAPI_AT_FDCWD) {
         char abs[UAPI_PATH_MAX];
         if (guest_path_absolutize(abs, sizeof(abs), path)) {
-            return map_abs_path(buffer, abs);
+            return map_abs_path_ex(buffer, abs, follow_final);
         }
     }
     return path;
+}
+
+/* Everything that acts *on* the named file follows links (open, stat, chdir,
+ * exec, truncate, ...). The few syscalls that must not - unlink, rmdir,
+ * readlink, lstat, rename, mkdir - go through wrap_guest_path_ex() directly. */
+static const char* wrap_guest_path(char* buffer, int dirfd, const char* path)
+{
+    return wrap_guest_path_ex(buffer, dirfd, path, true);
 }
 
 /* The asset name of a guest-absolute path under VP_ASSET_MOUNT, or NULL when the
@@ -2949,6 +3240,171 @@ static int64_t rvvm_sys_asset_getdents(rvvm_asset_dir_t* d, void* out, size_t si
     return (int64_t)reclen;
 }
 
+/* The replay slot for a host directory fd, or NULL when the directory has no
+ * archive links to add. */
+static rvvm_shadow_dir_t* shadow_dir_lookup(int fd)
+{
+    rvvm_userland_t* ctx = uctx();
+    for (size_t i = 0; i < RVVM_SHADOW_DIR_MAX; i++) {
+        if (fd != 0 && ctx->shadow_dirs[i].fd == fd) {
+            return &ctx->shadow_dirs[i];
+        }
+    }
+    return NULL;
+}
+
+/* A directory has something to add only when one of its archive children is a
+ * link: a materialized file or directory is already in the host's own listing. */
+static bool shadow_dir_has_links(uint32_t index)
+{
+    vp_shadow_t* shadow = uctx()->shadow;
+    for (uint32_t child = vp_shadow_first_child(shadow, index); child != VP_SHADOW_NONE;
+         child = vp_shadow_entry(shadow, child)->next) {
+        const vp_shadow_entry_t* entry = vp_shadow_entry(shadow, child);
+        if (entry->kind == VP_SHADOW_LINK && !entry->hidden) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Remember that @fd - a real host directory fd the guest just opened - also has
+ * to list the archive's links for @abs. A full table only costs the extra names,
+ * so it is not worth failing the open over. */
+static void shadow_dir_track(int fd, const char* abs)
+{
+    rvvm_userland_t* ctx = uctx();
+    uint32_t index;
+
+    if (fd <= 0 || !ctx->shadow || !abs || abs[0] != '/') {
+        return;
+    }
+    index = vp_shadow_index(ctx->shadow, abs);
+    if (index == VP_SHADOW_NONE || !shadow_dir_has_links(index)) {
+        return;
+    }
+    for (size_t i = 0; i < RVVM_SHADOW_DIR_MAX; i++) {
+        if (ctx->shadow_dirs[i].fd == 0) {
+            memset(&ctx->shadow_dirs[i], 0, sizeof(ctx->shadow_dirs[i]));
+            ctx->shadow_dirs[i].fd = fd;
+            ctx->shadow_dirs[i].dir_index = index;
+            ctx->shadow_dirs[i].next_child = vp_shadow_first_child(ctx->shadow, index);
+            return;
+        }
+    }
+}
+
+/* Register a directory whose names the core supplies itself. /dev is the one
+ * today: its nodes are synthesized (see the /dev section), so the host tree has
+ * nothing to list and a guest would otherwise see an empty directory next to a
+ * working /dev/null. */
+static void shadow_dir_track_names(int fd, const char* const* names, uint32_t count)
+{
+    rvvm_userland_t* ctx = uctx();
+    if (fd <= 0 || !ctx->shadow || !names || !count) {
+        return;
+    }
+    for (size_t i = 0; i < RVVM_SHADOW_DIR_MAX; i++) {
+        if (ctx->shadow_dirs[i].fd == 0) {
+            memset(&ctx->shadow_dirs[i], 0, sizeof(ctx->shadow_dirs[i]));
+            ctx->shadow_dirs[i].fd         = fd;
+            ctx->shadow_dirs[i].dir_index  = VP_SHADOW_NONE;
+            ctx->shadow_dirs[i].names      = names;
+            ctx->shadow_dirs[i].name_count = count;
+            return;
+        }
+    }
+}
+
+static void shadow_dir_forget(int fd)
+{
+    rvvm_shadow_dir_t* d = shadow_dir_lookup(fd);
+    if (d) {
+        memset(d, 0, sizeof(*d));
+    }
+}
+
+/* A rewind (lseek 0) has to replay the shadow's part as well; the caller rewinds
+ * the host fd itself. */
+static void shadow_dir_rewind(int fd)
+{
+    rvvm_shadow_dir_t* d = shadow_dir_lookup(fd);
+    if (d) {
+        d->next_child  = vp_shadow_first_child(uctx()->shadow, d->dir_index);
+        d->name_next   = 0;
+        d->links_done  = false;
+        d->has_pending = false;
+    }
+}
+
+/* One record from the shadow's part of a directory listing: >0 the record length,
+ * 0 when the shadow has nothing left (the host's own walk owns the rest), or a
+ * negative guest errno. One entry per call, like the asset mount's, so a
+ * destination buffer too small for the entry does not consume it. */
+static int64_t shadow_dir_getdents(rvvm_shadow_dir_t* d, void* out, size_t size)
+{
+    vp_shadow_t* shadow = uctx()->shadow;
+    struct uapi_linux_dirent64* de;
+    size_t name_len;
+    size_t reclen;
+
+    if (!d->has_pending) {
+        const char* name = NULL;
+        uint8_t type = RVVM_DT_LNK;
+
+        if (d->names) {
+            /* A directory the core supplies itself: every name in it is one of
+             * the synthesized /dev nodes, so a character device. */
+            while (d->name_next < d->name_count) {
+                const char* candidate = d->names[d->name_next++];
+                if (candidate && *candidate) {
+                    name = candidate;
+                    break;
+                }
+            }
+            type = RVVM_DT_CHR;
+        } else {
+            while (d->next_child != VP_SHADOW_NONE) {
+                const vp_shadow_entry_t* candidate = vp_shadow_entry(shadow, d->next_child);
+                d->next_child = candidate->next;
+                if (candidate->kind == VP_SHADOW_LINK && !candidate->hidden) {
+                    /* An entry's name is the last component of its path. */
+                    for (const char* p = candidate->path; *p; ++p) {
+                        if (*p == '/') {
+                            name = p + 1;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if (!name) {
+            d->links_done = true;
+            return 0;
+        }
+        rvvm_strlcpy(d->pending, name, sizeof(d->pending));
+        d->pending_type = type;
+        d->has_pending = true;
+    }
+
+    name_len = rvvm_strlen(d->pending);
+    reclen = (sizeof(*de) + name_len + 1 + 7) & ~(size_t)7;
+    if (reclen > size) {
+        return -UAPI_EINVAL;
+    }
+
+    de = out;
+    memset(de, 0, reclen);
+    de->d_ino    = ++d->ino;
+    de->d_off    = (int64_t)d->ino;
+    de->d_reclen = (uint16_t)reclen;
+    de->d_type   = d->pending_type;
+    memcpy(de->d_name, d->pending, name_len + 1);
+
+    d->has_pending = false;
+    return (int64_t)reclen;
+}
+
 static size_t unwrap_path(char* buffer, const char* path, size_t size)
 {
     const char* prefix = uctx()->prefix_path;
@@ -3120,6 +3576,27 @@ static void user_fault_handler_install(void)
  * 1 changes a process's signal handling), and reports a parent of 1. */
 #define USERLAND_FIRST_TASK_ID  100
 #define USERLAND_ROOT_PARENT_ID 1
+/* ... unless it *is* an init, which gets the pid it demands. */
+#define USERLAND_INIT_TASK_ID   1
+
+/* An image named "init" is an init, the way a container's is: it is launched the
+ * same way every init expects to be, and every init refuses to run as anything
+ * else - busybox init exits with "init: must be run as PID 1" before it reads
+ * /etc/inittab. Ordinary guests are unaffected: they keep starting at
+ * USERLAND_FIRST_TASK_ID, which is what stops them taking themselves for one. */
+static bool userland_image_is_init(const char* path)
+{
+    const char* name = path;
+    if (!path) {
+        return false;
+    }
+    for (const char* p = path; *p; ++p) {
+        if (*p == '/' || *p == '\\') {
+            name = p + 1;
+        }
+    }
+    return !strcmp(name, "init") || !strcmp(name, "init.exe");
+}
 
 /* How long a blocked wait4() sleeps before it looks at the registry again. The
  * child's exit event wakes it immediately in the common case; this timeout is
@@ -3535,7 +4012,7 @@ static void userland_procs_reset(rvvm_userland_t* ctx)
         userland_proc_unref(vector_at(ctx->procs, i));
     }
     vector_clear(ctx->procs);
-    ctx->next_task_id = USERLAND_FIRST_TASK_ID;
+    ctx->next_task_id = ctx->init_pid1 ? USERLAND_INIT_TASK_ID : USERLAND_FIRST_TASK_ID;
     spin_unlock(&ctx->proc_lock);
 }
 
@@ -4100,6 +4577,11 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
      * descriptors this context hands out are its own to sweep. */
     ctx->asset_ops  = parent->asset_ops;
     ctx->asset_user = parent->asset_user;
+
+    /* The same rootfs archive. The index and its hidden set are shared with the
+     * parent for now: the emulator's fork copies the address space, and the two
+     * keep seeing one namespace. */
+    ctx->shadow = parent->shadow;
 
     /* Console output goes through the same sink, so a child's writes reach the
      * console its parent was started on. Its bytes are not parsed into the
@@ -4914,6 +5396,23 @@ static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
         return rvvm_sys_asset_getdents(asset_dir, dirp, size);
     }
 
+    /* A real host directory that also carries the archive's links: the links go
+     * out first, then the host's own walk continues where it stood. A zero here
+     * means the shadow is spent, not end-of-directory. */
+    {
+        rvvm_shadow_dir_t* shadow_dir = shadow_dir_lookup(fd);
+        if (shadow_dir) {
+            int64_t sret;
+            if (!dirp) {
+                return -UAPI_EFAULT;
+            }
+            sret = shadow_dir_getdents(shadow_dir, dirp, size);
+            if (sret != 0) {
+                return sret;
+            }
+        }
+    }
+
     /* SYS_getdents64 is served by the host layer: the native syscall on Linux,
      * the Win32 directory walk in posix_shim.c elsewhere. The guest structure
      * (struct uapi_linux_dirent64 above) is filled by that layer. */
@@ -5174,9 +5673,31 @@ static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* bu
 {
     char host[UAPI_PATH_MAX] = {0};
     char tmp[UAPI_PATH_MAX] = {0};
+    char abs[UAPI_PATH_MAX] = {0};
+
+    /* An archive symlink exists only in the index - the host has no file to read
+     * a target out of (that is the whole point of the shadow layer). */
+    if (buffer && uctx()->shadow && pathname &&
+        (pathname[0] == '/' || dirfd == UAPI_AT_FDCWD) &&
+        guest_path_absolutize(abs, sizeof(abs), pathname)) {
+        const vp_shadow_entry_t* entry = vp_shadow_lookup(uctx()->shadow, abs);
+        if (entry) {
+            size_t len;
+            if (entry->kind != VP_SHADOW_LINK || !entry->target) {
+                return -UAPI_EINVAL; // not a symlink: Linux says EINVAL
+            }
+            len = rvvm_strlen(entry->target);
+            if (len > size) {
+                len = size; // readlink() truncates, it does not fail
+            }
+            memcpy(buffer, entry->target, len);
+            return (rvvm_addr_t)len;
+        }
+    }
+
     /* Separate buffers: the mapped host path and the link target are both
      * strings, and reading one into the other's storage is asking for it. */
-    if (readlinkat(dirfd, wrap_guest_path(host, dirfd, pathname), tmp, size) < 0) {
+    if (readlinkat(dirfd, wrap_guest_path_ex(host, dirfd, pathname, false), tmp, size) < 0) {
         return last_errno();
     }
     return unwrap_path(buffer, tmp, size);
@@ -5875,6 +6396,11 @@ static bool userland_pty_readable(struct userland_pty* pty, bool master)
 #define DEV_NULL          0
 #define DEV_ZERO          1
 #define DEV_RANDOM        2
+/* The run's own console. A userland guest has exactly one terminal - the
+ * session its host attached - so /dev/console and every /dev/ttyN name it. That
+ * is what init, getty and a login shell need, and there is no second terminal
+ * for them to reach anyway. */
+#define DEV_CONSOLE       3
 
 static bool userland_dev_by_fd(int fd, int* out_dev)
 {
@@ -5882,7 +6408,7 @@ static bool userland_dev_by_fd(int fd, int* out_dev)
         return false;
     }
     uint32_t dev = (uint32_t)fd - RVVM_DEV_FD_BASE;
-    if (dev > DEV_RANDOM) {
+    if (dev > DEV_CONSOLE) {
         return false;
     }
     if (out_dev) {
@@ -5905,6 +6431,9 @@ static int64_t userland_dev_read(int dev, void* buf, size_t count)
         case DEV_NULL:  return 0;                       // EOF, always
         case DEV_ZERO:  memset(buf, 0, count); return (int64_t)count;
         case DEV_RANDOM: rvvm_randombytes(buf, count); return (int64_t)count;
+        /* The console's input half is the same ring fd 0 reads: the host pushes
+         * keyboard bytes into it with rvvm_user_tty_input(). */
+        case DEV_CONSOLE: return user_tty_read(uctx(), buf, count, true);
     }
     return -UAPI_EINVAL;
 }
@@ -5913,6 +6442,18 @@ static int64_t userland_dev_write(int dev, const void* buf, size_t count)
 {
     if (!buf) {
         return -UAPI_EFAULT;
+    }
+    if (dev == DEV_CONSOLE) {
+        /* The console's output half is what fd 1 does: parse the bytes into the
+         * virtual TTY (so CR / ANSI escapes render) and then let them reach the
+         * sink the host installed - logcat plus the Java console on Android,
+         * stdout on win32. */
+        rvvm_userland_t* ctx = uctx();
+        user_tty_write(ctx, 1, buf, count);
+        if (ctx->io_callback) {
+            return errno_ret(ctx->io_callback(1, buf, count));
+        }
+        return errno_ret(write(1, buf, count));
     }
     (void)dev;   // /dev/null and /dev/zero both swallow everything
     return (int64_t)count;
@@ -5935,6 +6476,23 @@ static bool guest_dev_device(char* abs, size_t size, const char* path)
         for (const char* p = num; *p; ++p) {
             if (*p < '0' || *p > '9') {
                 return false;
+            }
+        }
+        return true;
+    }
+    /* The run's terminal: /dev/console, /dev/tty, and the /dev/ttyN an inittab
+     * respawns getty on. They all name the one session the host attached. */
+    if (!strcmp(abs, "/dev/console") || !strcmp(abs, "/dev/tty")) {
+        return true;
+    }
+    if (!strncmp(abs, "/dev/tty", 8)) {
+        const char* num = abs + 8;
+        if (!*num) {
+            return false;   // "/dev/tty" is handled above
+        }
+        for (const char* p = num; *p; ++p) {
+            if (*p < '0' || *p > '9') {
+                return false;   // /dev/ttyS0 and friends are not the console
             }
         }
         return true;
@@ -5963,6 +6521,10 @@ static int userland_dev_open(const char* abs, int flags)
     }
     if (!strcmp(abs, "/dev/urandom") || !strcmp(abs, "/dev/random")) {
         return userland_dev_fd(DEV_RANDOM);
+    }
+    if (!strcmp(abs, "/dev/console") || !strcmp(abs, "/dev/tty") ||
+        !strncmp(abs, "/dev/tty", 8)) {
+        return userland_dev_fd(DEV_CONSOLE);
     }
     if (!strcmp(abs, "/dev/null")) {
         return userland_dev_fd(DEV_NULL);
@@ -6169,10 +6731,114 @@ static void userland_pty_fill_stat(struct userland_pty* pty, bool master, struct
 }
 
 /* The same shape for /dev/null, /dev/zero and /dev/urandom: character devices
- * with no pair behind them. */
-static void userland_dev_fill_stat(struct stat* st)
+ * with no pair behind them. The console is a character device too, but reports
+ * Linux's console major so a guest that reads st_rdev sees something sensible. */
+static void userland_dev_fill_stat(int dev, struct stat* st)
 {
+    if (dev == DEV_CONSOLE) {
+        memset(st, 0, sizeof(*st));
+        st->st_mode    = S_IFCHR | 0620;
+        st->st_rdev    = (5ULL << 8);
+        st->st_nlink   = 1;
+        st->st_blksize = 4096;
+        return;
+    }
     userland_pty_fill_stat(NULL, true, st);
+}
+
+/* The nodes a listing of /dev shows. The archive ships /dev as an empty
+ * directory and none of these exist on the host, so without this "ls /dev" would
+ * show nothing next to a working /dev/null. */
+static const char* const userland_dev_names[] = {
+    "console", "tty", "tty1", "tty2", "tty3", "tty4", "tty5", "tty6",
+    "null", "zero", "random", "urandom", "ptmx",
+    /* "pts" is deliberately absent: the host materializes that directory (it is
+     * a mount point), so it is already in the host's own listing and naming it
+     * here would list it twice. Directories are the host's, nodes are ours. */
+};
+static const char* const userland_devpts_names[] = { "ptmx" };
+
+/* Whether @abs is a directory whose listing the core supplies itself. */
+static bool userland_dev_dir(const char* abs, const char* const** names, uint32_t* count)
+{
+    if (!strcmp(abs, "/dev")) {
+        *names = userland_dev_names;
+        *count = (uint32_t)(sizeof(userland_dev_names) / sizeof(userland_dev_names[0]));
+        return true;
+    }
+    if (!strcmp(abs, "/dev/pts")) {
+        *names = userland_devpts_names;
+        *count = (uint32_t)(sizeof(userland_devpts_names) / sizeof(userland_devpts_names[0]));
+        return true;
+    }
+    return false;
+}
+
+/* A stable synthetic inode for a path the core answers itself. (st_dev, st_ino)
+ * is what find and tar use for loop detection, so two different synthesized
+ * names must not share one. */
+static uint32_t userland_dev_ino(const char* path)
+{
+    uint32_t hash = 2166136261u;
+    while (*path) {
+        hash ^= (uint8_t)*path++;
+        hash *= 16777619u;
+    }
+    return hash ? hash : 1;
+}
+
+/* The N of "/dev/ttyN", or NULL when @abs is not one (a bare /dev/tty, or a
+ * serial port like /dev/ttyS0, which is not this run's console). */
+static const char* userland_dev_tty_number(const char* abs)
+{
+    if (strncmp(abs, "/dev/tty", 8) || !abs[8]) {
+        return NULL;
+    }
+    for (const char* p = abs + 8; *p; ++p) {
+        if (*p < '0' || *p > '9') {
+            return NULL;
+        }
+    }
+    return abs + 8;
+}
+
+/* stat()/lstat() of a synthesized /dev path. The archive's /dev is an empty
+ * directory and these nodes are answered by the core, so without this a guest
+ * could open /dev/tty1 but not stat() it - and getty, and every shell's tty
+ * check, do both. The two synthesized directories are here for the same reason:
+ * a listing that can show a name it cannot stat is worse than no listing. */
+static bool userland_dev_stat_path(const char* abs, struct stat* st)
+{
+    bool known = true;
+
+    if (!strcmp(abs, "/dev") || !strcmp(abs, "/dev/pts")) {
+        memset(st, 0, sizeof(*st));
+        st->st_mode  = S_IFDIR | 0755;
+        st->st_nlink = 2;
+    } else if (!strcmp(abs, "/dev/null") || !strcmp(abs, "/dev/zero")) {
+        userland_dev_fill_stat(DEV_NULL, st);
+    } else if (!strcmp(abs, "/dev/urandom") || !strcmp(abs, "/dev/random")) {
+        userland_dev_fill_stat(DEV_RANDOM, st);
+    } else if (!strcmp(abs, "/dev/console") || !strcmp(abs, "/dev/tty") ||
+               userland_dev_tty_number(abs)) {
+        userland_dev_fill_stat(DEV_CONSOLE, st);
+    } else if (!strcmp(abs, "/dev/ptmx") || !strcmp(abs, "/dev/pts/ptmx") ||
+               !strncmp(abs, "/dev/pts/", 9)) {
+        /* A pty pair is allocated on open, so a stat can only report the shape
+         * of one - which is all a guest learns from it anyway. */
+        userland_pty_fill_stat(NULL, true, st);
+    } else {
+        known = false;
+    }
+
+    if (known) {
+        rvvm_userland_t* ctx = uctx();
+        st->st_dev = (dev_t)RVVM_SHADOW_DEV;
+        st->st_ino = (ino_t)userland_dev_ino(abs);
+        st->st_uid = (unsigned)ctx->fake_uid;
+        st->st_gid = (unsigned)ctx->fake_gid;
+    }
+    return known;
 }
 
 /* openat() on /dev/ptmx: a new pair, with the master as the descriptor the
@@ -6621,9 +7287,16 @@ static void* rvvm_user_thread_wrap(void* arg)
                         int hfd = userland_fd_host(uctx(), (int)a0);
                         struct userland_pty* pty = NULL;
                         bool master = false;
+                        int idev = -1;
                         if (userland_pty_by_fd(hfd, &pty, &master)) {
                             a0 = (rvvm_addr_t)userland_pty_ioctl(pty, master, a1, a2 ? to_ptr(a2) : NULL,
                                                                  (int32_t)(thread->proc ? thread->proc->pid : 0));
+                        } else if (userland_dev_by_fd(hfd, &idev) && idev == DEV_CONSOLE) {
+                            /* /dev/console or /dev/ttyN: the termios and window
+                             * size of the run's session, exactly as for an
+                             * untracked fd 0/1/2 above. getty asks for both
+                             * before it reads a login name. */
+                            a0 = user_tty_ioctl(a1, a2 ? to_ptr(a2) : NULL);
                         } else {
                             a0 = errno_ret(ioctl(hfd, a1, a2));
                         }
@@ -6636,20 +7309,44 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 33: // mknodat
                     rvvm_info("sys_mknodat(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
                     /* A dirfd is a descriptor like any other: the guest's number
-                     * goes to the table before the host sees it. */
+                     * goes to the table before the host sees it. Creating a node
+                     * does not follow the path's last component. */
                     a0 = errno_ret(mknodat(userland_fd_host(uctx(), (int)a0),
-                                           wrap_guest_path(path_buf, (int)a0, to_str(a1)), a2, a3));
+                                           wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false), a2, a3));
                     break;
                 case 34: // mkdirat
                     rvvm_info("sys_mkdirat(%ld, %s, %lx)", a0, to_str(a1), a2);
                     a0 = errno_ret(mkdirat(userland_fd_host(uctx(), (int)a0),
-                                           wrap_guest_path(path_buf, (int)a0, to_str(a1)), a2));
+                                           wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false), a2));
                     break;
-                case 35: // unlinkat
+                case 35: { // unlinkat (guest rmdir is the same call with AT_REMOVEDIR)
+                    char unlink_abs[UAPI_PATH_MAX];
+                    bool have_unlink_abs = false;
+                    int unlink_ret;
                     rvvm_info("sys_unlinkat(%ld, %s, %lx)", a0, to_str(a1), a2);
-                    a0 = errno_ret(unlinkat(userland_fd_host(uctx(), (int)a0),
-                                            wrap_guest_path(path_buf, (int)a0, to_str(a1)), a2));
+                    if (to_str(a1) && (to_str(a1)[0] == '/' || (int)a0 == UAPI_AT_FDCWD)) {
+                        have_unlink_abs = guest_path_absolutize(unlink_abs, sizeof(unlink_abs), to_str(a1));
+                    }
+                    unlink_ret = unlinkat(userland_fd_host(uctx(), (int)a0),
+                                          wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false), a2);
+                    a0 = errno_ret(unlink_ret);
+                    if (have_unlink_abs && uctx()->shadow) {
+                        if (a0 == -UAPI_ENOENT && vp_shadow_lookup(uctx()->shadow, unlink_abs)) {
+                            /* The index knows this name but the host has no file
+                             * for it: the guest just unlinked an archive-only
+                             * entry, a symlink above all. The host seeing
+                             * nothing to remove is expected - recording the
+                             * hidden flag *is* the unlink, and it succeeds. */
+                            shadow_hide_tree(unlink_abs);
+                            a0 = 0;
+                        } else if (unlink_ret == 0) {
+                            /* A materialized entry was removed from this run's
+                             * own copy; the index must stop reporting it too. */
+                            shadow_hide_tree(unlink_abs);
+                        }
+                    }
                     break;
+                }
                 case 36: // symlinkat
                     rvvm_info("sys_symlinkat(%s, %ld, %s)", to_str(a0), a1, to_str(a2));
                     /* The target is stored verbatim by the kernel, so it is not
@@ -6657,15 +7354,41 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * The link path is an ordinary guest path. */
                     a0 = errno_ret(symlinkat(map_abs_path(path_buf, to_str(a0)),
                                              userland_fd_host(uctx(), (int)a1),
-                                             wrap_guest_path(path_buf1, (int)a1, to_str(a2))));
+                                             wrap_guest_path_ex(path_buf1, (int)a1, to_str(a2), false)));
                     break;
                 case 37: // linkat
                     rvvm_info("sys_linkat(%ld, %s, %ld, %s, %lx)", a0, to_str(a1), a2, to_str(a3), a4);
+                    /* Neither name is dereferenced: the new one is created, and a
+                     * hard link to a symlink is legal. */
                     a0 = errno_ret(linkat(userland_fd_host(uctx(), (int)a0),
-                                          wrap_guest_path(path_buf, (int)a0, to_str(a1)),
+                                          wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false),
                                           userland_fd_host(uctx(), (int)a2),
-                                          wrap_guest_path(path_buf1, (int)a2, to_str(a3)), a4));
+                                          wrap_guest_path_ex(path_buf1, (int)a2, to_str(a3), false), a4));
                     break;
+                case 39: // umount2
+                    /* Nothing is really mounted (see mount below), so nothing
+                     * can be unmounted. Answering success keeps a session's
+                     * shutdown from tripping over it. */
+                    rvvm_info("sys_umount2(%s)", to_str(a0));
+                    a0 = 0;
+                    break;
+                case 40: { // mount
+                    const char* fstype = to_str(a2);
+                    rvvm_info("sys_mount(%s, %s, %s)", to_str(a0), to_str(a1), fstype);
+                    /* The guest's rootfs already *is* the whole namespace, and
+                     * the devices a session needs are synthesized, so there is
+                     * nothing left to mount. These are answered as success
+                     * because init and getty refuse to go on otherwise; every
+                     * other fstype is honestly unsupported. */
+                    if (fstype && (!strcmp(fstype, "proc") || !strcmp(fstype, "sysfs") ||
+                                   !strcmp(fstype, "devtmpfs") || !strcmp(fstype, "tmpfs") ||
+                                   !strcmp(fstype, "devpts"))) {
+                        a0 = 0;
+                    } else {
+                        a0 = -UAPI_ENOSYS;
+                    }
+                    break;
+                }
                 case 43: { // statfs64
                     struct statfs stfs = {0};
                     struct uapi_statfs64* out = to_ptr_sz(a1, sizeof(*out));
@@ -6751,12 +7474,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                     } else {
                         char abs[UAPI_PATH_MAX];
                         const char* asset = NULL;
+                        bool have_abs = false;
                         /* The asset mount is matched on the guest's own absolute
                          * path, before the prefix mapping - the host's asset tree
                          * is not a path in any file system, so there is nothing
                          * to translate it to. */
                         if (path && (path[0] == '/' || (int)a0 == UAPI_AT_FDCWD) &&
                             guest_path_absolutize(abs, sizeof(abs), path)) {
+                            have_abs = true;
                             asset = asset_mount_name(abs);
                         }
                         if (asset) {
@@ -6807,6 +7532,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                             a0 = errno_ret(openat(userland_fd_host(uctx(), (int)a0),
                                                   host_path, uapi_open_flags(a2), a3));
                             if (a0 >= 0) {
+                                /* A rootfs directory may also have to list the
+                                 * archive's links (see rvvm_sys_getdents64). */
+                                shadow_dir_track((int)a0, have_abs ? abs : NULL);
+                                /* /dev holds synthesized nodes: the host tree
+                                 * has none of them, so the core supplies the
+                                 * names of that listing itself. */
+                                if (have_abs && uctx()->shadow) {
+                                    const char* const* dev_names = NULL;
+                                    uint32_t dev_count = 0;
+                                    if (userland_dev_dir(abs, &dev_names, &dev_count)) {
+                                        shadow_dir_track_names((int)a0, dev_names, dev_count);
+                                    }
+                                }
                                 /* O_CLOEXEC is not translated into the host
                                  * flags, so the guest's view of the flag lives
                                  * in the table (and execve() acts on it). */
@@ -6817,6 +7555,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 }
                 case 57: // close
+                    /* Before the host fd can be reused: drop any replay state
+                     * this directory carried. */
+                    shadow_dir_forget(userland_fd_host(uctx(), (int)a0));
                     if (asset_dir_lookup((int)a0)) {
                         a0 = rvvm_sys_asset_closedir((int)a0);
                     } else if (userland_fd_close(uctx(), (int)a0)) {
@@ -6854,9 +7595,16 @@ static void* rvvm_user_thread_wrap(void* arg)
                          : (rvvm_addr_t)rvvm_sys_getdents64(userland_fd_host(uctx(), (int)a0), dirp, a2);
                     break;
                 }
-                case 62: // lseek
-                    a0 = errno_ret(lseek(userland_fd_host(uctx(), (int)a0), a1, a2));
+                case 62: { // lseek
+                    int lfd = userland_fd_host(uctx(), (int)a0);
+                    a0 = errno_ret(lseek(lfd, a1, a2));
+                    /* Rewinding a directory restarts its listing, which has to
+                     * replay the archive's links as well. */
+                    if (a0 == 0 && a1 == 0 && a2 == SEEK_SET) {
+                        shadow_dir_rewind(lfd);
+                    }
                     break;
+                }
                 case 63: { // read
                     void* buf = a2 ? to_ptr_sz(a1, a2) : NULL;
                     if (a2 && !buf) {
@@ -7114,6 +7862,32 @@ static void* rvvm_user_thread_wrap(void* arg)
                         uapi_stat_convert(out, &st);
                         break;
                     }
+                    /* A synthesized /dev node or directory: the guest can open
+                     * it (and list it), so it must be able to stat() it too -
+                     * getty and every shell's tty check do. */
+                    if (path && (path[0] == '/' || (int)a0 == UAPI_AT_FDCWD)) {
+                        char dev_abs[UAPI_PATH_MAX];
+                        struct stat dev_st = {0};
+                        if (guest_path_absolutize(dev_abs, sizeof(dev_abs), path) &&
+                            userland_dev_stat_path(dev_abs, &dev_st)) {
+                            a0 = 0;
+                            uapi_stat_convert(out, &dev_st);
+                            break;
+                        }
+                    }
+                    /* An archive symlink with AT_SYMLINK_NOFOLLOW: lstat() asks
+                     * about the link itself, and the host has no file for it. */
+                    if (uctx()->shadow && (a3 & AT_SYMLINK_NOFOLLOW) && path &&
+                        (path[0] == '/' || (int)a0 == UAPI_AT_FDCWD) &&
+                        guest_path_absolutize(abs, sizeof(abs), path)) {
+                        const vp_shadow_entry_t* entry = vp_shadow_lookup(uctx()->shadow, abs);
+                        if (entry && entry->kind == VP_SHADOW_LINK) {
+                            shadow_fill_stat(&st, entry);
+                            a0 = 0;
+                            uapi_stat_convert(out, &st);
+                            break;
+                        }
+                    }
                     /* fstatat(fd, NULL, AT_EMPTY_PATH) on a synthetic asset
                      * directory fd - there is no host fd to hand to fstatat. */
                     if (!path && (a3 & AT_EMPTY_PATH) && asset_dir_lookup((int)a0)) {
@@ -7131,7 +7905,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                          * fstatat() accepts it, and wrap_guest_path() passes
                          * NULL straight through. */
                         ret = fstatat(userland_fd_host(uctx(), (int)a0),
-                                      wrap_guest_path(path_buf, (int)a0, path), &st, a3);
+                                      wrap_guest_path_ex(path_buf, (int)a0, path,
+                                                         (a3 & AT_SYMLINK_NOFOLLOW) == 0), &st, a3);
                     }
                     a0 = errno_ret(ret);
                     uapi_stat_convert(out, &st);
@@ -7163,7 +7938,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                             userland_pty_fill_stat(pty, master, &st);
                             a0 = 0;
                         } else if (userland_dev_by_fd(hfd, &dev)) {
-                            userland_dev_fill_stat(&st);
+                            userland_dev_fill_stat(dev, &st);
                             a0 = 0;
                         } else {
                             a0 = errno_ret(fstat(hfd, &st));
@@ -7950,10 +8725,11 @@ static void* rvvm_user_thread_wrap(void* arg)
 #endif
                 case 276: // renameat2
                     rvvm_info("sys_renameat2(%ld, %s, %ld, %s, %lx)", a0, to_str(a1), a2, to_str(a3), a4);
+                    /* rename() moves the link, it never dereferences it. */
                     a0 = errno_ret(renameat(userland_fd_host(uctx(), (int)a0),
-                                            wrap_guest_path(path_buf, (int)a0, to_str(a1)),
+                                            wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false),
                                             userland_fd_host(uctx(), (int)a2),
-                                            wrap_guest_path(path_buf1, (int)a2, to_str(a3))));
+                                            wrap_guest_path_ex(path_buf1, (int)a2, to_str(a3), false)));
                     break;
                 case 277: // seccomp - stub
                     // Hitler SHOT HIMSELF after seeing this...
@@ -8206,7 +8982,12 @@ static void jump_start(size_t entry, size_t stack_top)
     /* The process the host launched: this run's root, and the owner of the host
      * callback. The main thread wears the same id (Linux: a thread group leader's
      * tid equals the process id), which is also what its gettid() reports. */
-    thread->proc = userland_proc_create(ctx, userland_task_id_alloc(ctx), USERLAND_ROOT_PARENT_ID, 0, true);
+    uint32_t root_pid = userland_task_id_alloc(ctx);
+    /* An init has no parent at all, and reports it that way (Linux: pid 1's
+     * getppid() is 0) - a userland guest that is not an init keeps reporting 1. */
+    thread->proc = userland_proc_create(ctx, root_pid,
+                                        root_pid == USERLAND_INIT_TASK_ID ? 0 : USERLAND_ROOT_PARENT_ID,
+                                        0, true);
     thread->tid  = thread->proc->pid;
 
     rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_X0 + 2, (size_t)stack_top);
@@ -8990,6 +9771,9 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
      * The brk heap is reset by guest_vm_init() below. */
     rvvm_userland_t* ctx = uctx();
     memset(ctx->siga, 0, sizeof(ctx->siga));
+    /* Before the ids are handed out: an image named "init" runs as pid 1 (it
+     * refuses to run at all otherwise), everything else starts at 100. */
+    ctx->init_pid1 = userland_image_is_init(argv ? argv[0] : NULL);
     userland_procs_reset(ctx);
     /* Free, then init: the previous guest's descriptors close, and the console
      * this one starts with (0/1/2) is put back, so its first dup(2) does not
@@ -9000,9 +9784,12 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
     /* Path prefix override: an empty RVVM_USER_PREFIX passes host paths through
      * unchanged, unset keeps the build-time default. Resolved here, on the
      * guest thread, rather than in rvvm_user_create(): hosts putenv() right
-     * before launching this thread, so create() would have read a stale value. */
+     * before launching this thread, so create() would have read a stale value.
+     * A prefix the host set with rvvm_user_set_prefix() wins: the environment is
+     * a convenience for a command line, not a way to take a bundle away from a
+     * host that mounted one (see prefix_forced). */
     const char* env_prefix = getenv("RVVM_USER_PREFIX");
-    if (env_prefix) {
+    if (env_prefix && !ctx->prefix_forced) {
         ctx->prefix_path = env_prefix[0] ? env_prefix : NULL;
     }
 

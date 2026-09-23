@@ -13,3 +13,5 @@ obj/
 libs/
 # Guest programs cross-compiled from src/virtpass/guest-samples (see project.mk)
 app/src/main/assets/*.exe
+# The release bundle staged into the APK (rootfs.tar.gz / apps.tar.gz)
+app/src/main/assets/bundle/

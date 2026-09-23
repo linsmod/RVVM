@@ -1508,15 +1508,22 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // Copy ELF from assets to internal storage (always refresh so updated builds take effect)
-        File elfFile = new File(getFilesDir(), elfName);
-
-        try {
-            copyAssetToFile(elfName, elfFile);
-        } catch (IOException e) {
-            statusText.setText("Failed to copy ELF: " + e.getMessage());
-            Log.e(TAG, "Failed to copy ELF", e);
-            return;
+        // An app out of the bundle is booted at its guest path
+        // (/data/app/<id>/<entry>): native installs its payload into this run's
+        // own rootfs, so there is nothing to copy out of the APK.
+        String elfPath = RvvmNative.nativeAppEntryPath(elfName);
+        if (elfPath == null || elfPath.isEmpty()) {
+            // No bundle: the old path - copy the loose .exe out of the assets
+            // (always refreshed so an updated build takes effect).
+            File elfFile = new File(getFilesDir(), elfName);
+            try {
+                copyAssetToFile(elfName, elfFile);
+            } catch (IOException e) {
+                statusText.setText("Failed to copy ELF: " + e.getMessage());
+                Log.e(TAG, "Failed to copy ELF", e);
+                return;
+            }
+            elfPath = elfFile.getAbsolutePath();
         }
 
         // This run's guest handle: created before its card, because the card is
@@ -1545,13 +1552,13 @@ public class MainActivity extends Activity {
         if (!card.isSurfaceReady()) {
             glRunPendingId = guestId;
             pendingElfName = elfName;
-            pendingElfPath = elfFile.getAbsolutePath();
+            pendingElfPath = elfPath;
             statusText.setText("Waiting for the graphics window...");
             Log.i(TAG, "Run " + guestId + " held back until the card's surface is up");
             return;
         }
 
-        startRun(guestId, elfName, elfFile.getAbsolutePath());
+        startRun(guestId, elfName, elfPath);
     }
 
     /** A run whose card now has its surface: seed the lifecycle state and hand
@@ -1803,9 +1810,23 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Scan assets for .exe files and populate the guest app list.
+     * Populate the guest app list: the bundle's apps when this APK ships one
+     * (each is booted from its own /data/app/&lt;id&gt;, with its own resources), the
+     * .exe files in assets otherwise - which is how the samples ran before the
+     * app model, and still do for a bundle-less build.
      */
     private void populateGuestApps() {
+        try {
+            String[] apps = RvvmNative.nativeListApps();
+            if (apps != null && apps.length > 0) {
+                guestApps = apps;
+                selectedGuestApp = guestApps[0];
+                Log.i(TAG, "Guest apps from the bundle: " + apps.length);
+                return;
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to list the bundle's apps", t);
+        }
         try {
             String[] assets = getAssets().list("");
             java.util.List<String> exeList = new java.util.ArrayList<>();

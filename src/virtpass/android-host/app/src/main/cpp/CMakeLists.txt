@@ -95,6 +95,9 @@ add_library(rvvm_core STATIC
     ${RVVM_SRC}/virtpass/vp_cmdpost.c
     ${RVVM_SRC}/virtpass/vp_sensor.c
     ${RVVM_SRC}/virtpass/vp_session.c
+
+    # The guest rootfs "shape" index (plain data, no zlib)
+    ${RVVM_SRC}/virtpass/vp_shadow.c
 )
 
 target_include_directories(rvvm_core PUBLIC
@@ -131,6 +134,11 @@ add_library(rvvm_jni SHARED
     vp_aaudio_android.c
     vp_sensor_android.c
     android_gl_host.c
+    # Bundle archive reader (gzip + tar): host side, hence linked against zlib
+    # here rather than into rvvm_core. vp_bundle.c is the other half of it - the
+    # mount, the app install and the /assets ops, shared with the WinHost.
+    ${RVVM_SRC}/virtpass/vp_rootfs.c
+    ${RVVM_SRC}/virtpass/vp_bundle.c
 )
 
 target_include_directories(rvvm_jni PRIVATE
@@ -159,6 +167,7 @@ target_link_libraries(rvvm_jni
     m
     aaudio
     vterm
+    z
 )
 
 # 16KB page size alignment for Android 15+ compatibility

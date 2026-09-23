@@ -21,8 +21,26 @@ public class RvvmNative {
      *               AssetManager), so native is handed it here once; pass null
      *               when this host serves no assets, and every asset open then
      *               fails with ENOENT.
+     * @param filesDir the app's private files directory. The bundle in
+     *               assets/bundle/ is unpacked under it (native reads the
+     *               archives as real files) and each run materializes the guest
+     *               rootfs under filesDir/runtime/.
      */
-    public static native void nativeInit(android.content.res.AssetManager assets);
+    public static native void nativeInit(android.content.res.AssetManager assets, String filesDir);
+
+    /**
+     * The apps the bundled apps.tar.gz declares, by id - the picker's list.
+     * Empty when this APK ships no bundle, and the caller then falls back to the
+     * .exe files in assets/ (how the samples ran before the app model).
+     */
+    public static native String[] nativeListApps();
+
+    /**
+     * The guest path an app is booted at: /data/app/&lt;id&gt;/&lt;entry&gt;, with the entry
+     * its manifest names. Null when the bundle has no such app, which is the
+     * signal to fall back to a loose .exe.
+     */
+    public static native String nativeAppEntryPath(String appId);
 
     /**
      * Create a guest run and return its id (or -1 when the run table is full).

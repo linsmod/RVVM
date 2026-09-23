@@ -28,6 +28,7 @@
 #include <pthread.h>
 #include <signal.h>   /* pthread_sigmask() for the asset feeder's SIGPIPE */
 #include <unistd.h>
+#include <sys/stat.h> /* mkdir()/stat() for the bundle unpack */
 #include <sys/system_properties.h>  /* rvvm.max_guests capacity knob */
 
 /* Include vp_cmdpost API */
@@ -42,6 +43,7 @@
 
 /* Include rvvm-user API */
 #include "rvvm_user.h"
+#include "virtpass/vp_bundle.h"   /* the bundle: guest rootfs, apps, /assets */
 
 #define LOG_TAG "RVVM-JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -123,6 +125,12 @@ struct android_run {
      * thread (the UI polls it). */
     volatile int    suspended;
     char            elf_path[512];
+    /* The /assets tree this run serves, owned here. A host that can have several
+     * runs at once cannot use a process-global root: two guests would read each
+     * other's resources. It is the app's own assets/ directory when the run
+     * booted an app out of the bundle, and "" (or NULL) when it did not, in
+     * which case the mount falls back to the APK's asset tree. */
+    char*           assets_root;
     int             argc;
     char*           argv[16];
     /* Storage for those argv strings, one set per run. It used to be a single
@@ -334,6 +342,7 @@ static void android_run_destroy(struct android_run* run)
         run->tty = NULL;
     }
 
+    free(run->assets_root);
     free(run);
 }
 
@@ -1941,8 +1950,96 @@ static void jni_register_cmdpost_callbacks(vp_cmdpost_t* inst)
     android_gl_host_init();
 }
 
+/* ==================================================================
+ * The bundle
+ *
+ * A release ships bundle/rootfs.tar.gz and bundle/apps.tar.gz inside the APK -
+ * the same archives the WinHost reads. vp_rootfs opens them by path, and an APK
+ * asset is not a path, so they are unpacked once into the app's private storage;
+ * the guest's rootfs is then materialized per run under <files>/runtime/rootfs,
+ * and the run's app out of the apps archive. Both of those are the shared
+ * vp_bundle code (vp_bundle.h), so the two hosts give a guest the same view.
+ *
+ * A build whose APK has no bundle is not an error: the guest then runs with its
+ * filesystem view disabled and /assets served straight from the APK's asset
+ * tree, which is how this host has always run.
+ * ================================================================== */
+
+#define ANDROID_BUNDLE_PATH 4096
+
+static char g_bundle_dir[ANDROID_BUNDLE_PATH] = "";
+static char g_bundle_rootfs[ANDROID_BUNDLE_PATH] = "";
+static char g_bundle_apps[ANDROID_BUNDLE_PATH] = "";
+
+/* Unpack one APK asset into @dest, unless an identical file is already there:
+ * the archives run to several MB, and re-copying them on every process start
+ * would be most of the cost of launching a guest. */
+static bool android_asset_to_file(const char* asset_name, const char* dest)
+{
+    char buffer[64 * 1024];
+    struct stat st;
+    AAsset* asset;
+    FILE* out;
+    off_t size;
+    int read;
+
+    if (!g_asset_mgr) {
+        return false;
+    }
+    asset = AAssetManager_open(g_asset_mgr, asset_name, AASSET_MODE_STREAMING);
+    if (!asset) {
+        return false;
+    }
+    size = AAsset_getLength64(asset);
+    if (stat(dest, &st) == 0 && st.st_size == size) {
+        AAsset_close(asset);
+        return true;
+    }
+    out = fopen(dest, "wb");
+    if (!out) {
+        AAsset_close(asset);
+        return false;
+    }
+    while ((read = AAsset_read(asset, buffer, sizeof(buffer))) > 0) {
+        if (fwrite(buffer, 1, (size_t)read, out) != (size_t)read) {
+            break;
+        }
+    }
+    if (fclose(out) != 0 || read < 0) {
+        AAsset_close(asset);
+        LOGE("bundle: %s could not be unpacked into %s", asset_name, dest);
+        return false;
+    }
+    AAsset_close(asset);
+    LOGI("bundle: %s unpacked into %s (%lld byte(s))", asset_name, dest, (long long)size);
+    return true;
+}
+
+static void android_bundle_prepare(const char* files_dir)
+{
+    char dir[ANDROID_BUNDLE_PATH];
+
+    if (!files_dir || !*files_dir) {
+        return;
+    }
+    snprintf(g_bundle_dir, sizeof(g_bundle_dir), "%s", files_dir);
+    snprintf(dir, sizeof(dir), "%s/bundle", files_dir);
+    mkdir(dir, 0755);
+    snprintf(g_bundle_rootfs, sizeof(g_bundle_rootfs), "%s/%s", dir, VP_ROOTFS_TAR_GZ);
+    snprintf(g_bundle_apps, sizeof(g_bundle_apps), "%s/%s", dir, VP_APPS_TAR_GZ);
+
+    if (!android_asset_to_file("bundle/" VP_ROOTFS_TAR_GZ, g_bundle_rootfs)) {
+        LOGI("bundle: no rootfs archive in this APK - guests run without one");
+        g_bundle_rootfs[0] = 0;
+    }
+    if (!android_asset_to_file("bundle/" VP_APPS_TAR_GZ, g_bundle_apps)) {
+        LOGI("bundle: no apps archive in this APK - the list falls back to the assets");
+        g_bundle_apps[0] = 0;
+    }
+}
+
 JNIEXPORT void JNICALL
-Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz, jobject assets)
+Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz, jobject assets, jstring files_dir)
 {
     (void)thiz;
     g_env = env;
@@ -1952,6 +2049,17 @@ Java_com_rvvm_android_RvvmNative_nativeInit(JNIEnv* env, jobject thiz, jobject a
      * belongs to the Application), which is why the pointer can be cached for
      * the process. NULL is accepted: this host then serves no assets. */
     g_asset_mgr = assets ? AAssetManager_fromJava(env, assets) : NULL;
+
+    /* The bundle, unpacked out of the APK into the app's own storage: the guest
+     * rootfs and the apps archive are read as real files (vp_rootfs opens them
+     * by path), and an APK asset is not one. */
+    if (files_dir) {
+        const char* dir = (*env)->GetStringUTFChars(env, files_dir, NULL);
+        if (dir) {
+            android_bundle_prepare(dir);
+            (*env)->ReleaseStringUTFChars(env, files_dir, dir);
+        }
+    }
 
     /* No session and no run exist here: runs are created explicitly by
      * nativeCreateGuest(), and each one binds its own session (with this
@@ -2011,6 +2119,69 @@ Java_com_rvvm_android_RvvmNative_nativeDestroy(JNIEnv* env, jobject thiz)
     }
 
     LOGI("Native destroy complete");
+}
+
+/* The apps the bundle declares, by id - what the picker lists. Empty when this
+ * APK has no bundle, which is what tells Java to fall back to the .exe files in
+ * the APK assets (how the samples ran before there was an app model). */
+JNIEXPORT jobjectArray JNICALL
+Java_com_rvvm_android_RvvmNative_nativeListApps(JNIEnv* env, jobject thiz)
+{
+    vp_bundle_app_t apps[VP_BUNDLE_APPS_MAX];
+    jobjectArray result;
+    jclass string_class;
+    size_t found, i;
+
+    (void)thiz;
+    found = g_bundle_apps[0] ? vp_bundle_list_apps(g_bundle_apps, apps, VP_BUNDLE_APPS_MAX) : 0;
+    string_class = (*env)->FindClass(env, "java/lang/String");
+    if (!string_class) {
+        return NULL;
+    }
+    result = (*env)->NewObjectArray(env, (jsize)found, string_class, NULL);
+    if (!result) {
+        return NULL;
+    }
+    for (i = 0; i < found; i++) {
+        jstring id = (*env)->NewStringUTF(env, apps[i].id);
+        if (!id) {
+            return NULL;
+        }
+        (*env)->SetObjectArrayElement(env, result, (jsize)i, id);
+        (*env)->DeleteLocalRef(env, id);
+    }
+    return result;
+}
+
+/* The guest path an app is booted at: /data/app/<id>/<entry>, the manifest's
+ * entry included - so Java never has to know how an app lays its payload out.
+ * NULL when the bundle has no such app: that is the signal to fall back to a
+ * loose .exe. */
+JNIEXPORT jstring JNICALL
+Java_com_rvvm_android_RvvmNative_nativeAppEntryPath(JNIEnv* env, jobject thiz, jstring app_id)
+{
+    vp_bundle_app_t apps[VP_BUNDLE_APPS_MAX];
+    const char* id;
+    jstring result = NULL;
+    size_t found, i;
+
+    (void)thiz;
+    if (!app_id || !g_bundle_apps[0]) {
+        return NULL;
+    }
+    id = (*env)->GetStringUTFChars(env, app_id, NULL);
+    if (!id) {
+        return NULL;
+    }
+    found = vp_bundle_list_apps(g_bundle_apps, apps, VP_BUNDLE_APPS_MAX);
+    for (i = 0; i < found; i++) {
+        if (strcmp(apps[i].id, id) == 0) {
+            result = (*env)->NewStringUTF(env, apps[i].guest_path);
+            break;
+        }
+    }
+    (*env)->ReleaseStringUTFChars(env, app_id, id);
+    return result;
 }
 
 JNIEXPORT jstring JNICALL
@@ -2543,10 +2714,57 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
      * of these syscalls. */
     rvvm_user_set_host_ctx(run->machine, run->cmdpost);
 
-    /* The host's asset tree, mounted at /assets for this run. Per run like the
-     * rest of the host context; the manager it reads through is process-global,
-     * handed over once in nativeInit(). */
-    rvvm_user_set_assets(run->machine, &android_asset_ops, NULL);
+    /* The bundle, when this build has one: the guest gets the archive's `/`, and
+     * the one app whose guest path it was booted with. Both are per run - the
+     * rootfs is materialized under this app's own runtime directory and the app
+     * tree is emptied first - so two guests in the process cannot see each
+     * other's payload or resources. */
+    if (g_bundle_rootfs[0]) {
+        char dest[ANDROID_BUNDLE_PATH];
+        char app_id[VP_APP_ID_MAX];
+        char assets_root[ANDROID_BUNDLE_PATH];
+        vp_bundle_stats_t stats;
+        const char* error = NULL;
+        int wrote;
+
+        wrote = snprintf(dest, sizeof(dest), "%s/runtime/rootfs", g_bundle_dir);
+        if (wrote > 0 && (size_t)wrote < sizeof(dest)) {
+            if (vp_bundle_mount(run->machine, g_bundle_rootfs, dest, &stats, &error)) {
+                LOGI("bundle: %zu entries, %zu files at %s", stats.entries, stats.files, dest);
+            } else {
+                LOGE("bundle: %s could not be mounted: %s", g_bundle_rootfs,
+                     error ? error : "?");
+            }
+            /* "/data/app/<id>/<entry>" is both the guest's path and how the host
+             * knows which app this run is about. */
+            bool have_app = vp_bundle_app_id_from_guest_path(run->elf_path, app_id,
+                                                             sizeof(app_id));
+            if (vp_bundle_install_app(g_bundle_apps, dest, have_app ? app_id : NULL,
+                                      assets_root, sizeof(assets_root), &error)) {
+                if (have_app) {
+                    LOGI("bundle: app %s installed at %s/data/app/%s", app_id, dest, app_id);
+                }
+                if (assets_root[0]) {
+                    free(run->assets_root);
+                    run->assets_root = strdup(assets_root);
+                }
+            } else {
+                LOGE("bundle: app install failed: %s", error ? error : "?");
+            }
+        }
+    }
+
+    /* The host's asset tree, mounted at /assets for this run. It is the app's own
+     * resources when the run booted an app out of the bundle, and the APK's asset
+     * tree otherwise. The root travels as this run's own (the mount's userdata):
+     * a process-global root would let two guests read each other's resources.
+     * The manager the fallback reads through is process-global, handed over once
+     * in nativeInit(). */
+    if (run->assets_root) {
+        rvvm_user_set_assets(run->machine, vp_bundle_assets(), run->assets_root);
+    } else {
+        rvvm_user_set_assets(run->machine, &android_asset_ops, NULL);
+    }
 
     /* This run's own console session: opened fresh (the previous run's frozen
      * screen stays retired for the view to fall back to), wiped, and attached

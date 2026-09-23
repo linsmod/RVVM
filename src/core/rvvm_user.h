@@ -24,6 +24,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <stdbool.h>
 
 #include <rvvm/rvvm_base.h> /* rvvm_machine_t handle */
+#include "virtpass/vp_shadow.h" /* vp_shadow_t: the guest rootfs index */
 
 // Callback type for guest I/O redirection
 // Returns number of bytes written, or -1 on error
@@ -313,6 +314,28 @@ typedef struct {
 // ENOENT, which is also what a host with no asset tree should see. @ops must
 // outlive the run; call this before rvvm_user_linux_ex().
 void rvvm_user_set_assets(rvvm_machine_t* machine, const rvvm_asset_ops_t* ops, void* userdata);
+
+// --- Guest rootfs archive (the shadow layer) ---
+//
+// A host that runs the guest on a packaged rootfs materializes the archive's
+// regular files into a host directory and hands that directory to
+// rvvm_user_set_prefix(). What a host directory cannot express is the archive's
+// *shape*, and that is what this index supplies:
+//
+//   - a symlink (335 of them in an Alpine minirootfs) has no host counterpart
+//     at all - on Windows creating one needs a privilege - so the core resolves
+//     it in the guest namespace, and lstat()/readlink() answer from the index;
+//   - getdents64() of a real host directory also lists the archive's links,
+//     which the host directory cannot hold;
+//   - unlinking an archive-only entry is recorded in the index, since there was
+//     never a host file to remove.
+//
+// Regular files and directories stay the host's answers: they were materialized,
+// so the host is authoritative, and a guest that deletes one deletes this run's
+// own copy. The index is built by src/virtpass/vp_rootfs.c (gzip + tar) and is
+// owned by the caller, which must keep it alive for as long as the run lasts.
+// Call this before rvvm_user_linux_ex().
+void rvvm_user_set_shadow(rvvm_machine_t* machine, vp_shadow_t* shadow);
 
 // Create a userland machine instance without starting it.
 //

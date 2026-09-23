@@ -109,7 +109,8 @@ static void print_help(const char* prog)
         "  --display SPEC   Layer-1 virtual panel geometry: \"WxH\", \"@PPI\" or\n"
         "                   \"WxH@PPI\" (default 640x480@160; env RVVM_VIRT_W/H/PPI)\n"
         "  --assets DIR     Directory the launcher picker lists guests from\n"
-        "                   (default src\\virtpass\\android-host\\app\\src\\main\\assets;\n"
+        "                   (default: <exe dir>/guest-assets, where the\n"
+        "                   build puts the guest ELFs)\n"
         "                   env RVVM_ASSETS)\n"
         "  --help, -h       Show this help and exit\n"
         "\n"
@@ -154,14 +155,13 @@ int main(int argc, char** argv)
     virt_h   = parse_positive(getenv("RVVM_VIRT_H"), virt_h);
     virt_ppi = parse_positive(getenv("RVVM_VIRT_PPI"), virt_ppi);
 
-    /* Default assets dir for the launcher picker (relative to CWD, which is
-     * the repo root when launched from the build scripts). */
-    if (assets_env && *assets_env) {
-        snprintf(assets_dir, sizeof(assets_dir), "%s", assets_env);
-    } else {
-        snprintf(assets_dir, sizeof(assets_dir),
-                 "src\\virtpass\\android-host\\app\\src\\main\\assets");
-    }
+    /* No assets directory by default. The launcher names one itself: the samples
+     * the build produced sit next to the binary (<exe dir>/guest-assets), which is
+     * the only place a host with a bundle looks for a loose ELF - and the bundle's
+     * own apps (bundle/apps.tar.gz) are what it lists first in any case.
+     * --assets / RVVM_ASSETS override this, as before. */
+    snprintf(assets_dir, sizeof(assets_dir), "%s",
+             (assets_env && *assets_env) ? assets_env : "");
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--display") == 0 && i + 1 < argc) {

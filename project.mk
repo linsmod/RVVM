@@ -207,7 +207,13 @@ override lib_src_virtpass_guest := $(SRCDIR)/virtpass/vp_ndk_stub.c $(SRCDIR)/vi
 # Android JNI pass are cross-built for RISC-V / Android, win32-host provides
 # its own binary, vp-sdk is cross-built by `make vp-sdk` - none of them may end
 # up in librvvm
-override lib_src_virtpass_nonhost := $(SRCDIR)/virtpass/guest-samples/% $(SRCDIR)/virtpass/android-host/% $(SRCDIR)/virtpass/win32-host/% $(SRCDIR)/virtpass/vp-sdk/%
+#
+# vp_rootfs.c reads the bundle archives (gzip + tar) and needs zlib, so it is a
+# host-side module too: it is built into rvvm_winhost (and the Android JNI pass)
+# instead of librvvm, which stays free of the dependency. vp_shadow.c is the
+# plain index the core queries and has no such dependency, so it does live in
+# librvvm.
+override lib_src_virtpass_nonhost := $(SRCDIR)/virtpass/guest-samples/% $(SRCDIR)/virtpass/android-host/% $(SRCDIR)/virtpass/win32-host/% $(SRCDIR)/virtpass/vp-sdk/% $(SRCDIR)/virtpass/vp_rootfs.c $(SRCDIR)/virtpass/vp_bundle.c
 
 # virtpass_stub bundles those guest-side stubs so guest programs can link them
 # against the virtpass passthrough. It is only buildable on a native riscv64
@@ -361,8 +367,12 @@ override bin_src_rvvm_winhost  := $(SRCDIR)/virtpass/win32-host/win32_main.c \
                                   $(SRCDIR)/virtpass/win32-host/win32_gl_backend.c \
                                   $(SRCDIR)/virtpass/win32-host/win32_gl_dispatch.c \
                                   $(SRCDIR)/virtpass/win32-host/win32_aaudio_wasapi.c \
-                                  $(SRCDIR)/virtpass/win32-host/win32_sensor_stub.c
-override bin_libs_rvvm_winhost := rvvm
+                                  $(SRCDIR)/virtpass/win32-host/win32_sensor_stub.c \
+                                  $(SRCDIR)/virtpass/vp_rootfs.c \
+                                  $(SRCDIR)/virtpass/vp_bundle.c
+# zlib: vp_rootfs.c inflates the bundle archives (pkg-config module name is
+# "zlib", not "z")
+override bin_libs_rvvm_winhost := rvvm zlib
 endif
 endif
 
@@ -421,84 +431,110 @@ override ANDROID_GRADLE := $(if $(HOST_POSIX),./gradlew,gradlew.bat)
 override android_build_type := $(call capitalize,$(ANDROID_VARIANT))
 
 #
-# Guest programs bundled into the APK assets
+# Guest programs (shared by both hosts)
 #
-# These ELFs execute inside the emulated RISC-V machine, not on the Android
-# host, so they are cross-compiled for riscv64-linux-musl and linked against the
+# These ELFs execute inside the emulated RISC-V machine, not on the host running
+# it, so they are cross-compiled for riscv64-linux-musl and linked against the
 # virtpass guest stubs. musl is used in place of the NDK's bionic because scudo
 # reserves address space in a way the Win32 mmap shim does not support yet.
 #
+# They land in the build tree (GUEST_ASSETS_DIR), not in any one host's tree: the
+# APK boots apps out of bundle/apps.tar.gz - which is packed from here - and ships
+# no loose ELF at all, while the WinHost looks for that same directory next to its
+# own binary. Neither host has to know where the other keeps its files.
+#
 
-# Samples to bundle: every guest program found in guest-samples/, so dropping a
-# new <name>.c there is enough to get it built and copied into the assets tree
-override android_guest_samples := $(notdir $(basename $(filter %.c,$(call ls_dir,$(SRCDIR)/virtpass/guest-samples))))
-ANDROID_GUEST_SAMPLES ?= $(android_guest_samples)
+# Samples to build: every guest program found in guest-samples/, so dropping a new
+# <name>.c there is enough to get it built and packed into the apps archive.
+override guest_samples := $(notdir $(basename $(filter %.c,$(call ls_dir,$(SRCDIR)/virtpass/guest-samples))))
+GUEST_SAMPLES ?= $(guest_samples)
 
-override ANDROID_ASSETS_DIR  := $(ANDROID_HOST)/app/src/main/assets
-override ANDROID_GUEST_DIR   := $(BUILDDIR)/android-guest
-override ANDROID_GUEST_ZIG   := zig cc
-override ANDROID_GUEST_AR    := zig ar
+# The APK's assets/ directory carries exactly two things: the tree an app's own
+# resources are packed from (fonts/) and the staged bundle/ directory. Not the
+# guest ELFs: they are build output, and build output does not belong in a source
+# tree that is also the APK's package.
+override ANDROID_ASSETS_DIR := $(ANDROID_HOST)/app/src/main/assets
+override GUEST_ASSETS_DIR   := $(BUILDDIR)/guest-assets
+override GUEST_OBJ_DIR      := $(BUILDDIR)/guest-obj
+override GUEST_ZIG          := zig cc
+override GUEST_AR           := zig ar
 # Debug build of the guests: -O0 -g keeps line tables for the in-host
 # userland debugger; -fno-sanitize=undefined is a zig cc requirement
-override ANDROID_GUEST_FLAGS := -target riscv64-linux-musl -O0 -g -I$(INCDIR) -fno-sanitize=undefined
+override GUEST_CFLAGS := -target riscv64-linux-musl -O0 -g -I$(INCDIR) -fno-sanitize=undefined
 # Whole guest ABI header directory: listing the headers by hand silently missed
 # vp_aaudio.h / vp_sensor_abi.h, so edits to those never rebuilt a guest.
-override ANDROID_GUEST_HEADS := $(filter %.h,$(call ls_dir,$(INCDIR)/virtpass))
-override ANDROID_GUEST_LIBS  := $(ANDROID_GUEST_DIR)/libandroid_stubs.a $(ANDROID_GUEST_DIR)/libgles_stubs.a
-override android_guest_assets := $(addprefix $(ANDROID_ASSETS_DIR)/,$(addsuffix .exe,$(ANDROID_GUEST_SAMPLES)))
+override GUEST_HEADS := $(filter %.h,$(call ls_dir,$(INCDIR)/virtpass))
+override GUEST_LIBS  := $(GUEST_OBJ_DIR)/libandroid_stubs.a $(GUEST_OBJ_DIR)/libgles_stubs.a
+override guest_assets := $(addprefix $(GUEST_ASSETS_DIR)/,$(addsuffix .exe,$(GUEST_SAMPLES)))
 
-# Guest ELFs left behind by samples that no longer exist. Both launchers
-# enumerate guests by scanning *.exe, so a stale file stays listed forever and
+# Guest ELFs left behind by samples that no longer exist. Both launchers can
+# enumerate a directory of them, and a stale file stays listed forever and then
 # fails to launch. Computed before the build so it only ever names orphans.
-override android_guest_stale := $(filter-out $(android_guest_assets),$(filter %.exe,$(call ls_dir,$(ANDROID_ASSETS_DIR))))
+override guest_assets_stale := $(filter-out $(guest_assets),$(filter %.exe,$(call ls_dir,$(GUEST_ASSETS_DIR))))
 
 # Cross-compile flags are data, not a file, so they are not prerequisites of
 # the objects they affect. Keep them in a stamp and depend on it: the stamp is
 # rewritten (and thus made newer than every guest) only when the flags change,
 # so an unchanged build stays up to date.
-override ANDROID_GUEST_STAMP := $(ANDROID_GUEST_DIR)/guest_flags.stamp
-ifneq ($(if $(wildcard $(ANDROID_GUEST_STAMP)),$(file <$(ANDROID_GUEST_STAMP)),),$(ANDROID_GUEST_FLAGS))
-$(call create_dirs,$(ANDROID_GUEST_DIR))
-$(file >$(ANDROID_GUEST_STAMP),$(ANDROID_GUEST_FLAGS))
+override GUEST_STAMP := $(GUEST_OBJ_DIR)/guest_flags.stamp
+ifneq ($(if $(wildcard $(GUEST_STAMP)),$(file <$(GUEST_STAMP)),),$(GUEST_CFLAGS))
+$(call create_dirs,$(GUEST_OBJ_DIR))
+$(file >$(GUEST_STAMP),$(GUEST_CFLAGS))
 endif
 
 # Guest-side syscall stubs, shared by every sample
-$(ANDROID_GUEST_DIR)/vp_ndk_stub.o: $(SRCDIR)/virtpass/vp_ndk_stub.c $(ANDROID_GUEST_HEADS) $(ANDROID_GUEST_STAMP)
+$(GUEST_OBJ_DIR)/vp_ndk_stub.o: $(SRCDIR)/virtpass/vp_ndk_stub.c $(GUEST_HEADS) $(GUEST_STAMP)
 	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)CC$(TEXT)] $@ $(RESET))
-	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -c -o $@ $<)
+	@$(call shell_esc,$(GUEST_ZIG) $(GUEST_CFLAGS) -c -o $@ $<)
 
-$(ANDROID_GUEST_DIR)/vp_gl_stub.o: $(SRCDIR)/virtpass/vp_gl_stub.c $(ANDROID_GUEST_HEADS) $(ANDROID_GUEST_STAMP)
+$(GUEST_OBJ_DIR)/vp_gl_stub.o: $(SRCDIR)/virtpass/vp_gl_stub.c $(GUEST_HEADS) $(GUEST_STAMP)
 	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)CC$(TEXT)] $@ $(RESET))
-	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -c -o $@ $<)
+	@$(call shell_esc,$(GUEST_ZIG) $(GUEST_CFLAGS) -c -o $@ $<)
 
-$(ANDROID_GUEST_DIR)/vp_aaudio_stub.o: $(SRCDIR)/virtpass/vp_aaudio_stub.c $(ANDROID_GUEST_HEADS) $(ANDROID_GUEST_STAMP)
+$(GUEST_OBJ_DIR)/vp_aaudio_stub.o: $(SRCDIR)/virtpass/vp_aaudio_stub.c $(GUEST_HEADS) $(GUEST_STAMP)
 	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)CC$(TEXT)] $@ $(RESET))
-	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -c -o $@ $<)
+	@$(call shell_esc,$(GUEST_ZIG) $(GUEST_CFLAGS) -c -o $@ $<)
 
-$(ANDROID_GUEST_DIR)/libandroid_stubs.a: $(ANDROID_GUEST_DIR)/vp_ndk_stub.o $(ANDROID_GUEST_DIR)/vp_aaudio_stub.o
+$(GUEST_OBJ_DIR)/libandroid_stubs.a: $(GUEST_OBJ_DIR)/vp_ndk_stub.o $(GUEST_OBJ_DIR)/vp_aaudio_stub.o
 	$(call println,$(TEXT)[$(GREEN)AR$(TEXT)] $@ $(RESET))
-	@$(call shell_esc,$(ANDROID_GUEST_AR) rcs $@ $(ANDROID_GUEST_DIR)/vp_ndk_stub.o $(ANDROID_GUEST_DIR)/vp_aaudio_stub.o)
+	@$(call shell_esc,$(GUEST_AR) rcs $@ $(GUEST_OBJ_DIR)/vp_ndk_stub.o $(GUEST_OBJ_DIR)/vp_aaudio_stub.o)
 
-$(ANDROID_GUEST_DIR)/libgles_stubs.a: $(ANDROID_GUEST_DIR)/vp_gl_stub.o
+$(GUEST_OBJ_DIR)/libgles_stubs.a: $(GUEST_OBJ_DIR)/vp_gl_stub.o
 	$(call println,$(TEXT)[$(GREEN)AR$(TEXT)] $@ $(RESET))
-	@$(call shell_esc,$(ANDROID_GUEST_AR) rcs $@ $<)
+	@$(call shell_esc,$(GUEST_AR) rcs $@ $<)
 
-# Each sample is linked straight into the APK assets tree
-$(ANDROID_ASSETS_DIR)/%.exe: $(SRCDIR)/virtpass/guest-samples/%.c $(ANDROID_GUEST_LIBS) $(ANDROID_GUEST_HEADS) $(ANDROID_GUEST_STAMP)
+# Each sample is linked into the build tree's guest assets
+$(GUEST_ASSETS_DIR)/%.exe: $(SRCDIR)/virtpass/guest-samples/%.c $(GUEST_LIBS) $(GUEST_HEADS) $(GUEST_STAMP)
 	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)LD$(TEXT)] $@ $(RESET))
-	@$(call shell_esc,$(ANDROID_GUEST_ZIG) $(ANDROID_GUEST_FLAGS) -static -L$(ANDROID_GUEST_DIR) $< -landroid_stubs -lgles_stubs -o $@)
+	@$(call shell_esc,$(GUEST_ZIG) $(GUEST_CFLAGS) -static -L$(GUEST_OBJ_DIR) $< -landroid_stubs -lgles_stubs -o $@)
 
-.PHONY: android-assets # Cross-compile the guest samples into the APK assets
-android-assets: $(android_guest_assets)
-	$(if $(android_guest_stale),$(call log_info,Removing stale guests: $(notdir $(android_guest_stale))))
-	$(if $(android_guest_stale),$(if $(HOST_POSIX),$(call shell_ex,rm -f $(call path_shell,$(android_guest_stale))),$(call shell_ex,del /F /Q $(call path_shell,$(subst /,\,$(android_guest_stale))))))
+.PHONY: guest-assets # Cross-compile the guest samples into the build tree
+guest-assets: $(guest_assets)
+	$(if $(guest_assets_stale),$(call log_info,Removing stale guests: $(notdir $(guest_assets_stale))))
+	$(if $(guest_assets_stale),$(if $(HOST_POSIX),$(call shell_ex,rm -f $(call path_shell,$(guest_assets_stale))),$(call shell_ex,del /F /Q $(call path_shell,$(subst /,\,$(guest_assets_stale))))))
 
-.PHONY: android       # Build the Android APK (Java + librvvm_jni.so + guest assets)
-android: android-assets
+.PHONY: android-assets # Old name of guest-assets, kept for existing scripts
+android-assets: guest-assets
+
+# The APK ships the same two archives a release bundle carries. The host unpacks
+# them into the app's own storage on first use and materializes the guest's
+# rootfs from there, exactly as the WinHost does it - the code is the same
+# (vp_bundle.c). Staged out of the release bundle/ directory, so an APK always
+# carries what the host binary of that release boots from.
+override ANDROID_BUNDLE_DIR := $(ANDROID_ASSETS_DIR)/bundle
+
+.PHONY: android-bundle # Stage the release bundle (rootfs + apps) into the APK assets
+android-bundle: pack-apps fetch-rootfs
+	$(call println,$(TEXT)[$(GREEN)STAGE$(TEXT)] $(ANDROID_BUNDLE_DIR) $(RESET))
+	$(call install_file,$(ROOTFS_TAR),$(ANDROID_BUNDLE_DIR)/$(notdir $(ROOTFS_TAR)),0644)
+	$(call install_file,$(APPS_TAR),$(ANDROID_BUNDLE_DIR)/$(notdir $(APPS_TAR)),0644)
+
+.PHONY: android       # Build the Android APK (Java + librvvm_jni.so + the bundle)
+android: guest-assets android-bundle
 	$(call log_info,Building Android $(ANDROID_VARIANT) APK)
 	$(call shell_esc,cd $(ANDROID_HOST) && $(ANDROID_GRADLE) $(ANDROID_GRADLE_OPTS) :app:assemble$(android_build_type))
 
@@ -511,3 +547,86 @@ android-jni:
 android-clean:
 	$(call log_info,Cleaning Android builds)
 	$(call shell_esc,cd $(ANDROID_HOST) && $(ANDROID_GRADLE) $(ANDROID_GRADLE_OPTS) clean)
+
+#
+# Bundle: the two archives a released host reads at runtime
+#
+# They sit next to the host binary (win32: the exe's own directory, resolved
+# with GetModuleFileNameA because the guest chdir()s away; Android: the APK's
+# assets/), under one directory, and neither is ever visible to the guest:
+#
+#   <bundle>/rootfs.tar.gz   the guest's `/` (Alpine minirootfs)
+#   <bundle>/apps.tar.gz     the sample apps (one directory each + app.json)
+#
+# Both are gitignored (the repo ignores the whole root), so a release - and any
+# end-to-end run - has to fetch or pack them first. These variables mirror the C
+# literals in src/virtpass/vp_rootfs.h; change them together.
+#
+override VP_BUNDLE_DIR    := bundle
+override VP_ROOTFS_TAR_GZ := rootfs.tar.gz
+override VP_APPS_TAR_GZ   := apps.tar.gz
+
+# Recursive on purpose: BUILDDIR is not defined yet while project.mk is parsed.
+override BUNDLE_DIR = $(BUILDDIR)/$(VP_BUNDLE_DIR)
+override ROOTFS_TAR = $(BUNDLE_DIR)/$(VP_ROOTFS_TAR_GZ)
+override APPS_TAR   = $(BUNDLE_DIR)/$(VP_APPS_TAR_GZ)
+
+ALPINE_MIRROR  ?= https://dl-cdn.alpinelinux.org/alpine
+ALPINE_VERSION ?= 3.24.2
+ALPINE_ARCH    ?= riscv64
+override ALPINE_BRANCH := $(word 1,$(subst ., ,$(ALPINE_VERSION))).$(word 2,$(subst ., ,$(ALPINE_VERSION)))
+override ROOTFS_URL := $(ALPINE_MIRROR)/v$(ALPINE_BRANCH)/releases/$(ALPINE_ARCH)/alpine-minirootfs-$(ALPINE_VERSION)-$(ALPINE_ARCH).tar.gz
+
+.PHONY: fetch-rootfs # Download the Alpine minirootfs archive into the bundle
+fetch-rootfs:
+	$(call create_dirs,$(BUNDLE_DIR))
+	$(if $(call paths_exist,$(ROOTFS_TAR)),\
+		$(call log_info,Rootfs archive already present: $(ROOTFS_TAR)),\
+		$(call log_info,Fetching $(ROOTFS_URL))$(call shell_ex,curl -fL -o $(call path_shell,$(ROOTFS_TAR)) $(ROOTFS_URL)))
+	@:
+
+#
+# The apps archive: one directory per guest program
+#
+# Each app is packed as apps/<id>/{app.json,bin/<id>.exe,assets/...} and the host
+# installs exactly one of them per run at <guest>/data/app/<id> - which is what
+# keeps one app from seeing another's payload or assets. Nothing in an app is
+# host-specific, so this one archive serves both hosts: the ELFs come from the
+# build tree, the shared resources from the source tree they live in.
+#
+override APPS_PACKER     ?= python $(CURDIR)/tools/pack_apps.py
+override APPS_SRC_DIR    ?= $(GUEST_ASSETS_DIR)
+override APPS_ASSET_ROOT ?= $(ANDROID_ASSETS_DIR)
+override APPS_ASSET_DIRS ?= fonts
+override APPS_ONLY       ?=
+
+.PHONY: pack-apps # Pack the guest programs into the bundle's apps.tar.gz
+pack-apps: guest-assets
+	$(call create_dirs,$(BUNDLE_DIR))
+	$(call println,$(TEXT)[$(GREEN)PACK$(TEXT)] $(APPS_TAR) $(RESET))
+	@$(call shell_esc,$(APPS_PACKER) --src $(call path_shell,$(APPS_SRC_DIR))\
+		$(foreach name,$(APPS_ASSET_DIRS),$(if $(wildcard $(APPS_ASSET_ROOT)/$(name)),--asset $(name)=$(call path_shell,$(APPS_ASSET_ROOT)/$(name))))\
+		$(if $(APPS_ONLY),--only $(APPS_ONLY))\
+		--out $(call path_shell,$(APPS_TAR)))
+
+#
+# dist: the release layout, which is also the layout the host reads at runtime
+#
+#   $(DIST_DIR)/
+#     rvvm_winhost_<arch>.exe        (and every other host binary this build made)
+#     bundle/{rootfs.tar.gz,apps.tar.gz}
+#
+# The host resolves bundle/ next to its own binary (GetModuleFileNameA, never the
+# cwd: the guest chdir()s away the moment it starts), so this is not just a
+# packaging convention - it is what the binary looks for. The guest ELFs are
+# deliberately absent: apps.tar.gz is the only thing a host boots them from.
+#
+override DIST_DIR ?= $(BUILDDIR)/dist
+
+.PHONY: dist # Assemble a release: the host binaries and the bundle they boot from
+dist: bin pack-apps fetch-rootfs
+	$(call create_dirs,$(DIST_DIR)/$(VP_BUNDLE_DIR))
+	$(foreach bin,$(BIN_TARGETS),$(call install_file,$(bin),$(DIST_DIR)/$(notdir $(bin)),0755))
+	$(call install_file,$(ROOTFS_TAR),$(DIST_DIR)/$(VP_BUNDLE_DIR)/$(notdir $(ROOTFS_TAR)),0644)
+	$(call install_file,$(APPS_TAR),$(DIST_DIR)/$(VP_BUNDLE_DIR)/$(notdir $(APPS_TAR)),0644)
+	$(call println,$(TEXT)[$(GREEN)DIST$(TEXT)] $(DIST_DIR) $(RESET))

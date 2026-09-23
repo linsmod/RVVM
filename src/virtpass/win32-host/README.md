@@ -107,13 +107,18 @@ MinGW.
 
 ## Run
 
-Build the guests first (`mingw32-make android-assets`, zig/musl - see
-`src/virtpass/README.md`); they land in the APK assets directory, then:
+Build the guests first (`mingw32-make guest-assets`, zig/musl - see
+`src/virtpass/README.md`); they land in the build tree, at
+`release.<os>.<arch>/guest-assets/`, then:
+
+A release carries no loose ELF at all: `mingw32-make dist` puts the host binary
+next to `bundle/{rootfs,apps}.tar.gz`, and the host boots an app out of that
+archive (`--guest /data/app/<id>/<entry>`).
 
 ```powershell
 # one specific guest
 .\release.windows.x86_64\rvvm_winhost_x86_64.exe --guest `
-    src\virtpass\android-host\app\src\main\assets\test_render.exe
+    release.windows.x86_64\guest-assets\test_render.exe
 
 # the picker
 .\release.windows.x86_64\rvvm_winhost_x86_64.exe --launcher
@@ -136,7 +141,7 @@ more than to wait on the process:
 
 ```powershell
 $p = Start-Process -FilePath .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
-     -ArgumentList 'src\virtpass\android-host\app\src\main\assets\test_cli.exe',
+     -ArgumentList 'release.windows.x86_64\guest-assets\test_cli.exe',
                    'asset','fonts/JetBrainsMono-OFL.txt' `
      -NoNewWindow -PassThru -RedirectStandardOutput guest.log
 $p | Wait-Process -Timeout 45
@@ -150,7 +155,7 @@ same guest, driven by its line protocol instead of its argv:
 $in = Join-Path $PWD t_in.txt
 [IO.File]::WriteAllText($in, "ls /`ncalc 6 * 7`nexit`n", [Text.Encoding]::ASCII)
 $p = Start-Process -FilePath .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
-     -ArgumentList '--guest','src\virtpass\android-host\app\src\main\assets\test_cli.exe' `
+     -ArgumentList '--guest','release.windows.x86_64\guest-assets\test_cli.exe' `
      -NoNewWindow -PassThru -RedirectStandardInput $in -RedirectStandardOutput guest.log
 $p | Wait-Process -Timeout 45
 $p.ExitCode        # 0: every command in the script succeeded
@@ -160,7 +165,7 @@ Or straight through a shell pipe:
 
 ```powershell
 "calc 6 + 7`nexit`n" | .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
-    --guest src\virtpass\android-host\app\src\main\assets\test_cli.exe
+    --guest release.windows.x86_64\guest-assets\test_cli.exe
 ```
 
 Guest output arrives on the host's stdout unprefixed and as it is written; the
@@ -184,7 +189,7 @@ whenever the client area is clicked (the picker's combo box would otherwise
 keep it, see below).
 
 ```powershell
-.\release.windows.x86_64\rvvm_winhost_x86_64.exe --assets src\virtpass\android-host\app\src\main\assets
+.\release.windows.x86_64\rvvm_winhost_x86_64.exe --assets release.windows.x86_64\guest-assets
 # pick test_cli, Run, then type into the window:
 #   vp> ls /
 #   vp> calc 6 * 7
@@ -242,7 +247,7 @@ end-to-end check of the path:
 
 ```powershell
 .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
-    src\virtpass\android-host\app\src\main\assets\test_game_activity.exe
+    release.windows.x86_64\guest-assets\test_game_activity.exe
 # focus the window and press a key:
 # GameActivity: key event 0 action=0 keyCode=29 metaState=0x0 repeat=0
 ```
@@ -256,11 +261,14 @@ rather than becoming a guest key.
 
 ### Launcher (Android-style picker)
 
-Run with **no guest argument** and the host shows a picker instead: a dropdown
-listing the `.exe` guests found in the assets directory plus **Run / Stop /
-Suspend / Exit** buttons. `--assets <dir>` (or `RVVM_ASSETS`) points at that directory;
-the default is `src\virtpass\android-host\app\src\main\assets`. Known sample
-names are used as a fallback when the directory is missing or empty.
+Run with **no guest argument** and the host shows a picker instead: **Run / Stop /
+Suspend / Exit** buttons and a dropdown. What the dropdown lists, in order:
+
+1. the apps in `bundle/apps.tar.gz`, by id - each booted as
+   `/data/app/<id>/<entry>`, with its own payload and its own resources;
+2. otherwise (no bundle) the `.exe` files in the assets directory -
+   `<exe dir>/guest-assets` by default, or `--assets <dir>` / `RVVM_ASSETS`.
+   Known sample names are used as a fallback when that is missing or empty.
 
 ```powershell
 .\release.windows.x86_64\rvvm_winhost_x86_64.exe                # picker
@@ -352,11 +360,16 @@ Debug switches:
 3. **Sensors are stubs.** Fixed values pushed on a timer; wire up
    `Windows.Devices.Sensors` (WinRT) for real data.
 
-4. **Assets.** The host mounts its assets directory - the same tree the picker
-   lists guests from (`--assets DIR` / `RVVM_ASSETS`, default
-   `src\virtpass\android-host\app\src\main\assets`) - at `/assets`, and the
-   guest's `AAssetManager_*` calls are a shell over that mount. Because the tree
-   is a real directory here, every mount op is a plain file call: `open()` hands
+4. **Assets.** The host mounts a directory at `/assets`. Which one:
+
+   - when the run booted an app out of the bundle, **that app's own `assets/`**
+     (`<rootfs>/data/app/<id>/assets`) - which is what keeps one app from reading
+     another's resources;
+   - otherwise the tree the picker lists guests from (`--assets DIR` /
+     `RVVM_ASSETS`, default `<exe dir>/guest-assets`).
+
+   The guest's `AAssetManager_*` calls are a shell over that mount. Because the
+   tree is a real directory here, every mount op is a plain file call: `open()` hands
    out a real seekable descriptor (unlike the Android host, which streams through
    a pipe), `stat()` answers a size, `opendir()` the entries, and a name that
    tries to leave the tree is refused. `AAsset_openFileDescriptor()` therefore

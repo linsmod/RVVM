@@ -15,7 +15,7 @@
  *     table compiled into the guest stub.
  *
  * Build: bundled into the APK assets / the win32 host assets by the Makefile
- *   (see project.mk: android_guest_samples).
+ *   (see project.mk: guest_samples).
  * Run:   android: am start -n com.rvvm.android/.MainActivity --es guest test_sensor_guest
  *        win32:   rvvm_winhost.exe --assets <dir>  (pick it in the launcher)
  */

@@ -1,1 +1,0 @@
-post_build_assets should be copy to assets in build pipe

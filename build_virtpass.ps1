@@ -16,13 +16,14 @@
       win32   -> bin                  (rvvm_winhost_<arch>.exe + the other Windows binaries)
       apk     -> android              (guest assets + librvvm_jni.so + APK)
       android -> same as apk
-      assets  -> android-assets       (zig/musl riscv64 guest ELFs into APK assets)
+      assets  -> guest-assets         (zig/musl riscv64 guest ELFs into the build tree)
+      dist    -> dist                 (host binaries + bundle/{rootfs,apps}.tar.gz)
       jni     -> android-jni          (librvvm_jni.so only)
       sdk     -> vp-sdk               (guest VirtPass SDK -> lib/libvpsdk.{a,so})
       clean   -> clean android-clean  (make build tree + Gradle outputs)
 
 .PARAMETER Target
-    What to build: all (default), win32, apk, android, assets, jni, sdk or clean.
+    What to build: all (default), win32, apk, android, assets, jni, sdk, dist or clean.
 
 .PARAMETER Variant
     Gradle build variant for the Android goals: debug (default) or release.
@@ -59,7 +60,7 @@
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('all', 'win32', 'apk', 'android', 'assets', 'jni', 'sdk', 'clean')]
+    [ValidateSet('all', 'win32', 'apk', 'android', 'assets', 'jni', 'sdk', 'dist', 'clean')]
     [string]$Target = 'all',
     [ValidateSet('debug', 'release')]
     [string]$Variant = 'debug',
@@ -68,7 +69,7 @@ param(
     [switch]$RegenGlAbi,
 
     # Anything not recognised as a named parameter is forwarded to make,
-    # e.g. 'USE_RVJIT=0' or 'ANDROID_GUEST_SAMPLES=test_render'
+    # e.g. 'USE_RVJIT=0' or 'GUEST_SAMPLES=test_render'
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$MakeArgs
 )
@@ -114,9 +115,10 @@ $targetMap = @{
     'win32'   = @('bin')
     'apk'     = @('android')
     'android' = @('android')
-    'assets'  = @('android-assets')
+    'assets'  = @('guest-assets')
     'jni'     = @('android-jni')
     'sdk'     = @('vp-sdk')
+    'dist'    = @('dist')
     'clean'   = @('clean', 'android-clean')
 }
 
@@ -131,7 +133,7 @@ function Test-Goal {
     return $false
 }
 
-$needsZig    = Test-Goal @('android-assets', 'android', 'vp-sdk')
+$needsZig    = Test-Goal @('guest-assets', 'android', 'vp-sdk', 'dist')
 $needsGradle = Test-Goal @('android', 'android-jni')
 
 # --- Preflight: fail before any work instead of halfway through ---
@@ -190,12 +192,20 @@ function Show-Artifacts {
         Write-ArtifactLine 'Win32 host' $hostBin
     }
 
-    if (Test-Goal @('android-assets', 'android')) {
-        # android-assets links every sample straight into the APK assets tree
-        $assetsDir = Join-Path $ANDROID_HOST 'app\src\main\assets'
-        $guest = @(Get-ChildItem -LiteralPath $assetsDir -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+    if (Test-Goal @('guest-assets', 'android', 'dist')) {
+        # guest-assets links every sample into the build tree's guest-assets/.
+        # The APK carries no loose ELF at all: it boots apps out of
+        # bundle/apps.tar.gz, which is packed from that directory.
+        $guest = @(Get-ChildItem -Path "$RVVM_ROOT\*\*\guest-assets\*.exe" -File -ErrorAction SilentlyContinue |
             ForEach-Object { $_.FullName })
         Write-ArtifactLine 'guest ELFs' $guest
+    }
+
+    if (Test-Goal @('dist')) {
+        # The release layout: host binaries next to the bundle they boot from.
+        $dist = @(Get-ChildItem -Path "$RVVM_ROOT\*\*\dist" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.FullName })
+        Write-ArtifactLine 'release' $dist
     }
 
     if (Test-Goal @('android-jni')) {
@@ -253,7 +263,7 @@ try {
         # The make-side artifacts live in the build tree, the APK/JNI outputs
         # belong to Gradle - clean only the side the selection actually builds.
         $cleanTargets = @()
-        if (Test-Goal @('bin', 'android-assets', 'vp-sdk')) { $cleanTargets += 'clean' }
+        if (Test-Goal @('bin', 'guest-assets', 'vp-sdk', 'dist')) { $cleanTargets += 'clean' }
         if ($needsGradle) { $cleanTargets += 'android-clean' }
         if ($cleanTargets.Count -eq 0) { $cleanTargets = @('clean') }
         Invoke-Make $cleanTargets

@@ -30,6 +30,7 @@
 #include <errno.h> /* -ENOENT/-EINVAL from the asset mount ops */
 #include <time.h>
 #include <io.h>       /* _access(), _setmode() */
+#include <direct.h>   /* _mkdir() for the rootfs support files */
 #include <fcntl.h>    /* open() */
 #include <sys/stat.h> /* stat() for the asset mount's size op */
 #include <dirent.h>   /* opendir()/readdir() for its directory ops */
@@ -37,6 +38,8 @@
 #include "win32_cmdpost_bridge.h" /* self-protypes for forward refs (launcher) */
 #include "virtpass/vp_cmdpost.h"  /* single copy lives in src/virtpass */
 #include "core/rvvm_user.h"       /* rvvm_user_linux() guest entry point */
+#include "virtpass/vp_rootfs.h"   /* bundle archives -> guest rootfs + shadow */
+#include "virtpass/vp_bundle.h"   /* what a host does with a bundle (mount/apps/assets) */
 #include "virtpass/vp_android.h"  /* guest ABI constants: APP_CMD_*, WINDOW_FORMAT_*, ASENSOR_TYPE_* */
 #include "virtpass/vp_session.h"  /* display geometry + console lines, shared with the Android host */
 #include "win32_gl_dispatch.h" /* on_egl_dispatch, on_gl_dispatch, g_gl_active */
@@ -277,8 +280,17 @@ static const char* LAUNCHER_DEFAULT_GUESTS[] = {
     "test_render_gles", "test_audio",
 };
 
+/* Directory the running executable lives in. Defined with the bundle install
+ * further down; declared here because the picker reads the same bundle. */
+static bool win32_exe_directory(char* out, size_t size);
+
 static char g_assets_dir[MAX_PATH] = ".";
 static char g_guest_names[MAX_GUESTS][MAX_GUEST_NAME];
+/* The launch target of each picker entry when it is a *guest* path rather than a
+ * host file: an app is booted as /data/app/<id>/<entry>, and its payload is
+ * unpacked from the bundle at launch time. Empty for a loose .exe entry, which
+ * is still resolved against g_assets_dir. */
+static char g_guest_paths[MAX_GUESTS][MAX_PATH + 96];
 static int  g_guest_count   = 0;
 static bool g_launcher      = false; /* launcher UI enabled (only when no
                                         guest is given on the command line) */
@@ -2414,6 +2426,45 @@ static DWORD WINAPI guest_thread_main(LPVOID arg)
 /* Public API                                                          */
 /* ------------------------------------------------------------------ */
 
+/* The picker lists what the bundle offers. When apps.tar.gz is there, that is
+ * one entry per app - each booted at /data/app/<id>/<entry>, and each seeing
+ * only its own payload and resources. Otherwise the loose .exe files of an
+ * assets directory, which is how the samples ran before there was an app model
+ * (and still do for a one-off regression run). */
+static bool launcher_scan_apps(void)
+{
+    char exe_dir[MAX_PATH];
+    char path[MAX_PATH];
+    /* Heap, not the stack: one entry is ~650 byte and a bundle may carry
+     * VP_BUNDLE_APPS_MAX of them, which is a frame the compiler (rightly) warns
+     * about. The list is read once, at picker time. */
+    vp_bundle_app_t* list = calloc(VP_BUNDLE_APPS_MAX, sizeof(*list));
+    size_t n, i;
+
+    if (!list) {
+        return false;
+    }
+    if (!win32_exe_directory(exe_dir, sizeof(exe_dir))) {
+        free(list);
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s\\%s\\%s", exe_dir, VP_BUNDLE_DIR, VP_APPS_TAR_GZ);
+    n = vp_bundle_list_apps(path, list, VP_BUNDLE_APPS_MAX);
+    for (i = 0; i < n && i < (size_t)MAX_GUESTS; i++) {
+        snprintf(g_guest_names[i], MAX_GUEST_NAME, "%s", list[i].id);
+        snprintf(g_guest_paths[i], sizeof(g_guest_paths[i]), "%s", list[i].guest_path);
+    }
+    free(list);
+    if (n > (size_t)MAX_GUESTS) {
+        n = MAX_GUESTS;
+    }
+    g_guest_count = (int)n;
+    if (n) {
+        winhost_log("launcher: %zu app(s) in %s", n, path);
+    }
+    return n > 0;
+}
+
 static void launcher_scan_guests(void)
 {
     char pattern[MAX_PATH + 4];
@@ -2422,6 +2473,25 @@ static void launcher_scan_guests(void)
     int n = 0;
 
     g_guest_count = 0;
+    memset(g_guest_paths, 0, sizeof(g_guest_paths));
+
+    if (launcher_scan_apps()) {
+        return;
+    }
+
+    /* Nothing was named with --assets: the guest ELFs the build produced sit
+     * next to this binary (<exe dir>/guest-assets), which is the one place a
+     * host with no bundle looks for a loose one. */
+    {
+        char exe_dir[MAX_PATH];
+        if (!strcmp(g_assets_dir, ".") && win32_exe_directory(exe_dir, sizeof(exe_dir))) {
+            char built[MAX_PATH];
+            snprintf(built, sizeof(built), "%s\\guest-assets", exe_dir);
+            if (GetFileAttributesA(built) != INVALID_FILE_ATTRIBUTES) {
+                win32_host_set_assets_dir(built);
+            }
+        }
+    }
 
     snprintf(pattern, sizeof(pattern), "%s\\*.exe", g_assets_dir);
     h = FindFirstFileA(pattern, &fd);
@@ -2586,10 +2656,17 @@ static void launcher_launch_sel(int sel)
 
     if (g_guest_count <= 0 || sel < 0 || sel >= g_guest_count) return;
 
-    snprintf(path, sizeof(path), "%s\\%s.exe", g_assets_dir, g_guest_names[sel]);
-    if (_access(path, 0) != 0) {
-        winhost_log("launcher: guest not found: %s", path);
-        return;
+    if (g_guest_paths[sel][0]) {
+        /* An app: the guest path is the launch target. Its payload is unpacked
+         * from the bundle inside win32_host_start_guest(), which is also where
+         * the app tree is emptied first - that is the isolation. */
+        snprintf(path, sizeof(path), "%s", g_guest_paths[sel]);
+    } else {
+        snprintf(path, sizeof(path), "%s\\%s.exe", g_assets_dir, g_guest_names[sel]);
+        if (_access(path, 0) != 0) {
+            winhost_log("launcher: guest not found: %s", path);
+            return;
+        }
     }
 
     /* This run's cmdpost instance, made here so the startup sequence queued
@@ -2721,108 +2798,18 @@ static void launcher_toggle_suspend(void)
 /* ============================================================
  * Bundled assets (the /assets mount)
  *
- * The WinHost has no APK: its asset tree is a real directory - the same one the
- * launcher lists guests from (--assets / RVVM_ASSETS) - so every op here is a
- * plain file call. The descriptors the mount hands out are ordinary seekable
- * files, a guest can lseek() an asset like any other file, and nothing is
- * buffered and nothing needs a thread.
+ * The mount itself lives in vp_bundle.c, shared with the Android host: it is a
+ * real directory tree either way, and once an app's payload is on disk the two
+ * hosts serve the same bytes the same way. What stays here is g_assets_dir,
+ * which is the *launcher's* directory - where the loose .exe files of a
+ * bundle-less run are listed from (--assets / RVVM_ASSETS).
  * ============================================================ */
-
-/* Resolve an asset name under g_assets_dir, refusing anything that climbs out of
- * it: the tree belongs to the guest and must not turn into a way to read the
- * host's disk. Returns false when @name is not a plain relative path. */
-static bool asset_host_path(char* out, size_t outsz, const char* name)
-{
-    if (!name || !*name || name[0] == '/' || name[0] == '\\' || strstr(name, "..")) {
-        return false;
-    }
-    /* APK asset names use '/', Windows accepts it as a separator too, so a nested
-     * name like "shaders/basic.glsl" resolves as-is. */
-    snprintf(out, outsz, "%s\\%s", g_assets_dir, name);
-    return true;
-}
-
-static int win32_asset_open_fd(void* user, const char* name)
-{
-    char path[MAX_PATH + 128];
-    int fd;
-
-    (void)user;
-
-    if (!asset_host_path(path, sizeof(path), name)) {
-        return -EINVAL;
-    }
-    fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        return -ENOENT;
-    }
-    /* The guest reads raw bytes: no CRLF translation on the way through. */
-    _setmode(fd, _O_BINARY);
-    return fd;
-}
-
-static int64_t win32_asset_size(void* user, const char* name)
-{
-    char path[MAX_PATH + 128];
-    struct stat st;
-
-    (void)user;
-
-    if (!asset_host_path(path, sizeof(path), name)) {
-        return -EINVAL;
-    }
-    if (stat(path, &st) != 0) {
-        return -ENOENT;
-    }
-    /* A directory says so by refusing to answer a size - the core then asks
-     * open_dir() and reports S_IFDIR. */
-    if (S_ISDIR(st.st_mode)) {
-        return -EISDIR;
-    }
-    return (int64_t)st.st_size;
-}
-
-static void* win32_asset_open_dir(void* user, const char* name)
-{
-    char path[MAX_PATH + 128];
-
-    (void)user;
-
-    if (!name || !*name) {
-        /* The mount root is the asset directory itself. */
-        snprintf(path, sizeof(path), "%s", g_assets_dir);
-    } else if (!asset_host_path(path, sizeof(path), name)) {
-        return NULL;
-    }
-    return opendir(path);
-}
-
-static const char* win32_asset_dir_next(void* user, void* dir)
-{
-    struct dirent* de;
-    (void)user;
-    de = readdir(dir);
-    return de ? de->d_name : NULL;   /* "." and ".." are the core's to report */
-}
-
-static void win32_asset_dir_close(void* user, void* dir)
-{
-    (void)user;
-    closedir(dir);
-}
-
-static const rvvm_asset_ops_t win32_asset_ops = {
-    .open_fd   = win32_asset_open_fd,
-    .size      = win32_asset_size,
-    .open_dir  = win32_asset_open_dir,
-    .dir_next  = win32_asset_dir_next,
-    .dir_close = win32_asset_dir_close,
-};
 
 void win32_host_set_assets_dir(const char* dir)
 {
     if (dir && *dir) {
         snprintf(g_assets_dir, sizeof(g_assets_dir), "%s", dir);
+        vp_bundle_set_assets_root(dir);
     }
 }
 
@@ -2956,6 +2943,99 @@ bool win32_host_init(const char* title, int win_w, int win_h,
     return true;
 }
 
+/* ============================================================
+ * Guest rootfs: install the bundle
+ *
+ * A release carries an Alpine minirootfs next to the binary
+ * (<exe dir>/bundle/rootfs.tar.gz). Running on it is what makes the guest's `/`
+ * a real userland: the archive's regular files are materialized once into
+ * <exe dir>/runtime/rootfs, that directory becomes the guest's prefix, and the
+ * archive's *shape* goes to the core as the shadow index. The shape is what
+ * Windows cannot express otherwise - a symlink there needs a privilege, and a
+ * minirootfs has 335 of them, 304 of which are busybox's applet names.
+ *
+ * The install is idempotent (a file of the same size is left alone), so a
+ * relaunch walks the tree instead of rewriting it. A missing bundle is not an
+ * error: the guest then runs with its filesystem view disabled, which is how the
+ * plain sample guests have always run.
+ * ============================================================ */
+/* (The archive index for the run is the mount's own - vp_bundle holds it.) */
+
+/* Directory the running executable lives in - not the process's cwd, which
+ * rvvm_user.c chdir()s away to the guest's prefix as soon as the guest starts. */
+static bool win32_exe_directory(char* out, size_t size)
+{
+    char module[MAX_PATH];
+    DWORD len = GetModuleFileNameA(NULL, module, sizeof(module));
+
+    if (!len || len >= sizeof(module)) {
+        return false;
+    }
+    for (DWORD i = len; i > 0; --i) {
+        if (module[i - 1] == '\\' || module[i - 1] == '/') {
+            module[i - 1] = 0;
+            break;
+        }
+    }
+    if (strlen(module) + 1 > size) {
+        return false;
+    }
+    strcpy(out, module);
+    return true;
+}
+
+/* ============================================================
+ * Apps: /data/app/<id>
+ *
+ * A run boots one app, and only that app: vp_bundle_install_app() unpacks it
+ * into the run's own rootfs at <guest>/data/app/<id> after emptying the app
+ * tree, so there is nothing else there for the guest to name, and it reports the
+ * app's own assets/ directory for the /assets mount root. That is what makes
+ * AAssetManager_* per-app without touching the guest ABI - and it is the same
+ * code the Android host runs, which is the point of it living in vp_bundle.
+ * ============================================================ */
+
+
+static void win32_guest_rootfs_mount(rvvm_machine_t* machine, const char* app_id)
+{
+    char exe_dir[MAX_PATH];
+    char archive[MAX_PATH];
+    char apps_archive[MAX_PATH];
+    char dest[MAX_PATH];
+    char assets_root[MAX_PATH];
+    vp_bundle_stats_t stats;
+    const char* error = NULL;
+
+    if (!win32_exe_directory(exe_dir, sizeof(exe_dir))) {
+        return;
+    }
+    snprintf(archive, sizeof(archive), "%s\\%s\\%s", exe_dir, VP_BUNDLE_DIR, VP_ROOTFS_TAR_GZ);
+    snprintf(apps_archive, sizeof(apps_archive), "%s\\%s\\%s", exe_dir, VP_BUNDLE_DIR, VP_APPS_TAR_GZ);
+    snprintf(dest, sizeof(dest), "%s\\runtime\\rootfs", exe_dir);
+
+    if (!vp_bundle_mount(machine, archive, dest, &stats, &error)) {
+        winhost_log("rootfs: %s could not be mounted (%s) - running without a guest rootfs",
+                    archive, error ? error : "?");
+        return;
+    }
+    winhost_log("rootfs: %zu archive entries, %zu files at %s", stats.entries, stats.files, dest);
+
+    /* The app this run boots: named by --guest /data/app/<id>/... (or by the
+     * picker's own entry path), and by nothing else. The app tree is emptied
+     * either way, so a run with no app has no /data/app to look at. */
+    if (!vp_bundle_install_app(apps_archive, dest, app_id, assets_root, sizeof(assets_root), &error)) {
+        winhost_log("apps: %s: %s", (app_id && *app_id) ? app_id : "(no app)",
+                    error ? error : "?");
+    } else if (app_id && *app_id) {
+        winhost_log("apps: %s installed at %s\\data\\app\\%s", app_id, dest, app_id);
+    }
+    /* An app's own resources are the /assets tree. Without one the mount root
+     * stays whatever the launcher was pointed at (--assets / RVVM_ASSETS). */
+    if (assets_root[0]) {
+        vp_bundle_set_assets_root(assets_root);
+    }
+}
+
 bool win32_host_start_guest(int argc, char** argv)
 {
     int i;
@@ -2993,8 +3073,20 @@ bool win32_host_start_guest(int argc, char** argv)
      * exist on this host. */
     {
         const char* host_prefix = getenv("RVVM_USER_PREFIX");
-        rvvm_user_set_prefix(g_guest_machine,
-                             (host_prefix && host_prefix[0]) ? host_prefix : NULL);
+        if (host_prefix && host_prefix[0]) {
+            /* An explicit prefix wins: that is how a regression run points the
+             * guest at a hand-made tree of its own. */
+            rvvm_user_set_prefix(g_guest_machine, host_prefix);
+        } else {
+            /* Otherwise run on the bundle. A guest named /data/app/<id>/... is
+             * also the request to boot that app and nothing else; a guest of any
+             * other shape runs on the bare rootfs. A host with no bundle keeps
+             * the pass-through view (nothing is set). */
+            char app_id[VP_APP_ID_MAX];
+            bool have_app = vp_bundle_app_id_from_guest_path(argc > 0 ? argv[0] : NULL,
+                                                            app_id, sizeof(app_id));
+            win32_guest_rootfs_mount(g_guest_machine, have_app ? app_id : NULL);
+        }
     }
 
     /* Route guest fd 1/2 through the console session so CR / ANSI escapes
@@ -3047,7 +3139,7 @@ bool win32_host_start_guest(int argc, char** argv)
     /* The host's asset tree, mounted at /assets. This host's tree is a real
      * directory, so the mount serves plain seekable files; see the ops above.
      * Registered per run like the rest of the host context. */
-    rvvm_user_set_assets(g_guest_machine, &win32_asset_ops, NULL);
+    rvvm_user_set_assets(g_guest_machine, vp_bundle_assets(), NULL);
 
     g_guest_argv = (char**)calloc((size_t)argc + 1, sizeof(char*));
     if (!g_guest_argv) {
