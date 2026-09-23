@@ -361,7 +361,7 @@ ifneq (,$(filter windows mingw mingw32 msys cygwin,$(OS)))
 ifeq (,$(filter i386,$(ARCH)))
 # vp_cmdpost.c bridges the guest syscalls to the host window, so it is required
 USE_VERTPASS                   ?= 1
-override BIN_TARGETS           := $(BIN_TARGETS) rvvm_winhost
+override BIN_TARGETS           := $(BIN_TARGETS) rvvm_winhost rvvm_ash
 override bin_src_rvvm_winhost  := $(SRCDIR)/virtpass/win32-host/win32_main.c \
                                   $(SRCDIR)/virtpass/win32-host/win32_cmdpost_bridge.c \
                                   $(SRCDIR)/virtpass/win32-host/win32_gl_backend.c \
@@ -373,6 +373,14 @@ override bin_src_rvvm_winhost  := $(SRCDIR)/virtpass/win32-host/win32_main.c \
 # zlib: vp_rootfs.c inflates the bundle archives (pkg-config module name is
 # "zlib", not "z")
 override bin_libs_rvvm_winhost := rvvm zlib
+
+# rvvm_ash: the same host without a window. It boots the bundle's shell on the
+# console it was started from (bash.exe to the WinHost's wsl.exe), so it shares
+# every source but the entry point - the bridge keeps its window, GL, audio and
+# sensor code behind win32_host_init(), which this one never calls.
+override bin_src_rvvm_ash     := $(SRCDIR)/virtpass/win32-host/ash_main.c \
+                                 $(filter-out $(SRCDIR)/virtpass/win32-host/win32_main.c,$(bin_src_rvvm_winhost))
+override bin_libs_rvvm_ash    := rvvm zlib
 endif
 endif
 

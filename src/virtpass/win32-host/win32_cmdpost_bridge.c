@@ -1125,9 +1125,42 @@ static DWORD WINAPI stdin_pump_thread(LPVOID param)
             }
         }
         if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), buf, sizeof(buf), &got, NULL) || got == 0) {
-            return 0; /* EOF, or a broken pipe: nothing more will arrive */
+            /* EOF (or a broken pipe): nothing more will ever arrive. The guest's
+             * end is a terminal, and a terminal says "the input ended" with
+             * Ctrl-D - so that is what this delivers. Without it a shell parked
+             * on read(0) would wait forever for input that cannot come, and a
+             * batch run piped from a file would hang instead of finishing. */
+            tty_input("\x04", 1);
+            return 0;
         }
         tty_input(buf, (size_t)got);
+    }
+}
+
+/* The console mode as this process found it. The pump below puts the console in
+ * raw mode (no echo, no line assembly); a host that exits without putting it back
+ * leaves the user's terminal unusable - the kind of bug that makes a tool feel
+ * broken long after it has actually finished its job. Restore on the way out. */
+static DWORD g_console_mode_in  = 0;
+static DWORD g_console_mode_out = 0;
+static bool  g_console_mode_saved = false;
+
+static void console_restore_mode(void)
+{
+    HANDLE hin;
+    HANDLE hout;
+
+    if (!g_console_mode_saved) {
+        return;
+    }
+    g_console_mode_saved = false;
+    hin = GetStdHandle(STD_INPUT_HANDLE);
+    hout = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hin && hin != INVALID_HANDLE_VALUE) {
+        SetConsoleMode(hin, g_console_mode_in);
+    }
+    if (hout && hout != INVALID_HANDLE_VALUE) {
+        SetConsoleMode(hout, g_console_mode_out);
     }
 }
 
@@ -1167,11 +1200,14 @@ static void stdin_pump_start(void)
         HANDLE hout = GetStdHandle(STD_OUTPUT_HANDLE);
 
         if (GetConsoleMode(hin, &mode)) {
+            g_console_mode_in = mode;
+            g_console_mode_saved = true;
             SetConsoleMode(hin, (mode & ~(DWORD)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT |
                                                  ENABLE_PROCESSED_INPUT))
                                     | ENABLE_VIRTUAL_TERMINAL_INPUT);
         }
         if (hout && hout != INVALID_HANDLE_VALUE && GetConsoleMode(hout, &mode)) {
+            g_console_mode_out = mode;
             SetConsoleMode(hout, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING |
                                           ENABLE_PROCESSED_OUTPUT);
         }
@@ -1935,6 +1971,15 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
         if (g_hwnd) {
             PostMessageA(g_hwnd, WM_CLOSE, 0, 0);
             return TRUE; /* handled: do not fall back to TerminateProcess */
+        }
+        /* No window (the console-only host, rvvm_ash): there is no message loop
+         * to run an ordered teardown, so ask the guest to stop here. Ctrl+C is
+         * the one case that must *not* do this: the console is in raw mode and
+         * the byte has already been handed to the guest's own line discipline,
+         * which is what turns it into the shell's SIGINT. */
+        if (type != CTRL_C_EVENT && g_guest_machine) {
+            rvvm_user_stop(g_guest_machine, STOP_FORCED_EXIT_CODE);
+            return TRUE;
         }
         /* Window already gone (message loop exited): nothing left to drain. */
         return FALSE;
@@ -2943,6 +2988,65 @@ bool win32_host_init(const char* title, int win_w, int win_h,
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* Console-only host (rvvm_ash)                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Everything win32_host_init() does except the parts that need a window: no
+ * window class, no surface, no GL backend, no vsync clock, no sensors. What is
+ * left is what a guest that only ever talks to a terminal needs - the session
+ * its geometry comes from, the cmdpost instance its syscalls land in, and a
+ * console control handler so a closed console still unwinds the guest instead of
+ * letting Windows terminate the process mid-flight.
+ */
+bool win32_host_init_console(int virt_w, int virt_h, int virt_ppi)
+{
+    g_launcher = false;
+
+    vp_session_init(&g_session);
+    vp_session_set_panel(&g_session, (virt_w > 0) ? virt_w : 1024,
+                                     (virt_h > 0) ? virt_h : 768);
+    vp_session_set_density(&g_session,
+                           (virt_ppi > 0) ? virt_ppi : ACONFIGURATION_DENSITY_MEDIUM);
+
+    InitializeCriticalSection(&g_surf_cs);
+    g_cs_ready = true;
+
+    if (!g_cmdpost) {
+        g_cmdpost = cmdpost_create();
+    }
+    if (!SetConsoleCtrlHandler(console_ctrl_handler, TRUE)) {
+        winhost_log("SetConsoleCtrlHandler failed; closing the console will not be graceful");
+    }
+    win32_cmdpost_register_callbacks();
+    return true;
+}
+
+/*
+ * Block until the guest exits and return its exit code - the console host's
+ * equivalent of win32_host_message_loop(). The guest runs on its own thread and
+ * so do the stdin pump and the console geometry poller, so there is nothing to
+ * pump here: this is only the wait a caller needs before it can exit.
+ */
+int win32_host_wait_guest(void)
+{
+    if (!g_guest_thread) {
+        console_restore_mode();
+        return (int)g_guest_rc;
+    }
+    WaitForSingleObject(g_guest_thread, INFINITE);
+    /* No window means no WM_APP_GUEST_EXIT, which is the windowed host's chance
+     * to release this handle - so it is closed here. A guest thread handle must
+     * not outlive the run it belongs to. */
+    CloseHandle(g_guest_thread);
+    g_guest_thread = NULL;
+    /* The guest is gone: put the console back the way we found it, before the
+     * caller's prompt reappears on it. */
+    console_restore_mode();
+    return (int)g_guest_rc;
+}
+
 /* ============================================================
  * Guest rootfs: install the bundle
  *
@@ -3210,6 +3314,11 @@ int win32_host_guest_exit_code(void)
 
 void win32_host_shutdown(void)
 {
+    /* Whatever happens from here, the caller's console comes back the way we
+     * found it: this is the last path out for a host that never reached
+     * win32_host_wait_guest() (a failed launch, most often). */
+    console_restore_mode();
+
     /* Stop the frame clock first: it tells a guest blocked in poll() that the
      * source is gone, so the guest degrades instead of waiting forever. */
     vsync_clock_stop();

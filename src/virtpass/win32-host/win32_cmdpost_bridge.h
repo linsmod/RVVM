@@ -60,6 +60,22 @@ bool win32_host_set_launcher(const char* assets_dir);
 void win32_host_set_assets_dir(const char* dir);
 
 /*
+ * Console-only host (rvvm_ash): everything win32_host_init() does except the
+ * parts that need a window - no surface, no GL, no vsync, no sensors. What is
+ * left is what a guest that only ever talks to a terminal needs. Pass 0 for any
+ * geometry to take its default.
+ */
+bool win32_host_init_console(int virt_w, int virt_h, int virt_ppi);
+
+/*
+ * Block until the guest exits and return its exit code. The console host's
+ * equivalent of win32_host_message_loop(): with the guest, the stdin pump and
+ * the console geometry poller all on threads of their own, there is no message
+ * loop to run.
+ */
+int win32_host_wait_guest(void);
+
+/*
  * Launch the guest Linux ELF (argv[0] = ELF path, argv[1..] = guest args)
  * on a dedicated thread. Does not block.
  */

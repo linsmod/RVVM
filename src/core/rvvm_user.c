@@ -681,6 +681,11 @@ typedef struct {
     bool cloexec;  // FD_CLOEXEC: execve() closes this slot
     bool shared;   // Rides on another address space's host fd: never closed here
     bool used;     // The slot holds a descriptor
+    bool console;  // Still the run's console (0/1/2 as they started): reads come
+                   // from the keyboard (rvvm_user_tty_input), never from the
+                   // host process's own stdin. Cleared the moment a real
+                   // descriptor is put on the number - `cmd < file` then reads
+                   // the file, which is the whole point of the distinction.
 } rvvm_fd_entry_t;
 typedef struct rvvm_process {
     uint32_t     pid;         // Guest-visible process id
@@ -1591,7 +1596,7 @@ typedef struct {
 // line discipline need it before that.
 static inline rvvm_userland_t* uctx(void);
 
-static int64_t user_tty_ioctl(uint64_t cmd, void* arg)
+static int64_t user_tty_ioctl(uint64_t cmd, void* arg, int32_t pid)
 {
     switch (cmd) {
         case UAPI_TCGETS: {
@@ -1644,6 +1649,24 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg)
             // Window size changes: accepted and ignored. The grid belongs to
             // the host (it is sized to the host viewport, see TIOCGWINSZ
             // above), so a guest-requested resize does not move it.
+            return 0;
+        case UAPI_TIOCGPGRP: {
+            /* No process groups are modelled, so the foreground group is the
+             * caller - exactly what a pty answers (userland_pty_ioctl) and what
+             * getpgrp() reports (case 155). A shell compares the two and, when
+             * they agree, concludes it is in the foreground: two different
+             * answers would send it round the loop of signalling itself. */
+            if (!arg) {
+                return -UAPI_EINVAL;
+            }
+            memcpy(arg, &pid, sizeof(pid));
+            return 0;
+        }
+        case UAPI_TIOCSPGRP:
+        case UAPI_TIOCSCTTY:
+            /* Accepted: this console *is* the session's terminal, and the pair
+             * a shell names is the only one there is. Refusing TIOCSCTTY is
+             * what leaves a shell convinced the terminal is somebody else's. */
             return 0;
     }
     return -UAPI_ENOTTY;
@@ -3764,6 +3787,10 @@ static void userland_fd_install(rvvm_userland_t* ctx, int guest_fd, int host_fd,
     ctx->fds[guest_fd].fd      = host_fd;
     ctx->fds[guest_fd].cloexec = cloexec;
     ctx->fds[guest_fd].shared  = false;
+    /* A real descriptor landed on this number, so it is no longer the console:
+     * `cmd < file` reads the file, not the keyboard. Every way of putting an fd
+     * in the table (open, dup, pipe, socket, accept) comes through here. */
+    ctx->fds[guest_fd].console = false;
 }
 
 /* Track a descriptor the host just handed out: its number is the guest's too. */
@@ -3775,6 +3802,15 @@ static void userland_fd_add(rvvm_userland_t* ctx, int fd, bool cloexec)
 static bool userland_fd_tracked(rvvm_userland_t* ctx, int fd)
 {
     return ctx && fd >= 0 && fd < USERLAND_FD_TABLE_MAX && ctx->fds[fd].used;
+}
+
+/* Whether @fd is still the run's console: one of 0/1/2, untouched by any
+ * redirect since. Those read from the keyboard and write to the console, not
+ * from/to the host process's own descriptors - which are the host's to use
+ * (its stdin is what the pump reads). */
+static bool userland_fd_is_console(rvvm_userland_t* ctx, int fd)
+{
+    return userland_fd_tracked(ctx, fd) && ctx->fds[fd].console;
 }
 
 /* The host fd a guest fd rides on. Every syscall that consumes a descriptor
@@ -3947,9 +3983,16 @@ static void userland_fd_table_init(rvvm_userland_t* ctx)
         ctx->fds[fd].used = false;
     }
     for (int fd = 0; fd <= 2; ++fd) {
-        ctx->fds[fd].used   = true;
-        ctx->fds[fd].fd     = fd;
-        ctx->fds[fd].shared = true;
+        ctx->fds[fd].used    = true;
+        ctx->fds[fd].fd      = fd;
+        ctx->fds[fd].shared  = true;
+        /* 0/1/2 start out as the run's console. fd 0 is the one that matters:
+         * it is served by the virtual TTY (user_tty_read), so the host's own
+         * stdin is the host's to read - the stdin pump feeds those bytes in
+         * through rvvm_user_tty_input() instead of racing the guest for the
+         * same handle, which is what made an interactive shell see EOF at once.
+         */
+        ctx->fds[fd].console = true;
     }
 }
 
@@ -7271,16 +7314,17 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 29: // ioctl
                     // TODO: I sure hope not many ioctl() interfaces need struct conversion...
                     rvvm_info("sys_ioctl(%ld, %lx, %lx)", a0, a1, a2);
-                    /* Only an untracked 0/1/2 is the console: a dup2() onto
-                     * that number put a real descriptor there, and the termios
-                     * probes are not for it. */
+                    /* Only 0/1/2 *as they started* are the console: a dup2()
+                     * onto that number put a real descriptor there, and the
+                     * termios probes are not for it. */
                     if ((a0 == 0 || a0 == 1 || a0 == 2) && uctx()->tty &&
-                        !userland_fd_tracked(uctx(), (int)a0)) {
+                        userland_fd_is_console(uctx(), (int)a0)) {
                         // Virtual TTY rendered by the host: answer the termios
                         // probes guest libc makes for isatty() itself instead
                         // of forwarding them to the host fd. fd 0 is included
                         // because it is the same console, only the input half.
-                        a0 = user_tty_ioctl(a1, a2 ? to_ptr(a2) : NULL);
+                        a0 = user_tty_ioctl(a1, a2 ? to_ptr(a2) : NULL,
+                                            (int32_t)(thread->proc ? thread->proc->pid : 0));
                         break;
                     }
                     {
@@ -7296,7 +7340,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                              * size of the run's session, exactly as for an
                              * untracked fd 0/1/2 above. getty asks for both
                              * before it reads a login name. */
-                            a0 = user_tty_ioctl(a1, a2 ? to_ptr(a2) : NULL);
+                            a0 = user_tty_ioctl(a1, a2 ? to_ptr(a2) : NULL,
+                                                (int32_t)(thread->proc ? thread->proc->pid : 0));
                         } else {
                             a0 = errno_ret(ioctl(hfd, a1, a2));
                         }
@@ -7611,10 +7656,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -UAPI_EFAULT;
                         break;
                     }
-                    /* Only an *untracked* fd 0 is the console: `cmd < file` puts
+                    /* Only fd 0 *as it started* is the console: `cmd < file` puts
                      * a real descriptor on that number (dup2), and reading it has
                      * to reach the file, not the keyboard. */
-                    if (a0 == 0 && uctx()->tty && !userland_fd_tracked(uctx(), (int)a0)) {
+                    if (a0 == 0 && uctx()->tty && userland_fd_is_console(uctx(), (int)a0)) {
                         // fd 0 is the virtual TTY: the guest's stdin comes from
                         // the host keyboard (rvvm_user_tty_input), not from the
                         // host process's own stdin. Blocks until a line has been
