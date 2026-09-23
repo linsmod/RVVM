@@ -4932,12 +4932,22 @@ static rvvm_addr_t rvvm_sys_wait4(rvvm_userland_t* ctx, rvvm_user_thread_t* self
             return gpid;
         }
 
-        /* A process living in this address space: block on its exit event, holding
-         * our reference so the record cannot go away under the wait. The event is
-         * one-shot and consumed by whoever sees it first, so the wait is bounded
-         * and the loop re-scans: a wake that another waiter took, or one that
-         * raced this scan, costs a poll interval instead of hanging the guest. */
-        rvvm_event_wait(&child->exit_event, USERLAND_WAIT_POLL_NS);
+        /* A process living in this address space: wait for its exit, holding our
+         * reference so the record cannot go away under the wait.
+         *
+         * A bounded poll rather than a sleep on the exit event: the event wait
+         * is what a wake must interrupt, and this loop is where a missed one
+         * would hang a shell's wait(2) forever - which is exactly what happened
+         * on win32, where the emulated futex behind rvvm_event_wait() did not
+         * return on either the wake or its own timeout. The re-scan is the
+         * design anyway (a wake another waiter took costs one interval), so the
+         * poll costs nothing but the 100 ms granularity of USERLAND_WAIT_POLL_NS,
+         * and the interrupt checks below stay live. */
+        while (!atomic_load_uint32(&child->exited) &&
+               !atomic_load_uint32(&self->finished) &&
+               !atomic_load_uint32(&ctx->sig_pending)) {
+            sleep_ns(USERLAND_WAIT_POLL_NS);
+        }
         userland_proc_unref(child);
     }
 }
