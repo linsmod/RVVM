@@ -697,6 +697,13 @@ typedef struct rvvm_process {
     int          exit_status; // wait(2) status word
     uint32_t     vfork_done;  // It execed or exited: a vfork() parent stops waiting
     rvvm_event_t exit_event;  // Woken when it exits (or vfork_done turns), for wait4()
+    struct rvvm_userland* child_ctx; // The address space an in-process fork()ed
+                                // child runs in: its threads are registered
+                                // there, not in the parent's, so a signal that
+                                // ends this process has to stop them through
+                                // it. Valid while the process is not exited
+                                // (its machine dies with its last thread); set
+                                // by the fork path only.
 } rvvm_process_t;
 
 typedef struct {
@@ -1866,6 +1873,7 @@ static size_t tty_line_erase(rvvm_userland_t* ctx)
 
 // Defined with the guest signal delivery below the syscall dispatch.
 static bool userland_deliver_signal(rvvm_userland_t* ctx, uint32_t sig);
+static bool userland_kill_foreground(rvvm_userland_t* ctx, uint32_t sig);
 
 // Run one host input burst through the line discipline.
 static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
@@ -1905,7 +1913,22 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
             ctx->tty_line_len = 0;
             ctx->tty_esc_state = 0;
             ctx->tty_esc_hold_len = 0;
-            if (echo) user_tty_vt_write(ctx, "^C\r\n", 4);
+            /* Echoed like ECHOCTL makes a real tty do: the ^C notation is the
+             * line discipline's doing, independent of the guest's ECHO - and
+             * an interactive shell edits in raw mode (ECHO off), so tying the
+             * echo to it would leave ^C invisible exactly where it matters.
+             * The notation goes to both sinks the guest's own console writes
+             * use: the VTerm screen, and the raw console - a console host
+             * (rvvm_ash) displays the raw one and never renders the screen.
+             * The raw leg mirrors the DEV_CONSOLE write: io_callback when the
+             * host installed one, the host's stdout otherwise. */
+            user_tty_vt_write(ctx, "^C\r\n", 4);
+            if (ctx->io_callback) {
+                ctx->io_callback(1, "^C\r\n", 4);
+            } else {
+                ssize_t raw_echo = write(1, "^C\r\n", 4);
+                (void)raw_echo;
+            }
             continue;
         }
 
@@ -2062,13 +2085,17 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
         rvvm_event_wake(&ctx->tty_in_event);
     }
     if (interrupt) {
-        // SIGINT with a guest-registered handler is delivered in-guest: the
-        // handler runs at the vCPU's next instruction boundary, before the
-        // guest sees any EINTR from a read this unblocked. The default
-        // disposition is termination - what ^C has always meant here (130 =
-        // 128 + SIGINT, what a shell reports for a ^C'd job).
-        if (!userland_deliver_signal(ctx, UAPI_SIGINT)) {
-            rvvm_user_stop(ctx->machine, 130);
+        // SIGINT for the foreground job first: a running command dies with
+        // 128+SIGINT and the shell's wait4() reaps it. With nothing running,
+        // the signal is the shell's - a registered handler is delivered
+        // in-guest (it runs at the vCPU's next instruction boundary, before
+        // the guest sees any EINTR from a read this unblocked), and the
+        // default disposition is termination - what ^C has always meant here
+        // (130 = 128 + SIGINT, what a shell reports for a ^C'd job).
+        if (!userland_kill_foreground(ctx, UAPI_SIGINT)) {
+            if (!userland_deliver_signal(ctx, UAPI_SIGINT)) {
+                rvvm_user_stop(ctx->machine, 130);
+            }
         }
     }
 }
@@ -2111,6 +2138,26 @@ static int64_t user_tty_read(rvvm_userland_t* ctx, void* buf, size_t count, bool
         if (ctx->tty_cooked_len) {
             size_t n = tty_cooked_pop(ctx, buf, count);
             spin_unlock(&ctx->tty_in_lock);
+            if (path_trace_enabled()) {
+                /* What the guest's read(0) actually gets: the byte-level
+                 * truth about control characters (0x03/0x04/DEL/ESC...) the
+                 * guest's line editor has to make sense of. */
+                char shown[64];
+                size_t s = 0;
+                for (size_t i = 0; i < n && s < sizeof(shown) - 4; ++i) {
+                    uint8_t ch = ((uint8_t*)buf)[i];
+                    if (ch >= 0x20 && ch < 0x7f) {
+                        shown[s++] = (char)ch;
+                    } else {
+                        shown[s++] = '\\';
+                        shown[s++] = 'x';
+                        shown[s++] = "0123456789abcdef"[ch >> 4];
+                        shown[s++] = "0123456789abcdef"[ch & 15];
+                    }
+                }
+                shown[s] = 0;
+                rvvm_warn("tty:  read(0) -> %u \"%s\"", (unsigned)n, shown);
+            }
             return (int64_t)n;
         }
         if (ctx->tty_eof_pending) {
@@ -3838,6 +3885,9 @@ static void userland_proc_register(rvvm_userland_t* ctx, rvvm_process_t* proc)
  * consumed), or the run it belonged to is over. */
 static void userland_proc_forget(rvvm_userland_t* ctx, rvvm_process_t* proc)
 {
+    if (path_trace_enabled()) {
+        rvvm_warn("forget: ctx=%p pid=%u", (void*)ctx, proc->pid);
+    }
     spin_lock(&ctx->proc_lock);
     vector_foreach_back(ctx->procs, i) {
         if (vector_at(ctx->procs, i) == proc) {
@@ -4192,6 +4242,9 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
  * tree of its own (see rvvm_sys_clone). */
 static void userland_procs_reset(rvvm_userland_t* ctx)
 {
+    if (path_trace_enabled()) {
+        rvvm_warn("procs_reset: ctx=%p n=%u", (void*)ctx, (unsigned)vector_size(ctx->procs));
+    }
     spin_lock(&ctx->proc_lock);
     vector_foreach(ctx->procs, i) {
         userland_proc_unref(vector_at(ctx->procs, i));
@@ -4913,6 +4966,10 @@ static int rvvm_sys_clone(rvvm_user_thread_t* self, rvvm_hart_t* cpu, uint32_t f
         return -UAPI_ENOMEM;
     }
     userland_proc_register(child, record);
+    record->child_ctx = child;
+    if (path_trace_enabled()) {
+        rvvm_warn("fork: parent=%u child=%u", parent_pid, child_pid);
+    }
 
     /* The child's descriptors: the parent's slots, never host-closed by the
      * child (see userland_fd_close). */
@@ -5014,6 +5071,18 @@ static rvvm_addr_t rvvm_sys_wait4(rvvm_userland_t* ctx, rvvm_user_thread_t* self
         if (!child && !spare) {
             /* Nothing of ours matches: what Linux reports for a pid that is not
              * one of our children, and for one that was already reaped. */
+            if (path_trace_enabled()) {
+                rvvm_warn("wait4: ECHILD self=%u upid=%d procs=%u",
+                          self_proc->pid, upid, (unsigned)vector_size(ctx->procs));
+                spin_lock(&ctx->proc_lock);
+                vector_foreach(ctx->procs, i) {
+                    rvvm_process_t* proc = vector_at(ctx->procs, i);
+                    rvvm_warn("  proc pid=%u ppid=%u exited=%u host_pid=%d",
+                              proc->pid, proc->ppid,
+                              atomic_load_uint32(&proc->exited), proc->host_pid);
+                }
+                spin_unlock(&ctx->proc_lock);
+            }
             return -UAPI_ECHILD;
         }
         if (child) {
@@ -6011,9 +6080,52 @@ static void userland_kill_process(rvvm_userland_t* ctx, rvvm_process_t* proc, in
         return;
     }
     userland_proc_exit(proc, userland_exit_status(status));
-    /* The caller belongs to another process and is not exempt from anything:
-     * NULL means every thread of @proc unwinds. */
-    userland_finish_threads(ctx, proc, NULL);
+    /* The threads of an in-process fork()ed child are registered in the child's
+     * own address space, not the caller's - the parent's registry only shares
+     * the record. Stopping them through the caller's ctx would miss the vCPU
+     * and leave it running. */
+    userland_finish_threads(proc->child_ctx ? proc->child_ctx : ctx, proc, NULL);
+}
+
+/* ^C at the console: SIGINT for the foreground job. Process groups are not
+ * modeled, but with job control off (what an interactive shell here runs with)
+ * every job of the shell shares its group anyway, so the working set is
+ * "every live descendant of the run's root process": a `sleep` in the
+ * foreground dies with 128+SIGINT and the shell's wait4() reaps it, a
+ * background job dies with it, exactly as the kernel would treat them.
+ *
+ * The disposition is the default one regardless of ctx->siga[] - that array is
+ * shared by every process of the address space, so the shell's SIGINT handler
+ * would speak for its children too, and a ^C would never kill anything. On the
+ * hosts this runs, guest children do not trap SIGINT, so the kernel-visible
+ * outcome (the command dies, the shell lives) is what this produces.
+ *
+ * Returns false when nothing was running, leaving the signal to the shell. */
+static bool userland_kill_foreground(rvvm_userland_t* ctx, uint32_t sig)
+{
+    rvvm_process_t* victims[16];
+    size_t          nvictims = 0;
+    bool            killed   = false;
+
+    spin_lock(&ctx->proc_lock);
+    vector_foreach(ctx->procs, i) {
+        rvvm_process_t* proc = vector_at(ctx->procs, i);
+        if (proc->run_root || proc->host_pid ||
+            atomic_load_uint32(&proc->exited) || proc->ppid == USERLAND_ROOT_PARENT_ID) {
+            continue;   // The shell itself, a host-backed child, or a dead one
+        }
+        if (nvictims < STATIC_ARRAY_SIZE(victims)) {
+            victims[nvictims++] = userland_proc_ref(proc);
+        }
+    }
+    spin_unlock(&ctx->proc_lock);
+
+    for (size_t i = 0; i < nvictims; ++i) {
+        userland_kill_process(ctx, victims[i], (int)sig);
+        userland_proc_unref(victims[i]);
+        killed = true;
+    }
+    return killed;
 }
 
 /* Route a signal at @pid (0 or negative means "ourselves": process groups are not
