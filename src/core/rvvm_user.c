@@ -1624,6 +1624,16 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg, int32_t pid)
             t.c_cc[6] = 1;                  // VMIN
             t.c_ispeed = t.c_ospeed = 0xF;  // B38400
             memcpy(arg, &t, sizeof(t));
+            /* isatty() is exactly this probe succeeding; without the trace a
+             * "console looks dead" symptom cannot be told apart from a guest
+             * that went non-interactive because TCGETS never landed here. */
+            if (path_trace_enabled()) {
+                rvvm_warn("tty:  syscall %ld TCGETS -> console isatty=yes (canon=%d echo=%d isig=%d)",
+                          (long)tls_cur_syscall,
+                          (int)!!(t.c_lflag & TTY_LFLAG_ICANON),
+                          (int)!!(t.c_lflag & TTY_LFLAG_ECHO),
+                          (int)!!(t.c_lflag & TTY_LFLAG_ISIG));
+            }
             return 0;
         }
         case UAPI_TIOCGWINSZ: {
@@ -8001,7 +8011,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     /* The console is only an untracked 1/2: a `cmd > file` put a
                      * real descriptor on that number, and the bytes belong to it,
                      * not to the host's console sink. */
-                    bool console_out = (a0 == 1 || a0 == 2) && !userland_fd_tracked(uctx(), (int)a0);
+                    bool console_out = (a0 == 1 || a0 == 2) && userland_fd_is_console(uctx(), (int)a0);
                     int  host_fd     = userland_fd_host(uctx(), (int)a0);
                     if (console_out) {
                         // fd 1/2: feed the virtual TTY parser first (no-op unless a
@@ -8053,7 +8063,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * a descriptor the host reads or writes by its own number. */
                     int  iov_fd      = userland_fd_host(uctx(), (int)a0);
                     bool iov_console = (a0 == 0 || a0 == 1 || a0 == 2) &&
-                                       !userland_fd_tracked(uctx(), (int)a0);
+                                       userland_fd_is_console(uctx(), (int)a0);
                     /* A pty end or a /dev device is served here too: the host
                      * has no descriptor behind either. */
                     struct userland_pty* iov_pty = NULL;

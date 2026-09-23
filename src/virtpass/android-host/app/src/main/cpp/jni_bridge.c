@@ -1874,6 +1874,18 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved)
 {
     (void)reserved;
     g_jvm = vm;
+    /* Device-side debug switch: the trace gates in the core read the
+     * environment (RVVM_TRACE_PATH), which an app process inherits from the
+     * zygote and cannot get from `am start`. `adb shell setprop
+     * debug.rvvm.trace 1` before launching the app turns the path/tty traces
+     * on (this runs before any guest, and getenv is cached in the core). */
+    {
+        char value[PROP_VALUE_MAX] = "";
+        if (__system_property_get("debug.rvvm.trace", value) > 0 && value[0]) {
+            putenv("RVVM_TRACE_PATH=1");
+            LOGI("RVVM_TRACE_PATH enabled via debug.rvvm.trace=%s", value);
+        }
+    }
     LOGI("JNI_OnLoad: RVVM JNI bridge loaded");
     return JNI_VERSION_1_6;
 }
