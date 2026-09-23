@@ -4776,6 +4776,15 @@ static int rvvm_sys_clone(rvvm_user_thread_t* self, rvvm_hart_t* cpu, uint32_t f
      * child (see userland_fd_close). */
     userland_fd_table_inherit(child, ctx);
 
+    /* The child's console is the run's console, not a new one: the session
+     * belongs to the host and outlives every process of the run (a shell's
+     * children - `stty`, `vi`, a pipeline - ask it for isatty(), the window
+     * size and the terminal modes, and each would otherwise get a private
+     * screen of its own, or an ENOTTY that makes them think there is no
+     * terminal at all). Never owned: freeing it is the host's. */
+    child->tty       = ctx->tty;
+    child->tty_owned = false;
+
     /* One vCPU, continuing right after the ecall, wearing the child's pid as its
      * tid (the surviving thread leads the new process, as on Linux). */
     rvvm_user_thread_t* thread = safe_new_obj(rvvm_user_thread_t);
@@ -7971,6 +7980,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                          * fstat. fdopendir() does exactly this to validate its
                          * argument, so it has to answer S_IFDIR. */
                         asset_dir_fill_stat(&st);
+                        a0 = 0;
+                    } else if (userland_fd_is_console(uctx(), (int)fd) && uctx()->tty) {
+                        /* The run's console: a character device, exactly what
+                         * /dev/tty1 and /dev/console report, and with the same
+                         * st_rdev. That is what lets ttyname() name it - it
+                         * matches the descriptor against the nodes in /dev -
+                         * instead of answering "not a tty" for a terminal that
+                         * plainly is one. */
+                        userland_dev_fill_stat(DEV_CONSOLE, &st);
                         a0 = 0;
                     } else {
                         int hfd = userland_fd_host(uctx(), (int)fd);
