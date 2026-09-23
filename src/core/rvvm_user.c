@@ -937,6 +937,9 @@ typedef struct rvvm_userland {
     size_t       tty_cooked_len;   // bytes waiting for the guest
     uint8_t      tty_line[TTY_IN_LINE];
     size_t       tty_line_len;     // canonical line under construction
+    uint8_t      tty_esc_state;    // canonical scan: 0 none, 1 saw ESC, 2 in CSI params
+    uint8_t      tty_esc_hold[16]; // bytes held by that scan, across bursts
+    uint8_t      tty_esc_hold_len;
     uint32_t     tty_lflag;        // c_lflag from the last TCGETS/TCSETS
     uint32_t     tty_iflag;        // c_iflag from the last TCSETS (ICRNL is acted on)
     uint32_t     tty_eof_pending;  // Ctrl-D delivered: next read returns 0
@@ -1544,6 +1547,11 @@ static void user_tty_vt_write(rvvm_userland_t* ctx, const char* buf, size_t len)
 #define UAPI_TCSETS     0x5402
 #define UAPI_TCSETSW    0x5403
 #define UAPI_TCSETSF    0x5404
+
+/* Defined further down with the path trace (wrap_guest_path_ex); shared by the
+ * TCSETS trace here so one env var turns on both. */
+static bool path_trace_enabled(void);
+static THREAD_LOCAL rvvm_addr_t tls_cur_syscall;   // definition lives with it
 #define UAPI_TIOCGWINSZ 0x5413
 #define UAPI_TIOCSWINSZ 0x5414
 /* The pty-master ioctls (asm-generic): ptsname() and grantpt()/unlockpt() are
@@ -1643,6 +1651,12 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg, int32_t pid)
                 const uapi_termios_t* t = arg;
                 uctx()->tty_lflag = t->c_lflag;
                 uctx()->tty_iflag = t->c_iflag;
+                if (path_trace_enabled()) {
+                    rvvm_warn("tty:  syscall %ld TCSETS lflag=%lx (canon=%d echo=%d)",
+                              (long)tls_cur_syscall, (unsigned long)t->c_lflag,
+                              (int)!!(t->c_lflag & TTY_LFLAG_ICANON),
+                              (int)!!(t->c_lflag & TTY_LFLAG_ECHO));
+                }
             }
             return 0;
         case UAPI_TIOCSWINSZ:
@@ -1889,6 +1903,8 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
         if (isig && c == TTY_CC_VINTR) {
             interrupt = true;
             ctx->tty_line_len = 0;
+            ctx->tty_esc_state = 0;
+            ctx->tty_esc_hold_len = 0;
             if (echo) user_tty_vt_write(ctx, "^C\r\n", 4);
             continue;
         }
@@ -1896,6 +1912,17 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
         if (!canon) {
             // Raw mode (guest cleared ICANON): hand the byte straight through
             // and echo it verbatim - the guest owns its own line editing.
+            // A canonical scan caught mid-sequence cannot continue here: the
+            // held bytes go over untouched, since the guest may well be the
+            // one waiting for the report the scan was matching.
+            if (ctx->tty_esc_state == 1) {
+                tty_cooked_push(ctx, "\x1b", 1);
+            } else if (ctx->tty_esc_state == 2) {
+                tty_cooked_push(ctx, "\x1b[", 2);
+                tty_cooked_push(ctx, ctx->tty_esc_hold, ctx->tty_esc_hold_len);
+            }
+            ctx->tty_esc_state = 0;
+            ctx->tty_esc_hold_len = 0;
             tty_cooked_push(ctx, &c, 1);
             if (echo) {
                 user_tty_vt_write(ctx, (const char*)&c, 1);
@@ -1905,6 +1932,82 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
         }
 
         // --- canonical mode ---
+        // The host terminal answers a guest's ESC[6n cursor query by putting
+        // ESC[<row>;<col>R back into the input - the same channel as typed
+        // keys. The guest asks (and consumes the answer) in raw mode, but the
+        // answer can come back after it restored canonical mode (busybox ash
+        // runs every command that way), and a real terminal never delivers
+        // the report as typing: scanning it out here is what keeps a prompt
+        // from growing a "[30;1R" prefix. Raw mode below passes everything
+        // through untouched - the waiting guest consumes the report itself.
+        if (c == 0x1b && ctx->tty_esc_state != 1) {
+            // Hold a fresh ESC: it may grow into a cursor report.
+            ctx->tty_esc_state = 1;
+            ctx->tty_esc_hold_len = 0;
+            continue;
+        }
+        if (ctx->tty_esc_state) {
+            if (ctx->tty_esc_state == 1) {
+                if (c == '[') {
+                    ctx->tty_esc_state = 2;
+                    ctx->tty_esc_hold_len = 0;
+                    continue;
+                }
+                // Not a CSI: it was a plain ESC key. Deliver it, then let c
+                // fall through to the ordinary handling below.
+                ctx->tty_esc_state = 0;
+                if (echo) {
+                    user_tty_vt_write(ctx, "\x1b", 1);
+                }
+                if (ctx->tty_line_len < sizeof(ctx->tty_line)) {
+                    ctx->tty_line[ctx->tty_line_len++] = 0x1b;
+                }
+            } else if ((c >= '0' && c <= '9') || c == ';') {
+                if (ctx->tty_esc_hold_len < sizeof(ctx->tty_esc_hold)) {
+                    ctx->tty_esc_hold[ctx->tty_esc_hold_len++] = c;
+                    continue;
+                }
+                // Parameter overflow: not a report we care to match. Deliver
+                // everything held, then let c fall through below.
+                ctx->tty_esc_state = 0;
+                if (echo) {
+                    user_tty_vt_write(ctx, "\x1b[", 2);
+                }
+                if (ctx->tty_line_len + 2 <= sizeof(ctx->tty_line)) {
+                    ctx->tty_line[ctx->tty_line_len++] = 0x1b;
+                    ctx->tty_line[ctx->tty_line_len++] = '[';
+                }
+            } else if (c == 'R' && ctx->tty_esc_hold_len < sizeof(ctx->tty_esc_hold)) {
+                // A complete cursor-position report: control traffic, not
+                // typing. Drop it whole - nothing echoed, nothing delivered.
+                if (path_trace_enabled()) {
+                    rvvm_warn("tty:  dropped cursor report ESC[%.*sR",
+                              (int)ctx->tty_esc_hold_len, (const char*)ctx->tty_esc_hold);
+                }
+                ctx->tty_esc_state = 0;
+                ctx->tty_esc_hold_len = 0;
+                continue;
+            } else {
+                // The sequence is not a report: deliver what was held, then
+                // let c fall through to the ordinary handling below.
+                ctx->tty_esc_state = 0;
+                if (echo) {
+                    user_tty_vt_write(ctx, "\x1b[", 2);
+                }
+                if (ctx->tty_line_len + 2 <= sizeof(ctx->tty_line)) {
+                    ctx->tty_line[ctx->tty_line_len++] = 0x1b;
+                    ctx->tty_line[ctx->tty_line_len++] = '[';
+                }
+                if (echo) {
+                    user_tty_vt_write(ctx, (const char*)ctx->tty_esc_hold, ctx->tty_esc_hold_len);
+                }
+                for (size_t h = 0; h < ctx->tty_esc_hold_len && ctx->tty_line_len < sizeof(ctx->tty_line); ++h) {
+                    ctx->tty_line[ctx->tty_line_len++] = ctx->tty_esc_hold[h];
+                }
+                ctx->tty_esc_hold_len = 0;
+            }
+        }
+
         if (c == TTY_CC_ERASE) {
             // Erase the last character, whole: one Backspace takes one
             // character the user typed, however many bytes of UTF-8 that is,
@@ -2944,6 +3047,26 @@ static bool guest_path_absolutize(char* out, size_t size, const char* path)
     return true;
 }
 
+/* The syscall number of the ecall currently being dispatched on this thread
+ * (set by the trap handler before the switch over a7). The path trace below
+ * names it, so a "Syscall N failed" warning can be matched with the exact
+ * path access that produced it. -1 outside syscall dispatch (image loading,
+ * early boot). */
+static THREAD_LOCAL rvvm_addr_t tls_cur_syscall = (rvvm_addr_t)-1;
+
+/* Path-access tracing, enabled by RVVM_TRACE_PATH in the environment. Printed
+ * at warn level on purpose: the point is to interleave with the
+ * "Syscall N failed" warnings (also warn level) so the failing syscall and the
+ * path it tripped on sit next to each other in the log. */
+static bool path_trace_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("RVVM_TRACE_PATH") != NULL;
+    }
+    return enabled;
+}
+
 /* The entry point every guest path syscall argument goes through.
  *
  * A relative path resolves against the guest's cwd when dirfd is AT_FDCWD. With
@@ -2961,8 +3084,17 @@ static const char* wrap_guest_path_ex(char* buffer, int dirfd, const char* path,
     if (path[0] == '/' || dirfd == UAPI_AT_FDCWD) {
         char abs[UAPI_PATH_MAX];
         if (guest_path_absolutize(abs, sizeof(abs), path)) {
-            return map_abs_path_ex(buffer, abs, follow_final);
+            const char* mapped = map_abs_path_ex(buffer, abs, follow_final);
+            if (path_trace_enabled()) {
+                rvvm_warn("path: syscall %ld dirfd=%d follow=%d \"%s\" -> \"%s\"",
+                          (long)tls_cur_syscall, dirfd, follow_final, path, mapped ? mapped : "(null)");
+            }
+            return mapped;
         }
+    }
+    if (path_trace_enabled()) {
+        rvvm_warn("path: syscall %ld dirfd=%d follow=%d \"%s\" (passthrough)",
+                  (long)tls_cur_syscall, dirfd, follow_final, path);
     }
     return path;
 }
@@ -3811,6 +3943,16 @@ static bool userland_fd_tracked(rvvm_userland_t* ctx, int fd)
 static bool userland_fd_is_console(rvvm_userland_t* ctx, int fd)
 {
     return userland_fd_tracked(ctx, fd) && ctx->fds[fd].console;
+}
+
+/* Read-readiness of the virtual console. Its input lives in the cooked ring -
+ * the stdin pump feeds that, not the host's stdin handle - so poll()/select()
+ * must answer from here: asked of the host fd, the console reads as a
+ * permanently empty pipe (the pump has long consumed whatever was there),
+ * which is exactly how a guest waiting on poll for queued bytes starves. */
+static bool userland_console_ready(rvvm_userland_t* ctx)
+{
+    return ctx->tty_cooked_len > 0 || ctx->tty_eof_pending || ctx->tty_in_eof;
 }
 
 /* The host fd a guest fd rides on. Every syscall that consumes a descriptor
@@ -5219,6 +5361,12 @@ static bool uapi_fdset_to_host(rvvm_userland_t* ctx, int nfds, rvvm_addr_t guest
         if (!(gset->bits[fd >> 6] & (1ULL << (fd & 63)))) {
             continue;
         }
+        /* The console is answered from the ring (see userland_console_ready):
+         * the host's stdin handle must stay out of the set, or the host would
+         * watch a pipe the pump has already drained. */
+        if (userland_fd_is_console(ctx, fd)) {
+            continue;
+        }
         int host_fd = userland_fd_host(ctx, fd);
         /* A descriptor of ours is not a host descriptor: it cannot go into the
          * set the host watches, and is answered from its own state instead. */
@@ -5269,6 +5417,14 @@ static int uapi_own_set_ready(rvvm_userland_t* ctx, int nfds, rvvm_addr_t guest_
     int ready = 0;
     for (int fd = 0; fd < nfds && fd < UAPI_FD_SETSIZE; ++fd) {
         if (!(gset->bits[fd >> 6] & (1ULL << (fd & 63)))) {
+            continue;
+        }
+        if (userland_fd_is_console(ctx, fd)) {
+            /* The console is always writable and readable when the ring is. */
+            if (write || userland_console_ready(ctx)) {
+                gset->bits[fd >> 6] |= 1ULL << (fd & 63);
+                ready++;
+            }
             continue;
         }
         int host_fd = userland_fd_host(ctx, fd);
@@ -5385,6 +5541,18 @@ static int rvvm_sys_poll_time32(rvvm_addr_t pfds, size_t npfds, const struct uap
         for (size_t i = 0; i < npfds; ++i) {
             short want = gfds[i].events;
             gfds[i].revents = 0;
+            if (userland_fd_is_console(ctx, (int)gfds[i].fd)) {
+                /* A virtual tty: readiness is the ring's, never the host
+                 * stdin's. Output is always accepted, as a terminal's is. */
+                short got = 0;
+                if ((want & POLLIN) && userland_console_ready(ctx)) got |= POLLIN;
+                if (want & POLLOUT) got |= POLLOUT;
+                gfds[i].revents = got;
+                if (got) {
+                    own++;
+                }
+                continue;
+            }
             int hfd = userland_fd_host(ctx, gfds[i].fd);
             if (userland_own_fd(hfd)) {
                 short got = 0;
@@ -5694,6 +5862,10 @@ static rvvm_addr_t rvvm_sys_chdir(const char* path)
     }
     if (!guest_path_absolutize(abs, sizeof(abs), path)) {
         return -UAPI_ENAMETOOLONG;
+    }
+    if (path_trace_enabled()) {
+        rvvm_warn("path: syscall %ld dirfd=AT_FDCWD follow=true \"%s\" -> \"%s\"",
+                  (long)tls_cur_syscall, path, map_abs_path(host, abs));
     }
     if (stat(map_abs_path(host, abs), &st) != 0) {
         return last_errno();
@@ -7124,6 +7296,7 @@ static void* rvvm_user_thread_wrap(void* arg)
              * already at the new entry point then, so the generic return path
              * below (write a0, advance PC past the ecall) must be skipped. */
             bool exec_retarget = false;
+            tls_cur_syscall = a7;
             switch (a7) {
                 case 17: { // getcwd
                     rvvm_info("sys_getcwd(%lx, %lx)", a0, a1);
