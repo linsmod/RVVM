@@ -686,6 +686,11 @@ typedef struct {
                    // host process's own stdin. Cleared the moment a real
                    // descriptor is put on the number - `cmd < file` then reads
                    // the file, which is the whole point of the distinction.
+    // The guest's open-file flag word, for the descriptors this userland serves
+    // itself (a pty end, a /dev entry, the console). A host descriptor's flags
+    // live where they are acted on - the host, which keeps the guest's own word
+    // per fd - so this stays 0 for them and F_GETFL asks the host instead.
+    uint32_t flags;
 } rvvm_fd_entry_t;
 typedef struct rvvm_process {
     uint32_t     pid;         // Guest-visible process id
@@ -697,6 +702,23 @@ typedef struct rvvm_process {
     int          exit_status; // wait(2) status word
     uint32_t     vfork_done;  // It execed or exited: a vfork() parent stops waiting
     rvvm_event_t exit_event;  // Woken when it exits (or vfork_done turns), for wait4()
+
+    // --- Job control ---
+    // A process group and a session are what the terminal's line discipline
+    // signals: ^C goes to the foreground *group*, not to whichever process
+    // happened to be reading. Both are ids out of the same pid space (a group
+    // id is the pid of its leader), so no extra table is needed - a process is
+    // identified by pid, and its group by pgid.
+    uint32_t     pgid;        // Its process group (== its own pid when it leads one)
+    uint32_t     sid;         // Its session (== its own pid for a session leader)
+    // Stopped by SIGTSTP/SIGSTOP/SIGTTIN/SIGTTOU and waiting for SIGCONT. A
+    // stopped process is parked, not exited: its exit_status is meaningless
+    // until it really exits, which is exactly what WIFSTOPPED reports.
+    uint32_t     stopped;
+    int          stop_signal; // Which signal stopped it (the wait status reports it)
+    uint32_t     stop_reported; // A wait4(WUNTRACED) already told its parent
+    uint32_t     continued;   // SIGCONT arrived; a wait4(WCONTINUED) waiter consumes it
+
     struct rvvm_userland* child_ctx; // The address space an in-process fork()ed
                                 // child runs in: its threads are registered
                                 // there, not in the parent's, so a signal that
@@ -704,6 +726,9 @@ typedef struct rvvm_process {
                                 // it. Valid while the process is not exited
                                 // (its machine dies with its last thread); set
                                 // by the fork path only.
+    struct rvvm_userland* parent_ctx; // The context its parent runs in, so an
+                                // exit/stop/continue can raise SIGCHLD there.
+                                // NULL for the run's root, which has no parent.
 } rvvm_process_t;
 
 typedef struct {
@@ -884,6 +909,22 @@ typedef struct rvvm_userland {
     // that reset, which is deliberately a fresh console rather than a
     // type-ahead buffer carried over from the previous guest.
     uint32_t                      userland_started;
+
+    // --- Job control (see rvvm_process_t's pgid/sid) ---
+    // The context that forked this one, NULL for a run's root. The tree they
+    // form is the *family*, and it is what a process group is searched in: a
+    // session's terminal must be able to signal a group whose members live in
+    // address spaces other than the one that wrote to it.
+    struct rvvm_userland*         parent_ctx;
+    // Park word of a stopped address space: while nonzero every vCPU of this
+    // context sits in rvvm_futex_wait() at its wrap-loop boundary. Deliberately
+    // separate from userland_suspend - a host suspend must not read as a stopped
+    // job, and a ^Z on one session must not park the whole launcher.
+    uint32_t                      userland_stop_req;
+    // Foreground process group of the console (fd 0/1/2, /dev/tty, /dev/ttyN).
+    // 0 means nobody claimed one yet, and TIOCGPGRP then answers the caller -
+    // what a shell that has not set up job control expects to see.
+    uint32_t                      tty_fg_pgid;
 
     // --- Guest process registry (group F) ---
     // Every process this run knows about, live or zombie: a parent finds its
@@ -1570,7 +1611,19 @@ static THREAD_LOCAL rvvm_addr_t tls_cur_syscall;   // definition lives with it
 #define UAPI_TIOCSPGRP   0x5410
 #define UAPI_TIOCSCTTY   0x540E
 #define UAPI_FIONREAD    0x541B
-#define UAPI_SIGINT     2
+/* Signals whose disposition the emulator has to act on itself, because it
+ * cannot run a host-installed handler for the guest. asm-generic numbering, the
+ * guest ABI's. */
+#define UAPI_SIGINT      2
+#define UAPI_SIGKILL     9
+#define UAPI_SIGALRM    14
+#define UAPI_SIGTERM    15
+#define UAPI_SIGCHLD    17
+#define UAPI_SIGCONT    18
+#define UAPI_SIGSTOP    19
+#define UAPI_SIGTSTP    20
+#define UAPI_SIGTTIN    21
+#define UAPI_SIGTTOU    22
 #define UAPI_SIGWINCH   28
 
 /*
@@ -1594,6 +1647,7 @@ static THREAD_LOCAL rvvm_addr_t tls_cur_syscall;   // definition lives with it
 #define TTY_CC_VINTR  0x03  // Ctrl-C, the default VINTR
 #define TTY_CC_ERASE  0x7F  // DEL, the default VERASE
 #define TTY_CC_VEOF   0x04  // Ctrl-D
+#define TTY_CC_VSUSP  0x1A  // Ctrl-Z, the default VSUSP
 
 // asm-generic struct termios: 4 flag words + c_line + c_cc[32] + 2 speeds
 typedef struct __attribute__((packed)) {
@@ -1610,6 +1664,13 @@ typedef struct {
 // Defined further down (it belongs with the TLS it reads); the TTY ioctl and the
 // line discipline need it before that.
 static inline rvvm_userland_t* uctx(void);
+
+// Job control, also defined far below: the TTY ioctl answers for the console's
+// foreground group, the line discipline signals it, and a child's exit/stop
+// raises SIGCHLD in its parent's address space.
+static rvvm_userland_t* userland_family_root(rvvm_userland_t* ctx);
+static size_t userland_signal_group(rvvm_userland_t* ctx, uint32_t pgid, uint32_t sig);
+static void userland_notify_parent(rvvm_userland_t* actor, rvvm_process_t* proc, uint32_t sig);
 
 static int64_t user_tty_ioctl(uint64_t cmd, void* arg, int32_t pid)
 {
@@ -1682,18 +1743,34 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg, int32_t pid)
             // above), so a guest-requested resize does not move it.
             return 0;
         case UAPI_TIOCGPGRP: {
-            /* No process groups are modelled, so the foreground group is the
-             * caller - exactly what a pty answers (userland_pty_ioctl) and what
-             * getpgrp() reports (case 155). A shell compares the two and, when
-             * they agree, concludes it is in the foreground: two different
-             * answers would send it round the loop of signalling itself. */
+            /* The console's foreground group, as tcsetpgrp(3) last set it. With
+             * none claimed the caller is the answer, which is what a shell
+             * without job control expects: it compares this with getpgrp() and,
+             * when the two agree, concludes it is in the foreground - two
+             * different answers would send it round the loop of signalling
+             * itself, which is exactly how job control ends up "turned off". */
+            rvvm_userland_t* root = userland_family_root(uctx());
+            uint32_t         fg   = root->tty_fg_pgid ? root->tty_fg_pgid : (uint32_t)pid;
             if (!arg) {
                 return -UAPI_EINVAL;
             }
-            memcpy(arg, &pid, sizeof(pid));
+            memcpy(arg, &fg, sizeof(fg));
             return 0;
         }
-        case UAPI_TIOCSPGRP:
+        case UAPI_TIOCSPGRP: {
+            /* tcsetpgrp(3): who this terminal's line discipline signals. The
+             * group lives in the console's family, so it is recorded at the
+             * family root - the context the input path reads it back from. A
+             * pgid whose last member is already gone is still accepted, which
+             * is what Linux does (the check is that it is in the session). */
+            uint32_t pgid = 0;
+            if (!arg) {
+                return -UAPI_EINVAL;
+            }
+            memcpy(&pgid, arg, sizeof(pgid));
+            userland_family_root(uctx())->tty_fg_pgid = pgid;
+            return 0;
+        }
         case UAPI_TIOCSCTTY:
             /* Accepted: this console *is* the session's terminal, and the pair
              * a shell names is the only one there is. Refusing TIOCSCTTY is
@@ -1883,7 +1960,6 @@ static size_t tty_line_erase(rvvm_userland_t* ctx)
 
 // Defined with the guest signal delivery below the syscall dispatch.
 static bool userland_deliver_signal(rvvm_userland_t* ctx, uint32_t sig);
-static bool userland_kill_foreground(rvvm_userland_t* ctx, uint32_t sig);
 
 // Run one host input burst through the line discipline.
 static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
@@ -1891,6 +1967,7 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
     const uint8_t* p = buf;
     bool wake = false;
     bool interrupt = false;
+    bool susp = false;
 
     spin_lock(&ctx->tty_in_lock);
 
@@ -1914,12 +1991,15 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
             c = '\n';
         }
 
-        // ISIG: Ctrl-C is not data. A real tty signals the foreground
-        // process, drops the pending line and never hands the byte over.
-        // The guest is that process; a guest-installed handler cannot be
-        // run, so the signal takes its default disposition: stop the run.
-        if (isig && c == TTY_CC_VINTR) {
-            interrupt = true;
+        // ISIG: Ctrl-C and Ctrl-Z are not data. A real tty signals the
+        // foreground process group, drops the pending line and never hands the
+        // byte over. Which signal that is, and what its default disposition
+        // does to the group, is decided after the loop.
+        if (isig && (c == TTY_CC_VINTR || c == TTY_CC_VSUSP)) {
+            const bool  ctrl_c = (c == TTY_CC_VINTR);
+            const char* note   = ctrl_c ? "^C\r\n" : "^Z\r\n";
+            interrupt |= ctrl_c;
+            susp      |= !ctrl_c;
             ctx->tty_line_len = 0;
             ctx->tty_esc_state = 0;
             ctx->tty_esc_hold_len = 0;
@@ -1932,11 +2012,11 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
              * (rvvm_ash) displays the raw one and never renders the screen.
              * The raw leg mirrors the DEV_CONSOLE write: io_callback when the
              * host installed one, the host's stdout otherwise. */
-            user_tty_vt_write(ctx, "^C\r\n", 4);
+            user_tty_vt_write(ctx, note, 4);
             if (ctx->io_callback) {
-                ctx->io_callback(1, "^C\r\n", 4);
+                ctx->io_callback(1, note, 4);
             } else {
-                ssize_t raw_echo = write(1, "^C\r\n", 4);
+                ssize_t raw_echo = write(1, note, 4);
                 (void)raw_echo;
             }
             continue;
@@ -2094,17 +2174,19 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
     if (wake) {
         rvvm_event_wake(&ctx->tty_in_event);
     }
-    if (interrupt) {
-        // SIGINT for the foreground job first: a running command dies with
-        // 128+SIGINT and the shell's wait4() reaps it. With nothing running,
-        // the signal is the shell's - a registered handler is delivered
-        // in-guest (it runs at the vCPU's next instruction boundary, before
-        // the guest sees any EINTR from a read this unblocked), and the
-        // default disposition is termination - what ^C has always meant here
-        // (130 = 128 + SIGINT, what a shell reports for a ^C'd job).
-        if (!userland_kill_foreground(ctx, UAPI_SIGINT)) {
-            if (!userland_deliver_signal(ctx, UAPI_SIGINT)) {
-                rvvm_user_stop(ctx->machine, 130);
+    if (interrupt || susp) {
+        /* The foreground process group first: a running command dies with
+         * 128+SIGINT, or parks on ^Z and is reported as WIFSTOPPED to the shell
+         * waiting for it. With nothing of that group alive the signal is the
+         * reader's own - an interactive shell with no job running - and takes
+         * its disposition there: a registered handler runs (the shell's own ^C
+         * handling), and with none the run ends, which is what 130 = 128 +
+         * SIGINT has always meant here. */
+        uint32_t sig = interrupt ? UAPI_SIGINT : UAPI_SIGTSTP;
+        uint32_t fg  = userland_family_root(ctx)->tty_fg_pgid;
+        if (!userland_signal_group(ctx, fg, sig)) {
+            if (!userland_deliver_signal(ctx, sig)) {
+                rvvm_user_stop(ctx->machine, 128 + (int)sig);
             }
         }
     }
@@ -3844,21 +3926,56 @@ static uint32_t userland_task_id_alloc(rvvm_userland_t* ctx)
 
 /* Create and register a process record. The registry holds one reference and the
  * caller gets another (which it either keeps on a thread, or drops right away -
- * see the fork path in rvvm_sys_clone). */
+ * see the fork path in rvvm_sys_clone).
+ *
+ * @pgid/@sid are the job-control identity the process starts with: a fork()
+ * passes its parent's, a freshly launched image leads a group and a session of
+ * its own (see rvvm_user_thread_wrap's launch path). */
 static rvvm_process_t* userland_proc_create(rvvm_userland_t* ctx, uint32_t pid, uint32_t ppid,
-                                            int host_pid, bool run_root)
+                                            int host_pid, bool run_root,
+                                            uint32_t pgid, uint32_t sid)
 {
     rvvm_process_t* proc = safe_new_obj(rvvm_process_t);
     proc->pid      = pid;
     proc->ppid     = ppid;
     proc->host_pid = host_pid;
     proc->run_root = run_root;
+    proc->pgid     = pgid;
+    proc->sid      = sid;
     proc->refs     = 2;   // The registry's, plus the one handed back here
     rvvm_event_init(&proc->exit_event);
     spin_lock(&ctx->proc_lock);
     vector_push_back(ctx->procs, proc);
     spin_unlock(&ctx->proc_lock);
     return proc;
+}
+
+/* The context a process's threads live in.
+ *
+ * A record is held by two registries (its parent's and its own - see
+ * userland_proc_register), and this is the one whose thread list and vCPUs
+ * actually belong to it. For the process the host launched, no child context was
+ * ever created, so its threads are the caller's own. */
+static rvvm_userland_t* userland_proc_ctx(rvvm_userland_t* ctx, rvvm_process_t* proc)
+{
+    return proc->child_ctx ? proc->child_ctx : ctx;
+}
+
+/* The root of the context family @ctx belongs to.
+ *
+ * A process group may span address spaces (a shell and every command it forks
+ * live in one each), and the terminal that signals the group is not necessarily
+ * in any of them - so the group is searched from the family's root, downwards.
+ * The walk is bounded by the depth of the fork tree, which is a guest's choice,
+ * so it is an iterative walk with a generous cap rather than a recursion. */
+#define USERLAND_FAMILY_DEPTH_MAX 256
+static rvvm_userland_t* userland_family_root(rvvm_userland_t* ctx)
+{
+    rvvm_userland_t* root = ctx;
+    for (int i = 0; root && root->parent_ctx && i < USERLAND_FAMILY_DEPTH_MAX; ++i) {
+        root = root->parent_ctx;
+    }
+    return root;
 }
 
 /* Look a process up by pid. Returns a caller-owned reference, or NULL. */
@@ -3949,12 +4066,36 @@ static void userland_proc_exit(rvvm_process_t* proc, int status)
 #define UAPI_EPOLL_CLOEXEC 0x80000
 #define UAPI_SOCK_CLOEXEC  0x80000
 #define UAPI_MFD_CLOEXEC   0x0001
+/* The non-blocking halves of those APIs are O_NONBLOCK - one bit, whatever the
+ * call that sets it is called (Linux defines them as the same value). */
+#define UAPI_EFD_NONBLOCK  0x800
+#define UAPI_SOCK_NONBLOCK 0x800
+/* The type bits the host socket() must not see: they are this ABI's, and the
+ * host has no equivalent for either (see the socket/socketpair cases). */
+#define UAPI_SOCK_TYPE_MASK (UAPI_SOCK_CLOEXEC | UAPI_SOCK_NONBLOCK)
 
 #define UAPI_F_DUPFD         0
 #define UAPI_F_GETFD         1
 #define UAPI_F_SETFD         2
+#define UAPI_F_GETFL         3
+#define UAPI_F_SETFL         4
 #define UAPI_F_DUPFD_CLOEXEC 1030
 #define UAPI_FD_CLOEXEC      1
+
+/* The open-file flag word the guest hands out and asks back (asm-generic
+ * values). Only O_NONBLOCK is acted on by this emulator - and only for the
+ * descriptors it serves itself, since a host descriptor's O_NONBLOCK is the
+ * host's to keep (see posix_shim.c's fcntl). */
+#define UAPI_O_ACCMODE   0x0003
+#define UAPI_O_RDONLY    0x0000
+#define UAPI_O_WRONLY    0x0001
+#define UAPI_O_RDWR      0x0002
+#define UAPI_O_APPEND    0x0400
+#define UAPI_O_NONBLOCK  0x0800
+#define UAPI_O_ASYNC     0x2000
+/* What F_SETFL may change; the access mode and the creation flags in its
+ * argument are ignored, as Linux does. */
+#define UAPI_SETFL_MASK  (UAPI_O_APPEND | UAPI_O_NONBLOCK | UAPI_O_ASYNC)
 
 /* File a descriptor the guest has just been handed: the guest sees @guest_fd,
  * and every host call on it goes to @host_fd.
@@ -3983,6 +4124,10 @@ static void userland_fd_install(rvvm_userland_t* ctx, int guest_fd, int host_fd,
      * `cmd < file` reads the file, not the keyboard. Every way of putting an fd
      * in the table (open, dup, pipe, socket, accept) comes through here. */
     ctx->fds[guest_fd].console = false;
+    /* ...and the flag word is the new descriptor's, never the one the number
+     * happened to carry before. A caller that knows the guest's flags sets them
+     * right after (see userland_fd_set_flags). */
+    ctx->fds[guest_fd].flags   = 0;
 }
 
 /* Track a descriptor the host just handed out: its number is the guest's too. */
@@ -4029,6 +4174,46 @@ static int userland_fd_host(rvvm_userland_t* ctx, int fd)
         return ctx->fds[fd].fd;
     }
     return fd;
+}
+
+/* Is @fd served by this userland rather than by a host descriptor: a pty end, a
+ * /dev entry, or the run's console (which is the virtual TTY, not the host's own
+ * stdin/stdout)? Those are the descriptors F_GETFL is answered for here, and
+ * O_NONBLOCK is honoured for - the host is not the one that would block. */
+static bool userland_fd_serves_own(rvvm_userland_t* ctx, int fd)
+{
+    struct userland_pty* pty = NULL;
+    bool                 master = false;
+    int                  dev = -1;
+    int                  hfd = userland_fd_host(ctx, fd);
+
+    if (userland_pty_by_fd(hfd, &pty, &master) || userland_dev_by_fd(hfd, &dev)) {
+        return true;
+    }
+    return fd >= 0 && fd <= 2 && userland_fd_is_console(ctx, fd);
+}
+
+/* The guest's open-file flag word for a descriptor (see rvvm_fd_entry_t::flags):
+ * what F_GETFL answers, and where the read path reads O_NONBLOCK from for the
+ * descriptors this userland serves itself. */
+static uint32_t userland_fd_flags(rvvm_userland_t* ctx, int fd)
+{
+    return userland_fd_tracked(ctx, fd) ? ctx->fds[fd].flags : 0;
+}
+
+static void userland_fd_set_flags(rvvm_userland_t* ctx, int fd, uint32_t flags)
+{
+    if (userland_fd_tracked(ctx, fd)) {
+        ctx->fds[fd].flags = flags;
+    }
+}
+
+/* May a read on @fd wait for data? False when the guest asked for O_NONBLOCK on
+ * a descriptor this userland serves: the read is served here, so the host's own
+ * per-fd flag could not answer it (and on win32 it cannot be set at all). */
+static bool userland_fd_read_blocks(rvvm_userland_t* ctx, int fd)
+{
+    return (userland_fd_flags(ctx, fd) & UAPI_O_NONBLOCK) == 0;
 }
 
 /* close(2) for a tracked descriptor. Returns false when it is not one of ours,
@@ -4080,13 +4265,17 @@ static int userland_fd_slot_alloc(rvvm_userland_t* ctx, int min_fd)
  *
  * Its FD_CLOEXEC starts clear for dup(2)/dup2(2) and as asked for dup3(2) and
  * F_DUPFD_CLOEXEC. */
-static int userland_fd_dup(rvvm_userland_t* ctx, int host_fd, int min_fd, bool cloexec)
+static int userland_fd_dup(rvvm_userland_t* ctx, int source_fd, int host_fd, int min_fd, bool cloexec)
 {
     int guest_fd = userland_fd_slot_alloc(ctx, min_fd);
     if (guest_fd < 0) {
         return -1;
     }
     userland_fd_install(ctx, guest_fd, host_fd, cloexec);
+    /* The copy reaches the same open file description, so it reports the same
+     * flags - the host dup carries its own copy of them, and the table's has to
+     * follow (see rvvm_fd_entry_t::flags). */
+    userland_fd_set_flags(ctx, guest_fd, userland_fd_flags(ctx, source_fd));
     return guest_fd;
 }
 
@@ -4096,7 +4285,7 @@ static int userland_fd_dup(rvvm_userland_t* ctx, int host_fd, int min_fd, bool c
  * call the host for it. Returns the guest fd, -1 when the table is full, or -2
  * when @host_fd is an ordinary host descriptor and the caller should dup it
  * itself. */
-static int userland_own_fd_dup(rvvm_userland_t* ctx, int host_fd, int min_fd, bool cloexec)
+static int userland_own_fd_dup(rvvm_userland_t* ctx, int source_fd, int host_fd, int min_fd, bool cloexec)
 {
     struct userland_pty* pty = NULL;
     bool master = false;
@@ -4109,6 +4298,9 @@ static int userland_own_fd_dup(rvvm_userland_t* ctx, int host_fd, int min_fd, bo
         }
         userland_pty_ref(pty, master);
         userland_fd_install(ctx, guest_fd, host_fd, cloexec);
+        /* The copy reaches the same object, so it keeps the flags the guest put
+         * on it (and the two may then be told apart, as dup(2) allows). */
+        userland_fd_set_flags(ctx, guest_fd, userland_fd_flags(ctx, source_fd));
         return guest_fd;
     }
     if (userland_dev_by_fd(host_fd, &dev)) {
@@ -4117,6 +4309,7 @@ static int userland_own_fd_dup(rvvm_userland_t* ctx, int host_fd, int min_fd, bo
             return -1;
         }
         userland_fd_install(ctx, guest_fd, host_fd, cloexec);
+        userland_fd_set_flags(ctx, guest_fd, userland_fd_flags(ctx, source_fd));
         return guest_fd;
     }
     return -2;
@@ -4183,6 +4376,7 @@ static void userland_fd_table_init(rvvm_userland_t* ctx)
 {
     for (int fd = 0; fd < USERLAND_FD_TABLE_MAX; ++fd) {
         ctx->fds[fd].used = false;
+        ctx->fds[fd].flags = 0;
     }
     for (int fd = 0; fd <= 2; ++fd) {
         ctx->fds[fd].used    = true;
@@ -4195,6 +4389,9 @@ static void userland_fd_table_init(rvvm_userland_t* ctx)
          * same handle, which is what made an interactive shell see EOF at once.
          */
         ctx->fds[fd].console = true;
+        /* ...and their access mode, which F_GETFL has to answer: stdin is read
+         * and stdout/stderr are written. */
+        ctx->fds[fd].flags   = fd ? UAPI_O_WRONLY : UAPI_O_RDONLY;
     }
 }
 
@@ -4269,6 +4466,20 @@ static void userland_procs_reset(rvvm_userland_t* ctx)
 static int userland_exit_status(int code)
 {
     return (code & 0xFF) << 8;
+}
+
+/* wait(2) status word of a process stopped by @sig: WIFSTOPPED() reads 0x7F in
+ * the low byte, and WSTOPSIG() the signal in the high one. */
+static int userland_stop_status(int sig)
+{
+    return ((sig & 0xFF) << 8) | 0x7F;
+}
+
+/* ...and of one continued by SIGCONT: the whole word, which is what
+ * WIFCONTINUED() tests for. */
+static int userland_cont_status(void)
+{
+    return 0xFFFF;
 }
 
 /* ============================================================
@@ -4409,6 +4620,67 @@ static void userland_park_if_suspended(rvvm_user_thread_t* thread)
 #ifdef RVVM_USER_PARK_TRACE
     rvvm_warn("DBG park: guest thread resumed");
 #endif
+    atomic_sub_uint32(&ctx->userland_parked, 1);
+}
+
+/* ============================================================
+ * Job control: stopping and continuing an address space
+ *
+ * What a ^Z does to a job is park it - nothing is torn down, and SIGCONT
+ * resumes it exactly where it stood. The mechanism is the same one a host
+ * suspend uses (a word every vCPU parks on at its wrap-loop boundary), on a
+ * word of its own: a host suspend must not read as a stopped job, and stopping
+ * one session must not look like the launcher suspended the whole run.
+ *
+ * The granularity is the address space, which is the process: an in-process
+ * fork() gives each process its own context (its threads are the only ones
+ * registered in it), so "park this context" and "stop this process" are the
+ * same act.
+ * ============================================================ */
+
+/* Park every vCPU of @ctx until userland_ctx_continue(). */
+static void userland_ctx_stop(rvvm_userland_t* ctx)
+{
+    if (!ctx || atomic_load_uint32(&ctx->userland_stop_req)) {
+        return;
+    }
+    atomic_store_uint32(&ctx->userland_stop_req, 1);
+    spin_lock(&ctx->userland_threads_lock);
+    vector_foreach(ctx->userland_threads, i) {
+        rvvm_user_thread_t* thread = vector_at(ctx->userland_threads, i);
+        if (thread->cpu) {
+            // Break out of the interpreter at the next instruction boundary;
+            // the wrap loop then parks on the word set above.
+            riscv_hart_queue_pause(thread->cpu);
+        }
+    }
+    spin_unlock(&ctx->userland_threads_lock);
+    rvvm_futex_wake(&ctx->userland_stop_req, UINT32_MAX);
+}
+
+/* Resume an address space stopped by userland_ctx_stop(). */
+static void userland_ctx_continue(rvvm_userland_t* ctx)
+{
+    if (!ctx || !atomic_load_uint32(&ctx->userland_stop_req)) {
+        return;
+    }
+    atomic_store_uint32(&ctx->userland_stop_req, 0);
+    rvvm_futex_wake(&ctx->userland_stop_req, UINT32_MAX);
+}
+
+/* Park the calling guest thread while its process is stopped. Like the suspend
+ * counterpart this is one relaxed load on the hot path. */
+static void userland_park_if_stopped(rvvm_user_thread_t* thread)
+{
+    rvvm_userland_t* ctx = uctx();
+    if (likely(atomic_load_uint32(&ctx->userland_stop_req) == 0)) {
+        return;
+    }
+
+    atomic_add_uint32(&ctx->userland_parked, 1);
+    while (atomic_load_uint32(&ctx->userland_stop_req) && !atomic_load_uint32(&thread->finished)) {
+        rvvm_futex_wait(&ctx->userland_stop_req, 1, USERLAND_SUSPEND_POLL_NS);
+    }
     atomic_sub_uint32(&ctx->userland_parked, 1);
 }
 
@@ -4622,6 +4894,10 @@ static void userland_exit_process(rvvm_userland_t* ctx, int code, rvvm_user_thre
 
     if (proc) {
         userland_proc_exit(proc, userland_exit_status(code));
+        /* The parent may run in an address space of its own (an in-process
+         * fork() gives the child one), so this is where a shell blocked in a
+         * wait for its job, or sitting at the prompt, learns it finished. */
+        userland_notify_parent(ctx, proc, UAPI_SIGCHLD);
     }
 
     if (!proc || proc->run_root) {
@@ -4840,6 +5116,13 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
     /* Signal dispositions are inherited; a pending signal is not. */
     memcpy(ctx->siga, parent->siga, sizeof(ctx->siga));
 
+    /* Job control: the family link the process-group search walks (a ^C on the
+     * terminal has to reach groups that live in address spaces other than the
+     * one that reads the keyboard), and the console's foreground group - the
+     * child answers to the same terminal the parent does. */
+    ctx->parent_ctx  = parent;
+    ctx->tty_fg_pgid = parent->tty_fg_pgid;
+
     /* Allocator and heap: the child continues where the parent was. */
     ctx->guest_bump       = parent->guest_bump;
     ctx->guest_mmap_end   = parent->guest_mmap_end;
@@ -4964,10 +5247,19 @@ static int rvvm_sys_clone(rvvm_user_thread_t* self, rvvm_hart_t* cpu, uint32_t f
     uint32_t child_pid  = userland_task_id_alloc(ctx);
     uint32_t parent_pid = self->proc ? self->proc->pid : USERLAND_ROOT_PARENT_ID;
     bool     vfork      = (flags & UAPI_CLONE_VFORK) != 0;
+    /* Job control is inherited like the terminal itself: a command the shell
+     * runs belongs to the shell's session, and starts in the shell's group (the
+     * shell then moves it into a group of its own with setpgid). */
+    uint32_t child_pgid = self->proc ? self->proc->pgid : child_pid;
+    uint32_t child_sid  = self->proc ? self->proc->sid  : child_pid;
 
     /* One record, held by both registries: the parent's wait4() finds it here,
      * and the child marks its own exit on the very same object. */
-    rvvm_process_t* record = userland_proc_create(ctx, child_pid, parent_pid, 0, false);
+    rvvm_process_t* record = userland_proc_create(ctx, child_pid, parent_pid, 0, false,
+                                                  child_pgid, child_sid);
+    /* Where SIGCHLD and the wait-status wakeups have to go: the parent runs in
+     * the context that just called clone(), not in the child's new one. */
+    record->parent_ctx = ctx;
 
     rvvm_userland_t* child = userland_child_create(ctx, child_pid);
     if (!child) {
@@ -5032,8 +5324,40 @@ static int rvvm_sys_clone(rvvm_user_thread_t* self, rvvm_hart_t* cpu, uint32_t f
 }
 
 /* wait4(2) options the emulator acts on; the rest are forwarded to the host for
- * a host-backed child. */
-#define UAPI_WNOHANG 1
+ * a host-backed child. WUNTRACED/WCONTINUED are what job control is built on:
+ * the first is how a shell learns a job stopped (^Z), the second that one was
+ * continued. */
+#define UAPI_WNOHANG    1
+#define UAPI_WUNTRACED  2
+#define UAPI_WCONTINUED 8
+
+/* Does @proc match the wait4(2) selector? A pid of 0 or -1 names any child of
+ * the caller, and one below -1 names a process group. */
+static bool userland_wait_matches(rvvm_process_t* proc, int32_t upid)
+{
+    if (upid > 0) {
+        return (int32_t)proc->pid == upid;
+    }
+    if (upid < -1) {
+        return proc->pgid == (uint32_t)(-upid);
+    }
+    return true;
+}
+
+/* Is there something to report about @proc right now? A stopped child is only
+ * reported to a WUNTRACED wait and only once per stop; a continue only to a
+ * WCONTINUED one. */
+static bool userland_wait_reportable(rvvm_process_t* proc, bool want_stop, bool want_cont)
+{
+    if (atomic_load_uint32(&proc->exited)) {
+        return true;
+    }
+    if (want_stop && atomic_load_uint32(&proc->stopped) &&
+        !atomic_load_uint32(&proc->stop_reported)) {
+        return true;
+    }
+    return want_cont && atomic_load_uint32(&proc->continued);
+}
 
 /* wait4(2), served from the process registry.
  *
@@ -5048,28 +5372,49 @@ static int rvvm_sys_clone(rvvm_user_thread_t* self, rvvm_hart_t* cpu, uint32_t f
 static rvvm_addr_t rvvm_sys_wait4(rvvm_userland_t* ctx, rvvm_user_thread_t* self, int32_t upid,
                                   int* status, int options, void* rusage)
 {
-    rvvm_process_t* self_proc = self->proc;
-    bool nohang = (options & UAPI_WNOHANG) != 0;
+    rvvm_process_t* self_proc  = self->proc;
+    bool            nohang     = (options & UAPI_WNOHANG) != 0;
+    bool            want_stop  = (options & UAPI_WUNTRACED) != 0;
+    bool            want_cont  = (options & UAPI_WCONTINUED) != 0;
 
+    if (path_trace_enabled()) {
+        rvvm_warn("job: wait4(pid=%d opt=%x) from pid=%u",
+                  upid, options, self_proc ? self_proc->pid : 0);
+    }
     if (!self_proc) {
         return -UAPI_ECHILD;
     }
 
     for (;;) {
-        rvvm_process_t* child = NULL;   // An exited child, ready to be reaped
-        rvvm_process_t* spare = NULL;   // A running one, to block on
+        rvvm_process_t* child = NULL;   // One with something to report now
+        rvvm_process_t* spare = NULL;   // A live one, to block on
+        int             report = 0;     // The status word to hand back
 
-        /* A pid of 0 or below names a process group in Linux. Groups are not
-         * modeled, so anything but a positive pid means "any child of mine" -
-         * which is what a shell's wait4(-1, ...) asks for anyway. */
         spin_lock(&ctx->proc_lock);
         vector_foreach(ctx->procs, i) {
             rvvm_process_t* proc = vector_at(ctx->procs, i);
-            if (proc->ppid != self_proc->pid || (upid > 0 && (int32_t)proc->pid != upid)) {
+            if (proc->ppid != self_proc->pid || !userland_wait_matches(proc, upid)) {
                 continue;
             }
             if (atomic_load_uint32(&proc->exited)) {
-                child = userland_proc_ref(proc);
+                child  = userland_proc_ref(proc);
+                report = proc->exit_status;
+                break;
+            }
+            /* A stop is reported once per stop, and a continue once per resume:
+             * consuming them here is what makes a second wait4() on the same
+             * event block, as it does on Linux. */
+            if (want_stop && atomic_load_uint32(&proc->stopped) &&
+                !atomic_load_uint32(&proc->stop_reported)) {
+                child  = userland_proc_ref(proc);
+                report = userland_stop_status(proc->stop_signal);
+                atomic_store_uint32(&proc->stop_reported, 1);
+                break;
+            }
+            if (want_cont && atomic_load_uint32(&proc->continued)) {
+                child  = userland_proc_ref(proc);
+                report = userland_cont_status();
+                atomic_store_uint32(&proc->continued, 0);
                 break;
             }
             if (!spare) {
@@ -5096,7 +5441,18 @@ static rvvm_addr_t rvvm_sys_wait4(rvvm_userland_t* ctx, rvvm_user_thread_t* self
             return -UAPI_ECHILD;
         }
         if (child) {
+            /* Something to report without blocking: an exit, which reaps, or a
+             * stop/continue the caller asked to hear about, which does not - the
+             * child is still there and will be waited for again. */
             userland_proc_unref(spare);
+            if (!atomic_load_uint32(&child->exited)) {
+                uint32_t cpid = child->pid;
+                userland_proc_unref(child);
+                if (status) {
+                    *status = report;
+                }
+                return cpid;
+            }
         } else {
             child = spare;
         }
@@ -5164,12 +5520,13 @@ static rvvm_addr_t rvvm_sys_wait4(rvvm_userland_t* ctx, rvvm_user_thread_t* self
          * design anyway (a wake another waiter took costs one interval), so the
          * poll costs nothing but the 100 ms granularity of USERLAND_WAIT_POLL_NS,
          * and the interrupt checks below stay live. */
-        while (!atomic_load_uint32(&child->exited) &&
+        while (!userland_wait_reportable(child, want_stop, want_cont) &&
                !atomic_load_uint32(&self->finished) &&
                !atomic_load_uint32(&ctx->sig_pending)) {
             sleep_ns(USERLAND_WAIT_POLL_NS);
         }
         userland_proc_unref(child);
+        /* ...and scan again: what woke this may be reportable now. */
     }
 }
 
@@ -6041,7 +6398,19 @@ static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* bu
  * stack, further arrivals queue (one deep) instead of re-entering.
  * ============================================================ */
 #define VP_SIGFRAME_MAGIC 0x4D49464753555356ULL
-#define UAPI_SIGINT       2
+
+/* Stop signals park the target until SIGCONT; the job-control ones can be
+ * caught, SIGSTOP cannot. */
+static bool userland_sig_stops(uint32_t sig)
+{
+    return sig == UAPI_SIGSTOP || sig == UAPI_SIGTSTP ||
+           sig == UAPI_SIGTTIN || sig == UAPI_SIGTTOU;
+}
+
+static bool userland_sig_uncatchable(uint32_t sig)
+{
+    return sig == UAPI_SIGKILL || sig == UAPI_SIGSTOP;
+}
 
 struct vp_sigframe {
     uint64_t magic;
@@ -6095,64 +6464,210 @@ static void userland_kill_process(rvvm_userland_t* ctx, rvvm_process_t* proc, in
      * the record. Stopping them through the caller's ctx would miss the vCPU
      * and leave it running. */
     userland_finish_threads(proc->child_ctx ? proc->child_ctx : ctx, proc, NULL);
+    userland_notify_parent(ctx, proc, UAPI_SIGCHLD);
 }
 
-/* ^C at the console: SIGINT for the foreground job. Process groups are not
- * modeled, but with job control off (what an interactive shell here runs with)
- * every job of the shell shares its group anyway, so the working set is
- * "every live descendant of the run's root process": a `sleep` in the
- * foreground dies with 128+SIGINT and the shell's wait4() reaps it, a
- * background job dies with it, exactly as the kernel would treat them.
+/* ============================================================
+ * Job control: process groups
  *
- * The disposition is the default one regardless of ctx->siga[] - that array is
- * shared by every process of the address space, so the shell's SIGINT handler
- * would speak for its children too, and a ^C would never kill anything. On the
- * hosts this runs, guest children do not trap SIGINT, so the kernel-visible
- * outcome (the command dies, the shell lives) is what this produces.
+ * A signal a terminal produces (^C, ^Z) is not addressed to a process: it goes
+ * to the foreground *process group*, whose members need not even share an
+ * address space (each fork() gets one of its own). Groups are therefore
+ * searched in the *family* - the context tree - rather than in one registry.
  *
- * Returns false when nothing was running, leaving the signal to the shell. */
-static bool userland_kill_foreground(rvvm_userland_t* ctx, uint32_t sig)
+ * A record is filed in two registries (its parent's and its own), so the walk
+ * counts a process only in the context that owns its address space, and
+ * descends into the contexts of the processes that were filed here by their
+ * parent. That visits every process exactly once.
+ * ============================================================ */
+#define USERLAND_GROUP_MAX 64
+
+struct userland_group {
+    rvvm_process_t* proc[USERLAND_GROUP_MAX];
+    size_t          count;
+};
+
+/* Collect the live members of process group @pgid in @ctx and below. */
+static void userland_group_collect(rvvm_userland_t* ctx, uint32_t pgid,
+                                   struct userland_group* out, unsigned depth)
 {
-    rvvm_process_t* victims[16];
-    size_t          nvictims = 0;
-    bool            killed   = false;
+    rvvm_userland_t* children[USERLAND_GROUP_MAX];
+    size_t           nchildren = 0;
+
+    if (!ctx || depth >= USERLAND_FAMILY_DEPTH_MAX) {
+        return;
+    }
 
     spin_lock(&ctx->proc_lock);
     vector_foreach(ctx->procs, i) {
         rvvm_process_t* proc = vector_at(ctx->procs, i);
-        if (proc->run_root || proc->host_pid ||
-            atomic_load_uint32(&proc->exited) || proc->ppid == USERLAND_ROOT_PARENT_ID) {
-            continue;   // The shell itself, a host-backed child, or a dead one
+        if (atomic_load_uint32(&proc->exited) || proc->host_pid) {
+            continue;   // Gone, or executed by a host process of its own
         }
-        if (nvictims < STATIC_ARRAY_SIZE(victims)) {
-            victims[nvictims++] = userland_proc_ref(proc);
+        if (userland_proc_ctx(ctx, proc) != ctx) {
+            /* Filed here by its parent: its threads live in the child context,
+             * which is walked below. */
+            if (proc->child_ctx && nchildren < STATIC_ARRAY_SIZE(children)) {
+                children[nchildren++] = proc->child_ctx;
+            }
+            continue;
+        }
+        if (proc->pgid == pgid && out->count < USERLAND_GROUP_MAX) {
+            out->proc[out->count++] = userland_proc_ref(proc);
         }
     }
     spin_unlock(&ctx->proc_lock);
 
-    for (size_t i = 0; i < nvictims; ++i) {
-        userland_kill_process(ctx, victims[i], (int)sig);
-        userland_proc_unref(victims[i]);
-        killed = true;
+    for (size_t i = 0; i < nchildren; ++i) {
+        userland_group_collect(children[i], pgid, out, depth + 1);
     }
-    return killed;
 }
 
-/* Route a signal at @pid (0 or negative means "ourselves": process groups are not
- * modeled) and return the guest errno to hand back, 0 on success.
+/* Is any member of process group @pgid alive in @ctx's family? The liveness
+ * probe behind kill(-pgid, 0). */
+static bool userland_group_alive(rvvm_userland_t* ctx, uint32_t pgid)
+{
+    struct userland_group group = {0};
+    userland_group_collect(ctx, pgid, &group, 0);
+    for (size_t i = 0; i < group.count; ++i) {
+        userland_proc_unref(group.proc[i]);
+    }
+    return group.count != 0;
+}
+
+/* Does @proc have a guest handler for @sig? A stop signal with a handler runs
+ * the handler instead of stopping (SIGSTOP/SIGKILL, which cannot be caught,
+ * never get here). */
+static bool userland_proc_handles(rvvm_userland_t* ctx, rvvm_process_t* proc, uint32_t sig)
+{
+    rvvm_userland_t* own = userland_proc_ctx(ctx, proc);
+    if (sig >= STATIC_ARRAY_SIZE(own->siga)) {
+        return false;
+    }
+    uint64_t handler = own->siga[sig].handler;
+    return handler != (uint64_t)SIG_DFL && handler != (uint64_t)SIG_IGN;
+}
+
+/* Raise SIGCHLD in the parent's context.
+ *
+ * The parent usually runs in an address space of its own, so this is a
+ * cross-context delivery: it is what makes `cmd &` notice a job finishing (the
+ * shell's handler runs, or its rt_sigsuspend returns) without polling.
+ *
+ * It is delivered even when the parent is the one that asked for the state
+ * change, which is not an optimization but the contract: a shell stops its own
+ * background job (`kill -STOP %1`) and *then* has to be told it stopped - that
+ * is how `jobs` learns to print "Stopped" instead of "Running", and Linux
+ * notifies the parent for stop and continue exactly the same way. */
+static void userland_notify_parent(rvvm_userland_t* actor, rvvm_process_t* proc, uint32_t sig)
+{
+    (void)actor;
+    if (!proc->parent_ctx) {
+        return;   // The run's root has no parent to tell
+    }
+    userland_deliver_signal(proc->parent_ctx, sig);
+}
+
+/* Stop @proc: park its address space and remember the signal that did it, so a
+ * wait4(WUNTRACED) can report WIFSTOPPED. Nothing is torn down - SIGCONT
+ * resumes it in place. */
+static void userland_proc_stop(rvvm_userland_t* ctx, rvvm_process_t* proc, int sig)
+{
+    if (atomic_load_uint32(&proc->exited) || atomic_load_uint32(&proc->stopped)) {
+        return;
+    }
+    if (path_trace_enabled()) {
+        rvvm_warn("job: pid=%u pgid=%u STOP sig=%d", proc->pid, proc->pgid, sig);
+    }
+    proc->stop_signal   = sig;
+    proc->stop_reported = 0;
+    atomic_store_uint32(&proc->stopped, 1);
+    userland_ctx_stop(userland_proc_ctx(ctx, proc));
+    /* Wakes a parent blocked in wait4(WUNTRACED). */
+    rvvm_event_wake(&proc->exit_event);
+    userland_notify_parent(ctx, proc, UAPI_SIGCHLD);
+}
+
+/* SIGCONT: resume a stopped process, and flag the event so a
+ * wait4(WCONTINUED) can consume it. A process that was not stopped is left
+ * alone - Linux reports a continue only for one that had stopped. */
+static void userland_proc_cont(rvvm_userland_t* ctx, rvvm_process_t* proc)
+{
+    if (atomic_load_uint32(&proc->exited)) {
+        return;
+    }
+    if (atomic_swap_uint32(&proc->stopped, 0)) {
+        if (path_trace_enabled()) {
+            rvvm_warn("job: pid=%u pgid=%u CONT", proc->pid, proc->pgid);
+        }
+        proc->stop_signal = 0;
+        userland_ctx_continue(userland_proc_ctx(ctx, proc));
+        atomic_store_uint32(&proc->continued, 1);
+        rvvm_event_wake(&proc->exit_event);
+        userland_notify_parent(ctx, proc, UAPI_SIGCHLD);
+    }
+}
+
+/* Apply @sig to one process, with the default disposition on the emulator's
+ * side (it cannot run a host-installed handler).
+ *
+ * A stop signal parks its target, SIGCONT resumes it, a catchable signal with a
+ * registered handler runs in that process, and everything else ends it - its
+ * parent reaps it through the registry, exactly as if it had been signalled on
+ * Linux. */
+static void userland_proc_signal(rvvm_userland_t* ctx, rvvm_process_t* proc, uint32_t sig)
+{
+    if (sig == UAPI_SIGCONT) {
+        userland_proc_cont(ctx, proc);
+    } else if (userland_sig_stops(sig) &&
+               (userland_sig_uncatchable(sig) || !userland_proc_handles(ctx, proc, sig))) {
+        userland_proc_stop(ctx, proc, (int)sig);
+    } else if (!userland_deliver_signal(userland_proc_ctx(ctx, proc), sig)) {
+        userland_kill_process(ctx, proc, (int)sig);
+    }
+}
+
+/* Deliver @sig to every member of process group @pgid in @ctx's family.
+ *
+ * This is what the terminal's line discipline calls: ^C and ^Z go to the
+ * foreground group, not to whichever process happens to be reading.
+ *
+ * Returns the number of processes the signal reached. Zero is not an error: the
+ * foreground group is often the reader's own, and the caller delivers to itself
+ * then. */
+static size_t userland_signal_group(rvvm_userland_t* ctx, uint32_t pgid, uint32_t sig)
+{
+    struct userland_group group = {0};
+
+    if (!pgid || !sig) {
+        return 0;   // No group, or a liveness probe rather than a signal
+    }
+    userland_group_collect(userland_family_root(ctx), pgid, &group, 0);
+    if (path_trace_enabled()) {
+        rvvm_warn("job: group %u <- sig %u, %u member(s)", pgid, sig, (unsigned)group.count);
+    }
+
+    for (size_t i = 0; i < group.count; ++i) {
+        userland_proc_signal(ctx, group.proc[i], sig);
+        userland_proc_unref(group.proc[i]);
+    }
+    return group.count;
+}
+
+/* Route a signal at @pid and return the guest errno to hand back, 0 on success.
+ *
+ * The pid selects what is signalled, as on Linux:
+ *   pid > 0   that process
+ *   pid == 0  every process of the caller's own group
+ *   pid < -1  every process of group -pid
+ *   pid == -1 "every process it may signal", which is not modelled - reported
+ *             as ESRCH rather than quietly signalling the whole family
  *
  * A pid is validated against the registry, never handed to the host - it names a
- * guest process, and a host pid belongs to something else entirely. A signal the
- * guest can receive (a handler is registered, or it is ignored) is delivered
- * in-guest, which is the only way a guest handler runs here; the default
- * disposition ends the run (what ^C has always meant here). A host-backed child -
- * a guest process that a host process of its own is executing - can only be
- * reached through that host process, so the signal goes there; the guest's own
+ * guest process, and a host pid belongs to something else entirely. A host-backed
+ * child - a guest process that a host process of its own is executing - can only
+ * be reached through that host process, so the signal goes there; the guest's own
  * handler does not run in it, an approximation the in-process fork() removes.
- *
- * Note the registry is shared by every process of the address space, and so is
- * ctx->siga[]: two guest processes cannot have different handlers for one signal
- * until the signal state moves per process.
  */
 static rvvm_addr_t userland_signal_pid(rvvm_userland_t* ctx, rvvm_user_thread_t* self, int32_t pid, uint32_t sig)
 {
@@ -6160,42 +6675,51 @@ static rvvm_addr_t userland_signal_pid(rvvm_userland_t* ctx, rvvm_user_thread_t*
         return -UAPI_EINVAL;
     }
 
-    rvvm_process_t* target = NULL;
-    if (pid > 0) {
-        target = userland_proc_find(ctx, (uint32_t)pid);
-        if (!target) {
+    if (pid <= 0) {
+        uint32_t own_pgid = self && self->proc ? self->proc->pgid : 0;
+        uint32_t pgid     = (pid == 0) ? own_pgid : (uint32_t)(-pid);
+        if (pid == -1) {
+            /* "Every process the caller may signal". Not modelled: reporting
+             * ESRCH is honest, quietly signalling the whole family is not. */
             return -UAPI_ESRCH;
         }
-        if (target->host_pid) {
-            int host_pid = target->host_pid;
-            userland_proc_unref(target);
-            return errno_ret(kill((pid_t)host_pid, (int)sig));
+        if (path_trace_enabled()) {
+            rvvm_warn("job: kill(%d, %u) from pgid=%u", pid, sig, own_pgid);
         }
+        if (sig == 0) {
+            // kill(-pgid, 0): a liveness probe for the group, not a signal
+            if (pgid && pgid == own_pgid) {
+                return 0;   // The caller is a member, so the group exists
+            }
+            return userland_group_alive(userland_family_root(ctx), pgid) ? 0 : -UAPI_ESRCH;
+        }
+        if (!userland_signal_group(ctx, pgid, sig)) {
+            /* Nothing of the group is alive. The caller's own group still
+             * counts as signalled: the caller is one of its members, which is
+             * what makes `kill(0, SIGCONT)` from a shell meaningful. */
+            return pgid == own_pgid ? 0 : -UAPI_ESRCH;
+        }
+        return 0;
+    }
+
+    rvvm_process_t* target = userland_proc_find(ctx, (uint32_t)pid);
+    if (!target) {
+        return -UAPI_ESRCH;
+    }
+    if (target->host_pid) {
+        int host_pid = target->host_pid;
+        userland_proc_unref(target);
+        return errno_ret(kill((pid_t)host_pid, (int)sig));
     }
 
     if (sig == 0) {
         // kill(pid, 0) is a liveness probe, not a signal
-        if (target) {
-            userland_proc_unref(target);
-        }
-        return 0;
-    }
-
-    if (userland_deliver_signal(ctx, sig)) {
-        if (target) {
-            userland_proc_unref(target);
-        }
-        return 0;
-    }
-
-    /* Default disposition: no handler can run for it, so the process the signal
-     * named ends. With no pid at all, that is the caller's own. */
-    if (target) {
-        userland_kill_process(ctx, target, (int)sig);
         userland_proc_unref(target);
-    } else {
-        userland_exit_process(ctx, 128 + (int)sig, self);
+        return 0;
     }
+
+    userland_proc_signal(ctx, target, sig);
+    userland_proc_unref(target);
     return 0;
 }
 
@@ -6220,6 +6744,114 @@ static rvvm_addr_t userland_signal_tid(rvvm_userland_t* ctx, rvvm_user_thread_t*
         }
     }
     return userland_signal_pid(ctx, self, (int32_t)pid, sig);
+}
+
+/* ============================================================
+ * Job control: process groups and sessions
+ *
+ * A group is identified by the pid of its leader, and a session by the pid of
+ * the process that created it, so neither needs a table - the identity lives on
+ * the process record (rvvm_process_t::pgid/sid). What the calls below have to
+ * get right is the handful of failures a shell's job-control setup probes for,
+ * because getting those wrong is what makes a shell decide the terminal is not
+ * its own and turn job control off ("can't access tty").
+ * ============================================================ */
+
+/* setpgid(2): move process @pid into group @pgid. 0 for either means "me" and
+ * "a group I lead".
+ *
+ * EPERM on a session leader is not an arbitrary check: a session leader's group
+ * *is* its session, and moving it would split the two apart. ESRCH on an
+ * unknown pid, and on a pid in another session (a shell must not be able to
+ * move somebody else's process). */
+static rvvm_addr_t userland_setpgid(rvvm_userland_t* ctx, rvvm_user_thread_t* self,
+                                   int32_t pid, int32_t pgid)
+{
+    rvvm_process_t* target;
+    uint32_t        self_pid = self && self->proc ? self->proc->pid : 0;
+    uint32_t        self_sid = self && self->proc ? self->proc->sid : 0;
+
+    if (pid == 0) {
+        target = userland_proc_ref(self ? self->proc : NULL);
+    } else if (pid > 0) {
+        target = userland_proc_find(ctx, (uint32_t)pid);
+    } else {
+        return -UAPI_EINVAL;
+    }
+    if (!target) {
+        return -UAPI_ESRCH;
+    }
+    if (pgid < 0) {
+        userland_proc_unref(target);
+        return -UAPI_EINVAL;
+    }
+    if (pgid == 0) {
+        pgid = (int32_t)target->pid;
+    }
+    if (target->pgid == (uint32_t)pgid) {
+        /* Already there: nothing to change, so nothing to refuse. This is the
+         * call a shell makes to give itself a group of its own, and a shell that
+         * checks the result must not be told its own group is off limits. */
+        userland_proc_unref(target);
+        return 0;
+    }
+    if (target->pid == target->sid) {
+        userland_proc_unref(target);   // A session leader: EPERM, see above
+        return -UAPI_EPERM;
+    }
+    if (target->sid != self_sid) {
+        userland_proc_unref(target);   // Another session's process
+        return -UAPI_ESRCH;
+    }
+    /* Only the process itself or its parent may move it. */
+    if (self_pid != target->pid && self_pid != target->ppid) {
+        userland_proc_unref(target);
+        return -UAPI_EPERM;
+    }
+    target->pgid = (uint32_t)pgid;
+    userland_proc_unref(target);
+    return 0;
+}
+
+/* getpgid(2) / getpgrp(2) / getsid(2): all three are "look @pid up and answer
+ * one of its ids", with pid 0 meaning the caller. */
+static rvvm_addr_t userland_proc_id_query(rvvm_userland_t* ctx, rvvm_user_thread_t* self,
+                                         int32_t pid, bool want_sid)
+{
+    rvvm_process_t* target;
+    uint32_t        ret;
+
+    if (pid == 0) {
+        target = userland_proc_ref(self ? self->proc : NULL);
+    } else if (pid > 0) {
+        target = userland_proc_find(ctx, (uint32_t)pid);
+    } else {
+        return -UAPI_EINVAL;
+    }
+    if (!target) {
+        return -UAPI_ESRCH;
+    }
+    ret = want_sid ? target->sid : target->pgid;
+    userland_proc_unref(target);
+    return ret;
+}
+
+/* setsid(2): start a new session, led by the caller's own new group.
+ *
+ * A process that already leads a group cannot start one (EPERM) - which is
+ * exactly the test a shell uses to learn it is already a session leader, so
+ * answering 0 unconditionally here would tell it the opposite of the truth. */
+static rvvm_addr_t userland_setsid(rvvm_process_t* proc)
+{
+    if (!proc) {
+        return -UAPI_ESRCH;
+    }
+    if (proc->pgid == proc->pid) {
+        return -UAPI_EPERM;
+    }
+    proc->sid  = proc->pid;
+    proc->pgid = proc->pid;
+    return proc->pid;
 }
 
 /* ============================================================
@@ -6461,6 +7093,10 @@ struct userland_pty {
     uint32_t     cols;
     bool         locked;           // TIOCSPTLCK: a slave may not be opened yet
     bool         slave_eof;        // master wrote VEOF on an empty line
+    /* At most one process group reads, like a real terminal: the master's side
+     * sets it with tcsetpgrp(3) (TIOCSPGRP) and ^C / ^Z are delivered to it.
+     * 0 = nobody claimed one, and TIOCGPGRP then answers the caller. */
+    uint32_t     fg_pgid;
     /* How many descriptors hold each end: an in-process fork() hands the child
      * a copy of the same fd, and the pair outlives the last of them. */
     uint32_t     refs[2];          // [0] master, [1] slave
@@ -6641,21 +7277,44 @@ static size_t userland_pty_slave_put(struct userland_pty* pty, const uint8_t* sr
 
 /* The master wrote: these are the bytes a terminal would have typed, so they go
  * through the input discipline - ICRNL, canonical line assembly with erase, and
- * echo back at whoever is on the other end. */
-static void userland_pty_master_put(struct userland_pty* pty, const uint8_t* src, size_t len)
+ * echo back at whoever is on the other end.
+ *
+ * ISIG is the job-control half: ^C and ^Z are not data, they signal the
+ * session's foreground group. @ctx is the context the write came from, which is
+ * where the group is looked up from (the group may live in another address
+ * space - a server holding the master and a shell in a child of it is the
+ * ordinary shape of an ssh-like session). */
+static void userland_pty_master_put(struct userland_pty* pty, const uint8_t* src, size_t len,
+                                    rvvm_userland_t* ctx)
 {
     uint8_t echo[USERLAND_PTY_RING];
     size_t  echo_len = 0;
+    uint32_t sig = 0;
 
     spin_lock(&pty->lock);
     bool canon = (pty->lflag & TTY_LFLAG_ICANON) != 0;
     bool icrnl = (pty->iflag & TTY_IFLAG_ICRNL) != 0;
     bool echo_on = (pty->lflag & TTY_LFLAG_ECHO) != 0;
+    bool isig = (pty->lflag & TTY_LFLAG_ISIG) != 0;
 
     for (size_t i = 0; i < len; ++i) {
         uint8_t c = src[i];
         if (icrnl && c == '\r') {
             c = '\n';
+        }
+        if (isig && (c == TTY_CC_VINTR || c == TTY_CC_VSUSP)) {
+            /* ^C / ^Z: the byte is consumed by the line discipline, the pending
+             * line is dropped, and the notation is echoed the way ECHOCTL makes
+             * a real tty do it - independent of the guest's ECHO, which is off
+             * in exactly the raw-mode editors that care. */
+            const char* note = (c == TTY_CC_VINTR) ? "^C\r\n" : "^Z\r\n";
+            sig = (c == TTY_CC_VINTR) ? UAPI_SIGINT : UAPI_SIGTSTP;
+            pty->slave_line_len = 0;
+            if (echo_len + 4 <= sizeof(echo)) {
+                memcpy(echo + echo_len, note, 4);
+                echo_len += 4;
+            }
+            continue;
         }
         if (!canon) {
             pty_ring_put(&pty->to_slave, &c, 1);
@@ -6722,6 +7381,17 @@ static void userland_pty_master_put(struct userland_pty* pty, const uint8_t* src
         spin_unlock(&pty->lock);
     }
     rvvm_event_wake(&pty->event);
+
+    if (sig) {
+        /* The foreground group first; with none of it alive the signal belongs
+         * to whoever wrote to the master - the session's own process - and
+         * takes its disposition there, exactly as on the console. */
+        if (!userland_signal_group(ctx, pty->fg_pgid, sig)) {
+            if (!userland_deliver_signal(ctx, sig)) {
+                rvvm_user_stop(ctx->machine, 128 + (int)sig);
+            }
+        }
+    }
 }
 
 /* Readable: data waiting, or a hangup / EOF the read has to report. */
@@ -6778,7 +7448,7 @@ static int userland_dev_fd(int dev)
     return (int)(RVVM_DEV_FD_BASE + (uint32_t)dev);
 }
 
-static int64_t userland_dev_read(int dev, void* buf, size_t count)
+static int64_t userland_dev_read(int dev, void* buf, size_t count, bool block)
 {
     if (!buf) {
         return -UAPI_EFAULT;
@@ -6788,8 +7458,14 @@ static int64_t userland_dev_read(int dev, void* buf, size_t count)
         case DEV_ZERO:  memset(buf, 0, count); return (int64_t)count;
         case DEV_RANDOM: rvvm_randombytes(buf, count); return (int64_t)count;
         /* The console's input half is the same ring fd 0 reads: the host pushes
-         * keyboard bytes into it with rvvm_user_tty_input(). */
-        case DEV_CONSOLE: return user_tty_read(uctx(), buf, count, true);
+         * keyboard bytes into it with rvvm_user_tty_input(). A guest that asked
+         * for O_NONBLOCK gets EAGAIN rather than a park - and not the 0 a
+         * non-blocking empty read would be mistaken for. */
+        case DEV_CONSOLE:
+            if (!block && !user_tty_readable(uctx())) {
+                return -UAPI_EAGAIN;
+            }
+            return user_tty_read(uctx(), buf, count, block);
     }
     return -UAPI_EINVAL;
 }
@@ -6946,7 +7622,8 @@ static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* bu
     }
 }
 
-static int64_t userland_pty_write(struct userland_pty* pty, bool master, const void* buf, size_t count)
+static int64_t userland_pty_write(struct userland_pty* pty, bool master, const void* buf, size_t count,
+                                  rvvm_userland_t* ctx)
 {
     if (!buf) {
         return -UAPI_EFAULT;
@@ -6955,7 +7632,7 @@ static int64_t userland_pty_write(struct userland_pty* pty, bool master, const v
         return 0;
     }
     if (master) {
-        userland_pty_master_put(pty, buf, count);
+        userland_pty_master_put(pty, buf, count, ctx);
         return (int64_t)count;
     }
     size_t n = userland_pty_slave_put(pty, buf, count);
@@ -7047,17 +7724,31 @@ static int64_t userland_pty_ioctl(struct userland_pty* pty, bool master, uint64_
             }
             return 0;
         case UAPI_TIOCGPGRP: {
-            /* No process groups are modelled, so the foreground group is the
-             * caller: a shell compares this answer with getpgrp() and moves
-             * into the foreground when the two agree, and with two different
-             * answers it would signal itself round and round instead. */
+            /* The group tcsetpgrp(3) last named, or the caller when nobody has:
+             * a shell compares this answer with getpgrp() and moves into the
+             * foreground when the two agree, and with two different answers it
+             * would signal itself round and round instead. */
+            uint32_t fg = pty->fg_pgid ? pty->fg_pgid : (uint32_t)caller_pid;
             if (!arg) {
                 return -UAPI_EINVAL;
             }
-            memcpy(arg, &caller_pid, sizeof(caller_pid));
+            memcpy(arg, &fg, sizeof(fg));
             return 0;
         }
-        case UAPI_TIOCSPGRP:
+        case UAPI_TIOCSPGRP: {
+            /* tcsetpgrp(3): who ^C and ^Z are delivered to (see
+             * userland_pty_master_put). A group whose last member is gone is
+             * still accepted, as Linux does - the check is the session. */
+            uint32_t pgid = 0;
+            if (!arg) {
+                return -UAPI_EINVAL;
+            }
+            memcpy(&pgid, arg, sizeof(pgid));
+            spin_lock(&pty->lock);
+            pty->fg_pgid = pgid;
+            spin_unlock(&pty->lock);
+            return 0;
+        }
         case UAPI_TIOCSCTTY:
             return 0;   // accepted: the pair is already the session's terminal
         case UAPI_FIONREAD: {
@@ -7368,6 +8059,12 @@ static void* rvvm_user_thread_wrap(void* arg)
             // Shutdown raced the suspend - do not re-enter the guest to unwind
             break;
         }
+        // Stopped by job control (^Z, SIGTSTP/SIGSTOP): park here until SIGCONT
+        userland_park_if_stopped(thread);
+        if (atomic_load_uint32(&thread->finished)) {
+            // Shutdown raced the stop - do not re-enter the guest to unwind
+            break;
+        }
         // Signal delivery, at a clean instruction boundary: the register file
         // is committed to the hart between interpreter rounds, so building a
         // frame and pointing PC at the handler is safe here.
@@ -7405,6 +8102,12 @@ static void* rvvm_user_thread_wrap(void* arg)
              */
             continue;
         }
+        if (atomic_load_uint32(&uctx()->userland_stop_req)) {
+            /* A job-control stop kicked it out, for the same reason and with the
+             * same conclusion: drop the stale trap description and park above.
+             * SIGCONT clears the word and the vCPU re-enters at the same PC. */
+            continue;
+        }
         if (cause == 8) {
             // Handle syscall trap
             rvvm_addr_t a0 = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 10);
@@ -7432,6 +8135,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(eventfd(a0, a1));
                     if (a0 >= 0) {
                         userland_fd_add(uctx(), (int)a0, (a1 & UAPI_EFD_CLOEXEC) != 0);
+                        userland_fd_set_flags(uctx(), (int)a0,
+                                              UAPI_O_RDWR | ((a1 & UAPI_EFD_NONBLOCK)
+                                                             ? UAPI_O_NONBLOCK : 0));
                     }
                     break;
 #endif
@@ -7442,6 +8148,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(epoll_create1(flags));
                     if (a0 >= 0) {
                         userland_fd_add(uctx(), (int)a0, (flags & UAPI_EPOLL_CLOEXEC) != 0);
+                        /* An epoll instance is read and written alike, and has
+                         * no non-blocking mode of its own. */
+                        userland_fd_set_flags(uctx(), (int)a0, UAPI_O_RDWR);
                     }
                     break;
                 }
@@ -7506,7 +8215,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_dup(%ld)", a0);
                     /* A descriptor of ours (a pty end) has no host fd to copy:
                      * the copy is another reference to the same object. */
-                    int own = userland_own_fd_dup(uctx(), userland_fd_host(uctx(), (int)a0), 0, false);
+                    int own = userland_own_fd_dup(uctx(), (int)a0,
+                                                  userland_fd_host(uctx(), (int)a0), 0, false);
                     if (own != -2) {
                         a0 = own >= 0 ? (rvvm_addr_t)own : (rvvm_addr_t)-UAPI_EMFILE;
                         break;
@@ -7520,7 +8230,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = errno_ret(-1);
                         break;
                     }
-                    int guest_new = userland_fd_dup(uctx(), host_new, 0, false);
+                    int guest_new = userland_fd_dup(uctx(), (int)a0, host_new, 0, false);
                     /* No slot left (the table is full): the host's number goes
                      * through untracked, which is what an untracked fd means. */
                     a0 = (rvvm_addr_t)(guest_new >= 0 ? guest_new : host_new);
@@ -7562,6 +8272,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         (void)dev;   // a /dev entry is the number itself
                         userland_fd_close(uctx(), newfd);
                         userland_fd_install(uctx(), newfd, host_old, (a2 & UAPI_O_CLOEXEC) != 0);
+                        userland_fd_set_flags(uctx(), newfd, userland_fd_flags(uctx(), oldfd));
                         a0 = newfd;
                         break;
                     }
@@ -7578,11 +8289,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * number, and the copy takes the slot. */
                     userland_fd_close(uctx(), newfd);
                     userland_fd_install(uctx(), newfd, host_new, (a2 & UAPI_O_CLOEXEC) != 0);
+                    userland_fd_set_flags(uctx(), newfd, userland_fd_flags(uctx(), oldfd));
                     a0 = newfd;
                     break;
                 }
                 case 25: { // fcntl64
                     rvvm_info("sys_fcntl64(%ld, %lx, %lx)", a0, a1, a2);
+                    int      guest_fd    = (int)a0;
+                    uint32_t guest_flags = userland_fd_flags(uctx(), guest_fd);
+                    int      fcntl_host  = userland_fd_host(uctx(), guest_fd);
                     /* FD_CLOEXEC lives in the table, so the F_GETFD/F_SETFD
                      * commands are answered from it; F_DUPFD and
                      * F_DUPFD_CLOEXEC make the host hand out another fd, which
@@ -7592,20 +8307,42 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * one (never opened through the table, or already gone) has
                      * to reach the host, which is what reports EBADF for a
                      * descriptor this execve() just closed. */
-                    if (a1 == UAPI_F_GETFD && userland_fd_tracked(uctx(), (int)a0)) {
-                        a0 = userland_fd_get_cloexec(uctx(), (int)a0) ? UAPI_FD_CLOEXEC : 0;
+                    if (a1 == UAPI_F_GETFD && userland_fd_tracked(uctx(), guest_fd)) {
+                        a0 = userland_fd_get_cloexec(uctx(), guest_fd) ? UAPI_FD_CLOEXEC : 0;
                         break;
                     }
-                    if (a1 == UAPI_F_SETFD && userland_fd_tracked(uctx(), (int)a0)) {
-                        userland_fd_set_cloexec(uctx(), (int)a0, (a2 & UAPI_FD_CLOEXEC) != 0);
+                    if (a1 == UAPI_F_SETFD && userland_fd_tracked(uctx(), guest_fd)) {
+                        userland_fd_set_cloexec(uctx(), guest_fd, (a2 & UAPI_FD_CLOEXEC) != 0);
                         a0 = 0;
                         break;
                     }
-                    int fcntl_host = userland_fd_host(uctx(), (int)a0);
+                    /* F_GETFL / F_SETFL: the guest's own flag word, which the
+                     * table keeps - that is what survives a dup(), a fork() and
+                     * the descriptors this userland serves itself, and it is
+                     * where the read path reads O_NONBLOCK from for those. */
+                    if (a1 == UAPI_F_GETFL && userland_fd_tracked(uctx(), guest_fd)) {
+                        a0 = guest_flags;
+                        break;
+                    }
+                    if (a1 == UAPI_F_SETFL && userland_fd_tracked(uctx(), guest_fd)) {
+                        userland_fd_set_flags(uctx(), guest_fd,
+                                              (guest_flags & ~UAPI_SETFL_MASK) |
+                                              ((uint32_t)a2 & UAPI_SETFL_MASK));
+                        if (userland_fd_serves_own(uctx(), guest_fd)) {
+                            /* A pty end, a /dev entry, the console: this side is
+                             * the one that reads it, so the table has just said
+                             * everything there is to say. */
+                            a0 = 0;
+                            break;
+                        }
+                        /* A host descriptor is also told, because its reads are
+                         * the host's and only the host can make them refuse to
+                         * park on an empty pipe (see posix_shim.c). */
+                    }
                     if (a1 == UAPI_F_DUPFD || a1 == UAPI_F_DUPFD_CLOEXEC) {
                         /* A descriptor of ours again: the copy is a reference,
                          * not a host dup. */
-                        int own = userland_own_fd_dup(uctx(), fcntl_host, (int)a2,
+                        int own = userland_own_fd_dup(uctx(), guest_fd, fcntl_host, (int)a2,
                                                       a1 == UAPI_F_DUPFD_CLOEXEC);
                         if (own != -2) {
                             a0 = own >= 0 ? (rvvm_addr_t)own : (rvvm_addr_t)-UAPI_EMFILE;
@@ -7617,7 +8354,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         /* The host picked a number at or above @a2 of its own;
                          * the guest gets a slot of its own, also at or above
                          * @a2, which is what F_DUPFD asks for. */
-                        int guest_new = userland_fd_dup(uctx(), (int)a0, (int)a2,
+                        int guest_new = userland_fd_dup(uctx(), guest_fd, (int)a0, (int)a2,
                                                         a1 == UAPI_F_DUPFD_CLOEXEC);
                         if (guest_new >= 0) {
                             a0 = guest_new;
@@ -7871,6 +8608,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                                 if (guest_fd >= 0) {
                                     userland_fd_install(uctx(), guest_fd, obj,
                                                         (a2 & UAPI_O_CLOEXEC) != 0);
+                                    /* The guest's own flag word: this descriptor
+                                     * is read here, so F_GETFL and a later
+                                     * F_SETFL(O_NONBLOCK) are answered from it
+                                     * (see userland_fd_flags). */
+                                    userland_fd_set_flags(uctx(), guest_fd,
+                                                          (uint32_t)a2 & (UAPI_O_ACCMODE | UAPI_SETFL_MASK));
                                     a0 = guest_fd;
                                 } else {
                                     /* No slot: the descriptor cannot be handed
@@ -7908,6 +8651,18 @@ static void* rvvm_user_thread_wrap(void* arg)
                                  * flags, so the guest's view of the flag lives
                                  * in the table (and execve() acts on it). */
                                 userland_fd_add(uctx(), (int)a0, (a2 & UAPI_O_CLOEXEC) != 0);
+                                /* F_GETFL reports the access mode and the status
+                                 * flags the guest opened with, not the host
+                                 * bits behind them. */
+                                userland_fd_set_flags(uctx(), (int)a0,
+                                                      (uint32_t)a2 & (UAPI_O_ACCMODE | UAPI_SETFL_MASK));
+                                /* ...and O_NONBLOCK has to reach the host too:
+                                 * the shim dropped it on the way in (there is no
+                                 * CRT equivalent), so it is asked for now, where
+                                 * the host fd is the one that would park. */
+                                if (a2 & UAPI_O_NONBLOCK) {
+                                    fcntl(userland_fd_host(uctx(), (int)a0), F_SETFL, UAPI_O_NONBLOCK);
+                                }
                             }
                         }
                     }
@@ -7945,6 +8700,17 @@ static void* rvvm_user_thread_wrap(void* arg)
                         bool cloexec = (flags & UAPI_O_CLOEXEC) != 0;
                         userland_fd_add(uctx(), fds[0], cloexec);
                         userland_fd_add(uctx(), fds[1], cloexec);
+                        /* A pipe end reads or writes, always: that is its
+                         * access mode, and O_NONBLOCK is the status flag the
+                         * guest may have asked for (the host pipe is told about
+                         * it below, since the host is the one that parks). */
+                        uint32_t status = (uint32_t)flags & UAPI_SETFL_MASK;
+                        userland_fd_set_flags(uctx(), fds[0], UAPI_O_RDONLY | status);
+                        userland_fd_set_flags(uctx(), fds[1], UAPI_O_WRONLY | status);
+                        if (flags & UAPI_O_NONBLOCK) {
+                            fcntl(userland_fd_host(uctx(), fds[0]), F_SETFL, UAPI_O_NONBLOCK);
+                            fcntl(userland_fd_host(uctx(), fds[1]), F_SETFL, UAPI_O_NONBLOCK);
+                        }
                     }
                     break;
                 }
@@ -7977,8 +8743,13 @@ static void* rvvm_user_thread_wrap(void* arg)
                         // fd 0 is the virtual TTY: the guest's stdin comes from
                         // the host keyboard (rvvm_user_tty_input), not from the
                         // host process's own stdin. Blocks until a line has been
-                        // assembled by the line discipline.
-                        a0 = (rvvm_addr_t)user_tty_read(uctx(), buf, a2, true);
+                        // assembled by the line discipline - unless the guest set
+                        // O_NONBLOCK on it, which an empty console answers with
+                        // EAGAIN (a 0 here would say "end of file").
+                        bool block = userland_fd_read_blocks(uctx(), (int)a0);
+                        a0 = (block || user_tty_readable(uctx()))
+                           ? (rvvm_addr_t)user_tty_read(uctx(), buf, a2, block)
+                           : (rvvm_addr_t)-UAPI_EAGAIN;
                         break;
                     }
                     if (asset_dir_lookup((int)a0)) {
@@ -7992,11 +8763,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                         struct userland_pty* pty = NULL;
                         bool master = false;
                         int dev = -1;
+                        bool block = userland_fd_read_blocks(uctx(), (int)a0);
                         if (userland_pty_by_fd(hfd, &pty, &master)) {
-                            a0 = (rvvm_addr_t)userland_pty_read(pty, master, buf, a2, true);
+                            /* Nothing to read and not waiting: EAGAIN, not the
+                             * EOF a 0 would report. */
+                            a0 = (block || userland_pty_readable(pty, master))
+                               ? (rvvm_addr_t)userland_pty_read(pty, master, buf, a2, block)
+                               : (rvvm_addr_t)-UAPI_EAGAIN;
                         } else if (userland_dev_by_fd(hfd, &dev)) {
-                            a0 = (rvvm_addr_t)userland_dev_read(dev, buf, a2);
+                            a0 = (rvvm_addr_t)userland_dev_read(dev, buf, a2, block);
                         } else {
+                            /* A host descriptor: its O_NONBLOCK is the host's,
+                             * set through fcntl(2) like any Linux guest expects
+                             * (see posix_shim.c's fcntl/read). */
                             a0 = errno_ret(read(hfd, buf, a2));
                         }
                     }
@@ -8029,7 +8808,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         bool master = false;
                         int dev = -1;
                         if (userland_pty_by_fd(host_fd, &pty, &master)) {
-                            a0 = (rvvm_addr_t)userland_pty_write(pty, master, wbuf, a2);
+                            a0 = (rvvm_addr_t)userland_pty_write(pty, master, wbuf, a2, uctx());
                         } else if (userland_dev_by_fd(host_fd, &dev)) {
                             a0 = (rvvm_addr_t)userland_dev_write(dev, wbuf, a2);
                         } else if (uctx()->io_callback) {
@@ -8077,15 +8856,27 @@ static void* rvvm_user_thread_wrap(void* arg)
                          * what is already there - the console's rule, so a
                          * multi-segment read returns as soon as it drained
                          * instead of blocking again. */
+                        bool    block = userland_fd_read_blocks(uctx(), (int)a0);
                         ssize_t total = 0;
                         for (int i = 0; i < (int)a2; i++) {
                             if (!hiov[i].iov_len) {
                                 continue;
                             }
-                            ssize_t r = iov_pty
-                                ? (ssize_t)userland_pty_read(iov_pty, iov_master,
-                                                             hiov[i].iov_base, hiov[i].iov_len, total == 0)
-                                : (ssize_t)userland_dev_read(iov_dev, hiov[i].iov_base, hiov[i].iov_len);
+                            bool    first = (total == 0);
+                            bool    seg_block = first && block;
+                            ssize_t r;
+                            if (iov_pty) {
+                                /* Nothing to read and not waiting: EAGAIN on the
+                                 * first segment (a 0 would say end of file). */
+                                r = (!seg_block && !userland_pty_readable(iov_pty, iov_master))
+                                  ? (first ? -(ssize_t)UAPI_EAGAIN : 0)
+                                  : (ssize_t)userland_pty_read(iov_pty, iov_master,
+                                                               hiov[i].iov_base, hiov[i].iov_len,
+                                                               seg_block);
+                            } else {
+                                r = (ssize_t)userland_dev_read(iov_dev, hiov[i].iov_base,
+                                                               hiov[i].iov_len, seg_block);
+                            }
                             if (r < 0) {
                                 total = total ? total : r;
                                 break;
@@ -8101,7 +8892,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         for (int i = 0; i < (int)a2; i++) {
                             ssize_t r = iov_pty
                                 ? (ssize_t)userland_pty_write(iov_pty, iov_master,
-                                                              hiov[i].iov_base, hiov[i].iov_len)
+                                                              hiov[i].iov_base, hiov[i].iov_len, uctx())
                                 : (ssize_t)userland_dev_write(iov_dev, hiov[i].iov_base, hiov[i].iov_len);
                             if (r < 0) { total = r; break; }
                             total += r;
@@ -8561,6 +9352,48 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_warn("sys_tgkill(%lx, %lx, %ld)", a0, a1, a2);
                     a0 = userland_signal_pid(uctx(), thread, (int32_t)a0, (uint32_t)a2);
                     break;
+                case 133: { // rt_sigsuspend
+                    /* Wait for a signal, then return -EINTR so the vCPU reaches
+                     * its delivery boundary and the handler runs.
+                     *
+                     * It has to actually block. A shell's job-control wait loop
+                     * parks here between unblocking SIGCHLD and the handler, and
+                     * returning EINTR immediately turns that into a busy loop
+                     * that never notices the signal it is waiting for - which is
+                     * how an interactive shell with job control on could hang a
+                     * whole session.
+                     *
+                     * The mask itself is not modelled (the handlers are
+                     * emulator-side), so this waits for the one pending slot
+                     * userland_deliver_signal() posts - which is what a handler
+                     * needs, and what a SIGCHLD from a finished or stopped job
+                     * wakes. */
+                    rvvm_userland_t* ctx = uctx();
+                    rvvm_info("sys_rt_sigsuspend(%lx, %lx)", a0, a1);
+                    if (path_trace_enabled()) {
+                        rvvm_warn("job: rt_sigsuspend(pid=%u) blocking",
+                                  thread->proc ? thread->proc->pid : 0);
+                    }
+                    while (!atomic_load_uint32(&ctx->sig_pending) &&
+                           !atomic_load_uint32(&thread->finished) &&
+                           !atomic_load_uint32(&ctx->userland_suspend) &&
+                           !atomic_load_uint32(&ctx->userland_stop_req) &&
+                           !atomic_load_uint32(&ctx->tty_in_eof)) {
+                        /* The pending slot is only written by another thread
+                         * (userland_deliver_signal), so there is nothing to
+                         * poll but the event it wakes. */
+                        rvvm_event_wait(&ctx->tty_in_event, USERLAND_WAIT_POLL_NS);
+                    }
+                    if (path_trace_enabled()) {
+                        rvvm_warn("job: rt_sigsuspend woke (pending=%u sat=%u stop=%u fin=%u)",
+                                  atomic_load_uint32(&ctx->sig_pending),
+                                  atomic_load_uint32(&ctx->sig_inflight),
+                                  atomic_load_uint32(&ctx->userland_stop_req),
+                                  atomic_load_uint32(&thread->finished));
+                    }
+                    a0 = -UAPI_EINTR;
+                    break;
+                }
                 case 134: { // rt_sigaction
                     rvvm_userland_t* ctx = uctx();
                     struct sigaction sa = {0};
@@ -8703,29 +9536,20 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(times(to_ptr(a0)));
                     break;
                 case 154: // setpgid
-                    /* Process groups are not modelled, and saying so with an
-                     * error is what leaves a shell's job-control setup with
-                     * nothing to stand on: it then treats every pgrp question
-                     * as broken and gives up on the terminal. Accepting it is
-                     * the answer a session can work with - the group is the
-                     * process, which is what a fresh session gets anyway. */
                     rvvm_info("sys_setpgid(%lx, %lx)", a0, a1);
-                    a0 = 0;
+                    a0 = userland_setpgid(uctx(), thread, (int32_t)a0, (int32_t)a1);
                     break;
                 case 155: // getpgid - and getpgrp, which is the same call with pid 0
-                    /* The caller's own pid, which is also what tcgetpgrp(3) on
-                     * one of our ptys reports - a shell compares the two, and
-                     * two different answers would send it round the loop of
-                     * signalling itself. */
                     rvvm_info("sys_getpgid(%lx)", a0);
-                    a0 = a0 == 0 ? (thread->proc ? thread->proc->pid : 0) : a0;
+                    a0 = userland_proc_id_query(uctx(), thread, (int32_t)a0, false);
+                    break;
+                case 156: // getsid
+                    rvvm_info("sys_getsid(%lx)", a0);
+                    a0 = userland_proc_id_query(uctx(), thread, (int32_t)a0, true);
                     break;
                 case 157: // setsid
-                    /* No sessions either: the new id a shell needs is its own
-                     * pid, and it is what the shell uses to tell whether it is
-                     * a session leader. */
                     rvvm_info("sys_setsid()");
-                    a0 = thread->proc ? thread->proc->pid : 0;
+                    a0 = userland_setsid(thread->proc);
                     break;
                 case 158: // getgroups
                     rvvm_warn("sys_getgroups(%lx, %lx)", a0, a1);
@@ -8833,9 +9657,18 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 198: { // socket
                     rvvm_info("sys_socket(%lx, %lx, %lx)", a0, a1, a2);
                     int type = (int)a1;
-                    a0 = errno_ret(socket(a0, a1, a2));
+                    /* SOCK_CLOEXEC / SOCK_NONBLOCK are this ABI's, and the host
+                     * socket() would read them as an unknown type: they are
+                     * taken off the type and applied on our side. */
+                    a0 = errno_ret(socket(a0, a1 & ~UAPI_SOCK_TYPE_MASK, a2));
                     if (a0 >= 0) {
                         userland_fd_add(uctx(), (int)a0, (type & UAPI_SOCK_CLOEXEC) != 0);
+                        userland_fd_set_flags(uctx(), (int)a0,
+                                              UAPI_O_RDWR | ((type & UAPI_SOCK_NONBLOCK)
+                                                             ? UAPI_O_NONBLOCK : 0));
+                        if (type & UAPI_SOCK_NONBLOCK) {
+                            fcntl((int)a0, F_SETFL, UAPI_O_NONBLOCK);
+                        }
                     }
                     break;
                 }
@@ -8843,11 +9676,21 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_socketpair(%lx, %lx, %lx, %lx)", a0, a1, a2, a3);
                     int type = (int)a1;
                     int* pair = to_ptr_sz(a3, sizeof(int) * 2);
-                    a0 = errno_ret(socketpair(a0, a1, a2, pair));
+                    a0 = errno_ret(socketpair(a0, a1 & ~UAPI_SOCK_TYPE_MASK, a2, pair));
                     if (a0 >= 0 && pair) {
                         bool cloexec = (type & UAPI_SOCK_CLOEXEC) != 0;
+                        uint32_t status = (type & UAPI_SOCK_NONBLOCK) ? UAPI_O_NONBLOCK : 0;
                         userland_fd_add(uctx(), pair[0], cloexec);
                         userland_fd_add(uctx(), pair[1], cloexec);
+                        userland_fd_set_flags(uctx(), pair[0], UAPI_O_RDWR | status);
+                        userland_fd_set_flags(uctx(), pair[1], UAPI_O_RDWR | status);
+                        if (status) {
+                            /* Both ends get the host's own non-blocking mode: a
+                             * guest that asked for it expects read to say EAGAIN
+                             * rather than park (see posix_shim.c). */
+                            fcntl(pair[0], F_SETFL, UAPI_O_NONBLOCK);
+                            fcntl(pair[1], F_SETFL, UAPI_O_NONBLOCK);
+                        }
                     }
                     break;
                 }
@@ -8868,8 +9711,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(accept(userland_fd_host(uctx(), (int)a0), to_ptr(a1), to_ptr(a2)));
                     if (a0 >= 0) {
                         /* accept(2) has no flag argument: the new descriptor
-                         * never carries FD_CLOEXEC, exactly like Linux. */
+                         * never carries FD_CLOEXEC, exactly like Linux - and it
+                         * is blocking, even when the listener is not. */
                         userland_fd_add(uctx(), (int)a0, false);
+                        userland_fd_set_flags(uctx(), (int)a0, UAPI_O_RDWR);
                     }
                     break;
                 case 203: // connect
@@ -9034,9 +9879,18 @@ static void* rvvm_user_thread_wrap(void* arg)
                     // TODO: struct conversion(?)
                     rvvm_info("sys_accept4(%ld, %lx, %lx, %lx)", a0, a1, a2, a3);
                     int flags = (int)a3;
-                    a0 = errno_ret(accept4(userland_fd_host(uctx(), (int)a0), to_ptr(a1), to_ptr(a2), a3));
+                    /* Same as socket(): the ABI's flags are taken off the host
+                     * call and applied here. */
+                    a0 = errno_ret(accept4(userland_fd_host(uctx(), (int)a0), to_ptr(a1), to_ptr(a2),
+                                           a3 & ~UAPI_SOCK_TYPE_MASK));
                     if (a0 >= 0) {
                         userland_fd_add(uctx(), (int)a0, (flags & UAPI_SOCK_CLOEXEC) != 0);
+                        userland_fd_set_flags(uctx(), (int)a0,
+                                              UAPI_O_RDWR | ((flags & UAPI_SOCK_NONBLOCK)
+                                                             ? UAPI_O_NONBLOCK : 0));
+                        if (flags & UAPI_SOCK_NONBLOCK) {
+                            fcntl((int)a0, F_SETFL, UAPI_O_NONBLOCK);
+                        }
                     }
                     break;
                 }
@@ -9122,6 +9976,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(memfd_create(to_str(a0), a1));
                     if (a0 >= 0) {
                         userland_fd_add(uctx(), (int)a0, (flags & UAPI_MFD_CLOEXEC) != 0);
+                        userland_fd_set_flags(uctx(), (int)a0, UAPI_O_RDWR);
                     }
                     break;
                 }
@@ -9353,10 +10208,16 @@ static void jump_start(size_t entry, size_t stack_top)
     uint32_t root_pid = userland_task_id_alloc(ctx);
     /* An init has no parent at all, and reports it that way (Linux: pid 1's
      * getppid() is 0) - a userland guest that is not an init keeps reporting 1. */
+    /* A launched image leads a process group and a session of its own, which is
+     * what a login shell or an init expects to find: it is already the
+     * foreground group of the console (tcgetpgrp() == getpgrp()), so a shell
+     * turns job control on instead of giving up on the terminal. */
     thread->proc = userland_proc_create(ctx, root_pid,
                                         root_pid == USERLAND_INIT_TASK_ID ? 0 : USERLAND_ROOT_PARENT_ID,
-                                        0, true);
+                                        0, true, root_pid, root_pid);
     thread->tid  = thread->proc->pid;
+    /* ...and it is the console's foreground group until somebody says otherwise. */
+    ctx->tty_fg_pgid = root_pid;
 
     rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_X0 + 2, (size_t)stack_top);
     rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_PC,     (size_t)entry);

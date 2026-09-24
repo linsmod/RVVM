@@ -123,9 +123,43 @@ While the guest runs the console is in raw mode - no echo, no line assembly, and
 SIGINT, `vi` gets a literal `^Z`) - and the console is restored on exit. The guest
 sees the real console size, and a resize as `SIGWINCH`.
 
-**Interactive input does not reach the guest yet.** The guest's `tty` answers
-`not a tty`, so there is no line discipline to deliver keystrokes to; `-c` works
-because the command arrives through `argv`. See `handover.md` (Step 6).
+### Job control
+
+The guest shell gets a real terminal, so it turns job control on (`bash.exe`'s
+behaviour, not `can't access tty; job control turned off`): the run's shell is
+the console's session leader and foreground group, and `^C` / `^Z` are delivered
+to the *foreground process group* the shell named with `tcsetpgrp` - which may
+live in another address space, since every `fork()` gets one of its own.
+
+```powershell
+.\release.windows.x86_64\rvvm_ash_x86_64.exe   # then, at the prompt:
+#   sleep 30        ^C                  # the command dies, the shell survives
+#   sleep 30        ^Z  jobs  fg  ^C    # stop / list / resume / kill
+#   sleep 30 &      jobs  kill -CONT %1
+```
+
+What the core implements (`handover.md` §5 Step 7): process groups and sessions,
+`setpgid`/`getpgid`/`getpgrp`/`getsid`/`setsid`, `kill(0)`/`kill(-pgid)`, the
+console's and a pty's foreground group, `SIGTSTP`/`SIGSTOP`/`SIGTTIN`/`SIGTTOU`
+parking a process and `SIGCONT` resuming it, `wait4`'s `WUNTRACED`/`WCONTINUED`
+statuses, and a cross-address-space `SIGCHLD` so the shell notices its jobs.
+`RVVM_TRACE_PATH=1` prints a `job:` line for each of those steps.
+
+```powershell
+# The interactive timing cannot be reproduced through a pipe - use the driver:
+foreach ($s in 'sigint','sigtstp','fg-resume','fg-again','bg','killpg','killpg-cont') {
+    pwsh ./tools/jobctl_e2e.ps1 -Scenario $s
+}
+
+# And the two corners a shell cannot be asked about (WCONTINUED, and the pty
+# line discipline a session server drives) are a guest sample:
+$env:RVVM_ASH_SHELL='guest-assets\test_jobctl.exe'
+.\release.windows.x86_64\rvvm_ash_x86_64.exe            # 31 checks, PASS
+```
+
+Known gaps (see `handover.md` §6): `jobs` still shows `Stopped` after a
+`kill -CONT` (busybox ash's own bookkeeping - the job does resume), and `^Z` on a
+long `nanosleep` takes effect when that sleep returns rather than instantly.
 
 ## Run
 
@@ -343,6 +377,13 @@ Debug switches:
    - signals: `sigaction` semantics are approximated, no real POSIX signal
      delivery (`tkill` returns ENOSYS, so musl `abort()` ends via
      `exit_group(127)`)
+   - non-blocking I/O: `O_NONBLOCK` is honoured for reads (a pipe is asked with
+     `PeekNamedPipe`, a socket with `FIONBIO`, and the core's own pty//dev
+     descriptors answer `EAGAIN` themselves), and `F_SETFL(O_APPEND)` appends by
+     hand. What Windows has no primitive for is **writing** to a full pipe
+     without blocking, so a non-blocking write that would have to wait still
+     does. `fcntl`'s flag word is kept per descriptor on both sides (`test_std`
+     checks the read side, `dup` and `F_GETFL`)
    Networking works: `src/win/win_socket.c` backs the BSD socket shim with
    WinSock 2 (AF_INET/AF_INET6 sockets, `socketpair` over a loopback TCP pair,
    and an epoll emulated over `poll()`), translating the guest's Linux UAPI

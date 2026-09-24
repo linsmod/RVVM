@@ -403,6 +403,81 @@ static void stage_identity(void)
 }
 
 /* -------------------------------------------------------------------------
+ * fcntl(2) flags: F_GETFL / F_SETFL, and the O_NONBLOCK they carry
+ *
+ * Called from stage 3, where the pipe and the temp file already exist. The
+ * win32 host has no non-blocking mode for a pipe (the CRT drops O_NONBLOCK on
+ * the way in), so before this was answered at all a guest that asked for one
+ * kept a blocking descriptor: F_SETFL returned success and the next read parked
+ * forever. The host now keeps the guest's flag word per descriptor, and read()
+ * asks the pipe itself whether there is anything in it.
+ * ---------------------------------------------------------------------- */
+static void check_fcntl_flags(void)
+{
+    if (g_pipe[0] < 0) {
+        skip("F_GETFL/F_SETFL on a pipe", "there is no pipe on this host");
+        return;
+    }
+
+    int fl = fcntl(g_pipe[0], F_GETFL);
+    check(fl >= 0, msgf("F_GETFL(pipe read end) works (0x%x)", fl));
+    check(fl >= 0 && (fl & O_ACCMODE) == O_RDONLY,
+          msgf("F_GETFL reports the access mode the pipe was made with (0x%x)", fl));
+    check(fl >= 0 && !(fl & O_NONBLOCK), "F_GETFL reports a blocking pipe as blocking");
+
+    errno = 0;
+    int rc = fcntl(g_pipe[0], F_SETFL, fl | O_NONBLOCK);
+    check(rc == 0, msgf("F_SETFL(O_NONBLOCK) succeeds (%s)", rc ? strerror(errno) : "ok"));
+    int fl2 = fcntl(g_pipe[0], F_GETFL);
+    check((fl2 & O_NONBLOCK) != 0, msgf("F_GETFL reads O_NONBLOCK back (0x%x)", fl2));
+
+    /* The point of the flag: an empty pipe answers EAGAIN. A read that parked
+     * instead would hang this whole sample, which is exactly what a silently
+     * ignored O_NONBLOCK used to do. */
+    char drain[64];
+    while (read(g_pipe[0], drain, sizeof(drain)) > 0) {
+        /* drain whatever an earlier check left behind */
+    }
+    errno = 0;
+    ssize_t n = read(g_pipe[0], drain, 1);
+    check(n == -1 && errno == EAGAIN,
+          msgf("read() on the non-blocking pipe is EAGAIN, not a park (%ld, %s)",
+               (long)n, n < 0 ? strerror(errno) : "it returned data"));
+
+    /* A copy reaches the same open file description, so it reports it too - and
+     * keeps obeying it. */
+    int dupfd = dup(g_pipe[0]);
+    check(dupfd >= 0 && (fcntl(dupfd, F_GETFL) & O_NONBLOCK) != 0,
+          "a dup(2) of it reports O_NONBLOCK as well");
+    if (dupfd >= 0) {
+        close(dupfd);
+    }
+
+    /* O_APPEND asked for through fcntl(2), on the file stage 3 wrote: the CRT
+     * only honours the append a file was opened with, so this one is done by
+     * hand (see posix_shim.c's write). */
+    if (!g_file_created) {
+        skip("F_SETFL(O_APPEND) on a file", "the temp file could not be created here");
+    } else {
+        int ofl = fcntl(g_file_fd, F_GETFL);
+        lseek(g_file_fd, 0, SEEK_SET);   /* rewound on purpose: append ignores it */
+        check(fcntl(g_file_fd, F_SETFL, ofl | O_APPEND) == 0,
+              msgf("F_SETFL(O_APPEND) on the file succeeds (0x%x)", ofl));
+        ssize_t wrote = write(g_file_fd, "Z", 1);
+        check(wrote == 1 && lseek(g_file_fd, 0, SEEK_CUR) == 9,
+              msgf("write() after it went to the end, not to the position (%ld, pos=%lld)",
+                   (long)wrote, (long long)lseek(g_file_fd, 0, SEEK_CUR)));
+        char last = 0;
+        check(pread(g_file_fd, &last, 1, 8) == 1 && last == 'Z',
+              msgf("the appended byte is the file's last one (\"%c\")", last));
+        fcntl(g_file_fd, F_SETFL, ofl);   /* leave it as the later stages expect */
+    }
+
+    /* ...and the pipe goes back to blocking: the audit stage reads it. */
+    fcntl(g_pipe[0], F_SETFL, fl);
+}
+
+/* -------------------------------------------------------------------------
  * Stage 3: file & pipe data path
  * ---------------------------------------------------------------------- */
 static void stage_data(void)
@@ -580,6 +655,11 @@ static void stage_data(void)
               msgf("getrandom fills the buffer (%ld, %ld)", ra, rb));
         check(memcmp(r1, r2, sizeof(r1)) != 0, "getrandom returns different bytes per call");
     }
+
+    /* Last, because it moves the pipe and the file back and forth: the guest's
+     * fcntl(2) flag word (and the O_NONBLOCK it may carry) is the same data-path
+     * property as the reads above. */
+    check_fcntl_flags();
 }
 
 /* -------------------------------------------------------------------------

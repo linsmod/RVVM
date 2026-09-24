@@ -658,7 +658,9 @@ ssize_t readv(int fd, const struct iovec* iov, int iovcnt)
         if (!iov[i].iov_len) {
             continue;
         }
-        r = _read(fd, iov[i].iov_base, (unsigned)iov[i].iov_len);
+        /* Through this file's read(): a socket anchored on a CRT fd is
+         * dispatched there, and so is the guest's O_NONBLOCK. */
+        r = read(fd, iov[i].iov_base, (unsigned)iov[i].iov_len);
         if (r < 0) {
             return total ? total : -1;
         }
@@ -683,7 +685,8 @@ ssize_t writev(int fd, const struct iovec* iov, int iovcnt)
         if (!iov[i].iov_len) {
             continue;
         }
-        r = _write(fd, iov[i].iov_base, (unsigned)iov[i].iov_len);
+        /* Same as readv(): the socket dispatch and the fd's flags live there. */
+        r = write(fd, iov[i].iov_base, (unsigned)iov[i].iov_len);
         if (r < 0) {
             return total ? total : -1;
         }
@@ -737,10 +740,67 @@ ssize_t pwrite(int fd, const void* buf, size_t count, long long offset)
 static int shim_epoll_anchor_release(int fd);
 static int shim_dir_forget(int fd);
 
+/* The guest's open-file flag word, per descriptor: what its fcntl(2) asked for.
+ * The emulator hands over the guest's own UAPI word, so O_NONBLOCK is 0x800
+ * (Linux's value; the CRT's O_NONBLOCK is a different bit) - see fcntl() below.
+ * Only O_NONBLOCK and O_APPEND have an effect here; the rest is kept so that
+ * F_GETFL can hand the word back. */
+#define SHIM_FD_MAX      4096
+#define SHIM_O_APPEND    0x400
+#define SHIM_O_NONBLOCK  0x800
+
+static int shim_fd_flags[SHIM_FD_MAX];
+
+static void shim_fd_flags_clear(int fd)
+{
+    if (fd >= 0 && fd < SHIM_FD_MAX) {
+        shim_fd_flags[fd] = 0;
+    }
+}
+
+static void shim_fd_flags_copy(int from, int to)
+{
+    if (to >= 0 && to < SHIM_FD_MAX) {
+        shim_fd_flags[to] = (from >= 0 && from < SHIM_FD_MAX) ? shim_fd_flags[from] : 0;
+    }
+}
+
+/* Ready for a read without blocking?
+ *
+ * Windows pipes are the case that matters: a guest that set O_NONBLOCK on one
+ * expects EAGAIN, not a park, and the CRT has no non-blocking mode for a pipe
+ * to ask for. PeekNamedPipe is the readiness primitive. A file (which does not
+ * block on the absence of data) and anything else answer "ready", so their
+ * behaviour is unchanged. The socket case never gets here - read() dispatches
+ * sockets first, where FIONBIO is a real mode. */
+static int shim_read_ready(int fd)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    DWORD  avail = 0;
+
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+    if (PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) {
+        return avail > 0;
+    }
+    return 1;
+}
+
 int read(int fd, void* buf, unsigned int count)
 {
     if (win_socket_is_fd(fd)) {
         return (int)win_socket_read(fd, buf, count);
+    }
+    if (fd >= 0 && fd < SHIM_FD_MAX && (shim_fd_flags[fd] & SHIM_O_NONBLOCK)) {
+        int ready = shim_read_ready(fd);
+        if (ready <= 0) {
+            if (ready == 0) {
+                errno = EAGAIN;
+            }
+            return -1;
+        }
     }
     return _read(fd, buf, count);
 }
@@ -749,6 +809,16 @@ int write(int fd, const void* buf, unsigned int count)
 {
     if (win_socket_is_fd(fd)) {
         return (int)win_socket_write(fd, buf, count);
+    }
+    if (fd >= 0 && fd < SHIM_FD_MAX && (shim_fd_flags[fd] & SHIM_O_APPEND)) {
+        /* O_APPEND asked for through fcntl(2): the CRT only honours the one a
+         * file was opened with, so the position is moved by hand. Only a disk
+         * file has a position to move (a pipe or a console would just fail the
+         * seek, which is why the type is checked first). */
+        HANDLE h = (HANDLE)_get_osfhandle(fd);
+        if (h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_DISK) {
+            _lseeki64(fd, 0, SEEK_END);
+        }
     }
     return _write(fd, buf, count);
 }
@@ -762,7 +832,15 @@ int close(int fd)
         return 0;
     }
     shim_dir_forget(fd);
-    return _close(fd);
+    /* ...and the number must not carry the closed descriptor's flags into
+     * whatever the CRT hands out next. */
+    {
+        int rc = _close(fd);
+        if (rc == 0) {
+            shim_fd_flags_clear(fd);
+        }
+        return rc;
+    }
 }
 
 int dup(int fd)
@@ -770,7 +848,11 @@ int dup(int fd)
     if (win_socket_is_fd(fd)) {
         return win_socket_dup(fd);
     }
-    return _dup(fd);
+    {
+        int nfd = _dup(fd);
+        shim_fd_flags_copy(fd, nfd);
+        return nfd;
+    }
 }
 
 int dup2(int oldfd, int newfd)
@@ -798,6 +880,9 @@ int dup2(int oldfd, int newfd)
     if (_dup2(oldfd, newfd) == -1) {
         return -1;
     }
+    /* The copy reaches the same open file description: it reports, and obeys,
+     * the same flags. */
+    shim_fd_flags_copy(oldfd, newfd);
     return newfd;
 }
 
@@ -834,7 +919,6 @@ int dup3(int oldfd, int newfd, int flags)
 
 int fcntl(int fd, int cmd, ...)
 {
-    static int fd_flags[4096];
     long arg = 0;
     if (cmd == F_SETFL || cmd == F_SETFD || cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
         va_list ap;
@@ -845,35 +929,39 @@ int fcntl(int fd, int cmd, ...)
     switch (cmd) {
     case F_DUPFD:
     case F_DUPFD_CLOEXEC:
-        return _dup(fd);
+        return dup(fd);
     case F_GETFD:
     case F_SETFD:
         /* The flag itself is the guest's own business (the emulator's descriptor
          * table keeps it), but an invalid descriptor still has to fail, or a
          * guest probing a closed fd reads success back. */
-        if (fd < 0 || fd >= 4096 || _get_osfhandle(fd) == -1) {
+        if (fd < 0 || fd >= SHIM_FD_MAX || _get_osfhandle(fd) == -1) {
             errno = EBADF;
             return -1;
         }
         return 0;
     case F_GETFL:
-        if (fd < 0 || fd >= 4096) {
+        if (fd < 0 || fd >= SHIM_FD_MAX) {
             errno = EBADF;
             return -1;
         }
-        return fd_flags[fd];
+        return shim_fd_flags[fd];
     case F_SETFL:
-        if (fd < 0 || fd >= 4096) {
+        if (fd < 0 || fd >= SHIM_FD_MAX) {
             errno = EBADF;
             return -1;
         }
         if (win_socket_is_fd(fd)) {
-            /* The guest passes the Linux UAPI O_NONBLOCK (0x800), not MinGW's */
-            if (win_socket_set_nonblock(fd, !!(arg & 0x800)) < 0) {
+            /* A socket's non-blocking mode is the socket's own (FIONBIO). The
+             * emulator hands over the guest's UAPI flag word, so O_NONBLOCK is
+             * 0x800 here, not the CRT's O_NONBLOCK. */
+            if (win_socket_set_nonblock(fd, !!(arg & SHIM_O_NONBLOCK)) < 0) {
                 return -1;
             }
         }
-        fd_flags[fd] = (int)arg;
+        /* Everything else reads it back from the table: read() above asks
+         * before parking on a pipe, and write() appends by hand for a file. */
+        shim_fd_flags[fd] = (int)arg;
         return 0;
     default:
         errno = EINVAL;
