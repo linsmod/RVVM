@@ -142,24 +142,28 @@ What the core implements (`handover.md` §5 Step 7): process groups and sessions
 `setpgid`/`getpgid`/`getpgrp`/`getsid`/`setsid`, `kill(0)`/`kill(-pgid)`, the
 console's and a pty's foreground group, `SIGTSTP`/`SIGSTOP`/`SIGTTIN`/`SIGTTOU`
 parking a process and `SIGCONT` resuming it, `wait4`'s `WUNTRACED`/`WCONTINUED`
-statuses, and a cross-address-space `SIGCHLD` so the shell notices its jobs.
-`RVVM_TRACE_PATH=1` prints a `job:` line for each of those steps.
+statuses, a cross-address-space `SIGCHLD` so the shell notices its jobs, and a
+pty resize (`TIOCSWINSZ` on the master) raising `SIGWINCH` in the foreground
+group - the shape a session server needs. `RVVM_TRACE_PATH=1` prints a `job:`
+line for each of those steps.
 
 ```powershell
 # The interactive timing cannot be reproduced through a pipe - use the driver:
-foreach ($s in 'sigint','sigtstp','fg-resume','fg-again','bg','killpg','killpg-cont') {
+foreach ($s in 'sigint','sigtstp','fg-resume','fg-again','bg','killpg','killpg-cont','wait-bg','wait-int') {
     pwsh ./tools/jobctl_e2e.ps1 -Scenario $s
 }
 
-# And the two corners a shell cannot be asked about (WCONTINUED, and the pty
-# line discipline a session server drives) are a guest sample:
+# And the corners a shell cannot be asked about (WCONTINUED, and the pty line
+# discipline / resize a session server drives) are a guest sample:
 $env:RVVM_ASH_SHELL='guest-assets\test_jobctl.exe'
-.\release.windows.x86_64\rvvm_ash_x86_64.exe            # 31 checks, PASS
+.\release.windows.x86_64\rvvm_ash_x86_64.exe            # 36 checks, PASS
 ```
 
 Known gaps (see `handover.md` §6): `jobs` still shows `Stopped` after a
-`kill -CONT` (busybox ash's own bookkeeping - the job does resume), and `^Z` on a
-long `nanosleep` takes effect when that sleep returns rather than instantly.
+`kill -CONT` (busybox ash's own bookkeeping - the job does resume), `^Z` on a
+long `nanosleep` takes effect when that sleep returns rather than instantly, and
+`/dev/tty` has no per-session owner yet (a session's own pty is what `openpty`
+gave it; `getty`/`login`/`vi` want `/dev/tty` to resolve to it).
 
 ## Run
 

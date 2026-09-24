@@ -1624,6 +1624,7 @@ static THREAD_LOCAL rvvm_addr_t tls_cur_syscall;   // definition lives with it
 #define UAPI_SIGTSTP    20
 #define UAPI_SIGTTIN    21
 #define UAPI_SIGTTOU    22
+#define UAPI_SIGURG     23
 #define UAPI_SIGWINCH   28
 
 /*
@@ -6412,6 +6413,16 @@ static bool userland_sig_uncatchable(uint32_t sig)
     return sig == UAPI_SIGKILL || sig == UAPI_SIGSTOP;
 }
 
+/* Signals POSIX gives the disposition "ignore" (Linux's table marks them
+ * SIG_IGN, they are not the default-terminate ones). It matters because the
+ * emulator applies the default disposition itself: without this list a
+ * `kill -WINCH` - the standard way to make a session re-layout itself, and what
+ * a resize sends - would *end* every process that has no handler for it. */
+static bool userland_sig_ignored_by_default(uint32_t sig)
+{
+    return sig == UAPI_SIGCHLD || sig == UAPI_SIGURG || sig == UAPI_SIGWINCH;
+}
+
 struct vp_sigframe {
     uint64_t magic;
     uint64_t regs[31];    // x1..x31 at the interruption point
@@ -6622,6 +6633,10 @@ static void userland_proc_signal(rvvm_userland_t* ctx, rvvm_process_t* proc, uin
     } else if (userland_sig_stops(sig) &&
                (userland_sig_uncatchable(sig) || !userland_proc_handles(ctx, proc, sig))) {
         userland_proc_stop(ctx, proc, (int)sig);
+    } else if (userland_sig_ignored_by_default(sig)) {
+        /* Default disposition: ignored. A registered handler runs, and with
+         * none the signal is dropped - it must not end the process. */
+        (void)userland_deliver_signal(userland_proc_ctx(ctx, proc), sig);
     } else if (!userland_deliver_signal(userland_proc_ctx(ctx, proc), sig)) {
         userland_kill_process(ctx, proc, (int)sig);
     }
@@ -7643,7 +7658,7 @@ static int64_t userland_pty_write(struct userland_pty* pty, bool master, const v
 /* The ioctls a pty exists for. Everything else is ENOTTY, which is what a
  * non-terminal descriptor answers - and what tells isatty() that this is one. */
 static int64_t userland_pty_ioctl(struct userland_pty* pty, bool master, uint64_t cmd, void* arg,
-                                  int32_t caller_pid)
+                                  int32_t caller_pid, rvvm_userland_t* ctx)
 {
     switch (cmd) {
         case UAPI_TIOCGPTN: {   // the N of /dev/pts/N, for ptsname()
@@ -7711,18 +7726,35 @@ static int64_t userland_pty_ioctl(struct userland_pty* pty, bool master, uint64_
             memcpy(arg, &ws, sizeof(ws));
             return 0;
         }
-        case UAPI_TIOCSWINSZ:
+        case UAPI_TIOCSWINSZ: {
             /* Here the grid is the *session's*, not the host's: there is no
              * viewport behind a pty, so what the server sets is what the guest
-             * inside it gets. A resize is also what SIGWINCH is for. */
+             * inside it gets. A resize is also what SIGWINCH is for: a
+             * full-screen program only re-lays itself out when it receives it,
+             * and a session server that resizes the terminal without telling
+             * its jobs (vim, top, less) leaves them drawn for the old size. */
+            bool resized = false;
             if (arg) {
                 const uapi_winsize_t* ws = arg;
                 spin_lock(&pty->lock);
-                if (ws->ws_row) pty->rows = ws->ws_row;
-                if (ws->ws_col) pty->cols = ws->ws_col;
+                if (ws->ws_row && ws->ws_row != pty->rows) {
+                    pty->rows = ws->ws_row;
+                    resized   = true;
+                }
+                if (ws->ws_col && ws->ws_col != pty->cols) {
+                    pty->cols = ws->ws_col;
+                    resized   = true;
+                }
                 spin_unlock(&pty->lock);
             }
+            if (resized) {
+                /* The foreground group of this terminal, the same set ^C and
+                 * ^Z reach (SIGWINCH's default disposition is "ignore", so
+                 * members without a handler are simply left alone). */
+                userland_signal_group(ctx, pty->fg_pgid, UAPI_SIGWINCH);
+            }
             return 0;
+        }
         case UAPI_TIOCGPGRP: {
             /* The group tcsetpgrp(3) last named, or the caller when nobody has:
              * a shell compares this answer with getpgrp() and moves into the
@@ -8385,7 +8417,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                         int idev = -1;
                         if (userland_pty_by_fd(hfd, &pty, &master)) {
                             a0 = (rvvm_addr_t)userland_pty_ioctl(pty, master, a1, a2 ? to_ptr(a2) : NULL,
-                                                                 (int32_t)(thread->proc ? thread->proc->pid : 0));
+                                                                 (int32_t)(thread->proc ? thread->proc->pid : 0),
+                                                                 uctx());
                         } else if (userland_dev_by_fd(hfd, &idev) && idev == DEV_CONSOLE) {
                             /* /dev/console or /dev/ttyN: the termios and window
                              * size of the run's session, exactly as for an

@@ -25,6 +25,10 @@
       killpg-cont  kill -CONT %1 really resumes: no job output before the CONT,
                    and the job's output after it.
       bg           a background job runs to completion and is reaped (SIGCHLD).
+      wait-bg      `sleep 2 &` + `wait` returns when the job exits (the shell's
+                   own SIGCHLD path - it must not hang).
+      wait-int     `wait` is a blocking syscall like any other: ^C cuts it
+                   short while the background job keeps running.
 
     Every assertion needs the process to be alive to the end, so both pipes are
     drained from the start: an emulator whose stderr write blocks on a full pipe
@@ -227,6 +231,38 @@ switch ($Scenario) {
         Start-Sleep -Milliseconds 400
         Send "exit 0`n"
         Finish 20000
+    }
+    'wait-bg' {
+        # A shell's own job loop: `wait` must return when the background job
+        # exits (it is the shell's SIGCHLD path, not a poll), and must not hang.
+        Send "sleep 2 &`n"
+        Start-Sleep -Milliseconds 400
+        Send "wait`n"
+        Start-Sleep -Milliseconds 3500
+        Send "echo WAIT-DONE-`$((6*7))`n"
+        Start-Sleep -Milliseconds 600
+        Send "jobs`n"
+        Start-Sleep -Milliseconds 600
+        Send "exit 0`n"
+        Finish 25000
+    }
+    'wait-int' {
+        # A `wait` is a blocking syscall like any other: ^C has to cut it short
+        # (the shell returns to its prompt) while the job keeps running.
+        Send "sleep 30 &`n"
+        Start-Sleep -Milliseconds 800
+        Send "wait`n"
+        Start-Sleep -Milliseconds 1200
+        SendKey 0x03
+        Start-Sleep -Milliseconds 1200
+        Send "echo AFTER-WAIT-INT`n"
+        Start-Sleep -Milliseconds 800
+        Send "jobs`n"
+        Start-Sleep -Milliseconds 800
+        Send "kill -KILL %1`n"
+        Start-Sleep -Milliseconds 600
+        Send "exit 0`n"
+        Finish 25000
     }
     default { throw "unknown scenario $Scenario" }
 }

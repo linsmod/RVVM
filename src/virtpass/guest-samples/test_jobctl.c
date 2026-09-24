@@ -21,6 +21,9 @@
  *      with tcsetpgrp(), and ^C written to the *master* is what the pty's ISIG
  *      delivers - the notation is echoed back and the job dies with
  *      128+SIGINT. This is the shape a session of `rvvm_ash --serve` will use.
+ *   4. the same session resized: TIOCSWINSZ on the master must raise SIGWINCH
+ *      in the foreground group (a full-screen program only re-lays itself out
+ *      when it receives it), and the new size must be what the slave reads.
  *
  * Expected console output: one "ok  <what>" line per check, then
  * "=== PASS: job control ===" (or "=== FAIL: N check(s) ===").
@@ -33,6 +36,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +61,17 @@ static void delay_ms(long ms)
 {
     struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
+}
+
+/* One formatted message at a time: each is printed before the next is built. */
+static char* msgf(const char* fmt, ...)
+{
+    static char buf[192];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    return buf;
 }
 
 /* --- 1: process group and session identity --- */
@@ -232,6 +247,106 @@ static void test_pty_sigint(void)
     close(master);
 }
 
+/* The child's SIGWINCH handler: reports the resize through the pty, which is
+ * where a full-screen program would redraw. */
+static void on_winch(int sig)
+{
+    (void)sig;
+    ssize_t n = write(1, "WINCH\n", 6);
+    (void)n;
+}
+
+/* --- 4: a resize on the terminal reaches the session's foreground group ---
+ *
+ * TIOCSWINSZ is not just a number to store: a session server resizing the
+ * terminal (a client's window, an ssh resize request) has to raise SIGWINCH in
+ * the job that is drawing on it, or vim/top/less keep laying themselves out for
+ * the old size. The signal goes to the terminal's foreground group - the same
+ * set ^C and ^Z reach - and it is raised by whoever resizes the master, no
+ * matter which address space that group lives in. */
+static void test_pty_winch(void)
+{
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0) {
+        check(0, msgf("posix_openpt() for the resize check (%s)", strerror(errno)));
+        return;
+    }
+    grantpt(master);
+    unlockpt(master);
+
+    const char* name = ptsname(master);
+    char slave_path[64];
+    snprintf(slave_path, sizeof(slave_path), "%s", name ? name : "");
+    int slave = name ? open(slave_path, O_RDWR) : -1;
+    if (slave < 0) {
+        check(0, "open() the slave for the resize check");
+        close(master);
+        return;
+    }
+
+    pid_t child = fork();
+    if (child == 0) {
+        close(master);
+        setsid();
+        ioctl(slave, TIOCSCTTY, 0);
+        dup2(slave, 0);
+        dup2(slave, 1);
+        dup2(slave, 2);
+        if (slave > 2) {
+            close(slave);
+        }
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_winch;
+        sigaction(SIGWINCH, &sa, NULL);
+        /* Ready: the session is set up and the handler is armed. The newline
+         * makes it a complete line, since the slave starts in canonical mode. */
+        ssize_t r = write(1, "R\n", 2);
+        (void)r;
+        for (int i = 0; i < 200; i++) {
+            delay_ms(50);
+        }
+        _exit(7);
+    }
+    if (child < 0) {
+        check(0, "fork() for the resize check");
+        close(slave);
+        close(master);
+        return;
+    }
+
+    /* Wait for the child's "ready" instead of racing its setsid(): the group a
+     * resize is delivered to has to be the child's own. */
+    struct pollfd pfd = { master, POLLIN, 0 };
+    char buf[64] = {0};
+    int ready = (poll(&pfd, 1, 2000) > 0) ? (int)read(master, buf, sizeof(buf) - 1) : -1;
+    check(ready > 0 && strchr(buf, 'R') != NULL, "the session reports itself ready on the pty");
+
+    check(ioctl(slave, TIOCSPGRP, &child) == 0, "the session is the pty's foreground group");
+
+    struct winsize ws = {0};
+    ws.ws_row = 30;
+    ws.ws_col = 100;
+    check(ioctl(master, TIOCSWINSZ, &ws) == 0, "TIOCSWINSZ(master) resizes to 30x100");
+
+    struct winsize back = {0};
+    check(ioctl(slave, TIOCGWINSZ, &back) == 0 && back.ws_row == 30 && back.ws_col == 100,
+          msgf("the session reads the new size back (%ux%u)",
+               (unsigned)back.ws_row, (unsigned)back.ws_col));
+
+    pfd.revents = 0;
+    memset(buf, 0, sizeof(buf));
+    int got = (poll(&pfd, 1, 1500) > 0) ? (int)read(master, buf, sizeof(buf) - 1) : -1;
+    check(got > 0 && strstr(buf, "WINCH") != NULL,
+          "the resize raised SIGWINCH in the session's foreground group");
+
+    kill(child, SIGKILL);
+    int st = 0;
+    waitpid(child, &st, 0);
+    close(slave);
+    close(master);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -240,6 +355,7 @@ int main(void)
     test_identity();
     test_group_stop();
     test_pty_sigint();
+    test_pty_winch();
 
     if (fails) {
         printf("=== FAIL: %d check(s) ===\n", fails);
