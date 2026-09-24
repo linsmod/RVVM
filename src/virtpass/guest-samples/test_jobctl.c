@@ -24,6 +24,12 @@
  *   4. the same session resized: TIOCSWINSZ on the master must raise SIGWINCH
  *      in the foreground group (a full-screen program only re-lays itself out
  *      when it receives it), and the new size must be what the slave reads.
+ *   5. who owns the terminal: TIOCSCTTY gives a session leader the pty, and
+ *      open("/dev/tty") then answers *that* pty rather than the run's console -
+ *      inherited by fork(), left behind by setsid(), refused to a process that
+ *      does not lead a session or names the master end, and dropped again by
+ *      TIOCNOTTY. vi, less, getty and login reach their terminal this way, and
+ *      a session server stands on it.
  *
  * Expected console output: one "ok  <what>" line per check, then
  * "=== PASS: job control ===" (or "=== FAIL: N check(s) ===").
@@ -41,6 +47,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -347,6 +354,148 @@ static void test_pty_winch(void)
     close(master);
 }
 
+/* --- 5: the controlling terminal, and where /dev/tty points ---
+ *
+ * open("/dev/tty") is how vi, less, getty and login reach "my terminal": it must
+ * answer the pty the *session* claimed and not the run's console, and the claim
+ * has to be inherited by fork(), left behind by setsid(), refused to a process
+ * that does not lead a session, and droppable with TIOCNOTTY. A session server
+ * and every job it starts stand on exactly this chain.
+ *
+ * The child reports through the pty instead of stdout: an in-process fork() gets
+ * its own address space, so a counter it bumped would not be visible here. */
+static void report(int fd, const char* name, long value)
+{
+    char line[64];
+    int  n = snprintf(line, sizeof(line), "%s=%ld\n", name, value);
+    if (n > 0) {
+        ssize_t w = write(fd, line, (size_t)n);
+        (void)w;
+    }
+}
+
+/* st_rdev of whatever /dev/tty currently means, or -1: the console reports
+ * major 5, a pty is major 136 plus its index. */
+static long rdev_of_tty(void)
+{
+    struct stat st;
+    return stat("/dev/tty", &st) == 0 ? (long)st.st_rdev : -1;
+}
+
+static long field_of(const char* buf, const char* name)
+{
+    char        pat[32];
+    const char* p;
+    snprintf(pat, sizeof(pat), "%s=", name);
+    p = strstr(buf, pat);
+    return p ? strtol(p + strlen(pat), NULL, 10) : -1;
+}
+
+static void test_ctty(void)
+{
+    long console_rdev = rdev_of_tty();
+
+    check(console_rdev == (5L << 8),
+          msgf("with nothing claimed, /dev/tty is the run's console (rdev %lx)", console_rdev));
+
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0) {
+        check(0, msgf("posix_openpt() for the terminal-owner check (%s)", strerror(errno)));
+        return;
+    }
+    grantpt(master);
+    unlockpt(master);
+
+    const char* name = ptsname(master);
+    char slave_path[64];
+    snprintf(slave_path, sizeof(slave_path), "%s", name ? name : "");
+    int slave = name ? open(slave_path, O_RDWR) : -1;
+    if (slave < 0) {
+        check(0, "open() the slave for the terminal-owner check");
+        close(master);
+        return;
+    }
+
+    struct stat sst;
+    fstat(slave, &sst);
+    long slave_rdev = (long)sst.st_rdev;
+
+    /* The run's root leads its own session (checked above), so it is allowed to
+     * claim a terminal - and claiming one is what moves /dev/tty. */
+    check(ioctl(slave, TIOCSCTTY, 0) == 0, "a session leader claims the pty as its terminal");
+    check(rdev_of_tty() == slave_rdev, "open(\"/dev/tty\") then answers that pty");
+
+    pid_t child = fork();
+    if (child == 0) {
+        report(slave, "fork-inherit", rdev_of_tty());
+        /* Not a session leader yet, and it already has a terminal: EPERM. */
+        int rc = ioctl(slave, TIOCSCTTY, 0);
+        report(slave, "rc-not-leader", rc < 0 ? errno : 0);
+        setsid();
+        report(slave, "after-setsid", rdev_of_tty());
+        report(slave, "rc-claim", ioctl(slave, TIOCSCTTY, 0));
+        report(slave, "rc-again", ioctl(slave, TIOCSCTTY, 0));
+        /* Only the slave end can be a terminal: the master is a file. */
+        report(slave, "rc-master", ioctl(master, TIOCSCTTY, 0) < 0 ? errno : 0);
+        int tty = open("/dev/tty", O_RDWR);
+        if (tty >= 0) {
+            ssize_t w = write(tty, "VIA-DEV-TTY\n", 12);
+            (void)w;
+            ioctl(tty, TIOCNOTTY, 0);
+            close(tty);
+        }
+        report(slave, "after-notty", rdev_of_tty());
+        _exit(0);
+    }
+    if (child < 0) {
+        check(0, "fork() for the terminal-owner check");
+        close(slave);
+        close(master);
+        return;
+    }
+
+    /* Everything the child found, as the terminal saw it. */
+    char          buf[512] = {0};
+    size_t        len      = 0;
+    struct pollfd pfd      = { master, POLLIN, 0 };
+    while (len + 1 < sizeof(buf)) {
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 1000) <= 0) {
+            break;
+        }
+        ssize_t r = read(master, buf + len, sizeof(buf) - 1 - len);
+        if (r <= 0) {
+            break;
+        }
+        len += (size_t)r;
+        buf[len] = 0;
+        if (strstr(buf, "after-notty=")) {
+            break;
+        }
+    }
+
+    check(field_of(buf, "fork-inherit") == slave_rdev,
+          "a forked child inherits its parent's terminal");
+    check(field_of(buf, "rc-not-leader") == EPERM,
+          "a process that does not lead a session cannot claim one");
+    check(field_of(buf, "after-setsid") == console_rdev,
+          "setsid() leaves the inherited terminal behind");
+    check(field_of(buf, "rc-claim") == 0, "the new session claims the pty");
+    check(field_of(buf, "rc-again") == 0, "re-claiming the same terminal is accepted");
+    check(field_of(buf, "rc-master") == EPERM, "the master end cannot be a terminal");
+    check(strstr(buf, "VIA-DEV-TTY") != NULL,
+          "a write to /dev/tty reaches that pty, not the console");
+    check(field_of(buf, "after-notty") == console_rdev, "TIOCNOTTY drops the claim");
+
+    int st = 0;
+    waitpid(child, &st, 0);
+    check(ioctl(slave, TIOCNOTTY, 0) == 0, "the parent drops its own claim");
+    check(rdev_of_tty() == console_rdev, "and /dev/tty is the console again");
+
+    close(slave);
+    close(master);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -356,6 +505,7 @@ int main(void)
     test_group_stop();
     test_pty_sigint();
     test_pty_winch();
+    test_ctty();
 
     if (fails) {
         printf("=== FAIL: %d check(s) ===\n", fails);

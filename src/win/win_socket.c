@@ -53,7 +53,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <fcntl.h>
 #include <io.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "win_socket.h"
@@ -239,6 +242,28 @@ static void wsock_set_errno(void)
     errno = wsock_errno_of(WSAGetLastError());
 }
 
+/* Anchor/socket lifecycle trace, for chasing descriptor-number collisions
+ * between this layer's CRT anchors and a guest's descriptor table. Off unless
+ * WIN_SOCKET_TRACE is set. */
+static int wsock_trace_on = -1;
+
+static void wsock_trace(const char* fmt, ...)
+{
+    va_list ap;
+    if (wsock_trace_on < 0) {
+        wsock_trace_on = getenv("WIN_SOCKET_TRACE") != NULL;
+    }
+    if (!wsock_trace_on) {
+        return;
+    }
+    fprintf(stderr, "[wsock] ");
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
 /* ------------------------------------------------------------------------ */
 /* Anchors                                                                   */
 /* ------------------------------------------------------------------------ */
@@ -252,11 +277,13 @@ int win_socket_alloc_anchor(void)
         errno = EMFILE;
         return -1;
     }
+    wsock_trace("alloc anchor %d", fd);
     return fd;
 }
 
 void win_socket_free_anchor(int fd)
 {
+    wsock_trace("free anchor %d", fd);
     _close(fd);
 }
 
@@ -274,6 +301,7 @@ static int wsock_fd_alloc(SOCKET s)
     AcquireSRWLockExclusive(&wsock_lock);
     wsock_fds[fd] = s;
     ReleaseSRWLockExclusive(&wsock_lock);
+    wsock_trace("fd %d <- socket %p", fd, (void*)s);
     return fd;
 }
 
@@ -623,6 +651,7 @@ int win_socket_dup(int fd)
 int win_socket_close(int fd)
 {
     SOCKET s = wsock_fd_take(fd);
+    wsock_trace("close anchor %d (socket %p)", fd, (void*)s);
     if (s == INVALID_SOCKET) {
         errno = ENOTSOCK;
         return -1;

@@ -654,12 +654,17 @@ typedef struct {
  * (a pty end, a /dev entry). The fd table's close path needs to know, and it
  * comes long before the implementations (see the pty section). */
 struct userland_pty;
+struct rvvm_userland;   // The context type itself is defined further below
 static bool userland_pty_by_fd(int fd, struct userland_pty** out_pty, bool* out_master);
 static void userland_pty_ref(struct userland_pty* pty, bool master);
 static void userland_pty_release(struct userland_pty* pty, bool master);
 static bool userland_pty_readable(struct userland_pty* pty, bool master);
 static int  userland_pty_open_master(void);
 static int  userland_pty_open_slave(uint32_t index);
+// A controlling terminal is claimed and dropped from three places (TIOCSCTTY /
+// TIOCNOTTY, setsid, and the teardown of the address space that owned it), so
+// its implementation lives with the pty section but is named here.
+static void userland_clear_ctty(struct rvvm_userland* ctx);
 static bool userland_dev_by_fd(int fd, int* out_dev);
 static int  userland_dev_fd(int dev);
 
@@ -925,6 +930,15 @@ typedef struct rvvm_userland {
     // 0 means nobody claimed one yet, and TIOCGPGRP then answers the caller -
     // what a shell that has not set up job control expects to see.
     uint32_t                      tty_fg_pgid;
+    // The terminal this address space's session controls: the pty slave a
+    // session leader named with TIOCSCTTY, which is what open("/dev/tty") has to
+    // answer - vi, less and login reach "my terminal" through it, and a session
+    // whose /dev/tty is the run's console is a session reading somebody else's
+    // terminal. NULL = none claimed, and the console is then the fallback: the
+    // right answer for a guest whose terminal actually is the console (rvvm_ash
+    // without a session server). Held with a slave reference, so the pair lives
+    // exactly as long as a session owns it.
+    struct userland_pty*          ctty;
 
     // --- Guest process registry (group F) ---
     // Every process this run knows about, live or zombie: a parent finds its
@@ -1610,6 +1624,7 @@ static THREAD_LOCAL rvvm_addr_t tls_cur_syscall;   // definition lives with it
 #define UAPI_TIOCGPGRP   0x540F
 #define UAPI_TIOCSPGRP   0x5410
 #define UAPI_TIOCSCTTY   0x540E
+#define UAPI_TIOCNOTTY   0x5422
 #define UAPI_FIONREAD    0x541B
 /* Signals whose disposition the emulator has to act on itself, because it
  * cannot run a host-installed handler for the guest. asm-generic numbering, the
@@ -1773,9 +1788,17 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg, int32_t pid)
             return 0;
         }
         case UAPI_TIOCSCTTY:
-            /* Accepted: this console *is* the session's terminal, and the pair
-             * a shell names is the only one there is. Refusing TIOCSCTTY is
-             * what leaves a shell convinced the terminal is somebody else's. */
+            /* A session can own the console too: accepting is what keeps a shell
+             * from deciding the terminal is somebody else's, and with no claim
+             * recorded /dev/tty already answers the console. One terminal at a
+             * time, though - a caller that claimed a pty is refused, the way
+             * Linux refuses a second controlling terminal. */
+            if (uctx()->ctty) {
+                return -UAPI_EPERM;
+            }
+            return 0;
+        case UAPI_TIOCNOTTY:
+            userland_clear_ctty(uctx());
             return 0;
     }
     return -UAPI_ENOTTY;
@@ -4131,12 +4154,6 @@ static void userland_fd_install(rvvm_userland_t* ctx, int guest_fd, int host_fd,
     ctx->fds[guest_fd].flags   = 0;
 }
 
-/* Track a descriptor the host just handed out: its number is the guest's too. */
-static void userland_fd_add(rvvm_userland_t* ctx, int fd, bool cloexec)
-{
-    userland_fd_install(ctx, fd, fd, cloexec);
-}
-
 static bool userland_fd_tracked(rvvm_userland_t* ctx, int fd)
 {
     return ctx && fd >= 0 && fd < USERLAND_FD_TABLE_MAX && ctx->fds[fd].used;
@@ -4217,6 +4234,14 @@ static bool userland_fd_read_blocks(rvvm_userland_t* ctx, int fd)
     return (userland_fd_flags(ctx, fd) & UAPI_O_NONBLOCK) == 0;
 }
 
+/* May a write on @fd wait for room? The same question, and the same answer: the
+ * rings behind a pty are the descriptors this userland serves that can be full,
+ * and the guest's O_NONBLOCK is what decides whether the write parks. */
+static bool userland_fd_write_blocks(rvvm_userland_t* ctx, int fd)
+{
+    return (userland_fd_flags(ctx, fd) & UAPI_O_NONBLOCK) == 0;
+}
+
 /* close(2) for a tracked descriptor. Returns false when it is not one of ours,
  * so the caller falls back to the host close (and its error reporting).
  *
@@ -4256,6 +4281,32 @@ static int userland_fd_slot_alloc(rvvm_userland_t* ctx, int min_fd)
         }
     }
     return -1;
+}
+
+/* Track a descriptor the host just handed out, and answer the number the *guest*
+ * will see.
+ *
+ * The two number spaces are deliberately not the same. The host recycles its
+ * descriptors on its own - an anchor allocated for a dup'd socket, a table reset
+ * at execve() - and a guest slot that still names one object must never be
+ * silently re-pointed at another, which is exactly what filing the host's number
+ * as the guest's does: a session server's accepted socket went dead the moment a
+ * fork() recycled its host number (the table's only trace was
+ * "fd N reused while still tracked"). So the table picks the guest's number, the
+ * way it already does for dup(2), and the host descriptor is the payload.
+ *
+ * Returns the guest fd, or -1 with the host descriptor closed when the table is
+ * full (EMFILE, which is what a kernel would report). */
+static int userland_fd_add(rvvm_userland_t* ctx, int host_fd, bool cloexec)
+{
+    int guest_fd = userland_fd_slot_alloc(ctx, 0);
+    if (guest_fd < 0) {
+        close(host_fd);
+        errno = EMFILE;
+        return -1;
+    }
+    userland_fd_install(ctx, guest_fd, host_fd, cloexec);
+    return guest_fd;
 }
 
 /* dup(2) family and F_DUPFD: the host has already made the copy, so this only
@@ -5123,6 +5174,15 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
      * child answers to the same terminal the parent does. */
     ctx->parent_ctx  = parent;
     ctx->tty_fg_pgid = parent->tty_fg_pgid;
+
+    /* The controlling terminal is inherited like the terminal itself: a command
+     * the shell runs keeps the session's terminal as its own, which is why
+     * open("/dev/tty") in a job reaches the pty its session was started on. A
+     * child that means to lead a session of its own drops it with setsid(). */
+    ctx->ctty = parent->ctty;
+    if (ctx->ctty) {
+        userland_pty_ref(ctx->ctty, false);
+    }
 
     /* Allocator and heap: the child continues where the parent was. */
     ctx->guest_bump       = parent->guest_bump;
@@ -6856,7 +6916,7 @@ static rvvm_addr_t userland_proc_id_query(rvvm_userland_t* ctx, rvvm_user_thread
  * A process that already leads a group cannot start one (EPERM) - which is
  * exactly the test a shell uses to learn it is already a session leader, so
  * answering 0 unconditionally here would tell it the opposite of the truth. */
-static rvvm_addr_t userland_setsid(rvvm_process_t* proc)
+static rvvm_addr_t userland_setsid(rvvm_userland_t* ctx, rvvm_process_t* proc)
 {
     if (!proc) {
         return -UAPI_ESRCH;
@@ -6866,6 +6926,11 @@ static rvvm_addr_t userland_setsid(rvvm_process_t* proc)
     }
     proc->sid  = proc->pid;
     proc->pgid = proc->pid;
+    /* A new session has no controlling terminal - that is the point of starting
+     * one, and it is what a session server relies on: it drops whatever terminal
+     * it inherited, so /dev/tty answers the pty it is about to claim and not the
+     * one its parent was started on. */
+    userland_clear_ctty(ctx);
     return proc->pid;
 }
 
@@ -7239,10 +7304,46 @@ static void userland_pty_release(struct userland_pty* pty, bool master)
             userland_ptys[pty->index] = NULL;
         }
         spin_unlock(&userland_pty_lock);
+        /* The hangup is told to whoever is parked on the other end *before* the
+         * pair goes: the event lives in the object being freed here. */
+        rvvm_event_wake(&pty->event);
         free(pty);
+        return;
     }
     /* A reader parked on the other end has to notice the hangup. */
     rvvm_event_wake(&pty->event);
+}
+
+/* Make @pty (its slave end) @ctx's controlling terminal, NULL to drop whatever
+ * it had.
+ *
+ * This is the whole of the terminal's *ownership*: the pair is referenced while
+ * a session holds it, so it cannot be freed and its slot cannot be recycled
+ * under the session's feet - and open("/dev/tty") can then answer it instead of
+ * the run's console. What it is *not* is access control: no signal here checks
+ * that a process belongs to the terminal's session. */
+static void userland_set_ctty(rvvm_userland_t* ctx, struct userland_pty* pty)
+{
+    if (ctx->ctty == pty) {
+        return;
+    }
+    userland_clear_ctty(ctx);
+    ctx->ctty = pty;
+    if (pty) {
+        userland_pty_ref(pty, false);
+    }
+}
+
+/* Drop it. A session leaves its terminal with setsid(2) (a new session has no
+ * controlling terminal), with TIOCNOTTY, or by going away entirely. */
+static void userland_clear_ctty(struct rvvm_userland* ctx)
+{
+    if (!ctx || !ctx->ctty) {
+        return;
+    }
+    struct userland_pty* pty = ctx->ctty;
+    ctx->ctty = NULL;
+    userland_pty_release(pty, false);   // The reference the claim held
 }
 
 static size_t pty_ring_put(userland_pty_ring* ring, const uint8_t* src, size_t len)
@@ -7267,8 +7368,16 @@ static size_t pty_ring_get(userland_pty_ring* ring, uint8_t* dst, size_t len)
     return n;
 }
 
-/* The slave wrote: ONLCR turns its bare LF into the CRLF a terminal expects,
- * and the result is what the master reads. */
+/* The slave wrote: ONLCR turns its bare LF into the CRLF a terminal expects, and
+ * the result is what the master reads.
+ *
+ * Returns how many bytes of @src were consumed - not how many reached the
+ * master, which ONLCR makes a larger number. A write(2) that answered with the
+ * emitted count is a write(2) that hands back more than it was given, and musl's
+ * stdio advances its buffer by that answer: one LF in a buffered write made it
+ * subtract more than it had, wrap round to SIZE_MAX, and send the next write
+ * with a length of 0xffffffff (which the emulator, correctly, called EFAULT).
+ * A shell in a pty is exactly the program that writes lines through stdio. */
 static size_t userland_pty_slave_put(struct userland_pty* pty, const uint8_t* src, size_t len)
 {
     spin_lock(&pty->lock);
@@ -7277,10 +7386,16 @@ static size_t userland_pty_slave_put(struct userland_pty* pty, const uint8_t* sr
         for (size_t i = 0; i < len; ++i) {
             if (src[i] == '\n') {
                 const uint8_t crlf[2] = {'\r', '\n'};
-                done += pty_ring_put(&pty->to_master, crlf, 2);
+                if (pty->to_master.len + 2 > USERLAND_PTY_RING) {
+                    break;   // No room for the pair: the LF is not consumed yet
+                }
+                pty_ring_put(&pty->to_master, crlf, 2);
+            } else if (pty->to_master.len < USERLAND_PTY_RING) {
+                pty_ring_put(&pty->to_master, src + i, 1);
             } else {
-                done += pty_ring_put(&pty->to_master, src + i, 1);
+                break;
             }
+            ++done;
         }
     } else {
         done = pty_ring_put(&pty->to_master, src, len);
@@ -7298,12 +7413,19 @@ static size_t userland_pty_slave_put(struct userland_pty* pty, const uint8_t* sr
  * session's foreground group. @ctx is the context the write came from, which is
  * where the group is looked up from (the group may live in another address
  * space - a server holding the master and a shell in a child of it is the
- * ordinary shape of an ssh-like session). */
-static void userland_pty_master_put(struct userland_pty* pty, const uint8_t* src, size_t len,
-                                    rvvm_userland_t* ctx)
+ * ordinary shape of an ssh-like session).
+ *
+ * Returns how many bytes of @src were consumed, which is the whole of @len
+ * unless the input ring filled up: the rest is the caller's to write again, and
+ * *not* something to drop - these are the user's keystrokes. A byte the line
+ * discipline acts on itself (^C, ^Z, erase) needs no room and is always
+ * consumed, so a ^C still works while a shell is not reading. */
+static size_t userland_pty_master_put(struct userland_pty* pty, const uint8_t* src, size_t len,
+                                      rvvm_userland_t* ctx)
 {
     uint8_t echo[USERLAND_PTY_RING];
     size_t  echo_len = 0;
+    size_t  done     = 0;
     uint32_t sig = 0;
 
     spin_lock(&pty->lock);
@@ -7317,6 +7439,11 @@ static void userland_pty_master_put(struct userland_pty* pty, const uint8_t* src
         if (icrnl && c == '\r') {
             c = '\n';
         }
+        if (path_trace_enabled() && (c == TTY_CC_VINTR || c == TTY_CC_VSUSP)) {
+            rvvm_warn("pty: %s from the master (lflag %lx isig %d fg_pgid %u)",
+                      c == TTY_CC_VINTR ? "INTR" : "SUSP", (unsigned long)pty->lflag, (int)isig,
+                      pty->fg_pgid);
+        }
         if (isig && (c == TTY_CC_VINTR || c == TTY_CC_VSUSP)) {
             /* ^C / ^Z: the byte is consumed by the line discipline, the pending
              * line is dropped, and the notation is echoed the way ECHOCTL makes
@@ -7329,13 +7456,18 @@ static void userland_pty_master_put(struct userland_pty* pty, const uint8_t* src
                 memcpy(echo + echo_len, note, 4);
                 echo_len += 4;
             }
+            ++done;
             continue;
         }
         if (!canon) {
+            if (pty->to_slave.len >= USERLAND_PTY_RING) {
+                break;   // No room: the caller writes the rest later
+            }
             pty_ring_put(&pty->to_slave, &c, 1);
             if (echo_on && echo_len < sizeof(echo)) {
                 echo[echo_len++] = c;
             }
+            ++done;
             continue;
         }
         if (c == TTY_CC_ERASE) {
@@ -7353,20 +7485,30 @@ static void userland_pty_master_put(struct userland_pty* pty, const uint8_t* src
                     echo[echo_len++] = '\b';
                 }
             }
+            ++done;
             continue;
         }
         if (c == TTY_CC_VEOF) {
             /* Ctrl-D: the pending line goes as it stands; on an empty line it
              * is end-of-file, which read() reports as 0. */
             if (pty->slave_line_len) {
+                if (pty->to_slave.len + pty->slave_line_len > USERLAND_PTY_RING) {
+                    break;   // The line waits for room, the byte is not consumed
+                }
                 pty_ring_put(&pty->to_slave, pty->slave_line, pty->slave_line_len);
                 pty->slave_line_len = 0;
             } else {
                 pty->slave_eof = true;
             }
+            ++done;
             continue;
         }
         if (c == '\n') {
+            /* The line and its newline go together: a half-flushed line would
+             * reach the shell as a command nobody typed. */
+            if (pty->to_slave.len + pty->slave_line_len + 1 > USERLAND_PTY_RING) {
+                break;
+            }
             if (pty->slave_line_len) {
                 pty_ring_put(&pty->to_slave, pty->slave_line, pty->slave_line_len);
                 pty->slave_line_len = 0;
@@ -7376,6 +7518,7 @@ static void userland_pty_master_put(struct userland_pty* pty, const uint8_t* src
                 echo[echo_len++] = '\r';
                 echo[echo_len++] = '\n';
             }
+            ++done;
             continue;
         }
         if (pty->slave_line_len < sizeof(pty->slave_line)) {
@@ -7384,6 +7527,10 @@ static void userland_pty_master_put(struct userland_pty* pty, const uint8_t* src
                 echo[echo_len++] = c;
             }
         }
+        /* A line longer than the buffer: the excess is dropped, as a real tty's
+         * canonical buffer drops it (MAX_CANON), rather than stalling the writer
+         * on a line the shell will never be handed. */
+        ++done;
     }
     spin_unlock(&pty->lock);
 
@@ -7407,6 +7554,7 @@ static void userland_pty_master_put(struct userland_pty* pty, const uint8_t* src
             }
         }
     }
+    return done;
 }
 
 /* Readable: data waiting, or a hangup / EOF the read has to report. */
@@ -7569,8 +7717,20 @@ static int userland_dev_open(const char* abs, int flags)
     if (!strcmp(abs, "/dev/urandom") || !strcmp(abs, "/dev/random")) {
         return userland_dev_fd(DEV_RANDOM);
     }
-    if (!strcmp(abs, "/dev/console") || !strcmp(abs, "/dev/tty") ||
-        !strncmp(abs, "/dev/tty", 8)) {
+    if (!strcmp(abs, "/dev/tty")) {
+        /* The caller's *own* terminal: the pty its session claimed, or the run's
+         * console when it has none. It is how vi, less and login reach "my
+         * terminal" - including after they rearranged their standard
+         * descriptors, which is exactly when an answer of "somebody else's
+         * console" is indistinguishable from a broken terminal. Opening it opens
+         * the slave again (a second descriptor on the same pair, as on Linux). */
+        struct userland_pty* ctty = uctx()->ctty;
+        if (ctty) {
+            return userland_pty_open_slave(ctty->index);
+        }
+        return userland_dev_fd(DEV_CONSOLE);
+    }
+    if (!strcmp(abs, "/dev/console") || !strncmp(abs, "/dev/tty", 8)) {
         return userland_dev_fd(DEV_CONSOLE);
     }
     if (!strcmp(abs, "/dev/null")) {
@@ -7606,6 +7766,10 @@ static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* bu
         if (ring->len) {
             size_t n = pty_ring_get(ring, buf, count);
             spin_unlock(&pty->lock);
+            /* Room appeared: a writer parked because the ring was full has to
+             * hear about it (a session's output outrunning its client is the
+             * ordinary case, not an exotic one). */
+            rvvm_event_wake(&pty->event);
             return (int64_t)n;
         }
         if (master) {
@@ -7631,6 +7795,9 @@ static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* bu
         if (!block) {
             return 0;
         }
+        if (path_trace_enabled()) {
+            rvvm_warn("pty %s read: nothing yet, parking", master ? "master" : "slave");
+        }
         /* Wake on new bytes or a hangup; the timeout is only so a signal
          * arriving while we wait is noticed. */
         rvvm_event_wait(&pty->event, 5000000ULL);
@@ -7638,7 +7805,7 @@ static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* bu
 }
 
 static int64_t userland_pty_write(struct userland_pty* pty, bool master, const void* buf, size_t count,
-                                  rvvm_userland_t* ctx)
+                                  rvvm_userland_t* ctx, bool block)
 {
     if (!buf) {
         return -UAPI_EFAULT;
@@ -7646,20 +7813,55 @@ static int64_t userland_pty_write(struct userland_pty* pty, bool master, const v
     if (!count) {
         return 0;
     }
-    if (master) {
-        userland_pty_master_put(pty, buf, count, ctx);
-        return (int64_t)count;
+
+    /* Both rings can be full, so a write can come up short - and a short write
+     * is not a detail a session server may ignore: the bytes that did not fit
+     * are the user's keystrokes on the way in, or the session's output on the
+     * way out. A blocking write parks until there is room, a non-blocking one
+     * reports EAGAIN, and a pty whose far end is gone reports EIO - all three
+     * the way a real terminal answers. */
+    for (;;) {
+        size_t done = master ? userland_pty_master_put(pty, buf, count, ctx)
+                             : userland_pty_slave_put(pty, buf, count);
+        if (done) {
+            if (path_trace_enabled() && done != count) {
+                rvvm_warn("pty %s write: %zu of %zu (ring full)", master ? "master" : "slave", done,
+                          count);
+            }
+            return (int64_t)done;
+        }
+        if (path_trace_enabled()) {
+            rvvm_warn("pty %s write: no room for %zu (%s)", master ? "master" : "slave", count,
+                      block ? "parking" : "EAGAIN");
+        }
+        if (!block) {
+            return -UAPI_EAGAIN;
+        }
+        bool hangup;
+        spin_lock(&pty->lock);
+        hangup = pty->refs[master ? 1 : 0] == 0;
+        spin_unlock(&pty->lock);
+        if (hangup) {
+            return -UAPI_EIO;
+        }
+        if (atomic_load_uint32(&ctx->sig_pending)) {
+            return -UAPI_EINTR;
+        }
+        rvvm_event_wait(&pty->event, 5000000ULL);
     }
-    size_t n = userland_pty_slave_put(pty, buf, count);
-    /* A short write is only the ring filling up; the caller writes again. */
-    return (int64_t)n;
 }
 
 /* The ioctls a pty exists for. Everything else is ENOTTY, which is what a
  * non-terminal descriptor answers - and what tells isatty() that this is one. */
 static int64_t userland_pty_ioctl(struct userland_pty* pty, bool master, uint64_t cmd, void* arg,
-                                  int32_t caller_pid, rvvm_userland_t* ctx)
+                                  rvvm_user_thread_t* self)
 {
+    /* The caller: its address space (where a controlling terminal would be
+     * recorded) and its process id (which TIOCGPGRP answers with when nobody
+     * claimed a foreground group). */
+    rvvm_userland_t* ctx        = uctx();
+    int32_t          caller_pid = self && self->proc ? (int32_t)self->proc->pid : 0;
+
     switch (cmd) {
         case UAPI_TIOCGPTN: {   // the N of /dev/pts/N, for ptsname()
             if (!master || !arg) {
@@ -7781,8 +7983,39 @@ static int64_t userland_pty_ioctl(struct userland_pty* pty, bool master, uint64_
             spin_unlock(&pty->lock);
             return 0;
         }
-        case UAPI_TIOCSCTTY:
-            return 0;   // accepted: the pair is already the session's terminal
+        case UAPI_TIOCSCTTY: {
+            /* TIOCSCTTY: name this pty (its slave end) as *my* controlling
+             * terminal. This is the one place a terminal gets an owner, and it
+             * is what makes open("/dev/tty") in the session's jobs answer this
+             * pty instead of the run's console - the difference between a
+             * session and a program that merely has a terminal's descriptors.
+             *
+             * The conditions are Linux's, because they are what a getty/login
+             * pair probes for: the caller must be a session leader that has no
+             * controlling terminal yet (EPERM otherwise), and only the slave end
+             * can be one - the master is a terminal, not a terminal's *user*. */
+            if (master) {
+                return -UAPI_EPERM;
+            }
+            if (!self || !self->proc || self->proc->pid != self->proc->sid) {
+                return -UAPI_EPERM;   // Not a session leader
+            }
+            if (ctx->ctty && ctx->ctty != pty) {
+                return -UAPI_EPERM;   // It already has one
+            }
+            userland_set_ctty(ctx, pty);
+            return 0;
+        }
+        case UAPI_TIOCNOTTY:
+            /* Let the terminal go (a daemon that never meant to keep one, a
+             * shell on its way out). Linux also drops the *foreground* group
+             * with it, which matters here because the next reader of an
+             * unowned pty would otherwise still be answering to a gone job. */
+            userland_clear_ctty(ctx);
+            spin_lock(&pty->lock);
+            pty->fg_pgid = 0;
+            spin_unlock(&pty->lock);
+            return 0;
         case UAPI_FIONREAD: {
             if (!arg) {
                 return -UAPI_EINVAL;
@@ -7898,6 +8131,11 @@ static bool userland_dev_stat_path(const char* abs, struct stat* st)
         userland_dev_fill_stat(DEV_NULL, st);
     } else if (!strcmp(abs, "/dev/urandom") || !strcmp(abs, "/dev/random")) {
         userland_dev_fill_stat(DEV_RANDOM, st);
+    } else if (!strcmp(abs, "/dev/tty") && uctx()->ctty) {
+        /* It names the caller's own pty, so it has to look like one (open() of
+         * it hands out a pty slave descriptor, and a guest that stats what it
+         * opened compares the two). */
+        userland_pty_fill_stat(uctx()->ctty, false, st);
     } else if (!strcmp(abs, "/dev/console") || !strcmp(abs, "/dev/tty") ||
                userland_dev_tty_number(abs)) {
         userland_dev_fill_stat(DEV_CONSOLE, st);
@@ -8166,10 +8404,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_eventfd2(%lx, %lx)", a0, a1);
                     a0 = errno_ret(eventfd(a0, a1));
                     if (a0 >= 0) {
-                        userland_fd_add(uctx(), (int)a0, (a1 & UAPI_EFD_CLOEXEC) != 0);
-                        userland_fd_set_flags(uctx(), (int)a0,
-                                              UAPI_O_RDWR | ((a1 & UAPI_EFD_NONBLOCK)
-                                                             ? UAPI_O_NONBLOCK : 0));
+                        int gfd = userland_fd_add(uctx(), (int)a0, (a1 & UAPI_EFD_CLOEXEC) != 0);
+                        if (gfd < 0) {
+                            a0 = -UAPI_EMFILE;
+                        } else {
+                            a0 = (rvvm_addr_t)gfd;
+                            userland_fd_set_flags(uctx(), gfd,
+                                                  UAPI_O_RDWR | ((a1 & UAPI_EFD_NONBLOCK)
+                                                                 ? UAPI_O_NONBLOCK : 0));
+                        }
                     }
                     break;
 #endif
@@ -8179,10 +8422,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                     int flags = (int)a0;
                     a0 = errno_ret(epoll_create1(flags));
                     if (a0 >= 0) {
-                        userland_fd_add(uctx(), (int)a0, (flags & UAPI_EPOLL_CLOEXEC) != 0);
-                        /* An epoll instance is read and written alike, and has
-                         * no non-blocking mode of its own. */
-                        userland_fd_set_flags(uctx(), (int)a0, UAPI_O_RDWR);
+                        int gfd = userland_fd_add(uctx(), (int)a0, (flags & UAPI_EPOLL_CLOEXEC) != 0);
+                        if (gfd < 0) {
+                            a0 = -UAPI_EMFILE;
+                        } else {
+                            a0 = (rvvm_addr_t)gfd;
+                            /* An epoll instance is read and written alike, and has
+                             * no non-blocking mode of its own. */
+                            userland_fd_set_flags(uctx(), gfd, UAPI_O_RDWR);
+                        }
                     }
                     break;
                 }
@@ -8417,8 +8665,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         int idev = -1;
                         if (userland_pty_by_fd(hfd, &pty, &master)) {
                             a0 = (rvvm_addr_t)userland_pty_ioctl(pty, master, a1, a2 ? to_ptr(a2) : NULL,
-                                                                 (int32_t)(thread->proc ? thread->proc->pid : 0),
-                                                                 uctx());
+                                                                 thread);
                         } else if (userland_dev_by_fd(hfd, &idev) && idev == DEV_CONSOLE) {
                             /* /dev/console or /dev/ttyN: the termios and window
                              * size of the run's session, exactly as for an
@@ -8817,6 +9064,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 64: { // write
                     void* wbuf = a2 ? to_ptr_sz(a1, a2) : NULL;
                     if (a2 && !wbuf) {
+                        if (path_trace_enabled()) {
+                            rvvm_warn("write: fd=%ld EFAULT (ptr %lx len %lx)", a0, a1, a2);
+                        }
                         a0 = -UAPI_EFAULT;
                         break;
                     }
@@ -8841,7 +9091,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                         bool master = false;
                         int dev = -1;
                         if (userland_pty_by_fd(host_fd, &pty, &master)) {
-                            a0 = (rvvm_addr_t)userland_pty_write(pty, master, wbuf, a2, uctx());
+                            a0 = (rvvm_addr_t)userland_pty_write(pty, master, wbuf, a2, uctx(),
+                                                                 userland_fd_write_blocks(uctx(), (int)a0));
                         } else if (userland_dev_by_fd(host_fd, &dev)) {
                             a0 = (rvvm_addr_t)userland_dev_write(dev, wbuf, a2);
                         } else if (uctx()->io_callback) {
@@ -8922,10 +9173,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = errno_ret(total);
                     } else if (a7 == 66 && iov_own) {
                         ssize_t total = 0;
+                        bool block = userland_fd_write_blocks(uctx(), (int)a0);
                         for (int i = 0; i < (int)a2; i++) {
                             ssize_t r = iov_pty
                                 ? (ssize_t)userland_pty_write(iov_pty, iov_master,
-                                                              hiov[i].iov_base, hiov[i].iov_len, uctx())
+                                                              hiov[i].iov_base, hiov[i].iov_len,
+                                                              uctx(), block)
                                 : (ssize_t)userland_dev_write(iov_dev, hiov[i].iov_base, hiov[i].iov_len);
                             if (r < 0) { total = r; break; }
                             total += r;
@@ -9582,7 +9835,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 157: // setsid
                     rvvm_info("sys_setsid()");
-                    a0 = userland_setsid(thread->proc);
+                    a0 = userland_setsid(uctx(), thread->proc);
                     break;
                 case 158: // getgroups
                     rvvm_warn("sys_getgroups(%lx, %lx)", a0, a1);
@@ -10944,6 +11197,11 @@ static void userland_destroy(rvvm_machine_t* machine)
      * anything below is released. */
     userland_itimer_stop(ctx);
     vector_free(ctx->userland_threads);
+    /* The terminal this session owned, if any: dropping the claim first means
+     * the pair is freed by the descriptor release below when it was the last
+     * thing holding it, rather than outliving the address space that claimed
+     * it. */
+    userland_clear_ctty(ctx);
     /* The descriptors this address space held close with it - including its
      * ends of any pty pair, which release their side here. */
     userland_fd_table_free(ctx);

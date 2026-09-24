@@ -162,8 +162,41 @@ $env:RVVM_ASH_SHELL='guest-assets\test_jobctl.exe'
 Known gaps (see `handover.md` §6): `jobs` still shows `Stopped` after a
 `kill -CONT` (busybox ash's own bookkeeping - the job does resume), `^Z` on a
 long `nanosleep` takes effect when that sleep returns rather than instantly, and
-`/dev/tty` has no per-session owner yet (a session's own pty is what `openpty`
-gave it; `getty`/`login`/`vi` want `/dev/tty` to resolve to it).
+`/dev/ttyN` still means the run's console (a *session's* own terminal is
+`/dev/tty`, which the core now resolves through `TIOCSCTTY`).
+
+### Sessions
+
+The guest-side half of the WSL-style split is `vpsessiond`
+(`src/virtpass/guest-samples/vpsessiond.c`): run it as the run root and the
+machine becomes a *core* - one pty-backed shell per TCP connection, each with its
+own controlling terminal (`setsid` + `TIOCSCTTY`, so `/dev/tty` inside the
+session answers that pty and not the run's console), its own foreground process
+group (`^C` / `^Z` written to the socket reach the job), and resize frames
+(`ESC ] 999 ; R<rows>;<cols> BEL`) that turn into SIGWINCH.
+
+```powershell
+$env:RVVM_ASH_SHELL='guest-assets\vpsessiond.exe'
+.\release.windows.x86_64\rvvm_ash_x86_64.exe      # prints "listening on 127.0.0.1:7900"
+# then, from anywhere on the host - netcat works, no protocol needed:
+#   nc 127.0.0.1 7900     -> an interactive shell at 24x80
+```
+
+```powershell
+# The end-to-end acceptance (real TCP clients, every assertion read off the socket):
+pwsh ./tools/session_e2e.ps1            # single session: PASS
+pwsh ./tools/session_e2e.ps1 -Multi     # two clients: currently blocked, see below
+```
+
+Known blocker for `-Multi` (reproduced and located, not yet fixed): a **host
+descriptor number recycled under a still-tracked guest slot**. `userland_fd_add`
+installs a host fd at the same guest number, so once a host number is released
+behind the emulator's back (descriptor inheritance around `fork`, the anchor
+allocations inside `win_socket.c`, an exec's table reset), the next `accept`
+overwrites a slot a session still holds - that session's socket stops delivering
+and later connections are never accepted. The signature in the log is
+`WARN: fd 5 reused while still tracked`; `handover.md` §5 (Step 8) has the
+evidence and the candidate fixes.
 
 ## Run
 
