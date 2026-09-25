@@ -11,8 +11,13 @@ See vp_rootfs.h. Two passes over the same bytes, deliberately:
     which is how one busybox covers ~300 names without a privilege and without
     300 copies.
 
-The inflated archive is kept in memory (a minirootfs expands to ~7 MB), which is
-what lets an app install pull one entry out by index after the fact.
+The inflated archive is held in memory while it is being lifted out (a minirootfs
+expands to ~7 MB), which is what lets a caller pull one entry out by index. Once
+the tree is materialized, vp_rootfs_release_data() drops it: the guest is
+answered from the shadow and the files on disk, so the ~7 MB need not stay
+resident for the life of the run. (An app install opens its own vp_rootfs_t and
+reads entries before closing it, so it does not rely on the rootfs keeping its
+bytes.)
 */
 
 #include "virtpass/vp_rootfs.h"
@@ -440,6 +445,24 @@ void vp_rootfs_close(vp_rootfs_t* rootfs)
     free(rootfs->tar);
     free(rootfs->data);
     free(rootfs);
+}
+
+/* Drop the inflated bytes and the content offsets that point into them. The
+ * index (shadow) stays: the guest's lstat()/readlink()/getdents64() are answered
+ * from it and from the materialized files, not from the archive. Any later
+ * extract/read call then refuses (there is nothing to read from). */
+void vp_rootfs_release_data(vp_rootfs_t* rootfs)
+{
+    if (!rootfs) {
+        return;
+    }
+    free(rootfs->tar);
+    rootfs->tar = NULL;
+    rootfs->tar_size = 0;
+    free(rootfs->data);
+    rootfs->data = NULL;
+    rootfs->data_count = 0;
+    rootfs->data_capacity = 0;
 }
 
 vp_shadow_t* vp_rootfs_shadow(const vp_rootfs_t* rootfs)

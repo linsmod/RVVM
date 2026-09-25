@@ -1213,6 +1213,13 @@ PUBLIC rvvm_hart_t* rvvm_create_user_thread(rvvm_machine_t* machine)
                 // This is the main thread, initialize the timer
                 rvtimer_init(&machine->timer, rvvm_get_opt(machine, RVVM_OPT_TIME_FREQ));
             }
+            /* Register the hart like a machine-created one, so the existing
+             * teardown paths own it: rvvm_free_user_thread() erases and frees it
+             * when its guest thread exits, and rvvm_free_machine() frees any that
+             * are left. Without this the hart - and the RVJIT heap it owns, ~16
+             * MiB - leaked on every fork()ed process (each fork is a machine of
+             * its own). */
+            vector_push_back(machine->harts, thread);
         }
         return thread;
     }

@@ -74,6 +74,13 @@ size_t vp_rootfs_count(const vp_rootfs_t* rootfs);
 // number of files written; 0 with *error set means nothing could be installed.
 size_t vp_rootfs_extract(vp_rootfs_t* rootfs, const char* dest_dir, const char** error);
 
+// Drop the inflated archive bytes, keeping the index (the shadow) and the entry
+// table. Call once the tree has been materialized: the guest's filesystem is
+// answered from the shadow and the files on disk afterwards, so holding the
+// whole archive (a minirootfs inflates to ~7 MB) for the life of the run only
+// costs resident memory. After this, the extract/read calls below refuse.
+void vp_rootfs_release_data(vp_rootfs_t* rootfs);
+
 // Write one indexed entry's bytes to an explicit host path, creating the parent
 // directory as needed. This is what an app install uses: the archive stores
 // apps/<id>/... while the guest expects it under /data/app/<id>/.... Returns

@@ -270,6 +270,10 @@ bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz, const c
         }
         bundle_stamp_write(dest, rootfs_tar_gz);
     }
+    /* The tree is materialized on disk and the shadow is what the guest is
+     * answered from; the inflated archive was only needed to write the files,
+     * which is done. Drop it so ~7 MB does not stay resident per run. */
+    vp_rootfs_release_data(rootfs);
     g_mounted = rootfs;
     if (stats) {
         stats->entries = vp_rootfs_count(rootfs);

@@ -635,6 +635,12 @@ PUBLIC uint64_t rvvm_user_host_ptr(const void* ptr)
 // Past the guest image and its brk heap, where mmap()ed ranges start
 #define GUEST_MMAP_BASE  0x11000000UL
 #define GUEST_STACK_SIZE 0x4000000UL // 64 MiB
+/* How much of the stack reservation is zeroed before the initial frame is built.
+ * The stack grows down by writing, so nothing below the frame is ever read
+ * before it is written; only the top of the reservation has to be clean (it is
+ * where the frame, its alignment gap and any slack live). Zeroing the whole
+ * 64 MiB made it all resident at boot for nothing. */
+#define GUEST_STACK_ZERO 0x100000UL // 1 MiB
 #define GUEST_PAGE_SIZE  0x1000UL
 
 // Guest address a relocatable (ET_DYN) main image is placed at: above the NULL
@@ -12588,9 +12594,12 @@ static rvvm_addr_t guest_setup_stack(rvvm_userland_t* ctx, size_t argc, char** a
         .phnum        = ctx->elf.phnum,
     };
 
-    // The stack lives in guest memory too, so the guest can name pointers to it
+    // The stack lives in guest memory too, so the guest can name pointers to it.
+    // Only the top of the reservation is zeroed (see GUEST_STACK_ZERO): the
+    // frame builder writes everything below that point before it is read, and on
+    // a reused address space (execve) the fresh pages are demand-zero anyway.
     uint8_t* stack_buffer = to_ptr(ctx->guest_stack_base);
-    memset(stack_buffer, 0, GUEST_STACK_SIZE);
+    memset(stack_buffer + GUEST_STACK_SIZE - GUEST_STACK_ZERO, 0, GUEST_STACK_ZERO);
     rvvm_addr_t stack_top = rvvm_user_init_stack(stack_buffer + GUEST_STACK_SIZE, &desc);
     rvvm_info("Stack top at %llx", (unsigned long long)stack_top);
     return stack_top;

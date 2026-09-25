@@ -226,7 +226,13 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
              * map_size stays 0 - the window owns this memory), so a debugger
              * disabling host ASLR can no longer collide with it. */
             elf->base = elf->guest_window + elf_loaddr;
-            memset(elf->base, 0, elf->buf_size + ELF_USERLAND_HEAP_MARGIN);
+            /* Zero only the image extent, like the dynamic path above: the
+             * bridge to the mmap area (ELF_USERLAND_HEAP_MARGIN) is brk heap
+             * headroom, and it is demand-zero already - the window is a fresh
+             * zeroed buffer on first load, and rvvm_sys_brk() zeroes every byte
+             * it hands out on a later load. Eagerly memseting the whole margin
+             * only made ~256 MiB resident at boot for nothing. */
+            memset(elf->base, 0, elf->buf_size);
             elf->map_size = 0;
         } else {
             // Non-relocatable ELF at fixed address
