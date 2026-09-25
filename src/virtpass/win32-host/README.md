@@ -190,19 +190,21 @@ $env:RVVM_ASH_SHELL='guest-assets\vpsessiond.exe'
 
 ```powershell
 # The end-to-end acceptance (real TCP clients, every assertion read off the socket):
-pwsh ./tools/session_e2e.ps1            # single session: PASS
-pwsh ./tools/session_e2e.ps1 -Multi     # two clients: currently blocked, see below
+pwsh ./tools/session_e2e.ps1            # single session: PASS (14 checks)
+pwsh ./tools/session_e2e.ps1 -Multi     # two clients: PASS (21 checks)
 ```
 
-Known blocker for `-Multi` (reproduced and located, not yet fixed): a **host
-descriptor number recycled under a still-tracked guest slot**. `userland_fd_add`
-installs a host fd at the same guest number, so once a host number is released
-behind the emulator's back (descriptor inheritance around `fork`, the anchor
-allocations inside `win_socket.c`, an exec's table reset), the next `accept`
-overwrites a slot a session still holds - that session's socket stops delivering
-and later connections are never accepted. The signature in the log is
-`WARN: fd 5 reused while still tracked`; `handover.md` §5 (Step 8) has the
-evidence and the candidate fixes.
+Two core bugs that the sessions once reproduced are fixed (see `handover.md`
+§5 Step 8 and §6): a **host descriptor number recycled under a still-tracked
+guest slot** (now the guest number is chosen by the fd table, the host number is
+only the payload), and **`sendfile(2)` losing the bytes of `cat file`** because
+it read the file through the host and then wrote it to a pty's synthetic number
+(`EBADF`); `rvvm_sys_sendfile` now takes the same dispatch `read(2)/write(2)`
+do. `-Multi` is how both were found - keep it as the regression driver.
+
+Still missing for the full WSL shape: there is no `--serve`/attach client yet, so
+each `rvvm_ash` run boots its own core instead of connecting to one (see
+`handover.md` §5 Step 8, "客户端：连上、中继字节（待做）").
 
 ## Run
 

@@ -254,9 +254,9 @@ $pidA = if ($r -match 'pid-a=([0-9]+)') { $Matches[1] } else { '' }
 Check ($pidA -ne '') "the session shell reports a pid ($pidA)"
 
 # --- a second client is a second session --------------------------------
-# Off by default: a second connection currently hits a known core bug (a host
-# descriptor number recycled under a still-tracked guest slot - see
-# handover.md §6), and this driver is the reproduction for it.
+# Off by default to keep the ordinary run to one session; `-Multi` adds the
+# shared-core checks (they pass - the fd-reuse and sendfile bugs they once
+# reproduced are fixed, see handover.md §6).
 if ($Multi) {
     $B = New-Client
     $r = Read-Until $B '/ #' 10000
@@ -279,7 +279,7 @@ if ($Multi) {
     $r = Read-Until $B 'shared-core-state' 5000
     Check ($r -match 'shared-core-state') 'both sessions share one filesystem (the core state)'
 } else {
-    "skip second-session checks (pass -Multi to run them; they need a core fix)"
+    "skip second-session checks (pass -Multi to run them)"
 }
 
 # --- job control, driven from outside the machine -----------------------

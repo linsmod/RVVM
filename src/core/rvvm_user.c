@@ -667,6 +667,21 @@ static int  userland_pty_open_slave(uint32_t index);
 static void userland_clear_ctty(struct rvvm_userland* ctx);
 static bool userland_dev_by_fd(int fd, int* out_dev);
 static int  userland_dev_fd(int dev);
+static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* buf,
+                                 size_t count, bool block);
+static int64_t userland_pty_write(struct userland_pty* pty, bool master, const void* buf,
+                                  size_t count, struct rvvm_userland* ctx, bool block);
+static int64_t userland_dev_read(int dev, void* buf, size_t count, bool block);
+static int64_t userland_dev_write(int dev, const void* buf, size_t count);
+static bool userland_own_fd(int host_fd);
+/* One read/write through the same dispatch read(2)/write(2) use: a pty end and
+ * a /dev entry are served here, the console from the virtual TTY, and the rest
+ * by the host descriptor behind the guest's number. sendfile(2) needs this
+ * because both of its descriptors are ordinary guest fds. */
+static int64_t userland_read_fd(struct rvvm_userland* ctx, int fd, void* buf,
+                                size_t count, bool block);
+static int64_t userland_write_fd(struct rvvm_userland* ctx, int fd, const void* buf,
+                                 size_t count, bool block);
 
 /* One slot of a process's fd table: the host fd it rides on, plus the flags that
  * belong to the slot rather than to what it points at.
@@ -5879,26 +5894,44 @@ static void uapi_itimerval_from_host(struct uapi_itimerval* dst, const struct it
  * caller can observe is what is kept: at most @count bytes, taken from @offset
  * when one is given (the input's own position stays where it was), and the
  * number of bytes that reached the output. A short copy is a count, not an
- * error - an empty one is whatever the input reported. */
+ * error - an empty one is whatever the input reported.
+ *
+ * Both descriptors go through the read(2)/write(2) dispatch, not straight to
+ * the host: a session's `cat file > /dev/tty` names a pty owner, not a CRT fd
+ * (see userland_read_fd/userland_write_fd), and writing the pty's synthetic
+ * number to the host loses the bytes after the input has already advanced. */
 #define SENDFILE_CHUNK 32768
 
 static int64_t rvvm_sys_sendfile(rvvm_userland_t* ctx, int out_fd, int in_fd, int64_t* offset, size_t count)
 {
-    int      host_out = userland_fd_host(ctx, out_fd);
-    int      host_in  = userland_fd_host(ctx, in_fd);
-    uint8_t* buf      = safe_new_arr(uint8_t, SENDFILE_CHUNK);
-    int64_t  off      = offset ? *offset : 0;
-    int64_t  total    = 0;
+    uint8_t* buf   = safe_new_arr(uint8_t, SENDFILE_CHUNK);
+    int64_t  off   = offset ? *offset : 0;
+    int64_t  total = 0;
 
     while (total < (int64_t)count) {
         size_t want = ((size_t)count - (size_t)total < SENDFILE_CHUNK)
                       ? ((size_t)count - (size_t)total) : SENDFILE_CHUNK;
-        ssize_t rd  = offset ? pread(host_in, buf, want, off) : read(host_in, buf, want);
+        int64_t rd;
+        if (offset) {
+            /* A positioned copy needs a host file: a pty end or a /dev entry
+             * has no offset to name. */
+            int host_in = userland_fd_host(ctx, in_fd);
+            if (userland_own_fd(host_in)) {
+                if (!total) {
+                    total = -UAPI_ESPIPE;
+                }
+                break;
+            }
+            ssize_t r = pread(host_in, buf, want, off);
+            rd = r < 0 ? errno_ret(-1) : (int64_t)r;
+        } else {
+            rd = userland_read_fd(ctx, in_fd, buf, want, true);
+        }
         if (rd < 0) {
             /* Nothing delivered yet: the caller gets the error. Anything
              * already written is reported as the short copy it is. */
             if (!total) {
-                total = errno_ret(-1);
+                total = rd;
             }
             break;
         }
@@ -5907,21 +5940,21 @@ static int64_t rvvm_sys_sendfile(rvvm_userland_t* ctx, int out_fd, int in_fd, in
         }
         size_t done = 0;
         while (done < (size_t)rd) {
-            ssize_t wr = write(host_out, buf + done, (size_t)rd - done);
+            int64_t wr = userland_write_fd(ctx, out_fd, buf + done, (size_t)rd - done, true);
             if (wr <= 0) {
                 if (wr < 0 && !total && !done) {
-                    total = errno_ret(-1);
+                    total = wr;
                 }
                 break;
             }
-            done += wr;
+            done += (size_t)wr;
         }
         if (done < (size_t)rd) {
             break;
         }
-        total += done;
+        total += (int64_t)done;
         if (offset) {
-            off += done;
+            off += (int64_t)done;
         }
     }
     if (offset) {
@@ -7989,6 +8022,60 @@ static int64_t userland_pty_write(struct userland_pty* pty, bool master, const v
     }
 }
 
+/* The same read/write dispatch the read(2)/write(2) cases perform, factored out
+ * for callers that move bytes between two ordinary guest descriptors (sendfile).
+ * Reading or writing `userland_fd_host(fd)` directly would send a pty's bytes to
+ * the host's CRT layer, where the pty's synthetic number means nothing. */
+static int64_t userland_read_fd(struct rvvm_userland* ctx, int fd, void* buf,
+                                size_t count, bool block)
+{
+    int host_fd = userland_fd_host(ctx, fd);
+    struct userland_pty* pty = NULL;
+    bool master = false;
+    int  dev = -1;
+
+    if (userland_pty_by_fd(host_fd, &pty, &master)) {
+        return userland_pty_read(pty, master, buf, count, block);
+    }
+    if (userland_dev_by_fd(host_fd, &dev)) {
+        return userland_dev_read(dev, buf, count, block);
+    }
+    if (fd == 0 && userland_fd_is_console(ctx, fd)) {
+        if (!block && !user_tty_readable(ctx)) {
+            return -UAPI_EAGAIN;
+        }
+        return user_tty_read(ctx, buf, count, block);
+    }
+    ssize_t rd = read(host_fd, buf, count);
+    return rd < 0 ? errno_ret(-1) : (int64_t)rd;
+}
+
+static int64_t userland_write_fd(struct rvvm_userland* ctx, int fd, const void* buf,
+                                 size_t count, bool block)
+{
+    int host_fd = userland_fd_host(ctx, fd);
+    struct userland_pty* pty = NULL;
+    bool master = false;
+    int  dev = -1;
+
+    if (userland_pty_by_fd(host_fd, &pty, &master)) {
+        return userland_pty_write(pty, master, buf, count, ctx, block);
+    }
+    if (userland_dev_by_fd(host_fd, &dev)) {
+        return userland_dev_write(dev, buf, count);
+    }
+    if ((fd == 1 || fd == 2) && userland_fd_is_console(ctx, fd)) {
+        user_tty_write(ctx, fd, buf, count);
+    }
+    if (ctx->io_callback) {
+        /* The sink recognizes the host's 1/2 and writes every other fd through
+         * to the host itself, so it is handed the host number (see write(2)). */
+        return errno_ret(ctx->io_callback(host_fd, buf, count));
+    }
+    ssize_t wr = write(host_fd, buf, count);
+    return wr < 0 ? errno_ret(-1) : (int64_t)wr;
+}
+
 /* The ioctls a pty exists for. Everything else is ENOTTY, which is what a
  * non-terminal descriptor answers - and what tells isatty() that this is one. */
 static int64_t userland_pty_ioctl(struct userland_pty* pty, bool master, uint64_t cmd, void* arg,
@@ -9173,9 +9260,6 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 63: { // read
                     void* buf = a2 ? to_ptr_sz(a1, a2) : NULL;
-                    if (path_trace_enabled()) {
-                        rvvm_warn("sys_read(fd=%ld count=%lu)", a0, (unsigned long)a2);
-                    }
                     if (a2 && !buf) {
                         a0 = -UAPI_EFAULT;
                         break;
@@ -9220,11 +9304,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                             /* A host descriptor: its O_NONBLOCK is the host's,
                              * set through fcntl(2) like any Linux guest expects
                              * (see posix_shim.c's fcntl/read). */
-                            int gfd = (int)a0;
                             a0 = errno_ret(read(hfd, buf, a2));
-                            if (path_trace_enabled()) {
-                                rvvm_warn("sys_read(guest fd=%d host=%d) = %ld", gfd, hfd, (long)a0);
-                            }
                         }
                     }
                     break;
