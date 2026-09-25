@@ -129,6 +129,15 @@ Check ($r -match '(?m)^cpu ' -and $r -match 'processes') "/proc/stat has cpu and
 
 $r = Client 'cat /proc/meminfo'
 Check ($r -match 'MemTotal:') "/proc/meminfo has MemTotal"
+$mt = if ($r -match 'MemTotal:\s+(\d+) kB') { [int64]$Matches[1] } else { 0 }
+$mf = if ($r -match 'MemFree:\s+(\d+) kB') { [int64]$Matches[1] } else { 0 }
+Check ($mt -gt 900000) "MemTotal reflects the ~1 GiB guest address space ($mt kB)"
+Check ($mf -gt 0 -and $mf -lt $mt) "MemFree is the unallocated address space ($mf kB)"
+
+# `free` reads sysinfo() (total/free) while `top` reads meminfo: both must agree.
+$r = Client 'free'
+$ft = if ($r -match 'Mem:\s+(\d+)') { [int64]$Matches[1] } else { 0 }
+Check ($ft -eq $mt) "free (sysinfo) and meminfo report the same total ($ft kB)"
 
 $r = Client 'cat /proc/version'
 Check ($r -match 'Linux version') "/proc/version names the kernel"

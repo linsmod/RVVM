@@ -9022,17 +9022,70 @@ static size_t userland_proc_gen_uptime(char* buf, size_t size)
     return userland_proc_appendf(buf, size, 0, "%llu.00 %llu.00\n", secs, secs);
 }
 
+/* The guest RAM this address space was given (the private buffer the userland
+ * machine owns - see rvvm_create_userland). */
+static unsigned long long userland_proc_total_bytes(rvvm_userland_t* ctx)
+{
+    return (ctx && ctx->machine) ? (unsigned long long)ctx->machine->mem.size : 0;
+}
+
+/* The guest address space not handed out yet. The allocator carves mappings out
+ * of one buffer (see the guest virtual memory allocator), so this is what is
+ * left of it: the unexplored tail of the mmap area, the recycled holes, and the
+ * headroom between the brk heap and where mmap()s start. */
+static unsigned long long userland_proc_free_bytes(rvvm_userland_t* ctx)
+{
+    if (!ctx) {
+        return 0;
+    }
+    unsigned long long free_b = 0;
+    if (ctx->guest_bump < ctx->guest_mmap_end) {
+        free_b += (unsigned long long)(ctx->guest_mmap_end - ctx->guest_bump);
+    }
+    for (size_t i = 0; i < ctx->guest_free_num; i++) {
+        free_b += (unsigned long long)ctx->guest_free[i].size;
+    }
+    if (ctx->guest_brk_ptr && ctx->guest_brk_ptr < GUEST_MMAP_BASE) {
+        free_b += (unsigned long long)(GUEST_MMAP_BASE - ctx->guest_brk_ptr);
+    }
+    return free_b;
+}
+
+/* /proc/meminfo. Memory is per address space here (each fork is a machine of its
+ * own), so the numbers describe the caller's own: total is the buffer it was
+ * given, free is what its allocator has not handed out, and the page-cache and
+ * swap fields are honestly zero - there is neither. */
 static size_t userland_proc_gen_meminfo(char* buf, size_t size)
 {
+    rvvm_userland_t* ctx     = uctx();
+    unsigned long long total = userland_proc_total_bytes(ctx);
+    unsigned long long free_b = userland_proc_free_bytes(ctx);
+    if (free_b > total) {
+        free_b = total;
+    }
+    unsigned long long total_kb = total / 1024ULL;
+    unsigned long long free_kb  = free_b / 1024ULL;
+
     return userland_proc_appendf(buf, size, 0,
-        "MemTotal:         262144 kB\n"
-        "MemFree:           65536 kB\n"
-        "MemAvailable:     131072 kB\n"
+        "MemTotal:       %llu kB\n"
+        "MemFree:        %llu kB\n"
+        "MemAvailable:   %llu kB\n"
         "Buffers:               0 kB\n"
         "Cached:                0 kB\n"
         "SwapCached:            0 kB\n"
+        "Active:                0 kB\n"
+        "Inactive:              0 kB\n"
         "SwapTotal:             0 kB\n"
-        "SwapFree:              0 kB\n");
+        "SwapFree:              0 kB\n"
+        "Shmem:                 0 kB\n"
+        "SReclaimable:          0 kB\n"
+        "SUnreclaim:            0 kB\n"
+        "VmallocTotal:          0 kB\n"
+        "VmallocUsed:           0 kB\n"
+        "HugePages_Total:       0\n"
+        "HugePages_Free:        0\n"
+        "Hugepagesize:       2048 kB\n",
+        total_kb, free_kb, free_kb);
 }
 
 static size_t userland_proc_gen_version(char* buf, size_t size)
@@ -9105,9 +9158,11 @@ static void userland_fill_sysinfo(struct uapi_sysinfo* si)
     userland_proc_snapshot_walk(userland_family_root(uctx()), pids, &n, RVVM_PROC_PID_MAX, 0);
     si->uptime   = (uapi_long_t)(userland_monotonic_ns() / 1000000000ULL);
     si->procs    = (uint16_t)n;
+    /* Memory as /proc/meminfo reports it (same source, so `free` - which reads
+     * sysinfo - and `top` - which reads meminfo - agree). */
     si->mem_unit = 1024;
-    si->totalram = 262144ULL;                  /* 256 MiB, in mem_unit units */
-    si->freeram  = 65536ULL;                   /*  64 MiB, in mem_unit units */
+    si->totalram = userland_proc_total_bytes(uctx()) / si->mem_unit;
+    si->freeram  = userland_proc_free_bytes(uctx()) / si->mem_unit;
 }
 
 static size_t userland_proc_gen_root_file(const char* leaf, char* buf, size_t size)
