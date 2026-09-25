@@ -228,9 +228,13 @@ as regression drivers.
 
 The core/client split is in place; the remaining distance to a full WSL is not
 the session model but the surrounding system: no Windows-drive bridge (`/mnt/c`,
-`wslpath`), only `/proc/mounts` is synthetic and `/sys` is empty (`ps`/`top` see
-nothing), no init/login in the rootfs, and the writable layer persists per
-release directory rather than per named distro (see `handover.md` §6).
+`wslpath`), `/sys` is empty, and the writable layer persists per release
+directory rather than per named distro (see `handover.md` §6). `/proc` is
+synthesized from the process registry (`rvvm_user.c`'s procfs section), so
+`ps`/`top` and `/proc/<pid>/{stat,status,statm,cmdline,comm,fd}` and
+`/proc/{self,uptime,stat,meminfo,version,cpuinfo,loadavg,filesystems,cmdline}`
+work; `/proc/mounts` stays the bundle's real file. There is no init/login in the
+rootfs.
 
 ### Persistence
 
@@ -536,7 +540,9 @@ Debug switches:
    `/home/lekkit/stuff/userland/debian`, and `RVVM_USER_PREFIX` (read by
    `rvvm_user`, applied via `rvvm_user_set_prefix()` by the WinHost) is what
    points it at a real rootfs. `/dev`, `/sys`, `/proc`, `/tmp` and `/var/tmp`
-   are deliberate exceptions that pass through unmapped. An empty environment
+   are deliberate exceptions that pass through unmapped - and `/dev` and
+   `/proc` are then answered by the core itself (`userland_dev_*` /
+   `userland_proc_*` in `rvvm_user.c`), since the host has no such tree. An empty environment
    value cannot express "no prefix" on Win32, because there `putenv("NAME=")`
    removes the variable and a removed variable means "keep the build-time
    default".

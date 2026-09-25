@@ -64,6 +64,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #endif
 
 #include <stdio.h>
+#include <stdarg.h>   // vsnprintf(), for the generated /proc files
 
 #include <errno.h>
 #include <unistd.h>
@@ -360,6 +361,25 @@ struct uapi_statfs64 {
     uapi_size_t frsize;
     uapi_size_t flags;
     uapi_size_t spare[4];
+};
+
+/* The RISC-V/Linux sysinfo(2) layout. The host call fills a host struct on
+ * Linux; elsewhere (Win32) it is generated from the registry, so `free`/`ps`
+ * see the guest's own numbers rather than the emulator host's. */
+struct uapi_sysinfo {
+    uapi_long_t  uptime;      /* seconds since boot */
+    uapi_ulong_t loads[3];
+    uapi_ulong_t totalram;    /* in units of mem_unit */
+    uapi_ulong_t freeram;
+    uapi_ulong_t sharedram;
+    uapi_ulong_t bufferram;
+    uapi_ulong_t totalswap;
+    uapi_ulong_t freeswap;
+    uint16_t     procs;
+    uint16_t     pad;
+    uapi_ulong_t totalhigh;
+    uapi_ulong_t freehigh;
+    uint32_t     mem_unit;    /* totalram/freeram are multiples of this */
 };
 
 struct uapi_sigaction {
@@ -686,6 +706,57 @@ static int64_t userland_read_fd(struct rvvm_userland* ctx, int fd, void* buf,
 static int64_t userland_write_fd(struct rvvm_userland* ctx, int fd, const void* buf,
                                  size_t count, bool block);
 
+/* ============================================================
+ * procfs (/proc) the userland serves itself
+ *
+ * A userland guest runs on a directory tree the host materializes, which has no
+ * kernel behind it: /proc exists as a plain (empty) directory, so `ps`, `top`
+ * and every tool that walks it see nothing - and `ps` in particular is handed
+ * by busybox, which reads /proc/<pid>/{stat,status,cmdline} for every pid it
+ * finds. The process registry (see rvvm_process_t) already knows every process
+ * of this run and its job-control identity, so the files are generated here
+ * from that registry rather than from a host file system.
+ *
+ * The files live behind descriptors of a reserved number range, exactly like
+ * the /dev nodes: the guest's number is an ordinary slot of the fd table, the
+ * payload is one of these records, and read()/lseek()/fstat()/close() dispatch
+ * on it (see userland_proc_by_fd).
+ * ============================================================ */
+#define RVVM_PROC_FD_BASE  0x7D000000   /* far above any host fd or /dev node */
+#define RVVM_PROC_FD_MAX   64
+#define RVVM_PROC_PID_MAX  256          /* Processes one snapshot can carry     */
+#define RVVM_PROC_NAME_MAX 64           /* Longest leaf name we serve           */
+#define RVVM_PROC_BUF_MAX  4096         /* Biggest generated file (status)      */
+#define RVVM_PROC_CMDLINE_MAX 256       /* argv snapshot kept per process        */
+
+struct rvvm_userland;
+static uint64_t userland_monotonic_ns(void);   // defined with the guest timers
+/* Whether @fd (a host-fd-table payload) is a procfs descriptor, and its
+ * reference/release pair. The fd table's own close path (which is defined long
+ * before the procfs section) needs them: a procfs descriptor rides on an
+ * emulator object, not a host fd, so it is released here rather than closed. */
+static bool userland_proc_is_fd(int fd);
+static void userland_proc_fd_ref(int fd);
+static void userland_proc_fd_release(int fd);
+static int64_t userland_proc_getdents(int fd, void* out, size_t size);
+static int64_t userland_proc_read(int fd, void* buf, size_t count);
+static int64_t userland_proc_lseek(int fd, int64_t off, int whence);
+/* The synthetic fd for a procfs directory or file, or a negative UAPI errno.
+ * Defined with the rest of the procfs section. */
+static rvvm_addr_t userland_proc_open_path(const char* abs, uint32_t self_pid,
+                                           int flags, bool cloexec);
+/* The pid of the process on this host thread - what "/proc/self" resolves to.
+ * Used by the path syscalls that run before the procfs section is defined. */
+static uint32_t userland_current_pid(void);
+/* Whether @abs names a procfs path, and what stat(2)/readlink(2) report for it.
+ * False means "not ours", and the caller continues with the host. */
+static bool userland_proc_path_stat(const char* abs, uint32_t self_pid, bool follow,
+                                    struct stat* st);
+/* 1 = ours and *out holds the target length, 0 = ours but not a symlink (the
+ * caller answers EINVAL), -1 = not ours. */
+static int userland_proc_readlink(const char* abs, uint32_t self_pid, char* buffer,
+                                  size_t size, rvvm_addr_t* out);
+
 /* One slot of a process's fd table: the host fd it rides on, plus the flags that
  * belong to the slot rather than to what it points at.
  *
@@ -752,6 +823,16 @@ typedef struct rvvm_process {
     struct rvvm_userland* parent_ctx; // The context its parent runs in, so an
                                 // exit/stop/continue can raise SIGCHLD there.
                                 // NULL for the run's root, which has no parent.
+
+    // --- What /proc reports about it (see the procfs section) ---
+    // The image's short name (Linux TASK_COMM_LEN), the argv strings joined by
+    // NULs, and the monotonic time it was launched. Set at launch and at every
+    // successful execve() by userland_proc_set_image(); a fork()ed child starts
+    // with a copy (see the record-copying in the clone path).
+    char         comm[16];
+    char         cmdline[RVVM_PROC_CMDLINE_MAX];
+    uint16_t     cmdline_len;
+    uint64_t     start_ms;    // Monotonic milliseconds, for /proc/<pid>/stat
 } rvvm_process_t;
 
 typedef struct {
@@ -804,6 +885,7 @@ typedef struct {
 #define RVVM_DT_UNKNOWN 0
 #define RVVM_DT_CHR     2
 #define RVVM_DT_DIR     4
+#define RVVM_DT_REG     8
 #define RVVM_DT_LNK     10
 
 typedef struct {
@@ -846,6 +928,32 @@ typedef struct {
     uint8_t  pending_type;
     char     pending[RVVM_SHADOW_DIR_NAME_MAX];
 } rvvm_shadow_dir_t;
+
+/* One descriptor the procfs hands out (see the "procfs" section). A directory
+ * carries a snapshot of the pid list taken when it was opened - a listing that
+ * changed under the reader mid-walk would be worse than a slightly stale one -
+ * plus the fixed names the core knows; a file carries its generated text and a
+ * read cursor. refs counts the slots reaching it (a dup, or a fork() that could
+ * not make a host copy), like a pty end. */
+typedef struct {
+    int      fd;          /* RVVM_PROC_FD_BASE + slot; 0 = free               */
+    uint32_t refs;
+    bool     is_dir;
+    bool     is_root;     /* A /proc root listing (fixed names are pid-less)   */
+    bool     fds_as_links;/* a /proc/<pid>/fd listing: pids[] hold fd numbers  */
+    // A regular file: the text generated at open, and how much was read.
+    char*    data;
+    size_t   size;
+    size_t   pos;
+    // A directory: the pids found when it was opened, and how far the walk got.
+    uint32_t pids[RVVM_PROC_PID_MAX];
+    uint32_t pid_count;
+    uint32_t phase;       /* 0 ".", 1 "..", then names[], then pids[]          */
+    const char* const* names;
+    uint32_t name_count;
+    uint64_t ino;         /* getdents cursor (d_ino/d_off), dirs only          */
+    uint32_t ino_stable;  /* st_ino, from the path it was opened by            */
+} rvvm_proc_fd_t;
 
 // Virtual TTY input ring (cooked bytes waiting for the guest) and the
 // canonical line buffer under construction. Both are small: this is an
@@ -3430,6 +3538,12 @@ static rvvm_addr_t rvvm_sys_faccessat(int dirfd, const char* path, int mode, int
         if (asset) {
             return rvvm_sys_asset_access(asset, mode);
         }
+        /* A procfs path exists, and is read-only: a write probe is refused the
+         * way the mount refuses one. */
+        struct stat pst;
+        if (userland_proc_path_stat(abs, userland_current_pid(), true, &pst)) {
+            return (mode & 2) ? -UAPI_EACCESS : 0;
+        }
     }
     return errno_ret(faccessat(dirfd, wrap_guest_path(pbuf, dirfd, path), mode, flags));
 }
@@ -3979,6 +4093,7 @@ static rvvm_process_t* userland_proc_create(rvvm_userland_t* ctx, uint32_t pid, 
     proc->pgid     = pgid;
     proc->sid      = sid;
     proc->refs     = 2;   // The registry's, plus the one handed back here
+    proc->start_ms = userland_monotonic_ns() / 1000000ULL;   // for /proc/<pid>/stat
     rvvm_event_init(&proc->exit_event);
     spin_lock(&ctx->proc_lock);
     vector_push_back(ctx->procs, proc);
@@ -4303,7 +4418,8 @@ static bool userland_fd_serves_own(rvvm_userland_t* ctx, int fd)
     int                  dev = -1;
     int                  hfd = userland_fd_host(ctx, fd);
 
-    if (userland_pty_by_fd(hfd, &pty, &master) || userland_dev_by_fd(hfd, &dev)) {
+    if (userland_pty_by_fd(hfd, &pty, &master) || userland_dev_by_fd(hfd, &dev) ||
+        userland_proc_is_fd(hfd)) {
         return true;
     }
     return fd >= 0 && fd <= 2 && userland_fd_is_console(ctx, fd);
@@ -4358,6 +4474,10 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
     bool master = false;
     if (userland_pty_by_fd(ctx->fds[fd].fd, &pty, &master)) {
         userland_pty_release(pty, master);
+    } else if (userland_proc_is_fd(ctx->fds[fd].fd)) {
+        /* A procfs descriptor rides on a generated object, not a host fd: the
+         * object is released here rather than closed. */
+        userland_proc_fd_release(ctx->fds[fd].fd);
     } else if (!ctx->fds[fd].shared && !userland_dev_by_fd(ctx->fds[fd].fd, NULL)) {
         /* A device descriptor is just a number: nothing was opened for it. */
         close(ctx->fds[fd].fd);
@@ -4461,6 +4581,16 @@ static int userland_own_fd_dup(rvvm_userland_t* ctx, int source_fd, int host_fd,
         if (guest_fd < 0) {
             return -1;
         }
+        userland_fd_install(ctx, guest_fd, host_fd, cloexec);
+        userland_fd_set_flags(ctx, guest_fd, userland_fd_flags(ctx, source_fd));
+        return guest_fd;
+    }
+    if (userland_proc_is_fd(host_fd)) {
+        int guest_fd = userland_fd_slot_alloc(ctx, min_fd);
+        if (guest_fd < 0) {
+            return -1;
+        }
+        userland_proc_fd_ref(host_fd);
         userland_fd_install(ctx, guest_fd, host_fd, cloexec);
         userland_fd_set_flags(ctx, guest_fd, userland_fd_flags(ctx, source_fd));
         return guest_fd;
@@ -4582,6 +4712,13 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
                                parent->fds[fd].cloexec, false,
                                parent->fds[fd].console, parent->fds[fd].flags,
                                "inherit_pty");
+            continue;
+        }
+        if (userland_proc_is_fd(parent->fds[fd].fd)) {
+            /* A generated /proc object: no host fd to dup, so the child gets its
+             * own reference to the same slot (its close releases that reference,
+             * not the parent's). */
+            userland_proc_fd_ref(parent->fds[fd].fd);
             continue;
         }
         if (parent->fds[fd].shared) {
@@ -5452,6 +5589,13 @@ static int rvvm_sys_clone(rvvm_user_thread_t* self, rvvm_hart_t* cpu, uint32_t f
     /* Where SIGCHLD and the wait-status wakeups have to go: the parent runs in
      * the context that just called clone(), not in the child's new one. */
     record->parent_ctx = ctx;
+    /* The child starts as a copy of the parent's image (it execve()s to change
+     * it), so /proc reports the same command until then. */
+    if (self->proc) {
+        memcpy(record->comm, self->proc->comm, sizeof(record->comm));
+        memcpy(record->cmdline, self->proc->cmdline, sizeof(record->cmdline));
+        record->cmdline_len = self->proc->cmdline_len;
+    }
 
     rvvm_userland_t* child = userland_child_create(ctx, child_pid);
     if (!child) {
@@ -5971,11 +6115,13 @@ static bool userland_own_fd(int host_fd)
     struct userland_pty* pty = NULL;
     bool master = false;
     int dev = -1;
-    return userland_pty_by_fd(host_fd, &pty, &master) || userland_dev_by_fd(host_fd, &dev);
+    return userland_pty_by_fd(host_fd, &pty, &master) || userland_dev_by_fd(host_fd, &dev) ||
+           userland_proc_is_fd(host_fd);
 }
 
 /* Ready right now, for the direction being watched. A /dev entry never blocks
- * either way; a pty is ready when the ring has data (or the far end is gone). */
+ * either way; a pty is ready when the ring has data (or the far end is gone); a
+ * generated /proc file can always be read (its text, or its end). */
 static bool userland_own_ready(int host_fd, bool write)
 {
     struct userland_pty* pty = NULL;
@@ -5983,6 +6129,9 @@ static bool userland_own_ready(int host_fd, bool write)
     int dev = -1;
     if (userland_pty_by_fd(host_fd, &pty, &master)) {
         return write || userland_pty_readable(pty, master);
+    }
+    if (userland_proc_is_fd(host_fd)) {
+        return !write;
     }
     return userland_dev_by_fd(host_fd, &dev);
 }
@@ -6255,6 +6404,11 @@ static int rvvm_sys_poll_time32(rvvm_addr_t pfds, size_t npfds, const struct uap
 
 static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
 {
+    /* A procfs directory: the entries come from the generated listing. */
+    if (userland_proc_is_fd(fd)) {
+        return userland_proc_getdents(fd, dirp, size);
+    }
+
     rvvm_asset_dir_t* asset_dir = asset_dir_lookup(fd);
 
     /* A directory inside the asset mount: the entries come from the host's
@@ -6564,6 +6718,20 @@ static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* bu
             }
             memcpy(buffer, entry->target, len);
             return (rvvm_addr_t)len;
+        }
+    }
+
+    /* A procfs link (/proc/self, /proc/<pid>/cwd|exe|root) is synthesized: the
+     * host has no file to read a target out of. */
+    if (pathname && (pathname[0] == '/' || dirfd == UAPI_AT_FDCWD) &&
+        guest_path_absolutize(abs, sizeof(abs), pathname)) {
+        rvvm_addr_t out = 0;
+        int rc = userland_proc_readlink(abs, userland_current_pid(), buffer, size, &out);
+        if (rc == 1) {
+            return out;
+        }
+        if (rc == 0) {
+            return -UAPI_EINVAL;   // ours, but not a symlink
         }
     }
 
@@ -7999,6 +8167,9 @@ static int64_t userland_read_fd(struct rvvm_userland* ctx, int fd, void* buf,
     bool master = false;
     int  dev = -1;
 
+    if (userland_proc_is_fd(host_fd)) {
+        return userland_proc_read(host_fd, buf, count);
+    }
     if (userland_pty_by_fd(host_fd, &pty, &master)) {
         return userland_pty_read(pty, master, buf, count, block);
     }
@@ -8023,6 +8194,9 @@ static int64_t userland_write_fd(struct rvvm_userland* ctx, int fd, const void* 
     bool master = false;
     int  dev = -1;
 
+    if (userland_proc_is_fd(host_fd)) {
+        return -UAPI_EACCESS;   /* /proc is read-only */
+    }
     if (userland_pty_by_fd(host_fd, &pty, &master)) {
         return userland_pty_write(pty, master, buf, count, ctx, block);
     }
@@ -8346,6 +8520,1143 @@ static bool userland_dev_stat_path(const char* abs, struct stat* st)
         st->st_gid = (unsigned)ctx->fake_gid;
     }
     return known;
+}
+
+/* ============================================================
+ * procfs (/proc) the userland serves itself
+ *
+ * A userland guest runs on a directory tree the host materializes, which has no
+ * kernel behind it: /proc exists as a plain directory, so `ps`, `top` and every
+ * tool that walks it would see nothing. The process registry (see rvvm_process_t)
+ * already knows every process of the run, so the files are generated here from
+ * that registry instead of from a host file system.
+ *
+ * The files ride on descriptors of a reserved number range, exactly like the
+ * /dev nodes: the guest's number is an ordinary fd-table slot, the payload is a
+ * record in userland_proc_fds, and read()/lseek()/fstat()/close() dispatch on it.
+ * A directory carries a snapshot of the pid list taken when it was opened (a
+ * listing that changed under the reader mid-walk would be worse than a slightly
+ * stale one); a file carries its generated text and a read cursor.
+ * ============================================================ */
+
+typedef enum {
+    RVVM_PROC_NONE = 0,
+    RVVM_PROC_ROOT_DIR,    // /proc
+    RVVM_PROC_ROOT_FILE,   // /proc/uptime, /proc/stat, ...
+    RVVM_PROC_SELF_LINK,   // /proc/self / /proc/thread-self (open follows it)
+    RVVM_PROC_PID_DIR,     // /proc/<pid>
+    RVVM_PROC_PID_FILE,    // /proc/<pid>/stat, status, ...
+    RVVM_PROC_PID_LINK,    // /proc/<pid>/cwd, exe, root
+    RVVM_PROC_PID_FD_DIR,  // /proc/<pid>/fd
+    RVVM_PROC_PID_FD_LINK, // /proc/<pid>/fd/<n>
+} rvvm_proc_kind_t;
+
+typedef struct {
+    rvvm_proc_kind_t kind;
+    uint32_t         pid;
+    uint32_t         fd;      // RVVM_PROC_PID_FD_LINK: which descriptor
+    char             leaf[RVVM_PROC_NAME_MAX];
+} rvvm_proc_path_t;
+
+static const char* const userland_proc_root_names[] = {
+    "self", "thread-self", "mounts", "uptime", "stat", "meminfo",
+    "version", "cpuinfo", "loadavg", "filesystems", "cmdline",
+};
+static const char* const userland_proc_root_files[] = {
+    "uptime", "stat", "meminfo", "version", "cpuinfo", "loadavg", "filesystems", "cmdline",
+};
+static const char* const userland_proc_pid_names[] = {
+    "stat", "status", "statm", "cmdline", "comm", "fd", "cwd", "exe", "root",
+};
+static const char* const userland_proc_pid_files[] = {
+    "stat", "status", "statm", "cmdline", "comm",
+};
+static const char* const userland_proc_pid_links[] = {
+    "cwd", "exe", "root",
+};
+
+/* The pid of the process running on this host thread: what "/proc/self" means
+ * to the syscall that is asking. 0 outside guest dispatch. */
+static uint32_t userland_current_pid(void)
+{
+    rvvm_user_thread_t* self = current_user_thread;
+    return (self && self->proc) ? self->proc->pid : 0;
+}
+
+static uint8_t userland_proc_name_type(bool is_root, const char* name)
+{
+    if (is_root) {
+        if (!strcmp(name, "self") || !strcmp(name, "thread-self")) {
+            return RVVM_DT_LNK;
+        }
+        return RVVM_DT_REG;
+    }
+    if (!strcmp(name, "fd")) {
+        return RVVM_DT_DIR;
+    }
+    if (!strcmp(name, "cwd") || !strcmp(name, "exe") || !strcmp(name, "root")) {
+        return RVVM_DT_LNK;
+    }
+    return RVVM_DT_REG;
+}
+
+/* Parse a guest-absolute path into what the procfs serves for it. False when it
+ * is not ours (including /proc/mounts, which the bundle materializes as a real
+ * file and which therefore stays with the host). */
+static bool userland_proc_parse(const char* abs, uint32_t self_pid, rvvm_proc_path_t* out)
+{
+    memset(out, 0, sizeof(*out));
+    out->kind = RVVM_PROC_NONE;
+
+    if (!abs || !path_has_prefix(abs, "/proc")) {
+        return false;
+    }
+    const char* rest = abs + 5;   /* past "/proc" */
+    if (*rest == 0) {
+        out->kind = RVVM_PROC_ROOT_DIR;
+        return true;
+    }
+    if (*rest != '/') {
+        return false;
+    }
+    rest++;
+
+    /* The first component, and whatever follows it. */
+    const char* slash = strchr(rest, '/');
+    size_t flen = slash ? (size_t)(slash - rest) : rvvm_strlen(rest);
+    if (flen == 0 || flen >= RVVM_PROC_NAME_MAX) {
+        return false;
+    }
+    char first[RVVM_PROC_NAME_MAX];
+    memcpy(first, rest, flen);
+    first[flen] = 0;
+    const char* tail = slash ? slash + 1 : NULL;
+    if (tail && *tail == 0) {
+        tail = NULL;
+    }
+
+    /* /proc/mounts is the bundle's real file: leave it to the host. */
+    if (!strcmp(first, "mounts")) {
+        return false;
+    }
+
+    bool self = !strcmp(first, "self") || !strcmp(first, "thread-self");
+    bool numeric = first[0] != 0;
+    uint32_t pid = 0;
+    for (const char* p = first; *p; ++p) {
+        if (*p < '0' || *p > '9') {
+            numeric = false;
+            break;
+        }
+        pid = pid * 10 + (uint32_t)(*p - '0');
+    }
+
+    if (self || numeric) {
+        if (numeric && pid == 0) {
+            return false;   /* pid 0 is not a process */
+        }
+        if (self) {
+            pid = self_pid;
+        }
+        if (!tail) {
+            out->kind = self ? RVVM_PROC_SELF_LINK : RVVM_PROC_PID_DIR;
+            out->pid  = pid;
+            return true;
+        }
+        if (!strcmp(tail, "fd")) {
+            out->kind = RVVM_PROC_PID_FD_DIR;
+            out->pid  = pid;
+            return true;
+        }
+        /* /proc/<pid>/fd/<n> names one descriptor. */
+        if (!strncmp(tail, "fd/", 3)) {
+            const char* num = tail + 3;
+            if (!*num) {
+                return false;
+            }
+            uint32_t n = 0;
+            for (const char* p = num; *p; ++p) {
+                if (*p < '0' || *p > '9') {
+                    return false;
+                }
+                n = n * 10 + (uint32_t)(*p - '0');
+            }
+            out->kind = RVVM_PROC_PID_FD_LINK;
+            out->pid  = pid;
+            out->fd   = n;
+            return true;
+        }
+        if (strchr(tail, '/') || rvvm_strlen(tail) >= RVVM_PROC_NAME_MAX) {
+            return false;   /* no other nested /proc/<pid>/x/y paths are served */
+        }
+        for (size_t i = 0; i < STATIC_ARRAY_SIZE(userland_proc_pid_files); i++) {
+            if (!strcmp(tail, userland_proc_pid_files[i])) {
+                out->kind = RVVM_PROC_PID_FILE;
+                out->pid  = pid;
+                rvvm_strlcpy(out->leaf, tail, sizeof(out->leaf));
+                return true;
+            }
+        }
+        for (size_t i = 0; i < STATIC_ARRAY_SIZE(userland_proc_pid_links); i++) {
+            if (!strcmp(tail, userland_proc_pid_links[i])) {
+                out->kind = RVVM_PROC_PID_LINK;
+                out->pid  = pid;
+                rvvm_strlcpy(out->leaf, tail, sizeof(out->leaf));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /* A pid-less file at the root of /proc. */
+    if (!tail) {
+        for (size_t i = 0; i < STATIC_ARRAY_SIZE(userland_proc_root_files); i++) {
+            if (!strcmp(first, userland_proc_root_files[i])) {
+                out->kind = RVVM_PROC_ROOT_FILE;
+                rvvm_strlcpy(out->leaf, first, sizeof(out->leaf));
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* ---------------------------------------------------------------- *
+ * Slots and the fd table
+ *
+ * The table is emulator-wide rather than per address space, like the pty pairs
+ * and for the same reason: an in-process fork() hands the child a copy of the
+ * descriptor, and both address spaces then reach the same object. A generated
+ * /proc file is self-contained (its text and pid snapshot were taken when it
+ * was opened), so there is nothing per-context about it once it exists.
+ * ---------------------------------------------------------------- */
+
+static spinlock_t     userland_proc_lock = RVVM_LOCK_INIT;
+static rvvm_proc_fd_t userland_proc_fds[RVVM_PROC_FD_MAX];
+
+static rvvm_proc_fd_t* userland_proc_slot_by_fd(int fd)
+{
+    if (fd < RVVM_PROC_FD_BASE) {
+        return NULL;
+    }
+    uint32_t idx = (uint32_t)fd - RVVM_PROC_FD_BASE;
+    if (idx >= RVVM_PROC_FD_MAX || userland_proc_fds[idx].fd != fd) {
+        return NULL;
+    }
+    return &userland_proc_fds[idx];
+}
+
+static bool userland_proc_is_fd(int fd)
+{
+    return userland_proc_slot_by_fd(fd) != NULL;
+}
+
+static void userland_proc_fd_ref(int fd)
+{
+    spin_lock(&userland_proc_lock);
+    rvvm_proc_fd_t* s = userland_proc_slot_by_fd(fd);
+    if (s) {
+        s->refs++;
+    }
+    spin_unlock(&userland_proc_lock);
+}
+
+static void userland_proc_fd_release(int fd)
+{
+    spin_lock(&userland_proc_lock);
+    rvvm_proc_fd_t* s = userland_proc_slot_by_fd(fd);
+    if (!s) {
+        spin_unlock(&userland_proc_lock);
+        return;
+    }
+    if (s->refs > 1) {
+        s->refs--;
+        spin_unlock(&userland_proc_lock);
+        return;
+    }
+    char* data = s->data;
+    memset(s, 0, sizeof(*s));
+    spin_unlock(&userland_proc_lock);
+    safe_free(data);
+}
+
+/* Reserve a free slot. The caller fills it and hands out its number; nothing
+ * else can grab it meanwhile because the fd is set under the lock. */
+static rvvm_proc_fd_t* userland_proc_slot_alloc(void)
+{
+    spin_lock(&userland_proc_lock);
+    for (size_t i = 0; i < RVVM_PROC_FD_MAX; i++) {
+        if (userland_proc_fds[i].fd == 0) {
+            rvvm_proc_fd_t* s = &userland_proc_fds[i];
+            memset(s, 0, sizeof(*s));
+            s->refs = 1;
+            s->fd   = RVVM_PROC_FD_BASE + (int)i;
+            spin_unlock(&userland_proc_lock);
+            return s;
+        }
+    }
+    spin_unlock(&userland_proc_lock);
+    return NULL;
+}
+
+/* ---------------------------------------------------------------- *
+ * Walking the process family
+ *
+ * A process record lives in two registries (its own context's and its parent's);
+ * a fork()ed child's address space is a context of its own, linked by
+ * child_ctx/parent_ctx. Enumerating "every process of this run" therefore means
+ * walking the context tree from the family root, not just the current ctx - `ps`
+ * itself runs in a child context and would otherwise only see itself.
+ * ---------------------------------------------------------------- */
+
+static void userland_proc_snapshot_walk(rvvm_userland_t* ctx, uint32_t* pids, uint32_t* count,
+                                        uint32_t max, int depth)
+{
+    if (!ctx || depth > USERLAND_FAMILY_DEPTH_MAX) {
+        return;
+    }
+    rvvm_userland_t* kids[RVVM_PROC_PID_MAX];
+    uint32_t nkids = 0;
+
+    spin_lock(&ctx->proc_lock);
+    vector_foreach(ctx->procs, i) {
+        rvvm_process_t* p = vector_at(ctx->procs, i);
+        bool dup = false;
+        for (uint32_t k = 0; k < *count; k++) {
+            if (pids[k] == p->pid) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup && *count < max) {
+            pids[(*count)++] = p->pid;
+        }
+        if (p->child_ctx && nkids < RVVM_PROC_PID_MAX) {
+            kids[nkids++] = p->child_ctx;
+        }
+    }
+    spin_unlock(&ctx->proc_lock);
+
+    for (uint32_t i = 0; i < nkids; i++) {
+        userland_proc_snapshot_walk(kids[i], pids, count, max, depth + 1);
+    }
+}
+
+/* Find one process by pid anywhere in the family. Returns a reference, and the
+ * context whose descriptors are its own. */
+static rvvm_process_t* userland_proc_find_family_walk(rvvm_userland_t* ctx, uint32_t pid,
+                                                      rvvm_userland_t** home, int depth)
+{
+    if (!ctx || depth > USERLAND_FAMILY_DEPTH_MAX) {
+        return NULL;
+    }
+    rvvm_process_t* found = NULL;
+    rvvm_userland_t* kids[RVVM_PROC_PID_MAX];
+    uint32_t nkids = 0;
+
+    spin_lock(&ctx->proc_lock);
+    vector_foreach(ctx->procs, i) {
+        rvvm_process_t* p = vector_at(ctx->procs, i);
+        if (p->pid == pid) {
+            found = userland_proc_ref(p);
+            if (home) {
+                *home = userland_proc_ctx(ctx, p);
+            }
+        } else if (p->child_ctx && nkids < RVVM_PROC_PID_MAX) {
+            kids[nkids++] = p->child_ctx;
+        }
+    }
+    spin_unlock(&ctx->proc_lock);
+
+    if (found) {
+        return found;
+    }
+    for (uint32_t i = 0; i < nkids; i++) {
+        found = userland_proc_find_family_walk(kids[i], pid, home, depth + 1);
+        if (found) {
+            return found;
+        }
+    }
+    return NULL;
+}
+
+static rvvm_process_t* userland_proc_find_family(rvvm_userland_t* ctx, uint32_t pid,
+                                                 rvvm_userland_t** home)
+{
+    return userland_proc_find_family_walk(userland_family_root(ctx), pid, home, 0);
+}
+
+static uint32_t userland_proc_thread_count(rvvm_userland_t* home)
+{
+    uint32_t n = 0;
+    if (!home) {
+        return 0;
+    }
+    spin_lock(&home->userland_threads_lock);
+    n = (uint32_t)vector_size(home->userland_threads);
+    spin_unlock(&home->userland_threads_lock);
+    return n;
+}
+
+/* ---------------------------------------------------------------- *
+ * Content generators
+ * ---------------------------------------------------------------- */
+
+/* Bounded append: writes as much of @fmt as fits and reports the new offset.
+ * Once the buffer is full the offset pins at @size and further calls are no-ops
+ * (the file is simply truncated, which is what a small /proc read would show). */
+static size_t userland_proc_appendf(char* buf, size_t size, size_t off, const char* fmt, ...)
+{
+    if (off >= size) {
+        return size;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, size - off, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        return off;
+    }
+    if ((size_t)n >= size - off) {
+        return size;
+    }
+    return off + (size_t)n;
+}
+
+/* /proc/<pid>/stat. Linux layout (fields 1..52); the ones this emulator does
+ * not model are reported as zero, which is what a reader that asks for them
+ * would see for a freshly started process anyway. busybox `ps` reads comm,
+ * state, ppid, pgrp, session, tty, utime/stime and the thread count. */
+/* The virtual size of @home's address space: the image plus the brk heap it
+ * grew. Enough for readers that want a non-zero number (busybox marks a
+ * process with vsz == rss == 0 as swapped). */
+static unsigned long long userland_proc_vsize(rvvm_userland_t* home)
+{
+    if (!home) {
+        return 0;
+    }
+    rvvm_addr_t base = home->elf.base ? to_addr(home->elf.base) : 0;
+    if (base && home->guest_brk_ptr > base) {
+        return (unsigned long long)(home->guest_brk_ptr - base);
+    }
+    /* The brk heap has not grown: the image's own extent is the size. */
+    return (unsigned long long)home->elf.buf_size;
+}
+
+static size_t userland_proc_gen_stat(rvvm_process_t* proc, rvvm_userland_t* home,
+                                     char* buf, size_t size)
+{
+    char  state      = proc->exited ? 'Z' : (proc->stopped ? 'T' : 'S');
+    unsigned long long tty = 0;
+    if (home && home->ctty) {
+        tty = (136ULL << 8) | (home->ctty->index & 0xFF);   /* Linux pts major */
+    }
+    unsigned long long nthreads  = userland_proc_thread_count(home);
+    unsigned long long starttime = proc->start_ms * 100ULL / 1000ULL;   /* USER_HZ */
+    unsigned long long vsize     = userland_proc_vsize(home);
+    unsigned long long rss       = vsize ? (vsize / 4096ULL) : 0;   /* pretend resident */
+
+    return userland_proc_appendf(buf, size, 0,
+        "%u (%s) %c"
+        " %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu"     /* 4..13  */
+        " %llu %llu %llu %llu"                                    /* 14..17 */
+        " %llu %llu %llu %llu"                                    /* 18..21 */
+        " %llu %llu %llu"                                         /* 22..24 */
+        " %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu"     /* 25..34 */
+        " %llu %llu %llu %llu %llu %llu %llu %llu"               /* 35..42 */
+        " %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n", /* 43..52 */
+        (unsigned)proc->pid, proc->comm[0] ? proc->comm : "?", (int)state,
+        /*  4 ppid     */ (unsigned long long)proc->ppid,
+        /*  5 pgrp     */ (unsigned long long)proc->pgid,
+        /*  6 session  */ (unsigned long long)proc->sid,
+        /*  7 tty_nr   */ tty,
+        /*  8 tpgid    */ 0ULL,
+        /*  9 flags    */ 0ULL,
+        /* 10 minflt   */ 0ULL,
+        /* 11 cminflt  */ 0ULL,
+        /* 12 majflt   */ 0ULL,
+        /* 13 cmajflt  */ 0ULL,
+        /* 14 utime    */ 0ULL,
+        /* 15 stime    */ 0ULL,
+        /* 16 cutime   */ 0ULL,
+        /* 17 cstime   */ 0ULL,
+        /* 18 priority */ 20ULL,
+        /* 19 nice     */ 0ULL,
+        /* 20 threads  */ nthreads,
+        /* 21 itreal   */ 0ULL,
+        /* 22 start    */ starttime,
+        /* 23 vsize    */ vsize,
+        /* 24 rss      */ rss,
+        /* 25..52      */ 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL,
+                           0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL,
+                           0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL);
+}
+
+/* /proc/<pid>/status. busybox reads Name, State, Uid and Gid out of it. */
+static size_t userland_proc_gen_status(rvvm_process_t* proc, rvvm_userland_t* home,
+                                       char* buf, size_t size)
+{
+    int uid = uctx()->fake_uid;
+    int gid = uctx()->fake_gid;
+    char st = proc->exited ? 'Z' : (proc->stopped ? 'T' : 'S');
+    const char* statename = proc->exited ? "zombie" : (proc->stopped ? "stopped" : "sleeping");
+    size_t len = 0;
+
+    len = userland_proc_appendf(buf, size, len, "Name:\t%s\n", proc->comm[0] ? proc->comm : "?");
+    len = userland_proc_appendf(buf, size, len, "State:\t%c (%s)\n", st, statename);
+    len = userland_proc_appendf(buf, size, len, "Tgid:\t%u\nPid:\t%u\nPPid:\t%u\n",
+                                (unsigned)proc->pid, (unsigned)proc->pid, (unsigned)proc->ppid);
+    len = userland_proc_appendf(buf, size, len, "Uid:\t%d\t%d\t%d\t%d\n", uid, uid, uid, uid);
+    len = userland_proc_appendf(buf, size, len, "Gid:\t%d\t%d\t%d\t%d\n", gid, gid, gid, gid);
+    len = userland_proc_appendf(buf, size, len, "FDSize:\t64\n");
+    len = userland_proc_appendf(buf, size, len, "Threads:\t%u\n", userland_proc_thread_count(home));
+    unsigned long long vsize_kb = userland_proc_vsize(home) / 1024ULL;
+    len = userland_proc_appendf(buf, size, len, "VmSize:\t%llu kB\nVmRSS:\t%llu kB\n",
+                                vsize_kb, vsize_kb);
+    return len;
+}
+
+static size_t userland_proc_gen_uptime(char* buf, size_t size)
+{
+    unsigned long long secs = userland_monotonic_ns() / 1000000000ULL;
+    return userland_proc_appendf(buf, size, 0, "%llu.00 %llu.00\n", secs, secs);
+}
+
+static size_t userland_proc_gen_meminfo(char* buf, size_t size)
+{
+    return userland_proc_appendf(buf, size, 0,
+        "MemTotal:         262144 kB\n"
+        "MemFree:           65536 kB\n"
+        "MemAvailable:     131072 kB\n"
+        "Buffers:               0 kB\n"
+        "Cached:                0 kB\n"
+        "SwapCached:            0 kB\n"
+        "SwapTotal:             0 kB\n"
+        "SwapFree:              0 kB\n");
+}
+
+static size_t userland_proc_gen_version(char* buf, size_t size)
+{
+    return userland_proc_appendf(buf, size, 0,
+        "Linux version 6.1.0-virtpass (rvvm@userland) #1 SMP riscv64\n");
+}
+
+static size_t userland_proc_gen_cpuinfo(char* buf, size_t size)
+{
+    return userland_proc_appendf(buf, size, 0,
+        "processor\t: 0\n"
+        "hart\t\t: 0\n"
+        "isa\t\t: rv64imafdc\n"
+        "mmu\t\t: sv39\n");
+}
+
+static size_t userland_proc_gen_loadavg(char* buf, size_t size)
+{
+    uint32_t pids[RVVM_PROC_PID_MAX];
+    uint32_t n = 0;
+    userland_proc_snapshot_walk(userland_family_root(uctx()), pids, &n, RVVM_PROC_PID_MAX, 0);
+    return userland_proc_appendf(buf, size, 0, "0.00 0.00 0.00 1/%u %u\n",
+                                 n ? n : 1, userland_current_pid());
+}
+
+static size_t userland_proc_gen_filesystems(char* buf, size_t size)
+{
+    return userland_proc_appendf(buf, size, 0,
+        "nodev\tsysfs\n"
+        "nodev\tproc\n"
+        "nodev\ttmpfs\n"
+        "nodev\tdevtmpfs\n"
+        "\text4\n");
+}
+
+static size_t userland_proc_gen_root_cmdline(char* buf, size_t size)
+{
+    return userland_proc_appendf(buf, size, 0, "\n");
+}
+
+static size_t userland_proc_gen_root_stat(char* buf, size_t size)
+{
+    uint32_t pids[RVVM_PROC_PID_MAX];
+    uint32_t n = 0;
+    userland_proc_snapshot_walk(userland_family_root(uctx()), pids, &n, RVVM_PROC_PID_MAX, 0);
+
+    size_t len = 0;
+    len = userland_proc_appendf(buf, size, len, "cpu  0 0 0 0 0 0 0 0 0 0\n");
+    len = userland_proc_appendf(buf, size, len, "cpu0 0 0 0 0 0 0 0 0 0 0\n");
+    len = userland_proc_appendf(buf, size, len, "intr 0\nctxt 0\n");
+    len = userland_proc_appendf(buf, size, len, "btime %llu\n", (unsigned long long)time(NULL));
+    len = userland_proc_appendf(buf, size, len, "processes %u\n", n);
+    len = userland_proc_appendf(buf, size, len, "procs_running 1\nprocs_blocked 0\n");
+    len = userland_proc_appendf(buf, size, len, "softirq 0 0 0 0 0 0 0 0 0 0\n");
+    return len;
+}
+
+/* sysinfo(2) as the guest should see it: uptime from the monotonic clock, the
+ * process count from the registry, and a fixed memory shape. (Linux keeps its
+ * own host call; this is what the hosts without one answer.) */
+static void userland_fill_sysinfo(struct uapi_sysinfo* si)
+{
+    if (!si) {
+        return;
+    }
+    memset(si, 0, sizeof(*si));
+    uint32_t pids[RVVM_PROC_PID_MAX];
+    uint32_t n = 0;
+    userland_proc_snapshot_walk(userland_family_root(uctx()), pids, &n, RVVM_PROC_PID_MAX, 0);
+    si->uptime   = (uapi_long_t)(userland_monotonic_ns() / 1000000000ULL);
+    si->procs    = (uint16_t)n;
+    si->mem_unit = 1024;
+    si->totalram = 262144ULL;                  /* 256 MiB, in mem_unit units */
+    si->freeram  = 65536ULL;                   /*  64 MiB, in mem_unit units */
+}
+
+static size_t userland_proc_gen_root_file(const char* leaf, char* buf, size_t size)
+{
+    if (!strcmp(leaf, "uptime"))    return userland_proc_gen_uptime(buf, size);
+    if (!strcmp(leaf, "stat"))      return userland_proc_gen_root_stat(buf, size);
+    if (!strcmp(leaf, "meminfo"))   return userland_proc_gen_meminfo(buf, size);
+    if (!strcmp(leaf, "version"))   return userland_proc_gen_version(buf, size);
+    if (!strcmp(leaf, "cpuinfo"))   return userland_proc_gen_cpuinfo(buf, size);
+    if (!strcmp(leaf, "loadavg"))   return userland_proc_gen_loadavg(buf, size);
+    if (!strcmp(leaf, "filesystems")) return userland_proc_gen_filesystems(buf, size);
+    if (!strcmp(leaf, "cmdline"))   return userland_proc_gen_root_cmdline(buf, size);
+    return 0;
+}
+
+static size_t userland_proc_gen_pid_file(const char* leaf, rvvm_process_t* proc,
+                                         rvvm_userland_t* home, char* buf, size_t size)
+{
+    if (!strcmp(leaf, "stat"))    return userland_proc_gen_stat(proc, home, buf, size);
+    if (!strcmp(leaf, "status"))  return userland_proc_gen_status(proc, home, buf, size);
+    if (!strcmp(leaf, "statm")) {
+        unsigned long long vsize = userland_proc_vsize(home);
+        return userland_proc_appendf(buf, size, 0, "%llu %llu 0 0 0 0 0\n",
+                                     vsize / 4096ULL, vsize / 4096ULL);
+    }
+    if (!strcmp(leaf, "cmdline")) {
+        size_t n = proc->cmdline_len;
+        if (n > size) {
+            n = size;
+        }
+        memcpy(buf, proc->cmdline, n);
+        return n;
+    }
+    if (!strcmp(leaf, "comm"))    return userland_proc_appendf(buf, size, 0, "%s\n",
+                                                                proc->comm[0] ? proc->comm : "?");
+    return 0;
+}
+
+/* ---------------------------------------------------------------- *
+ * Opening, reading and listing
+ * ---------------------------------------------------------------- */
+
+static rvvm_addr_t userland_proc_install(rvvm_proc_fd_t* s, bool cloexec)
+{
+    rvvm_userland_t* ctx = uctx();
+    int guest_fd = userland_fd_slot_alloc(ctx, 0);
+    if (guest_fd < 0) {
+        return -UAPI_EMFILE;
+    }
+    userland_fd_install(ctx, guest_fd, s->fd, cloexec);
+    userland_fd_set_flags(ctx, guest_fd, UAPI_O_RDONLY);
+    return (rvvm_addr_t)guest_fd;
+}
+
+/* A directory the procfs serves. @root picks the pid-less listing; otherwise it
+ * is a /proc/<pid> listing (pid_count stays 0). */
+static rvvm_addr_t userland_proc_opendir(bool root, int flags, bool cloexec)
+{
+    rvvm_userland_t* ctx = uctx();
+
+    if ((flags & 3) != 0) {
+        return -UAPI_EACCESS;   /* /proc is read-only */
+    }
+    rvvm_proc_fd_t* s = userland_proc_slot_alloc();
+    if (!s) {
+        return -UAPI_EMFILE;
+    }
+    s->is_dir = true;
+    s->is_root = root;
+    s->names  = root ? userland_proc_root_names : userland_proc_pid_names;
+    s->name_count = (uint32_t)(root ? STATIC_ARRAY_SIZE(userland_proc_root_names)
+                                    : STATIC_ARRAY_SIZE(userland_proc_pid_names));
+    if (root) {
+        userland_proc_snapshot_walk(userland_family_root(ctx), s->pids, &s->pid_count,
+                                    RVVM_PROC_PID_MAX, 0);
+    }
+
+    rvvm_addr_t fd = userland_proc_install(s, cloexec);
+    if ((int64_t)fd < 0) {
+        userland_proc_fd_release(s->fd);
+    }
+    return fd;
+}
+
+/* /proc/<pid>/fd: a listing of the descriptors that process holds. The records
+ * reuse the pid array - a fd number renders exactly like a pid, only with the
+ * link type (fds_as_links) instead of the directory type. */
+static rvvm_addr_t userland_proc_opendir_fd(uint32_t pid, int flags, bool cloexec)
+{
+    if ((flags & 3) != 0) {
+        return -UAPI_EACCESS;
+    }
+    rvvm_userland_t* home = NULL;
+    rvvm_process_t*  proc = userland_proc_find_family(uctx(), pid, &home);
+    if (!proc) {
+        return -UAPI_ENOENT;
+    }
+    rvvm_proc_fd_t* s = userland_proc_slot_alloc();
+    if (!s) {
+        userland_proc_unref(proc);
+        return -UAPI_EMFILE;
+    }
+    s->is_dir       = true;
+    s->fds_as_links = true;
+    s->names        = NULL;
+    s->name_count   = 0;
+    if (home) {
+        for (int fd = 0; fd < USERLAND_FD_TABLE_MAX && s->pid_count < RVVM_PROC_PID_MAX; fd++) {
+            if (home->fds[fd].used) {
+                s->pids[s->pid_count++] = (uint32_t)fd;
+            }
+        }
+    }
+    userland_proc_unref(proc);
+
+    rvvm_addr_t gfd = userland_proc_install(s, cloexec);
+    if ((int64_t)gfd < 0) {
+        userland_proc_fd_release(s->fd);
+    }
+    return gfd;
+}
+
+static rvvm_addr_t userland_proc_open_file(const rvvm_proc_path_t* pp, uint32_t self_pid,
+                                           int flags, bool cloexec)
+{
+    rvvm_userland_t* ctx = uctx();
+
+    if ((flags & 3) != 0) {
+        return -UAPI_EACCESS;
+    }
+/* A link (cwd/exe/root, /proc/self, /proc/<pid>/fd/<n>): served by
+     * readlink(2), not by open. */
+    if (pp->kind == RVVM_PROC_PID_LINK || pp->kind == RVVM_PROC_SELF_LINK ||
+        pp->kind == RVVM_PROC_PID_FD_LINK) {
+        return -UAPI_EACCESS;
+    }
+
+    rvvm_proc_fd_t* s = userland_proc_slot_alloc();
+    if (!s) {
+        return -UAPI_EMFILE;
+    }
+    s->ino_stable = userland_dev_ino(pp->leaf);   /* stable across reopens */
+
+    char*  buf = safe_new_arr(char, RVVM_PROC_BUF_MAX);
+    size_t len = 0;
+    if (pp->kind == RVVM_PROC_ROOT_FILE) {
+        len = userland_proc_gen_root_file(pp->leaf, buf, RVVM_PROC_BUF_MAX);
+    } else {
+        rvvm_userland_t* home = NULL;
+        rvvm_process_t*  proc = userland_proc_find_family(ctx, pp->pid, &home);
+        if (!proc) {
+            safe_free(buf);
+            return -UAPI_ENOENT;
+        }
+        len = userland_proc_gen_pid_file(pp->leaf, proc, home, buf, RVVM_PROC_BUF_MAX);
+        userland_proc_unref(proc);
+    }
+    s->data = buf;
+    s->size = len;
+    s->pos  = 0;
+    (void)self_pid;
+
+    rvvm_addr_t fd = userland_proc_install(s, cloexec);
+    if ((int64_t)fd < 0) {
+        userland_proc_fd_release(s->fd);
+    }
+    return fd;
+}
+
+static rvvm_addr_t userland_proc_open_path(const char* abs, uint32_t self_pid,
+                                           int flags, bool cloexec)
+{
+    rvvm_proc_path_t pp;
+    if (!userland_proc_parse(abs, self_pid, &pp) || pp.kind == RVVM_PROC_NONE) {
+        return -UAPI_ENOENT;
+    }
+    if (pp.kind == RVVM_PROC_ROOT_DIR || pp.kind == RVVM_PROC_PID_DIR) {
+        return userland_proc_opendir(pp.kind == RVVM_PROC_ROOT_DIR, flags, cloexec);
+    }
+    /* /proc/self opens as the pid's directory (the link is followed). */
+    if (pp.kind == RVVM_PROC_SELF_LINK) {
+        return userland_proc_opendir(false, flags, cloexec);
+    }
+    if (pp.kind == RVVM_PROC_PID_FD_DIR) {
+        return userland_proc_opendir_fd(pp.pid, flags, cloexec);
+    }
+    return userland_proc_open_file(&pp, self_pid, flags, cloexec);
+}
+
+/* One directory record per call, so the guest's readdir loop drives it. */
+static int64_t userland_proc_getdents(int fd, void* out, size_t size)
+{
+    if (!out) {
+        return -UAPI_EFAULT;
+    }
+    spin_lock(&userland_proc_lock);
+    rvvm_proc_fd_t* d = userland_proc_slot_by_fd(fd);
+    if (!d || !d->is_dir) {
+        spin_unlock(&userland_proc_lock);
+        return -UAPI_ENOTDIR;
+    }
+
+    const char* name = NULL;
+    uint8_t type = RVVM_DT_UNKNOWN;
+    char numbuf[16];
+
+    if (d->phase == 0) {
+        name = ".";
+        type = RVVM_DT_DIR;
+    } else if (d->phase == 1) {
+        name = "..";
+        type = RVVM_DT_DIR;
+    } else {
+        uint32_t idx = d->phase - 2;
+        if (idx < d->name_count) {
+            name = d->names[idx];
+            type = userland_proc_name_type(d->is_root, name);
+        } else {
+            uint32_t pidx = idx - d->name_count;
+            if (pidx >= d->pid_count) {
+                spin_unlock(&userland_proc_lock);
+                return 0;   /* end of directory */
+            }
+            snprintf(numbuf, sizeof(numbuf), "%u", d->pids[pidx]);
+            name = numbuf;
+            type = d->fds_as_links ? RVVM_DT_LNK : RVVM_DT_DIR;
+        }
+    }
+
+    size_t name_len = rvvm_strlen(name);
+    size_t reclen = (sizeof(struct uapi_linux_dirent64) + name_len + 1 + 7) & ~(size_t)7;
+    if (reclen > size) {
+        spin_unlock(&userland_proc_lock);
+        return -UAPI_EINVAL;
+    }
+    struct uapi_linux_dirent64* de = out;
+    memset(de, 0, reclen);
+    d->ino++;
+    de->d_ino     = d->ino;
+    de->d_off     = (int64_t)d->ino;
+    de->d_reclen  = (uint16_t)reclen;
+    de->d_type    = type;
+    memcpy(de->d_name, name, name_len + 1);
+    d->phase++;
+    spin_unlock(&userland_proc_lock);
+    return (int64_t)reclen;
+}
+
+static int64_t userland_proc_read(int fd, void* buf, size_t count)
+{
+    if (!buf) {
+        return -UAPI_EFAULT;
+    }
+    spin_lock(&userland_proc_lock);
+    rvvm_proc_fd_t* s = userland_proc_slot_by_fd(fd);
+    if (!s) {
+        spin_unlock(&userland_proc_lock);
+        return -UAPI_EBADF;
+    }
+    if (s->is_dir) {
+        spin_unlock(&userland_proc_lock);
+        return -UAPI_EISDIR;
+    }
+    if (s->pos >= s->size) {
+        spin_unlock(&userland_proc_lock);
+        return 0;
+    }
+    size_t left = s->size - s->pos;
+    if (count > left) {
+        count = left;
+    }
+    memcpy(buf, s->data + s->pos, count);
+    s->pos += count;
+    spin_unlock(&userland_proc_lock);
+    return (int64_t)count;
+}
+
+static int64_t userland_proc_lseek(int fd, int64_t off, int whence)
+{
+    spin_lock(&userland_proc_lock);
+    rvvm_proc_fd_t* s = userland_proc_slot_by_fd(fd);
+    if (!s) {
+        spin_unlock(&userland_proc_lock);
+        return -UAPI_EBADF;
+    }
+    if (s->is_dir) {
+        int64_t ret = -UAPI_EINVAL;
+        if (whence == SEEK_SET && off == 0) {
+            s->phase = 0;
+            s->ino   = 0;
+            ret = 0;
+        }
+        spin_unlock(&userland_proc_lock);
+        return ret;
+    }
+    int64_t base;
+    switch (whence) {
+        case SEEK_SET: base = 0;               break;
+        case SEEK_CUR: base = (int64_t)s->pos; break;
+        case SEEK_END: base = (int64_t)s->size; break;
+        default:
+            spin_unlock(&userland_proc_lock);
+            return -UAPI_EINVAL;
+    }
+    int64_t np = base + off;
+    if (np < 0) {
+        spin_unlock(&userland_proc_lock);
+        return -UAPI_EINVAL;
+    }
+    s->pos = (size_t)np;
+    spin_unlock(&userland_proc_lock);
+    return np;
+}
+
+static bool userland_proc_fd_fill_stat(int fd, struct stat* st)
+{
+    spin_lock(&userland_proc_lock);
+    rvvm_proc_fd_t* s = userland_proc_slot_by_fd(fd);
+    if (!s) {
+        spin_unlock(&userland_proc_lock);
+        return false;
+    }
+    uint32_t ino_stable = s->ino_stable;
+    bool     is_dir     = s->is_dir;
+    size_t   size       = s->size;
+    spin_unlock(&userland_proc_lock);
+
+    memset(st, 0, sizeof(*st));
+    st->st_dev = (dev_t)RVVM_SHADOW_DEV;
+    st->st_uid = (unsigned)uctx()->fake_uid;
+    st->st_gid = (unsigned)uctx()->fake_gid;
+    st->st_ino = (ino_t)(ino_stable ? ino_stable : 1);
+    if (is_dir) {
+        st->st_mode  = S_IFDIR | 0555;
+        st->st_nlink = 2;
+    } else {
+        st->st_mode  = S_IFREG | 0444;
+        st->st_nlink = 1;
+        st->st_size  = (off_t)size;
+    }
+    return true;
+}
+
+/* Whether @abs names something the procfs serves (as opposed to a path that
+ * merely starts with /proc, like /proc/mounts). */
+static bool userland_proc_has(const char* abs)
+{
+    rvvm_proc_path_t pp;
+    return userland_proc_parse(abs, userland_current_pid(), &pp);
+}
+
+/* stat(2)/lstat(2) of a procfs path. False when @abs is not ours. */
+static bool userland_proc_path_stat(const char* abs, uint32_t self_pid, bool follow,
+                                    struct stat* st)
+{
+    rvvm_proc_path_t pp;
+    if (!userland_proc_parse(abs, self_pid, &pp) || pp.kind == RVVM_PROC_NONE) {
+        return false;
+    }
+    /* A pid that is not in the registry has no /proc entry: let the caller fall
+     * through to the host, which reports the usual ENOENT. */
+    if (pp.kind != RVVM_PROC_ROOT_DIR && pp.kind != RVVM_PROC_ROOT_FILE &&
+        pp.kind != RVVM_PROC_SELF_LINK) {
+        rvvm_process_t* p = userland_proc_find_family(uctx(), pp.pid, NULL);
+        if (!p) {
+            return false;
+        }
+        userland_proc_unref(p);
+    }
+    memset(st, 0, sizeof(*st));
+    st->st_dev = (dev_t)RVVM_SHADOW_DEV;
+    st->st_uid = (unsigned)uctx()->fake_uid;
+    st->st_gid = (unsigned)uctx()->fake_gid;
+    st->st_ino = (ino_t)userland_dev_ino(abs);
+
+    switch (pp.kind) {
+        case RVVM_PROC_ROOT_DIR:
+        case RVVM_PROC_PID_DIR:
+        case RVVM_PROC_PID_FD_DIR:
+            st->st_mode  = S_IFDIR | 0555;
+            st->st_nlink = 2;
+            return true;
+        case RVVM_PROC_PID_FD_LINK:
+            if (!follow) {
+                st->st_mode  = S_IFLNK | 0777;
+                st->st_nlink = 1;
+            } else {
+                /* The target is a terminal or another device in every case this
+                 * userland can name; a character device is the honest shape. */
+                st->st_mode  = S_IFCHR | 0600;
+                st->st_nlink = 1;
+            }
+            return true;
+        case RVVM_PROC_SELF_LINK:
+            if (!follow) {
+                char num[16];
+                st->st_mode  = S_IFLNK | 0777;
+                st->st_nlink = 1;
+                st->st_size  = (off_t)snprintf(num, sizeof(num), "%u", pp.pid);
+            } else {
+                st->st_mode  = S_IFDIR | 0555;
+                st->st_nlink = 2;
+            }
+            return true;
+        case RVVM_PROC_ROOT_FILE:
+        case RVVM_PROC_PID_FILE:
+            st->st_mode  = S_IFREG | 0444;
+            st->st_nlink = 1;
+            return true;
+        case RVVM_PROC_PID_LINK:
+            if (!follow) {
+                st->st_mode  = S_IFLNK | 0777;
+                st->st_nlink = 1;
+            } else if (!strcmp(pp.leaf, "exe")) {
+                st->st_mode  = S_IFREG | 0555;
+                st->st_nlink = 1;
+            } else {
+                st->st_mode  = S_IFDIR | 0555;
+                st->st_nlink = 2;
+            }
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* The target of a /proc/<pid>/fd/<n> link: the terminal the descriptor answers,
+ * or the device it rides on. A descriptor this userland serves itself can be
+ * named exactly; something else gets the honest-enough /dev fallback. */
+static const char* userland_proc_fd_link_target(uint32_t pid, uint32_t fd,
+                                                char* buf, size_t size)
+{
+    rvvm_userland_t* home = NULL;
+    rvvm_process_t*  proc = userland_proc_find_family(uctx(), pid, &home);
+    int  hfd = (int)fd;
+    if (proc && home && (int)fd < USERLAND_FD_TABLE_MAX && home->fds[fd].used) {
+        hfd = home->fds[fd].fd;
+    }
+    if (proc) {
+        userland_proc_unref(proc);
+    }
+
+    struct userland_pty* pty = NULL;
+    bool master = false;
+    int  dev = -1;
+    if (userland_pty_by_fd(hfd, &pty, &master)) {
+        snprintf(buf, size, "/dev/pts/%u", pty->index);
+        return buf;
+    }
+    if (userland_dev_by_fd(hfd, &dev)) {
+        return dev == DEV_CONSOLE ? "/dev/console" : "/dev/null";
+    }
+    if (userland_proc_is_fd(hfd)) {
+        return "/proc";
+    }
+    return fd <= 2 ? "/dev/tty" : "/dev/null";
+}
+
+/* readlink(2) of a procfs link. See the header for the return convention. */
+static int userland_proc_readlink(const char* abs, uint32_t self_pid, char* buffer,
+                                  size_t size, rvvm_addr_t* out)
+{
+    rvvm_proc_path_t pp;
+    if (!userland_proc_parse(abs, self_pid, &pp)) {
+        return -1;
+    }
+    /* A pid that is not in the registry has no link to read. */
+    if (pp.kind == RVVM_PROC_PID_LINK || pp.kind == RVVM_PROC_PID_FD_LINK) {
+        rvvm_process_t* p = userland_proc_find_family(uctx(), pp.pid, NULL);
+        if (!p) {
+            return -1;
+        }
+        userland_proc_unref(p);
+    }
+    const char* target = NULL;
+    char pidstr[16];
+    char fdbuf[32];
+
+    if (pp.kind == RVVM_PROC_SELF_LINK) {
+        snprintf(pidstr, sizeof(pidstr), "%u", pp.pid);
+        target = pidstr;
+    } else if (pp.kind == RVVM_PROC_PID_FD_LINK) {
+        target = userland_proc_fd_link_target(pp.pid, pp.fd, fdbuf, sizeof(fdbuf));
+    } else if (pp.kind == RVVM_PROC_PID_LINK) {
+        if (!strcmp(pp.leaf, "cwd")) {
+            target = uctx()->cwd;
+        } else if (!strcmp(pp.leaf, "root")) {
+            target = "/";
+        } else if (!strcmp(pp.leaf, "exe")) {
+            target = uctx()->main_elf_path[0] ? uctx()->main_elf_path : "unknown";
+        }
+    }
+    if (!target) {
+        return 0;   /* ours, but not a symlink */
+    }
+    if (!buffer) {
+        return 0;
+    }
+    size_t len = rvvm_strlen(target);
+    if (len > size) {
+        len = size;
+    }
+    memcpy(buffer, target, len);
+    *out = (rvvm_addr_t)len;
+    return 1;
+}
+
+/* Record what /proc/<pid>/{stat,status,cmdline} report about @proc: the image's
+ * short name (the executable's basename, as Linux's TASK_COMM_LEN field), the
+ * argv strings joined by NULs, and the process's start time. Called at launch
+ * and at every successful execve(). @host_path is the host file the image came
+ * from, @argv/@argc the guest's arguments - either may be used for the name. */
+static void userland_proc_set_image(rvvm_process_t* proc, const char* host_path,
+                                    int argc, char** argv)
+{
+    if (!proc) {
+        return;
+    }
+    const char* name = (argc > 0 && argv && argv[0] && argv[0][0]) ? argv[0] : host_path;
+    const char* base = name ? name : "?";
+    for (const char* p = name; p && *p; ++p) {
+        if (*p == '/' || *p == '\\') {
+            base = p + 1;
+        }
+    }
+    /* The comm field lives in parens with no escaping, so a space or ')' in the
+     * name would break the stat line: replace both. */
+    size_t ci = 0;
+    for (; base[ci] && ci + 1 < sizeof(proc->comm); ci++) {
+        char c = base[ci];
+        proc->comm[ci] = (c == ')' || c == ' ' || c == '\t' || c == '\n') ? '_' : c;
+    }
+    proc->comm[ci] = 0;
+
+    size_t off = 0;
+    for (int i = 0; i < argc && argv && argv[i]; ++i) {
+        size_t l = rvvm_strlen(argv[i]);
+        if (off + l + 1 >= sizeof(proc->cmdline)) {
+            break;
+        }
+        memcpy(proc->cmdline + off, argv[i], l);
+        off += l;
+        proc->cmdline[off++] = 0;
+    }
+    if (off == 0) {
+        proc->cmdline[0] = 0;
+        off = 1;
+    }
+    proc->cmdline_len = (uint16_t)off;
 }
 
 /* openat() on /dev/ptmx: a new pair, with the master as the descriptor the
@@ -9099,6 +10410,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                             } else {
                                 a0 = errno_ret(-1);
                             }
+                        } else if (have_abs && userland_proc_has(abs)) {
+                            /* /proc is synthesized from the process registry:
+                             * the host tree has an empty directory (and a real
+                             * /proc/mounts, which userland_proc_parse() leaves
+                             * to the host). A directory gets a snapshot fd the
+                             * getdents64 path walks; a file its generated text. */
+                            a0 = userland_proc_open_path(abs, userland_current_pid(),
+                                                         (int)a2, (a2 & UAPI_O_CLOEXEC) != 0);
                         } else {
                             /* NULL path with AT_EMPTY_PATH refers to the dirfd */
                             const char* host_path = wrap_guest_path(path_buf, (int)a0, path);
@@ -9216,6 +10535,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 62: { // lseek
                     int lfd = userland_fd_host(uctx(), (int)a0);
+                    if (userland_proc_is_fd(lfd)) {
+                        /* A procfs file: the cursor is ours. A directory rewind
+                         * replays its listing from the start. */
+                        a0 = (rvvm_addr_t)userland_proc_lseek(lfd, (int64_t)a1, (int)a2);
+                        break;
+                    }
                     a0 = errno_ret(lseek(lfd, a1, a2));
                     /* Rewinding a directory restarts its listing, which has to
                      * replay the archive's links as well. */
@@ -9244,6 +10569,13 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = (block || user_tty_readable(uctx()))
                            ? (rvvm_addr_t)user_tty_read(uctx(), buf, a2, block)
                            : (rvvm_addr_t)-UAPI_EAGAIN;
+                        break;
+                    }
+                    if (userland_proc_is_fd(userland_fd_host(uctx(), (int)a0))) {
+                        /* A generated /proc file: copy from its text (a
+                         * directory answers EISDIR, like a real one). */
+                        a0 = (rvvm_addr_t)userland_proc_read(userland_fd_host(uctx(), (int)a0),
+                                                             buf, a2);
                         break;
                     }
                     if (asset_dir_lookup((int)a0)) {
@@ -9288,6 +10620,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                     bool console_out = (a0 == 1 || a0 == 2) && userland_fd_is_console(uctx(), (int)a0);
                     int  host_fd     = userland_fd_host(uctx(), (int)a0);
                     int  wfd         = (int)a0;   // a0 is the result from here on
+                    if (userland_proc_is_fd(host_fd)) {
+                        a0 = -UAPI_EACCESS;   /* /proc is read-only */
+                        break;
+                    }
                     if (console_out) {
                         // fd 1/2: feed the virtual TTY parser first (no-op unless a
                         // host injected a VTerm or registered a tty callback). The
@@ -9410,6 +10746,25 @@ static void* rvvm_user_thread_wrap(void* arg)
                             total += r;
                         }
                         a0 = errno_ret(total);
+                    } else if (a7 == 65 && userland_proc_is_fd(iov_fd)) {
+                        /* A generated /proc file, read segment by segment. */
+                        ssize_t total = 0;
+                        for (int i = 0; i < (int)a2; i++) {
+                            if (!hiov[i].iov_len) {
+                                continue;
+                            }
+                            ssize_t r = (ssize_t)userland_proc_read(iov_fd, hiov[i].iov_base,
+                                                                    hiov[i].iov_len);
+                            if (r < 0) {
+                                total = total ? total : r;
+                                break;
+                            }
+                            if (r == 0) {
+                                break;
+                            }
+                            total += r;
+                        }
+                        a0 = errno_ret(total);
                     } else if (a7 == 65) {
                         if (a0 == 0 && uctx()->tty && iov_console) {
                             // fd 0 is the virtual TTY: serve readv() from the
@@ -9464,14 +10819,38 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 67: { // pread64
                     void* buf = a2 ? to_ptr_sz(a1, a2) : NULL;
-                    a0 = (a2 && !buf) ? (rvvm_addr_t)-UAPI_EFAULT
-                         : errno_ret(pread(userland_fd_host(uctx(), (int)a0), buf, a2, a3));
+                    int   pfd = userland_fd_host(uctx(), (int)a0);
+                    if (a2 && !buf) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    if (userland_proc_is_fd(pfd)) {
+                        /* Positioned read on a generated file: save the cursor,
+                         * read from @off, restore. */
+                        int64_t saved = userland_proc_lseek(pfd, 0, SEEK_CUR);
+                        userland_proc_lseek(pfd, (int64_t)a3, SEEK_SET);
+                        int64_t rd = userland_proc_read(pfd, buf, a2);
+                        if (saved >= 0) {
+                            userland_proc_lseek(pfd, saved, SEEK_SET);
+                        }
+                        a0 = (rvvm_addr_t)rd;
+                        break;
+                    }
+                    a0 = errno_ret(pread(pfd, buf, a2, a3));
                     break;
                 }
                 case 68: { // pwrite64
                     const void* buf = a2 ? to_ptr_sz(a1, a2) : NULL;
-                    a0 = (a2 && !buf) ? (rvvm_addr_t)-UAPI_EFAULT
-                         : errno_ret(pwrite(userland_fd_host(uctx(), (int)a0), buf, a2, a3));
+                    int   pwfd = userland_fd_host(uctx(), (int)a0);
+                    if (a2 && !buf) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    if (userland_proc_is_fd(pwfd)) {
+                        a0 = -UAPI_EACCESS;   /* /proc is read-only */
+                        break;
+                    }
+                    a0 = errno_ret(pwrite(pwfd, buf, a2, a3));
                     break;
                 }
                 case 71: { // sendfile64
@@ -9524,6 +10903,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                         uapi_stat_convert(out, &st);
                         break;
                     }
+                    /* A procfs path: a directory, a generated file, or a link
+                     * (its target when followed, the link itself for lstat). */
+                    if (path && (path[0] == '/' || (int)a0 == UAPI_AT_FDCWD)) {
+                        char proc_abs[UAPI_PATH_MAX];
+                        struct stat proc_st = {0};
+                        if (guest_path_absolutize(proc_abs, sizeof(proc_abs), path) &&
+                            userland_proc_path_stat(proc_abs, userland_current_pid(),
+                                                    (a3 & AT_SYMLINK_NOFOLLOW) == 0, &proc_st)) {
+                            a0 = 0;
+                            uapi_stat_convert(out, &proc_st);
+                            break;
+                        }
+                    }
                     /* A synthesized /dev node or directory: the guest can open
                      * it (and list it), so it must be able to stat() it too -
                      * getty and every shell's tty check do. */
@@ -9558,6 +10950,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                         uapi_stat_convert(out, &st);
                         break;
                     }
+                    /* fstatat(fd, NULL, AT_EMPTY_PATH) on a procfs descriptor. */
+                    if (!path && (a3 & AT_EMPTY_PATH)) {
+                        int phfd = userland_fd_host(uctx(), (int)a0);
+                        if (userland_proc_is_fd(phfd) && userland_proc_fd_fill_stat(phfd, &st)) {
+                            a0 = 0;
+                            uapi_stat_convert(out, &st);
+                            break;
+                        }
+                    }
                     if (!path && !(a3 & AT_EMPTY_PATH)) {
                         /* fstatat would dereference the NULL path */
                         ret = -1;
@@ -9588,6 +10989,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                          * fstat. fdopendir() does exactly this to validate its
                          * argument, so it has to answer S_IFDIR. */
                         asset_dir_fill_stat(&st);
+                        a0 = 0;
+                    } else if (userland_proc_is_fd(userland_fd_host(uctx(), (int)fd))) {
+                        /* A generated /proc file or directory: no host fd to
+                         * fstat, so the shape is answered here. */
+                        userland_proc_fd_fill_stat(userland_fd_host(uctx(), (int)fd), &st);
                         a0 = 0;
                     } else if (userland_fd_is_console(uctx(), (int)fd) && uctx()->tty) {
                         /* The run's console: a character device, exactly what
@@ -10141,13 +11547,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 178: // gettid
                     a0 = thread->tid;
                     break;
-#ifdef __linux__
-                case 179: // sysinfo
-                    // TODO: struct conversion(?)
+case 179: // sysinfo
                     rvvm_info("sys_sysinfo(%lx)", a0);
+#ifdef __linux__
+                    // TODO: struct conversion(?)
                     a0 = errno_ret(sysinfo(to_ptr(a0)));
-                    break;
+#else
+                    /* No host sysinfo(): answer from the registry, so `ps`
+                     * (which calls it before walking /proc) gets a workable
+                     * structure instead of ENOSYS. */
+                    userland_fill_sysinfo(to_ptr_sz(a0, sizeof(struct uapi_sysinfo)));
+                    a0 = 0;
 #endif
+                    break;
                 case 194: // shmget
                     rvvm_info("sys_shmget(%lx, %lx, %lx)", a0, a1, a2);
                     a0 = errno_ret(shmget(a0, a1, a2));
@@ -10705,8 +12117,12 @@ static void* rvvm_user_thread_wrap(void* arg)
 
 // Jump into _start after setting up the context
 // Both @entry and @stack_top are guest addresses
-static void jump_start(size_t entry, size_t stack_top)
+static void jump_start(size_t entry, size_t stack_top, const char* image_path,
+                       int argc, char** argv)
 {
+    (void)image_path;
+    (void)argc;
+    (void)argv;
 #ifdef RVVM_USER_TEST_RISCV
     register size_t a0 __asm__("a0") = (size_t) entry;
     register size_t sp __asm__("sp") = (size_t) stack_top;
@@ -10771,6 +12187,8 @@ static void jump_start(size_t entry, size_t stack_top)
     thread->proc = userland_proc_create(ctx, root_pid,
                                         root_pid == USERLAND_INIT_TASK_ID ? 0 : USERLAND_ROOT_PARENT_ID,
                                         0, true, root_pid, root_pid);
+    /* What /proc/<pid>/{stat,status,cmdline} will report about it. */
+    userland_proc_set_image(thread->proc, image_path, argc, argv);
     thread->tid  = thread->proc->pid;
     /* ...and it is the console's foreground group until somebody says otherwise. */
     ctx->tty_fg_pgid = root_pid;
@@ -11304,6 +12722,10 @@ static bool guest_exec(rvvm_userland_t* ctx, rvvm_hart_t* cpu, rvvm_user_thread_
     }
     rvclose(file);
 
+    /* The process image changed in place: /proc/<pid>/{comm,cmdline} follow it.
+     * The pid and the start time do not - an execve() keeps its process. */
+    userland_proc_set_image(thread->proc, host_path, (int)argc, argv);
+
     /* A thread still running the old program would run the new image's bytes at
      * whatever address it happened to be, so the process is cut down to this
      * thread before the image starts. */
@@ -11656,7 +13078,7 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
 
     rvvm_addr_t stack_top = guest_setup_stack(ctx, (size_t)argc, argv, envp);
 
-    jump_start(guest_entry_point(ctx), stack_top);
+    jump_start(guest_entry_point(ctx), stack_top, ctx->main_elf_path, argc, argv);
 
     /* End the Android NDK API proxy's part in this run - not cmdpost_cleanup():
      * that dismantles the bridge the *host* owns, and the host may still want
