@@ -153,10 +153,16 @@ foreach ($s in 'sigint','sigtstp','fg-resume','fg-again','bg','killpg','killpg-c
     pwsh ./tools/jobctl_e2e.ps1 -Scenario $s
 }
 
-# And the corners a shell cannot be asked about (WCONTINUED, and the pty line
-# discipline / resize a session server drives) are a guest sample:
+# And the corners a shell cannot be asked about (WCONTINUED, the controlling
+# terminal, and the pty line discipline / resize a session server drives) are a
+# guest sample:
 $env:RVVM_ASH_SHELL='guest-assets\test_jobctl.exe'
-.\release.windows.x86_64\rvvm_ash_x86_64.exe            # 36 checks, PASS
+.\release.windows.x86_64\rvvm_ash_x86_64.exe            # 49 checks, PASS
+
+# A shell's redirect has to survive fork(): open -> dup2 -> close -> fork, and
+# the child (or an execve()d cat) must get a readable descriptor:
+$env:RVVM_ASH_SHELL='guest-assets\test_forkfd.exe'
+.\release.windows.x86_64\rvvm_ash_x86_64.exe            # 17 checks, PASS
 ```
 
 Known gaps (see `handover.md` §6): `jobs` still shows `Stopped` after a

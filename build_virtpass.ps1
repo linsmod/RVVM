@@ -13,7 +13,7 @@
     invocation (so -jN is shared by all goals of the run):
 
       all     -> bin android vp-sdk   (default when -Target is omitted)
-      win32   -> bin                  (rvvm_winhost_<arch>.exe + the other Windows binaries)
+      win32   -> guest-assets + bin   (guest ELFs + rvvm_winhost_<arch>.exe + the other Windows binaries)
       apk     -> android              (guest assets + librvvm_jni.so + APK)
       android -> same as apk
       assets  -> guest-assets         (zig/musl riscv64 guest ELFs into the build tree)
@@ -112,7 +112,7 @@ if (($env:PATH -split ';') -notcontains $mingwBin) {
 # --- -Target -> make goals (the single source of truth for what gets built) ---
 $targetMap = @{
     'all'     = @('bin', 'android', 'vp-sdk')
-    'win32'   = @('bin')
+    'win32'   = @('guest-assets', 'bin')
     'apk'     = @('android')
     'android' = @('android')
     'assets'  = @('guest-assets')

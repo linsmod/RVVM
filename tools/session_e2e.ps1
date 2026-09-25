@@ -55,11 +55,18 @@ $fails = 0
 $ESC = [char]27
 $BEL = [char]7
 
+# The harness's own lines carry the clock too: they are read next to the core's
+# trace and the daemon's log, and a session's trouble is usually a race between
+# them (what the client saw vs. what the guest did, milliseconds apart).
+function TS() {
+    "[" + ([Environment]::TickCount64).ToString().PadLeft(9) + " ms] "
+}
+
 function Check($ok, $what, $detail) {
     if ($ok) {
-        "ok   $what"
+        "$(TS)ok   $what"
     } else {
-        "FAIL $what"
+        "$(TS)FAIL $what"
         # What the socket answered, so a failing check can be read without
         # re-running the driver.
         $shown = if ($detail) { $detail } else { $script:lastRead }
@@ -104,11 +111,15 @@ function Read-Until($c, [string]$pattern, [int]$timeoutMs) {
     while ([Environment]::TickCount64 -lt $deadline) {
         if ($c.Tcp.Available -gt 0) {
             $n = $c.Tcp.GetStream().Read($buf, 0, $buf.Length)
-            if ($n -le 0) { break }   # the far end closed
+            if ($n -le 0) { break }
             $text = [Text.Encoding]::UTF8.GetString($buf, 0, $n)
             [void]$seen.Append($text)
             [void]$c.Buf.Append($text)
-            if ($seen.ToString() -match $pattern) { break }
+            # Match on the text with ANSI sequences stripped: the shell
+            # emits ESC[6n (and friends) right after a prompt, and a pattern
+            # like '# ' would then never see its space.
+            $plain = $seen.ToString() -replace "`e\[[0-9;]*[A-Za-z]", ''
+            if ($plain -match $pattern) { break }
         } else {
             Start-Sleep -Milliseconds 20
         }
@@ -121,21 +132,36 @@ function Read-Until($c, [string]$pattern, [int]$timeoutMs) {
 function Read-Until-Closed($c, [int]$timeoutMs) {
     $deadline = [Environment]::TickCount64 + $timeoutMs
     $buf = New-Object byte[] 4096
+    $seen = New-Object System.Text.StringBuilder
     while ([Environment]::TickCount64 -lt $deadline) {
         if ($c.Tcp.Available -gt 0) {
             $n = $c.Tcp.GetStream().Read($buf, 0, $buf.Length)
-            if ($n -le 0) { return $true }
-            [void]$c.Buf.Append([Text.Encoding]::UTF8.GetString($buf, 0, $n))
-        } else {
-            # Available == 0 and the peer is gone is what a closed socket looks
-            # like: probe with a zero-length read.
-            try {
-                if ($c.Tcp.Client.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead) -and
-                    $c.Tcp.Available -eq 0) { return $true }
-            } catch { return $true }
-            Start-Sleep -Milliseconds 20
+            if ($n -le 0) {
+                # The peer closed: anything already read is what the caller
+                # gets to look at when the check fails.
+                $script:lastRead = $seen.ToString()
+                return $true
+            }
+            $text = [Text.Encoding]::UTF8.GetString($buf, 0, $n)
+            [void]$seen.Append($text)
+            [void]$c.Buf.Append($text)
+            continue
         }
+        # Available == 0 and the peer is gone is what a closed socket looks
+        # like: probe with a zero-length read.
+        try {
+            if ($c.Tcp.Client.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead) -and
+                $c.Tcp.Available -eq 0) {
+                $script:lastRead = $seen.ToString()
+                return $true
+            }
+        } catch {
+            $script:lastRead = $seen.ToString()
+            return $true
+        }
+        Start-Sleep -Milliseconds 20
     }
+    $script:lastRead = $seen.ToString()
     return $false
 }
 
@@ -203,6 +229,25 @@ Send-Text $A ('cd /tmp && pwd' + $nl)
 $r = Read-Until $A '/tmp' 5000
 Check ($r -match '/tmp') 'the session keeps its own state (cwd)'
 
+# --- one session, one file ----------------------------------------------
+# The shape a shared filesystem stands on: a session redirects into a file
+# (which hands the shell's fd 1 to a host descriptor) and then reads it back.
+# Checked in *one* session first, so a failure here says "a session cannot read
+# what it wrote" rather than "the other session cannot see it".
+Send-Text $A ('echo selfcheck-content > /tmp/selfcheck.txt' + $nl)
+Start-Sleep -Milliseconds 400
+Send-Text $A ('ls -l /tmp/selfcheck.txt' + $nl)
+$r = Read-Until $A 'selfcheck.txt' 5000
+"$(TS)DIAG: ls -l: " + ($r -replace "`r", '' -replace "`n", '|')
+Send-Text $A ('cat /tmp/selfcheck.txt' + $nl)
+$r = Read-Until $A 'selfcheck-content' 5000
+Check ($r -match 'selfcheck-content') 'a session reads back the file it wrote'
+Send-Text $A ('wc -c < /tmp/selfcheck.txt' + $nl)
+$r = Read-Until $A 'selfcheck-content|\d+' 5000
+Check ($r -match '(?m)^\s*18\s*$') 'the file the session wrote has 18 bytes in it'
+Send-Text $A ('rm -f /tmp/selfcheck.txt' + $nl)
+Start-Sleep -Milliseconds 300
+
 Send-Text $A ('echo pid-a=$$' + $nl)
 $r = Read-Until $A 'pid-a=[0-9]+' 5000
 $pidA = if ($r -match 'pid-a=([0-9]+)') { $Matches[1] } else { '' }
@@ -224,6 +269,12 @@ if ($Multi) {
 
     Send-Text $A ('echo shared-core-state > /tmp/session-shared.txt' + $nl)
     Start-Sleep -Milliseconds 400
+    # A reads its own file back first: this separates "cat with an argument is
+    # broken in a session" from "the second session cannot see the file".
+    Send-Text $A ('cat /tmp/session-shared.txt' + $nl)
+    $r = Read-Until $A 'shared-core-state' 5000
+    Check ($r -match 'shared-core-state') 'the writing session reads the file back'
+
     Send-Text $B ('cat /tmp/session-shared.txt' + $nl)
     $r = Read-Until $B 'shared-core-state' 5000
     Check ($r -match 'shared-core-state') 'both sessions share one filesystem (the core state)'
@@ -237,11 +288,8 @@ Start-Sleep -Milliseconds 900
 Send-Key $A 0x03
 $r = Read-Until $A '\^C' 5000
 Check ($r -match '\^C') '^C written to the socket reaches the session (ISIG on the pty)'
-# The prompt after it says the shell survived. Asserted on the session's whole
-# transcript rather than the last read: the prompt often arrives in the same
-# burst as the notation.
-$r = Read-Until $A '# ' 3000
-Check ($A.Buf.ToString() -match '/tmp # ') 'the shell survives its command being interrupted'
+$r = Read-Until $A '#\s*' 5000
+Check ($r -match '# ') 'the shell survives its command being interrupted'
 
 Send-Text $A ('sleep 30' + $nl)
 Start-Sleep -Milliseconds 900
@@ -252,12 +300,25 @@ Send-Text $A ('jobs' + $nl)
 $r = Read-Until $A 'Stopped' 5000
 Check ($r -match 'Stopped') 'jobs reports it as stopped'
 Send-Text $A ('kill -KILL %1' + $nl)
-$r = Read-Until $A '# ' 5000
+$r = Read-Until $A '#\s*' 5000
 Check ($r -match '# ') 'the stopped job can be killed and the shell carries on'
 
 # --- a client leaving is not the core leaving ---------------------------
+# Let the previous command (`kill -KILL %1`) finish draining before the exit
+# goes in: the pty is byte-ordered, and an `exit` sent while its output is
+# still in flight races the driver's own read (it would see the trailing
+# prompt of the *previous* command and call the session still open).
+$r = Read-Until $A '#\s*' 5000
+Start-Sleep -Milliseconds 300
+$tsExit = [Environment]::TickCount64
 Send-Text $A ('exit' + $nl)
-Check (Read-Until-Closed $A 8000) 'the client that exits has its session closed'
+$rc = Read-Until-Closed $A 8000
+$tsDone = [Environment]::TickCount64
+$pollR = $A.Tcp.Client.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead)
+$pollW = $A.Tcp.Client.Poll(0, [System.Net.Sockets.SelectMode]::SelectWrite)
+$localPort = ($A.Tcp.Client.LocalEndPoint).Port
+"$(TS)DIAG: A.localPort=$localPort exitSent=$tsExit elapsed=$($tsDone-$tsExit)ms rc=$rc pollR=$pollR pollW=$pollW"
+Check $rc 'the client that exits has its session closed'
 
 if ($Multi) {
     Send-Text $B ('echo B-ALIVE' + $nl)
@@ -285,7 +346,7 @@ $want = if ($Multi) { 2 } else { 1 }
 Check ($sessions -ge $want) "the core started $sessions session(s) without exiting"
 
 "--- core console ---"
-($out -split "`n" | Where-Object { $_ -match 'vpsessiond' }) -join "`n"
+($out -split "`n" | Where-Object { $_ -match 'vpsessiond|dbg:' }) -join "`n"
 "--- core stderr (filtered) ---"
 ($err -split "`n" | Where-Object { $_ -and $_ -notmatch 'Syscall \d+ failed' }) -join "`n"
 

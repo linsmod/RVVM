@@ -2850,21 +2850,25 @@ static bool path_has_prefix(const char* path, const char* prefix)
 
 static bool path_bypass(const char* path)
 {
+    static const char* const dirs[] = { "/dev", "/sys", "/proc", "/tmp", "/var/tmp" };
     const char* prefix = uctx()->prefix_path;
+
     if (prefix == NULL) {
         return true;
     }
-    if (path_has_prefix(path, "/dev")  || path_has_prefix(path, "/sys") ||
-        path_has_prefix(path, "/proc") || path_has_prefix(path, "/tmp") ||
-        path_has_prefix(path, "/var/tmp")) {
-        /* These five still bypass the prefix, because on the host they are the
-         * session's own devices and scratch space. But when the guest runs on an
-         * archive that *has* them - a minirootfs ships /dev, /proc, /sys, /tmp
-         * and /var/tmp as (empty) directories - the guest's own rootfs wins:
-         * bypassing those would send it to the host's root, where they do not
-         * exist (Windows has no C:\dev), and the guest would lose directories it
-         * can see in its own listing. The mount table replaces this rule. */
-        return uctx()->shadow == NULL || vp_shadow_lookup(uctx()->shadow, path) == NULL;
+    for (size_t i = 0; i < STATIC_ARRAY_SIZE(dirs); ++i) {
+        if (path_has_prefix(path, dirs[i])) {
+            /* The guest's own rootfs wins when the archive *has* the
+             * directory: a minirootfs ships /dev, /tmp, ... (empty), and
+             * sending an access to the host's root - where they do not
+             * exist - would lose a directory the guest can see in its own
+             * listing. The lookup is on the directory itself, never on the
+             * full path: a name that does not exist yet (a file about to be
+             * created under it) has no entry of its own, and asking about it
+             * would send that very open() to the host. */
+            return uctx()->shadow == NULL ||
+                   vp_shadow_lookup(uctx()->shadow, dirs[i]) == NULL;
+        }
     }
     return false;
 }
@@ -4033,21 +4037,28 @@ static void userland_proc_register(rvvm_userland_t* ctx, rvvm_process_t* proc)
 }
 
 /* Take a process out of the registry: it was reaped by its parent (the zombie is
- * consumed), or the run it belonged to is over. */
-static void userland_proc_forget(rvvm_userland_t* ctx, rvvm_process_t* proc)
+ * consumed), or the run it belonged to is over. Returns whether @proc was found
+ * and removed — if not (a concurrent reparent already reaped it), no reference
+ * is dropped, so the caller does not double-free. */
+static bool userland_proc_forget(rvvm_userland_t* ctx, rvvm_process_t* proc)
 {
     if (path_trace_enabled()) {
         rvvm_warn("forget: ctx=%p pid=%u", (void*)ctx, proc->pid);
     }
+    bool found = false;
     spin_lock(&ctx->proc_lock);
     vector_foreach_back(ctx->procs, i) {
         if (vector_at(ctx->procs, i) == proc) {
             vector_erase(ctx->procs, i);
+            found = true;
             break;
         }
     }
     spin_unlock(&ctx->proc_lock);
-    userland_proc_unref(proc);
+    if (found) {
+        userland_proc_unref(proc);
+    }
+    return found;
 }
 
 /* Record an exit: the status is what a waiting parent reads, and the event wakes
@@ -4058,6 +4069,56 @@ static void userland_proc_exit(rvvm_process_t* proc, int status)
     atomic_store_uint32(&proc->exited, 1);
     atomic_store_uint32(&proc->vfork_done, 1);
     rvvm_event_wake(&proc->exit_event);
+}
+
+/* Auto-reap zombie children of @proc: a process that has just exited can no
+ * longer call wait4(), so any child of its that is already dead is an orphan
+ * no live parent will ever reap. Forgetting it here recycles its pid now,
+ * instead of leaking the record until the address space is torn down.
+ *
+ * Live children are left alone: they keep running with a dead ppid, and when
+ * they exit, userland_parent_alive() fails and they are auto-reaped in turn. */
+static void userland_reap_orphan_zombies(rvvm_userland_t* ctx, rvvm_process_t* proc)
+{
+    rvvm_userland_t* proc_ctx = userland_proc_ctx(ctx, proc);
+    spin_lock(&proc_ctx->proc_lock);
+    vector_foreach_back(proc_ctx->procs, i) {
+        rvvm_process_t* child = vector_at(proc_ctx->procs, i);
+        if (child->ppid != proc->pid ||
+            !atomic_load_uint32(&child->exited)) {
+            continue;
+        }
+        if (path_trace_enabled()) {
+            rvvm_warn("reap orphan zombie: pid=%u ppid=%u", child->pid, proc->pid);
+        }
+        vector_erase(proc_ctx->procs, i);
+        userland_proc_unref(child);
+    }
+    spin_unlock(&proc_ctx->proc_lock);
+}
+
+/* Is @proc's parent still alive and able to call wait4() to reap it? A parent
+ * that has already exited is a zombie: its threads are finished, so it will
+ * never call wait4(). A parent that has been reaped is gone from the registry
+ * entirely. In either case @proc would leak as a zombie, so the caller auto-
+ * reaps it instead. */
+static bool userland_parent_alive(rvvm_process_t* proc)
+{
+    if (!proc->parent_ctx) {
+        return false;
+    }
+    bool alive = false;
+    spin_lock(&proc->parent_ctx->proc_lock);
+    vector_foreach(proc->parent_ctx->procs, i) {
+        rvvm_process_t* parent = vector_at(proc->parent_ctx->procs, i);
+        if (parent->pid == proc->ppid &&
+            !atomic_load_uint32(&parent->exited)) {
+            alive = true;
+            break;
+        }
+    }
+    spin_unlock(&proc->parent_ctx->proc_lock);
+    return alive;
 }
 
 /* ============================================================
@@ -4128,6 +4189,44 @@ static void userland_proc_exit(rvvm_process_t* proc, int status)
  * (openat(), pipe2(), socket(), accept(), ...) and differ where the guest picks
  * it (dup2(), dup3(), F_DUPFD) or where the host could not give a copy of its
  * own (a fork() that ran out of descriptors - see userland_fd_table_inherit). */
+/* ---- fd table CRUD audit ---------------------------------------------- *
+ * userland_fds_write is the ONLY function that mutates ctx->fds[fd].  Every
+ * assignment — install, close, inherit, set_flags, set_cloexec, console init —
+ * goes through here, so grep "fd_wr" gives the complete mutation log.        */
+#define FD_TRACE_LO 0
+#define FD_TRACE_HI 12
+
+static void userland_fds_write(rvvm_userland_t* ctx, int fd,
+                               bool used, int host_fd, bool cloexec,
+                               bool shared, bool console, uint32_t flags,
+                               const char* op)
+{
+    ctx->fds[fd].used    = used;
+    ctx->fds[fd].fd      = host_fd;
+    ctx->fds[fd].cloexec = cloexec;
+    ctx->fds[fd].shared  = shared;
+    ctx->fds[fd].console = console;
+    ctx->fds[fd].flags   = flags;
+    if (fd >= FD_TRACE_LO && fd <= FD_TRACE_HI) {
+        rvvm_warn("fd_wr[%s] ctx=%p fd=%d used=%d host=%d clo=%d sh=%d con=%d fl=%x",
+                  op, (void*)ctx, fd, (int)used, host_fd,
+                  (int)cloexec, (int)shared, (int)console, flags);
+    }
+}
+
+static void userland_fd_dump(rvvm_userland_t* ctx, const char* tag)
+{
+    if (!ctx) return;
+    rvvm_warn("fd_dump[%s] ctx=%p uctx=%p", tag, (void*)ctx, (void*)uctx());
+    for (int fd = FD_TRACE_LO; fd <= FD_TRACE_HI; ++fd) {
+        if (ctx->fds[fd].used) {
+            rvvm_warn("fd_dump[%s]: fd=%d host=%d clo=%d sh=%d",
+                      tag, fd, ctx->fds[fd].fd,
+                      (int)ctx->fds[fd].cloexec, (int)ctx->fds[fd].shared);
+        }
+    }
+}
+
 static void userland_fd_install(rvvm_userland_t* ctx, int guest_fd, int host_fd, bool cloexec)
 {
     if (!ctx || guest_fd < 0 || guest_fd >= USERLAND_FD_TABLE_MAX) {
@@ -4140,18 +4239,13 @@ static void userland_fd_install(rvvm_userland_t* ctx, int guest_fd, int host_fd,
          * accounting rather than dropping it on the floor. */
         rvvm_warn("fd %d reused while still tracked", guest_fd);
     }
-    ctx->fds[guest_fd].used    = true;
-    ctx->fds[guest_fd].fd      = host_fd;
-    ctx->fds[guest_fd].cloexec = cloexec;
-    ctx->fds[guest_fd].shared  = false;
     /* A real descriptor landed on this number, so it is no longer the console:
      * `cmd < file` reads the file, not the keyboard. Every way of putting an fd
      * in the table (open, dup, pipe, socket, accept) comes through here. */
-    ctx->fds[guest_fd].console = false;
     /* ...and the flag word is the new descriptor's, never the one the number
      * happened to carry before. A caller that knows the guest's flags sets them
      * right after (see userland_fd_set_flags). */
-    ctx->fds[guest_fd].flags   = 0;
+    userland_fds_write(ctx, guest_fd, true, host_fd, cloexec, false, false, 0, "install");
 }
 
 static bool userland_fd_tracked(rvvm_userland_t* ctx, int fd)
@@ -4222,7 +4316,8 @@ static uint32_t userland_fd_flags(rvvm_userland_t* ctx, int fd)
 static void userland_fd_set_flags(rvvm_userland_t* ctx, int fd, uint32_t flags)
 {
     if (userland_fd_tracked(ctx, fd)) {
-        ctx->fds[fd].flags = flags;
+        userland_fds_write(ctx, fd, true, ctx->fds[fd].fd, ctx->fds[fd].cloexec,
+                           ctx->fds[fd].shared, ctx->fds[fd].console, flags, "setfl");
     }
 }
 
@@ -4263,7 +4358,9 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
         /* A device descriptor is just a number: nothing was opened for it. */
         close(ctx->fds[fd].fd);
     }
-    ctx->fds[fd].used = false;
+    userland_fds_write(ctx, fd, false, ctx->fds[fd].fd, ctx->fds[fd].cloexec,
+                       ctx->fds[fd].shared, ctx->fds[fd].console, ctx->fds[fd].flags,
+                       "close");
     return true;
 }
 
@@ -4376,7 +4473,9 @@ static bool userland_fd_get_cloexec(rvvm_userland_t* ctx, int fd)
 static void userland_fd_set_cloexec(rvvm_userland_t* ctx, int fd, bool cloexec)
 {
     if (userland_fd_tracked(ctx, fd)) {
-        ctx->fds[fd].cloexec = cloexec;
+        userland_fds_write(ctx, fd, true, ctx->fds[fd].fd, cloexec,
+                           ctx->fds[fd].shared, ctx->fds[fd].console, ctx->fds[fd].flags,
+                           "setclo");
     }
 }
 
@@ -4427,23 +4526,19 @@ static void userland_fd_table_free(rvvm_userland_t* ctx)
 static void userland_fd_table_init(rvvm_userland_t* ctx)
 {
     for (int fd = 0; fd < USERLAND_FD_TABLE_MAX; ++fd) {
-        ctx->fds[fd].used = false;
-        ctx->fds[fd].flags = 0;
+        userland_fds_write(ctx, fd, false, 0, false, false, false, 0, "init");
     }
     for (int fd = 0; fd <= 2; ++fd) {
-        ctx->fds[fd].used    = true;
-        ctx->fds[fd].fd      = fd;
-        ctx->fds[fd].shared  = true;
         /* 0/1/2 start out as the run's console. fd 0 is the one that matters:
          * it is served by the virtual TTY (user_tty_read), so the host's own
          * stdin is the host's to read - the stdin pump feeds those bytes in
          * through rvvm_user_tty_input() instead of racing the guest for the
          * same handle, which is what made an interactive shell see EOF at once.
          */
-        ctx->fds[fd].console = true;
         /* ...and their access mode, which F_GETFL has to answer: stdin is read
          * and stdout/stderr are written. */
-        ctx->fds[fd].flags   = fd ? UAPI_O_WRONLY : UAPI_O_RDONLY;
+        userland_fds_write(ctx, fd, true, fd, false, true, true,
+                           fd ? UAPI_O_WRONLY : UAPI_O_RDONLY, "console");
     }
 }
 
@@ -4466,16 +4561,23 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
     bool                 child_master = false;
 
     for (int fd = 0; fd < USERLAND_FD_TABLE_MAX; ++fd) {
-        child->fds[fd] = parent->fds[fd];
         if (!parent->fds[fd].used) {
+            userland_fds_write(child, fd, false, 0, false, false, false, 0, "inherit");
             continue;
         }
+        /* Copy the slot wholesale through the unified write. */
+        userland_fds_write(child, fd, parent->fds[fd].used, parent->fds[fd].fd,
+                           parent->fds[fd].cloexec, parent->fds[fd].shared,
+                           parent->fds[fd].console, parent->fds[fd].flags, "inherit");
         if (userland_pty_by_fd(parent->fds[fd].fd, &child_pty, &child_master)) {
             /* An emulator object, not a host descriptor: there is nothing to
              * dup, and the child shares the pair (its reference is counted, so
              * the pair outlives both of them). */
             userland_pty_ref(child_pty, child_master);
-            child->fds[fd].shared = false;
+            userland_fds_write(child, fd, true, parent->fds[fd].fd,
+                               parent->fds[fd].cloexec, false,
+                               parent->fds[fd].console, parent->fds[fd].flags,
+                               "inherit_pty");
             continue;
         }
         if (parent->fds[fd].shared) {
@@ -4486,12 +4588,16 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
         }
         int host_fd = dup(parent->fds[fd].fd);
         if (host_fd >= 0) {
-            child->fds[fd].fd     = host_fd;
-            child->fds[fd].shared = false;
+            userland_fds_write(child, fd, true, host_fd, parent->fds[fd].cloexec,
+                               false, parent->fds[fd].console, parent->fds[fd].flags,
+                               "inherit_dup");
         } else {
             /* No copy: the parent's host fd has to do, and the child may not
              * close it (see userland_fd_close). */
-            child->fds[fd].shared = true;
+            userland_fds_write(child, fd, true, parent->fds[fd].fd,
+                               parent->fds[fd].cloexec, true,
+                               parent->fds[fd].console, parent->fds[fd].flags,
+                               "inherit_shared");
         }
     }
 }
@@ -4950,9 +5056,22 @@ static void userland_exit_process(rvvm_userland_t* ctx, int code, rvvm_user_thre
          * fork() gives the child one), so this is where a shell blocked in a
          * wait for its job, or sitting at the prompt, learns it finished. */
         userland_notify_parent(ctx, proc, UAPI_SIGCHLD);
+        /* Reparent: a process that just exited can no longer wait4(), so its
+         * dead children are orphans — reap them now. And if its own parent is
+         * already gone or a zombie, it too will never be reaped — reap it
+         * eagerly so it does not leak in the registry. */
+        userland_reap_orphan_zombies(ctx, proc);
+        if (!proc->run_root && !userland_parent_alive(proc)) {
+            if (path_trace_enabled()) {
+                rvvm_warn("reap orphan: pid=%u ppid=%u (parent gone)",
+                          proc->pid, proc->ppid);
+            }
+            userland_proc_forget(proc->parent_ctx, proc);
+        }
     }
 
     if (!proc || proc->run_root) {
+        rvvm_warn("exit_early: ctx=%p proc=%p run_root=%d", (void*)ctx, (void*)proc, proc ? (int)proc->run_root : -1);
         if (ctx->exit_callback) {
             /* An embedded host owns the run: tell it and let it tear down. */
             userland_process_exit(ctx, code, self);
@@ -4964,7 +5083,19 @@ static void userland_exit_process(rvvm_userland_t* ctx, int code, rvvm_user_thre
         return;
     }
 
-    /* A process inside this address space: only its own threads unwind. */
+    /* A process inside this address space: only its own threads unwind.
+     * Linux closes every file descriptor when a process exits — a dup'd
+     * socket the child inherited but never closed would otherwise keep the
+     * ref count on the underlying SOCKET above zero, so closesocket() in
+     * the parent never sends a FIN.  Sweep the table here. */
+    userland_fd_dump(ctx, "exit");
+    int n_closed = 0;
+    for (int fd = 0; fd < USERLAND_FD_TABLE_MAX; ++fd) {
+        if (ctx->fds[fd].used) {
+            userland_fd_close(ctx, fd);
+            n_closed++;
+        }
+    }
     userland_finish_threads(ctx, proc, self);
 }
 
@@ -5439,8 +5570,8 @@ static rvvm_addr_t rvvm_sys_wait4(rvvm_userland_t* ctx, rvvm_user_thread_t* self
     bool            want_cont  = (options & UAPI_WCONTINUED) != 0;
 
     if (path_trace_enabled()) {
-        rvvm_warn("job: wait4(pid=%d opt=%x) from pid=%u",
-                  upid, options, self_proc ? self_proc->pid : 0);
+        DO_ONCE(rvvm_warn("job: wait4(pid=%d opt=%x) from pid=%u",
+                  upid, options, self_proc ? self_proc->pid : 0));
     }
     if (!self_proc) {
         return -UAPI_ECHILD;
@@ -7766,6 +7897,9 @@ static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* bu
         if (ring->len) {
             size_t n = pty_ring_get(ring, buf, count);
             spin_unlock(&pty->lock);
+            if (path_trace_enabled() && master) {
+                rvvm_warn("pty master read: %zu byte(s)", n);
+            }
             /* Room appeared: a writer parked because the ring was full has to
              * hear about it (a session's output outrunning its client is the
              * ordinary case, not an exotic one). */
@@ -7821,6 +7955,10 @@ static int64_t userland_pty_write(struct userland_pty* pty, bool master, const v
      * reports EAGAIN, and a pty whose far end is gone reports EIO - all three
      * the way a real terminal answers. */
     for (;;) {
+        if (path_trace_enabled()) {
+            rvvm_warn("pty %s write: %zu byte(s) from %02x", master ? "master" : "slave", count,
+                      (unsigned)((const uint8_t*)buf)[0]);
+        }
         size_t done = master ? userland_pty_master_put(pty, buf, count, ctx)
                              : userland_pty_slave_put(pty, buf, count);
         if (done) {
@@ -8914,9 +9052,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                             a0 = errno_ret(openat(userland_fd_host(uctx(), (int)a0),
                                                   host_path, uapi_open_flags(a2), a3));
                             if (a0 >= 0) {
+                                int host_fd  = (int)a0;
+                                int guest_fd = userland_fd_add(uctx(), host_fd,
+                                                               (a2 & UAPI_O_CLOEXEC) != 0);
+                                if (guest_fd < 0) {
+                                    /* The table is full: userland_fd_add() has
+                                     * already closed the host descriptor. */
+                                    a0 = -UAPI_EMFILE;
+                                    break;
+                                }
+                                a0 = (rvvm_addr_t)guest_fd;
                                 /* A rootfs directory may also have to list the
                                  * archive's links (see rvvm_sys_getdents64). */
-                                shadow_dir_track((int)a0, have_abs ? abs : NULL);
+                                shadow_dir_track(host_fd, have_abs ? abs : NULL);
                                 /* /dev holds synthesized nodes: the host tree
                                  * has none of them, so the core supplies the
                                  * names of that listing itself. */
@@ -8924,24 +9072,21 @@ static void* rvvm_user_thread_wrap(void* arg)
                                     const char* const* dev_names = NULL;
                                     uint32_t dev_count = 0;
                                     if (userland_dev_dir(abs, &dev_names, &dev_count)) {
-                                        shadow_dir_track_names((int)a0, dev_names, dev_count);
+                                        shadow_dir_track_names(host_fd, dev_names, dev_count);
                                     }
                                 }
-                                /* O_CLOEXEC is not translated into the host
-                                 * flags, so the guest's view of the flag lives
-                                 * in the table (and execve() acts on it). */
-                                userland_fd_add(uctx(), (int)a0, (a2 & UAPI_O_CLOEXEC) != 0);
+
                                 /* F_GETFL reports the access mode and the status
                                  * flags the guest opened with, not the host
                                  * bits behind them. */
-                                userland_fd_set_flags(uctx(), (int)a0,
+                                userland_fd_set_flags(uctx(), guest_fd,
                                                       (uint32_t)a2 & (UAPI_O_ACCMODE | UAPI_SETFL_MASK));
                                 /* ...and O_NONBLOCK has to reach the host too:
                                  * the shim dropped it on the way in (there is no
                                  * CRT equivalent), so it is asked for now, where
                                  * the host fd is the one that would park. */
                                 if (a2 & UAPI_O_NONBLOCK) {
-                                    fcntl(userland_fd_host(uctx(), (int)a0), F_SETFL, UAPI_O_NONBLOCK);
+                                    fcntl(host_fd, F_SETFL, UAPI_O_NONBLOCK);
                                 }
                             }
                         }
@@ -8978,18 +9123,34 @@ static void* rvvm_user_thread_wrap(void* arg)
                          * host pipe(2) is not told (no flag translation), so the
                          * table carries the flag and execve() acts on it. */
                         bool cloexec = (flags & UAPI_O_CLOEXEC) != 0;
-                        userland_fd_add(uctx(), fds[0], cloexec);
-                        userland_fd_add(uctx(), fds[1], cloexec);
+                        int  host0   = fds[0];
+                        int  host1   = fds[1];
+                        int  guest0  = userland_fd_add(uctx(), host0, cloexec);
+                        if (guest0 < 0) {
+                            /* userland_fd_add() has already closed host0; the
+                             * other end is this call's to close. */
+                            close(host1);
+                            a0 = -UAPI_EMFILE;
+                            break;
+                        }
+                        int guest1 = userland_fd_add(uctx(), host1, cloexec);
+                        if (guest1 < 0) {
+                            userland_fd_close(uctx(), guest0);
+                            a0 = -UAPI_EMFILE;
+                            break;
+                        }
+                        fds[0] = guest0;
+                        fds[1] = guest1;
                         /* A pipe end reads or writes, always: that is its
                          * access mode, and O_NONBLOCK is the status flag the
                          * guest may have asked for (the host pipe is told about
                          * it below, since the host is the one that parks). */
                         uint32_t status = (uint32_t)flags & UAPI_SETFL_MASK;
-                        userland_fd_set_flags(uctx(), fds[0], UAPI_O_RDONLY | status);
-                        userland_fd_set_flags(uctx(), fds[1], UAPI_O_WRONLY | status);
+                        userland_fd_set_flags(uctx(), guest0, UAPI_O_RDONLY | status);
+                        userland_fd_set_flags(uctx(), guest1, UAPI_O_WRONLY | status);
                         if (flags & UAPI_O_NONBLOCK) {
-                            fcntl(userland_fd_host(uctx(), fds[0]), F_SETFL, UAPI_O_NONBLOCK);
-                            fcntl(userland_fd_host(uctx(), fds[1]), F_SETFL, UAPI_O_NONBLOCK);
+                            fcntl(host0, F_SETFL, UAPI_O_NONBLOCK);
+                            fcntl(host1, F_SETFL, UAPI_O_NONBLOCK);
                         }
                     }
                     break;
@@ -9012,6 +9173,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 63: { // read
                     void* buf = a2 ? to_ptr_sz(a1, a2) : NULL;
+                    if (path_trace_enabled()) {
+                        rvvm_warn("sys_read(fd=%ld count=%lu)", a0, (unsigned long)a2);
+                    }
                     if (a2 && !buf) {
                         a0 = -UAPI_EFAULT;
                         break;
@@ -9056,7 +9220,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                             /* A host descriptor: its O_NONBLOCK is the host's,
                              * set through fcntl(2) like any Linux guest expects
                              * (see posix_shim.c's fcntl/read). */
+                            int gfd = (int)a0;
                             a0 = errno_ret(read(hfd, buf, a2));
+                            if (path_trace_enabled()) {
+                                rvvm_warn("sys_read(guest fd=%d host=%d) = %ld", gfd, hfd, (long)a0);
+                            }
                         }
                     }
                     break;
@@ -9075,6 +9243,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * not to the host's console sink. */
                     bool console_out = (a0 == 1 || a0 == 2) && userland_fd_is_console(uctx(), (int)a0);
                     int  host_fd     = userland_fd_host(uctx(), (int)a0);
+                    int  wfd         = (int)a0;   // a0 is the result from here on
                     if (console_out) {
                         // fd 1/2: feed the virtual TTY parser first (no-op unless a
                         // host injected a VTerm or registered a tty callback). The
@@ -9090,6 +9259,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                         struct userland_pty* pty = NULL;
                         bool master = false;
                         int dev = -1;
+                        if (path_trace_enabled()) {
+                            rvvm_warn("sys_write(guest fd=%ld host=%d) = %lu byte(s) from %02x",
+                                      a0, host_fd, (unsigned long)a2,
+                                      a2 ? (unsigned)((const uint8_t*)wbuf)[0] : 0);
+                        }
                         if (userland_pty_by_fd(host_fd, &pty, &master)) {
                             a0 = (rvvm_addr_t)userland_pty_write(pty, master, wbuf, a2, uctx(),
                                                                  userland_fd_write_blocks(uctx(), (int)a0));
@@ -9103,6 +9277,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                             a0 = errno_ret(ret);
                         } else {
                             a0 = errno_ret(write(host_fd, wbuf, a2));
+                        }
+                        if (path_trace_enabled()) {
+                            rvvm_warn("sys_write(guest fd=%d host=%d) = %ld (errno %d)",
+                                      wfd, host_fd, (long)a0, (long)a0 < 0 ? errno : 0);
                         }
                     }
                     break;
@@ -9118,6 +9296,13 @@ static void* rvvm_user_thread_wrap(void* arg)
                     const struct uapi_iovec* giov = to_ptr_sz(a1, a2 * sizeof(*giov));
                     struct iovec* hiov = giov ? rvvm_iovec_from_guest(giov, a2, stack_iov) : NULL;
                     if (!hiov) {
+                        if (path_trace_enabled()) {
+                            rvvm_warn("sys_writev(guest fd=%ld) EFAULT: array=%p iovs=%lu "
+                                      "(iov_base=%lx iov_len=%lx)",
+                                      a0, (void*)giov, (unsigned long)a2,
+                                      giov ? (unsigned long)giov[0].base : 0ul,
+                                      giov ? (unsigned long)giov[0].len : 0ul);
+                        }
                         a0 = -UAPI_EFAULT;
                         break;
                     }
@@ -9174,6 +9359,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                     } else if (a7 == 66 && iov_own) {
                         ssize_t total = 0;
                         bool block = userland_fd_write_blocks(uctx(), (int)a0);
+                        if (path_trace_enabled()) {
+                            rvvm_warn("sys_writev(guest fd=%ld host=%d) iovs=%lu first from %02x",
+                                      a0, iov_fd, (unsigned long)a2,
+                                      (unsigned)((const uint8_t*)hiov[0].iov_base)[0]);
+                        }
                         for (int i = 0; i < (int)a2; i++) {
                             ssize_t r = iov_pty
                                 ? (ssize_t)userland_pty_write(iov_pty, iov_master,
@@ -9413,7 +9603,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = 0;
                     break;
                 case 93: // exit
-                    rvvm_warn("sys_exit(%ld) @ PC %lx", (long)a0, rvvm_read_cpu_reg(cpu, RVVM_REGID_PC));
+                    rvvm_warn("sys_exit(%ld) ctx=%p thread=%p main=%p match=%d",
+                              (long)a0, (void*)uctx(), (void*)thread,
+                              (void*)uctx()->userland_main_thread,
+                              (int)(thread == uctx()->userland_main_thread));
                     if (thread == uctx()->userland_main_thread) {
                         // Linux semantics: main thread exit terminates the process
                         userland_exit_process(uctx(), (int)a0, thread);
@@ -9423,7 +9616,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     break;
                 case 94: // exit_group
-                    rvvm_warn("sys_exit_group(%ld)", (long)a0);
+                    rvvm_warn("sys_exit_group(%ld) ctx=%p", (long)a0, (void*)uctx());
                     userland_exit_process(uctx(), (int)a0, thread);
                     break;
                 case 96: // set_tid_address
@@ -9948,12 +10141,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * taken off the type and applied on our side. */
                     a0 = errno_ret(socket(a0, a1 & ~UAPI_SOCK_TYPE_MASK, a2));
                     if (a0 >= 0) {
-                        userland_fd_add(uctx(), (int)a0, (type & UAPI_SOCK_CLOEXEC) != 0);
-                        userland_fd_set_flags(uctx(), (int)a0,
+                        int host_fd  = (int)a0;
+                        int guest_fd = userland_fd_add(uctx(), host_fd,
+                                                       (type & UAPI_SOCK_CLOEXEC) != 0);
+                        if (guest_fd < 0) {
+                            a0 = -UAPI_EMFILE;
+                            break;
+                        }
+                        a0 = (rvvm_addr_t)guest_fd;
+                        userland_fd_set_flags(uctx(), guest_fd,
                                               UAPI_O_RDWR | ((type & UAPI_SOCK_NONBLOCK)
                                                              ? UAPI_O_NONBLOCK : 0));
                         if (type & UAPI_SOCK_NONBLOCK) {
-                            fcntl((int)a0, F_SETFL, UAPI_O_NONBLOCK);
+                            fcntl(host_fd, F_SETFL, UAPI_O_NONBLOCK);
                         }
                     }
                     break;
@@ -9966,16 +10166,31 @@ static void* rvvm_user_thread_wrap(void* arg)
                     if (a0 >= 0 && pair) {
                         bool cloexec = (type & UAPI_SOCK_CLOEXEC) != 0;
                         uint32_t status = (type & UAPI_SOCK_NONBLOCK) ? UAPI_O_NONBLOCK : 0;
-                        userland_fd_add(uctx(), pair[0], cloexec);
-                        userland_fd_add(uctx(), pair[1], cloexec);
-                        userland_fd_set_flags(uctx(), pair[0], UAPI_O_RDWR | status);
-                        userland_fd_set_flags(uctx(), pair[1], UAPI_O_RDWR | status);
+                        int  host0   = pair[0];
+                        int  host1   = pair[1];
+                        int  guest0  = userland_fd_add(uctx(), host0, cloexec);
+                        if (guest0 < 0) {
+                            /* userland_fd_add() has already closed host0. */
+                            close(host1);
+                            a0 = -UAPI_EMFILE;
+                            break;
+                        }
+                        int guest1 = userland_fd_add(uctx(), host1, cloexec);
+                        if (guest1 < 0) {
+                            userland_fd_close(uctx(), guest0);
+                            a0 = -UAPI_EMFILE;
+                            break;
+                        }
+                        pair[0] = guest0;
+                        pair[1] = guest1;
+                        userland_fd_set_flags(uctx(), guest0, UAPI_O_RDWR | status);
+                        userland_fd_set_flags(uctx(), guest1, UAPI_O_RDWR | status);
                         if (status) {
                             /* Both ends get the host's own non-blocking mode: a
                              * guest that asked for it expects read to say EAGAIN
                              * rather than park (see posix_shim.c). */
-                            fcntl(pair[0], F_SETFL, UAPI_O_NONBLOCK);
-                            fcntl(pair[1], F_SETFL, UAPI_O_NONBLOCK);
+                            fcntl(host0, F_SETFL, UAPI_O_NONBLOCK);
+                            fcntl(host1, F_SETFL, UAPI_O_NONBLOCK);
                         }
                     }
                     break;
@@ -9999,8 +10214,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                         /* accept(2) has no flag argument: the new descriptor
                          * never carries FD_CLOEXEC, exactly like Linux - and it
                          * is blocking, even when the listener is not. */
-                        userland_fd_add(uctx(), (int)a0, false);
-                        userland_fd_set_flags(uctx(), (int)a0, UAPI_O_RDWR);
+                        int host_fd  = (int)a0;
+                        int guest_fd = userland_fd_add(uctx(), host_fd, false);
+                        if (guest_fd < 0) {
+                            a0 = -UAPI_EMFILE;
+                            break;
+                        }
+                        a0 = (rvvm_addr_t)guest_fd;
+                        userland_fd_set_flags(uctx(), guest_fd, UAPI_O_RDWR);
                     }
                     break;
                 case 203: // connect
@@ -10170,12 +10391,20 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(accept4(userland_fd_host(uctx(), (int)a0), to_ptr(a1), to_ptr(a2),
                                            a3 & ~UAPI_SOCK_TYPE_MASK));
                     if (a0 >= 0) {
-                        userland_fd_add(uctx(), (int)a0, (flags & UAPI_SOCK_CLOEXEC) != 0);
-                        userland_fd_set_flags(uctx(), (int)a0,
+                        int host_fd  = (int)a0;
+                        int guest_fd = userland_fd_add(uctx(), host_fd,
+                                                       (flags & UAPI_SOCK_CLOEXEC) != 0);
+                        if (guest_fd < 0) {
+                            a0 = -UAPI_EMFILE;
+                            break;
+                        }
+                        rvvm_info("accept4: guest_fd=%d -> host_fd=%d (anchor)", guest_fd, host_fd);
+                        a0 = (rvvm_addr_t)guest_fd;
+                        userland_fd_set_flags(uctx(), guest_fd,
                                               UAPI_O_RDWR | ((flags & UAPI_SOCK_NONBLOCK)
                                                              ? UAPI_O_NONBLOCK : 0));
                         if (flags & UAPI_SOCK_NONBLOCK) {
-                            fcntl((int)a0, F_SETFL, UAPI_O_NONBLOCK);
+                            fcntl(host_fd, F_SETFL, UAPI_O_NONBLOCK);
                         }
                     }
                     break;
@@ -10261,8 +10490,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                     int flags = (int)a1;
                     a0 = errno_ret(memfd_create(to_str(a0), a1));
                     if (a0 >= 0) {
-                        userland_fd_add(uctx(), (int)a0, (flags & UAPI_MFD_CLOEXEC) != 0);
-                        userland_fd_set_flags(uctx(), (int)a0, UAPI_O_RDWR);
+                        int host_fd  = (int)a0;
+                        int guest_fd = userland_fd_add(uctx(), host_fd,
+                                                       (flags & UAPI_MFD_CLOEXEC) != 0);
+                        if (guest_fd < 0) {
+                            a0 = -UAPI_EMFILE;
+                            break;
+                        }
+                        a0 = (rvvm_addr_t)guest_fd;
+                        userland_fd_set_flags(uctx(), guest_fd, UAPI_O_RDWR);
                     }
                     break;
                 }
@@ -10421,6 +10657,8 @@ static void* rvvm_user_thread_wrap(void* arg)
         rvvm_sys_futex(thread->child_cleartid, UAPI_FUTEX_WAKE, 1, 0, NULL, 0);
     }
 
+    rvvm_warn("thread_exit: ctx=%p pid=%u", (void*)uctx(), thread->proc ? thread->proc->pid : 0);
+    userland_fd_dump(uctx(), "thread_exit");
     userland_thread_unregister(thread);
 
     /* This thread's reference to its process. The record itself stays as long as
@@ -11042,7 +11280,9 @@ static bool guest_exec(rvvm_userland_t* ctx, rvvm_hart_t* cpu, rvvm_user_thread_
     /* Descriptors marked FD_CLOEXEC go with the old image. This is where the
      * flag is acted on at all: the host open flags never carry O_CLOEXEC, so the
      * host cannot have done it. */
+    userland_fd_dump(ctx, "execve_pre");
     userland_fd_exec_close(uctx());
+    userland_fd_dump(ctx, "execve_post");
 
     /* A new image carries no signal dispositions: what the old process installed
      * with rt_sigaction() is back to the default, and a handler frame still on

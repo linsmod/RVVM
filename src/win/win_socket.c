@@ -590,6 +590,14 @@ int win_socket_pair(int domain, int type, int protocol, int sv[2])
     if (server == INVALID_SOCKET) {
         goto fail;
     }
+    {
+        struct sockaddr_in la = {}; int ll = sizeof(la);
+        getsockname(listener, (struct sockaddr*)&la, &ll);
+        struct sockaddr_in ca = {}; int cl = sizeof(ca);
+        getpeername(server, (struct sockaddr*)&ca, &cl);
+        wsock_trace("pair: listener port %d, server peer 127.0.0.1:%d",
+                    ntohs(la.sin_port), ntohs(ca.sin_port));
+    }
     closesocket(listener);
     listener = INVALID_SOCKET;
 
@@ -658,12 +666,25 @@ int win_socket_close(int fd)
     }
     /* The socket goes first: its handle value may be recycled immediately, and
      * the anchor (a plain CRT "NUL" file) is what _close() actually releases. */
+    {
+        struct sockaddr_storage peer;
+        int plen = (int)sizeof(peer);
+        if (getpeername(s, (struct sockaddr*)&peer, &plen) == 0) {
+            struct sockaddr_in* in = (struct sockaddr_in*)&peer;
+            unsigned char* ip = (unsigned char*)&in->sin_addr;
+            wsock_trace("close: peer=%d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], ntohs(in->sin_port));
+        } else {
+            wsock_trace("close: getpeername err=%d (not connected?)", WSAGetLastError());
+        }
+    }
     if (closesocket(s) == SOCKET_ERROR) {
         int err = WSAGetLastError();
+        wsock_trace("closesocket FAILED on fd %d (socket %p) err=%d", fd, (void*)s, err);
         _close(fd);
         errno = wsock_errno_of(err);
         return -1;
     }
+    wsock_trace("closesocket OK on fd %d (socket %p)", fd, (void*)s);
     _close(fd);
     return 0;
 }
@@ -755,6 +776,7 @@ int win_socket_accept(int fd, void* addr, int* len, int flags)
     if (nfd < 0) {
         closesocket(n);
     }
+    wsock_trace("accept -> anchor %d (socket %p)", nfd, (void*)n);
     return nfd;
 }
 
@@ -924,8 +946,15 @@ long win_socket_read(int fd, void* buf, size_t len)
         len = (size_t)INT_MAX;
     }
     n = recv(s, (char*)buf, (int)len, 0);
+    if (n == 0) {
+        wsock_trace("recv EOF on fd %d (socket %p)", fd, (void*)s);
+    }
     if (n == SOCKET_ERROR) {
+        int werr = WSAGetLastError();
         wsock_set_errno();
+        if (werr != WSAEWOULDBLOCK) {
+            wsock_trace("recv err %d on fd %d (socket %p) errno=%d", werr, fd, (void*)s, errno);
+        }
         return -1;
     }
     return n;

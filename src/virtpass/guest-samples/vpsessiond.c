@@ -43,6 +43,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,6 +110,21 @@ static long loop_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Every line this daemon prints carries the clock, and the same epoch the core's
+ * trace and the harness's transcript use: the three land in one file, and a
+ * session's trouble is usually a race between them (a write the relay had not
+ * drained, a signal that arrived a millisecond late). */
+static void dlog(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    printf("[%9ld ms] vpsessiond: ", loop_ms());
+    vprintf(fmt, ap);
+    printf("\n");
+    fflush(stdout);
+    va_end(ap);
 }
 
 static int session_count(void)
@@ -185,6 +201,10 @@ static void session_close(struct session* s, const char* why)
     if (!s->used) {
         return;
     }
+    int idx = (int)(s - sessions);
+    dlog("  [slot %d] close why=%s sock=%d pid=%d child_done=%d",
+         idx, why, s->sock, (int)s->pid, (int)s->child_done);
+    fflush(stdout);
     if (s->pid > 0) {
         /* Hang the session up: its terminal is gone, and a shell reading from it
          * is meant to notice (Linux sends SIGHUP to the foreground group when a
@@ -201,7 +221,7 @@ static void session_close(struct session* s, const char* why)
         s->sock = -1;
     }
     s->used = false;
-    printf("vpsessiond: session closed (%s), %d of %d in use\n", why, session_count(), SESSION_MAX);
+    dlog("session closed (%s), %d of %d in use", why, session_count(), SESSION_MAX);
     fflush(stdout);
 }
 
@@ -212,6 +232,9 @@ static bool session_spawn(struct session* s)
     if (master < 0) {
         return false;
     }
+    /* The master stays with the daemon: the session works on the slave end, and
+     * a shell holding the master would keep the pair's read side alive. */
+    fcntl(master, F_SETFD, FD_CLOEXEC);
     if (grantpt(master) || unlockpt(master)) {
         close(master);
         return false;
@@ -289,8 +312,8 @@ static bool session_spawn(struct session* s)
     s->master  = master;
     s->pid     = pid;
     s->started = true;
-    printf("vpsessiond: session %d started (pid %d, %s), %d of %d in use\n", s->sock, (int)pid,
-           s->has_cmd ? "command" : "shell", session_count(), SESSION_MAX);
+    dlog("session %d started (pid %d, %s), %d of %d in use", s->sock, (int)pid,
+         s->has_cmd ? "command" : "shell", session_count(), SESSION_MAX);
     fflush(stdout);
     return true;
 }
@@ -424,6 +447,9 @@ static void session_read_sock(struct session* s)
             continue;
         }
         if (n == 0) {
+            int idx = (int)(s - sessions);
+            dlog("  [slot %d] read EOF on sock=%d", idx, s->sock);
+            fflush(stdout);
             session_close(s, "client closed");
             return;
         }
@@ -448,6 +474,10 @@ static bool session_open(int sock, long now)
         s->master   = -1;
         s->grace_at = now + GRACE_MS;
         fcntl(sock, F_SETFL, O_NONBLOCK);
+        /* See the listener: a session forked later must not inherit this. */
+        fcntl(sock, F_SETFD, FD_CLOEXEC);
+        dlog("  [slot %d] open sock=%d", i, sock);
+        fflush(stdout);
         return true;
     }
     return false;
@@ -483,11 +513,16 @@ int main(int argc, char** argv)
 
     listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {
-        printf("vpsessiond: socket(): %s\n", strerror(errno));
+        dlog("socket(): %s", strerror(errno));
         return 1;
     }
     int on = 1;
     setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    /* Every descriptor this daemon owns is closed at execve() of the session it
+     * forks: a shell that kept a client's socket (or another session's) would
+     * hold its refcount up forever, and the client waiting for the FIN of a
+     * session that ended would wait for a close that never comes. */
+    fcntl(listener, F_SETFD, FD_CLOEXEC);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -496,12 +531,11 @@ int main(int argc, char** argv)
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(listener, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
         listen(listener, SESSION_MAX) < 0) {
-        printf("vpsessiond: bind/listen(%d): %s\n", port, strerror(errno));
+        dlog("bind/listen(%d): %s", port, strerror(errno));
         return 1;
     }
 
-    printf("vpsessiond: listening on 127.0.0.1:%d, shell %s (in %d, out %d)\n", port, shell_path,
-           IN_MAX, OUT_MAX);
+    dlog("listening on 127.0.0.1:%d, shell %s (in %d, out %d)", port, shell_path, IN_MAX, OUT_MAX);
     fflush(stdout);
 
     for (;;) {
@@ -546,12 +580,9 @@ int main(int argc, char** argv)
                         continue;
                     }
                     if (session_open(c, now)) {
-                        printf("vpsessiond: client connected, %d of %d in use\n", session_count(),
-                               SESSION_MAX);
-                        fflush(stdout);
+                        dlog("client connected, %d of %d in use", session_count(), SESSION_MAX);
                     } else {
-                        printf("vpsessiond: %d sessions already, refusing a client\n", SESSION_MAX);
-                        fflush(stdout);
+                        dlog("%d sessions already, refusing a client", SESSION_MAX);
                         close(c);
                     }
                     continue;

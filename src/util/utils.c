@@ -23,6 +23,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h> // clock_gettime(), CLOCK_MONOTONIC
 
 #if defined(ANDROID)
 #include <android/log.h>
@@ -783,10 +784,32 @@ static bool log_has_colors(void)
     return !!getenv("TERM") || !!getenv("WT_SESSION");
 }
 
+/* Milliseconds on the host's monotonic clock - the same epoch the host's own
+ * log lines use (GetTickCount64 on win32) and the one a guest's
+ * clock_gettime(CLOCK_MONOTONIC) reads, since the emulator serves that from the
+ * host. Several streams (the core's trace, the host's console, a session
+ * server's own lines, a driver's transcript) end up in one file, and only a
+ * shared clock says in what order things really happened - which is the whole
+ * point when a symptom is a race. */
+static uint64_t log_time_ms(void)
+{
+#if defined(CLOCK_MONOTONIC)
+    struct timespec ts = {0};
+    if (!clock_gettime(CLOCK_MONOTONIC, &ts)) {
+        return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    }
+#endif
+    return rvtimer_clocksource(1000);
+}
+
 static void log_print(const char* prefix, const char* fmt, const void* argv)
 {
     char   buffer[256] = {0};
-    size_t pos         = rvvm_strlcpy(buffer, prefix, sizeof(buffer));
+    size_t pos         = rvvm_snprintf(buffer, sizeof(buffer), "[%9llu ms] ",
+                                       (unsigned long long)log_time_ms());
+    pos = EVAL_MIN(pos, sizeof(buffer) - 1);
+    pos += rvvm_strlcpy(buffer + pos, prefix, sizeof(buffer) - pos);
+    pos = EVAL_MIN(pos, sizeof(buffer) - 1);
     size_t vsp_size    = sizeof(buffer) - EVAL_MIN(pos + 6, sizeof(buffer));
     if (vsp_size > 1) {
         int tmp = rvvm_vsnprintf(buffer + pos, vsp_size, fmt, argv);
