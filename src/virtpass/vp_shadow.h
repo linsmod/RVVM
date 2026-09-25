@@ -93,6 +93,13 @@ bool vp_shadow_hide(vp_shadow_t* shadow, const char* guest_path);
 bool vp_shadow_unhide(vp_shadow_t* shadow, const char* guest_path);
 void vp_shadow_unhide_all(vp_shadow_t* shadow);
 
+// Persist the "hidden" set to @path (one guest path per line) and load what is
+// already there. With a store set, every hide/unhide rewrites it, so a run that
+// is killed still leaves the deletions recorded. The set is tiny - it only holds
+// archive-only entries the host never materialized (symlinks, and the like) - so
+// a rewrite per change is cheaper than a journal. Pass NULL to detach.
+void vp_shadow_set_hidden_store(vp_shadow_t* shadow, const char* path);
+
 // First child of @parent (finalize() must have run), VP_SHADOW_NONE at the end.
 uint32_t vp_shadow_first_child(const vp_shadow_t* shadow, uint32_t parent);
 

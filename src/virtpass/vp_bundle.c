@@ -122,10 +122,99 @@ static const char* bundle_mounts =
     "devpts /dev/pts devpts rw,nosuid,noexec,relatime,mode=620 0 0\n"
     "tmpfs /tmp tmpfs rw,nosuid,nodev,relatime 0 0\n";
 
+static bool bundle_path_exists(const char* dest, const char* guest_path)
+{
+    char path[BUNDLE_PATH_MAX];
+    FILE* f;
+
+    if (strlen(dest) + strlen(guest_path) + 1 > sizeof(path)) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s%s", dest, guest_path);
+    f = fopen(path, "rb");
+    if (f) {
+        fclose(f);
+        return true;
+    }
+    return false;
+}
+
+/* /proc/mounts is regenerated every run (the mount table may differ), but
+ * /etc/inittab is only written when the archive's own is still there: a guest
+ * that edited it must find its version on the next run, which is what
+ * persistence means for a file the host also owns. */
 static bool bundle_write_session_files(const char* dest)
 {
-    return bundle_write_file(dest, "/etc/inittab", bundle_inittab) &&
-           bundle_write_file(dest, "/proc/mounts", bundle_mounts);
+    bool ok = bundle_write_file(dest, "/proc/mounts", bundle_mounts);
+    if (!bundle_path_exists(dest, "/etc/inittab")) {
+        ok = bundle_write_file(dest, "/etc/inittab", bundle_inittab) && ok;
+    }
+    return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* The install stamp                                                   */
+/*                                                                    */
+/* `dest` is not a scratch copy: it is the writable layer the guest    */
+/* keeps its state in (handover.md §1.7). So the archive is unpacked    */
+/* once, and a later run of the *same* bundle must not walk over what   */
+/* the guest changed. A stamp under `<dest>/.vp/` ties the tree to the  */
+/* archive's size and mtime, and an updated archive re-extracts. A dot  */
+/* directory keeps it out of a plain `ls /`; the shadow does not know   */
+/* host files, so it is not hidden from `ls -a` - a known, harmless     */
+/* deviation (§6).                                                     */
+/* ------------------------------------------------------------------ */
+
+static bool bundle_stamp_path(const char* dest, char* out, size_t size)
+{
+    char dir[BUNDLE_PATH_MAX];
+
+    if (!bundle_join(dir, sizeof(dir), dest, ".vp")) {
+        return false;
+    }
+    bundle_mkdir(dir);
+    return bundle_join(out, size, dir, "install");
+}
+
+static bool bundle_stamp_ok(const char* dest, const char* archive)
+{
+    struct stat ast;
+    char        path[BUNDLE_PATH_MAX];
+    char        want[128];
+    char        got[128];
+    size_t      n;
+    FILE*       f;
+
+    if (stat(archive, &ast) != 0 || !bundle_stamp_path(dest, path, sizeof(path))) {
+        return false;   /* no archive to fingerprint: extract and find out */
+    }
+    f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    n = fread(got, 1, sizeof(got) - 1, f);
+    fclose(f);
+    got[n] = 0;
+    snprintf(want, sizeof(want), "size=%lld\nmtime=%lld\n",
+             (long long)ast.st_size, (long long)ast.st_mtime);
+    return strcmp(want, got) == 0;
+}
+
+static void bundle_stamp_write(const char* dest, const char* archive)
+{
+    struct stat ast;
+    char        path[BUNDLE_PATH_MAX];
+    FILE*       f;
+
+    if (stat(archive, &ast) != 0 || !bundle_stamp_path(dest, path, sizeof(path))) {
+        return;
+    }
+    f = fopen(path, "wb");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "size=%lld\nmtime=%lld\n", (long long)ast.st_size, (long long)ast.st_mtime);
+    fclose(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -169,10 +258,17 @@ bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz, const c
     if (!rootfs) {
         return false;
     }
-    size_t written = vp_rootfs_extract(rootfs, dest, error);
-    if (!written) {
-        vp_rootfs_close(rootfs);
-        return false;
+    /* Installed once: a run of the same archive leaves the tree as the guest
+     * left it (that tree is the writable layer). An updated archive - a
+     * different size or mtime - re-extracts. */
+    size_t written = 0;
+    if (!bundle_stamp_ok(dest, rootfs_tar_gz)) {
+        written = vp_rootfs_extract(rootfs, dest, error);
+        if (!written) {
+            vp_rootfs_close(rootfs);
+            return false;
+        }
+        bundle_stamp_write(dest, rootfs_tar_gz);
     }
     g_mounted = rootfs;
     if (stats) {
@@ -191,6 +287,19 @@ bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz, const c
 
     rvvm_user_set_prefix(machine, dest);
     rvvm_user_set_shadow(machine, vp_rootfs_shadow(rootfs));
+
+    /* Archive-only entries the guest deletes are recorded in the shadow; keep
+     * that set on disk so a deletion survives the run (see vp_shadow.h). */
+    {
+        char vp_dir[BUNDLE_PATH_MAX];
+        char hidden[BUNDLE_PATH_MAX];
+        if (bundle_join(vp_dir, sizeof(vp_dir), dest, ".vp")) {
+            bundle_mkdir(vp_dir);
+            if (bundle_join(hidden, sizeof(hidden), vp_dir, "hidden")) {
+                vp_shadow_set_hidden_store(vp_rootfs_shadow(rootfs), hidden);
+            }
+        }
+    }
     return true;
 }
 

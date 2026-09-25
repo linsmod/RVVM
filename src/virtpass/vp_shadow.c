@@ -15,6 +15,7 @@ See vp_shadow.h for what this is and why. Implementation notes:
 
 #include "virtpass/vp_shadow.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -32,6 +33,7 @@ struct vp_shadow {
     size_t             capacity;
     size_t             map_size; // power of two
     uint32_t           root;     // the "/" entry
+    char*              hidden_store; // file the hidden set is kept in, or NULL
 };
 
 static uint32_t shadow_hash(const char* str)
@@ -185,7 +187,83 @@ void vp_shadow_free(vp_shadow_t* shadow)
     free(shadow->entries);
     free(shadow->map);
     free(shadow->tails);
+    free(shadow->hidden_store);
     free(shadow);
+}
+
+/* Rewrite the hidden set to its store, through a temp file so a crash cannot
+ * leave a half-written list. */
+static void shadow_hidden_store_save(vp_shadow_t* shadow)
+{
+    char*  tmp;
+    size_t len;
+    FILE*  f;
+
+    if (!shadow || !shadow->hidden_store) {
+        return;
+    }
+    len = strlen(shadow->hidden_store);
+    tmp = malloc(len + 8);
+    if (!tmp) {
+        return;
+    }
+    snprintf(tmp, len + 8, "%s.tmp", shadow->hidden_store);
+    f = fopen(tmp, "wb");
+    if (!f) {
+        free(tmp);
+        return;
+    }
+    for (size_t i = 0; i < shadow->count; ++i) {
+        if (shadow->entries[i].hidden && shadow->entries[i].path) {
+            fprintf(f, "%s\n", shadow->entries[i].path);
+        }
+    }
+    fclose(f);
+    remove(shadow->hidden_store);
+    if (rename(tmp, shadow->hidden_store) != 0) {
+        remove(tmp);
+    }
+    free(tmp);
+}
+
+void vp_shadow_set_hidden_store(vp_shadow_t* shadow, const char* path)
+{
+    FILE* f;
+    char  line[4096];
+
+    if (!shadow) {
+        return;
+    }
+    free(shadow->hidden_store);
+    shadow->hidden_store = NULL;
+    if (!path || !*path) {
+        return;
+    }
+    shadow->hidden_store = malloc(strlen(path) + 1);
+    if (!shadow->hidden_store) {
+        return;
+    }
+    strcpy(shadow->hidden_store, path);
+
+    f = fopen(path, "rb");
+    if (!f) {
+        return;   // nothing recorded yet
+    }
+    while (fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        uint32_t idx;
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+            line[--n] = 0;
+        }
+        if (!n) {
+            continue;
+        }
+        idx = vp_shadow_index(shadow, line);
+        if (idx != VP_SHADOW_NONE) {
+            shadow->entries[idx].hidden = true;
+        }
+    }
+    fclose(f);
 }
 
 size_t vp_shadow_count(const vp_shadow_t* shadow)
@@ -384,6 +462,7 @@ bool vp_shadow_hide(vp_shadow_t* shadow, const char* guest_path)
         return false;
     }
     shadow->entries[idx].hidden = true;
+    shadow_hidden_store_save(shadow);
     return true;
 }
 
@@ -394,6 +473,7 @@ bool vp_shadow_unhide(vp_shadow_t* shadow, const char* guest_path)
         return false;
     }
     shadow->entries[idx].hidden = false;
+    shadow_hidden_store_save(shadow);
     return true;
 }
 

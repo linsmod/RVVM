@@ -105,6 +105,11 @@ static struct session sessions[SESSION_MAX];
 static const char*    shell_path = "/bin/sh";
 static int            listener   = -1;
 
+/* A client's `Q` frame asks the whole core to stop: the listener goes, every
+ * session is closed, and the daemon returns - which is what lets `ash
+ * --shutdown` stop a core without knowing its pid. */
+static bool g_shutdown = false;
+
 static long loop_ms(void)
 {
     struct timespec ts;
@@ -180,6 +185,11 @@ static ssize_t frame_apply(struct session* s, const uint8_t* buf, size_t len)
                 ioctl(s->master, TIOCSWINSZ, &ws);
             }
         }
+    } else if (blen >= 1 && body[0] == 'Q') {
+        /* Stop the core: the main loop notices before the next round and closes
+         * every session on the way out. A one-shot client uses this to ask a
+         * standalone `ash --serve` to stop. */
+        g_shutdown = true;
     } else if (blen >= 1 && body[0] == 'C' && !s->started) {
         /* A command to run instead of an interactive shell. Only before the
          * spawn: afterwards there is a session already, and substituting what it
@@ -506,6 +516,10 @@ int main(int argc, char** argv)
             port = DEFAULT_PORT;
         }
     }
+    /* argv[2]: seconds with no session before the core stops itself; 0 (the
+     * default) keeps it up until asked. */
+    int  idle_s   = (argc > 2) ? atoi(argv[2]) : 0;
+    long idle_ms  = idle_s > 0 ? (long)idle_s * 1000 : 0;
     const char* env_shell = getenv("SHELL");
     if (env_shell && *env_shell) {
         shell_path = env_shell;
@@ -535,10 +549,13 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    dlog("listening on 127.0.0.1:%d, shell %s (in %d, out %d)", port, shell_path, IN_MAX, OUT_MAX);
+    dlog("listening on 127.0.0.1:%d, shell %s (in %d, out %d, idle %d s)",
+         port, shell_path, IN_MAX, OUT_MAX, idle_s);
     fflush(stdout);
 
-    for (;;) {
+    long last_active = loop_ms();
+
+    while (!g_shutdown) {
         /* poll() is asked about the listener (a host socket) and about each
          * session's pty - an emulated descriptor the emulator answers itself.
          * The session *sockets* are not in the set: they are read every round
@@ -632,5 +649,25 @@ int main(int argc, char** argv)
                 session_close(s, "shell exited");
             }
         }
+
+        /* Idle policy: a core with no session for @idle_s stops itself, so one
+         * started by an autostarting client does not linger forever. 0 keeps it
+         * up until asked (the WSL default). */
+        int  in_use = session_count();
+        if (in_use > 0) {
+            last_active = now;
+        } else if (idle_ms > 0 && now - last_active >= idle_ms) {
+            dlog("no session for %d s, shutting down", idle_s);
+            break;
+        }
     }
+
+    /* Every way out closes the sessions first: their shells get SIGHUP and the
+     * sockets a FIN, the same as if each client had left. */
+    for (int i = 0; i < SESSION_MAX; ++i) {
+        if (sessions[i].used) {
+            session_close(&sessions[i], "shutdown");
+        }
+    }
+    return 0;
 }

@@ -22,8 +22,10 @@ boundary, a client is a session boundary."
 #include "win32_cmdpost_bridge.h"
 
 /* Implemented in ash_client.c */
-int ash_serve(int port);
+int ash_serve(int port, int idle_s);
 int ash_client(int port, const char* one_cmd, bool autostart);
+int ash_list(void);
+int ash_shutdown(int port);
 
 #define ASH_GUEST_ARGS_MAX 32
 #define ASH_PORT_DEFAULT   7900
@@ -43,27 +45,34 @@ static int ash_port(void)
 static void print_usage(const char* self)
 {
     fprintf(stderr,
-            "usage: %s [--serve] [--direct] [--port N] [-c <command>] [args...]\n"
+            "usage: %s [--serve [--idle S]] [--direct] [--list] [--shutdown]\n"
+            "          [--port N] [-c <command>] [args...]\n"
             "\n"
             "  %s                  connect to the run's core (start one if none);"
             " a new session\n"
             "  %s --serve          run the core: one run, kept up for clients\n"
             "  %s --direct         boot the guest shell on this console (old mode)\n"
             "  %s -c \"ls /bin\"      run one command in a session\n"
+            "  %s --list           list the cores registered in this release tree\n"
+            "  %s --shutdown       ask the core on the port to stop\n"
             "\n"
-            "Options: --port N (default %d, RVVM_ASH_PORT). RVVM_ASH_SHELL overrides\n"
+            "Options: --port N (default %d, RVVM_ASH_PORT); --serve --idle S stops a\n"
+            "core after S seconds with no session (0 = never). RVVM_ASH_SHELL overrides\n"
             "the shell: for --direct the guest to boot, for --serve the core program\n"
             "(default guest-assets\\vpsessiond.exe).\n",
-            self, self, self, self, self, ASH_PORT_DEFAULT);
+            self, self, self, self, self, self, self, ASH_PORT_DEFAULT);
 }
 
 int main(int argc, char** argv)
 {
-    bool        serve  = false;
-    bool        direct = false;
-    const char* one_cmd = NULL;
-    int         port   = ash_port();
-    int         i      = 1;
+    bool        serve    = false;
+    bool        direct   = false;
+    bool        list     = false;
+    bool        shutdown = false;
+    const char* one_cmd  = NULL;
+    int         idle     = 0;
+    int         port     = ash_port();
+    int         i        = 1;
     int         rc;
 
     /* Host options first; the first argument that is not one of them starts the
@@ -78,6 +87,14 @@ int main(int argc, char** argv)
             serve = true;
         } else if (!strcmp(a, "--direct")) {
             direct = true;
+        } else if (!strcmp(a, "--list")) {
+            list = true;
+        } else if (!strcmp(a, "--shutdown")) {
+            shutdown = true;
+        } else if (!strcmp(a, "--idle") && i + 1 < argc) {
+            idle = atoi(argv[++i]);
+        } else if (!strncmp(a, "--idle=", 7)) {
+            idle = atoi(a + 7);
         } else if (!strcmp(a, "--port") && i + 1 < argc) {
             port = atoi(argv[++i]);
         } else if (!strncmp(a, "--port=", 7)) {
@@ -87,8 +104,14 @@ int main(int argc, char** argv)
         }
     }
 
+    if (list) {
+        return ash_list();
+    }
+    if (shutdown) {
+        return ash_shutdown(port);
+    }
     if (serve) {
-        return ash_serve(port);
+        return ash_serve(port, idle);
     }
 
     /* Backward compatibility: a caller that set RVVM_ASH_SHELL (the regression

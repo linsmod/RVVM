@@ -8573,7 +8573,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 19: // eventfd2
                     rvvm_info("sys_eventfd2(%lx, %lx)", a0, a1);
                     a0 = errno_ret(eventfd(a0, a1));
-                    if (a0 >= 0) {
+                    if ((int64_t)a0 >= 0) {
                         int gfd = userland_fd_add(uctx(), (int)a0, (a1 & UAPI_EFD_CLOEXEC) != 0);
                         if (gfd < 0) {
                             a0 = -UAPI_EMFILE;
@@ -8591,7 +8591,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_epoll_create1(%lx)", a0);
                     int flags = (int)a0;
                     a0 = errno_ret(epoll_create1(flags));
-                    if (a0 >= 0) {
+                    if ((int64_t)a0 >= 0) {
                         int gfd = userland_fd_add(uctx(), (int)a0, (flags & UAPI_EPOLL_CLOEXEC) != 0);
                         if (gfd < 0) {
                             a0 = -UAPI_EMFILE;
@@ -8800,7 +8800,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         }
                     }
                     a0 = errno_ret(fcntl(fcntl_host, a1, a2));
-                    if (a0 >= 0 && (a1 == UAPI_F_DUPFD || a1 == UAPI_F_DUPFD_CLOEXEC)) {
+                    if ((int64_t)a0 >= 0 && (a1 == UAPI_F_DUPFD || a1 == UAPI_F_DUPFD_CLOEXEC)) {
                         /* The host picked a number at or above @a2 of its own;
                          * the guest gets a slot of its own, also at or above
                          * @a2, which is what F_DUPFD asks for. */
@@ -9083,7 +9083,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                             const char* host_path = wrap_guest_path(path_buf, (int)a0, path);
                             a0 = errno_ret(openat(userland_fd_host(uctx(), (int)a0),
                                                   host_path, uapi_open_flags(a2), a3));
-                            if (a0 >= 0) {
+                            if ((int64_t)a0 >= 0) {
                                 int host_fd  = (int)a0;
                                 int guest_fd = userland_fd_add(uctx(), host_fd,
                                                                (a2 & UAPI_O_CLOEXEC) != 0);
@@ -9150,7 +9150,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     int* fds = to_ptr_sz(a0, sizeof(int) * 2);
                     int flags = (int)a1;
                     a0 = fds ? errno_ret(pipe(fds)) : (rvvm_addr_t)-UAPI_EFAULT;
-                    if (a0 >= 0 && fds) {
+                    if ((int64_t)a0 >= 0 && fds) {
                         /* Both ends. O_CLOEXEC is the guest's own view of it: the
                          * host pipe(2) is not told (no flag translation), so the
                          * table carries the flag and execve() acts on it. */
@@ -10151,7 +10151,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * socket() would read them as an unknown type: they are
                      * taken off the type and applied on our side. */
                     a0 = errno_ret(socket(a0, a1 & ~UAPI_SOCK_TYPE_MASK, a2));
-                    if (a0 >= 0) {
+                    if ((int64_t)a0 >= 0) {
                         int host_fd  = (int)a0;
                         int guest_fd = userland_fd_add(uctx(), host_fd,
                                                        (type & UAPI_SOCK_CLOEXEC) != 0);
@@ -10174,7 +10174,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     int type = (int)a1;
                     int* pair = to_ptr_sz(a3, sizeof(int) * 2);
                     a0 = errno_ret(socketpair(a0, a1 & ~UAPI_SOCK_TYPE_MASK, a2, pair));
-                    if (a0 >= 0 && pair) {
+                    if ((int64_t)a0 >= 0 && pair) {
                         bool cloexec = (type & UAPI_SOCK_CLOEXEC) != 0;
                         uint32_t status = (type & UAPI_SOCK_NONBLOCK) ? UAPI_O_NONBLOCK : 0;
                         int  host0   = pair[0];
@@ -10221,7 +10221,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     // TODO: struct conversion(?)
                     rvvm_info("sys_accept(%ld, %lx, %lx)", a0, a1, a2);
                     a0 = errno_ret(accept(userland_fd_host(uctx(), (int)a0), to_ptr(a1), to_ptr(a2)));
-                    if (a0 >= 0) {
+                    if ((int64_t)a0 >= 0) {
                         /* accept(2) has no flag argument: the new descriptor
                          * never carries FD_CLOEXEC, exactly like Linux - and it
                          * is blocking, even when the listener is not. */
@@ -10401,7 +10401,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * call and applied here. */
                     a0 = errno_ret(accept4(userland_fd_host(uctx(), (int)a0), to_ptr(a1), to_ptr(a2),
                                            a3 & ~UAPI_SOCK_TYPE_MASK));
-                    if (a0 >= 0) {
+                    if ((int64_t)a0 >= 0) {
                         int host_fd  = (int)a0;
                         int guest_fd = userland_fd_add(uctx(), host_fd,
                                                        (flags & UAPI_SOCK_CLOEXEC) != 0);
@@ -10500,7 +10500,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_memfd_create(%s, %lx)", to_str(a0), a1);
                     int flags = (int)a1;
                     a0 = errno_ret(memfd_create(to_str(a0), a1));
-                    if (a0 >= 0) {
+                    if ((int64_t)a0 >= 0) {
                         int host_fd  = (int)a0;
                         int guest_fd = userland_fd_add(uctx(), host_fd,
                                                        (flags & UAPI_MFD_CLOEXEC) != 0);

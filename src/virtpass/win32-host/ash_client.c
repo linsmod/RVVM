@@ -49,6 +49,10 @@ The wire protocol is the session server's, not a new one:
 #define ASH_AF_INET      2
 #define ASH_SOCK_STREAM  1
 
+/* Defined with the client below; the core's control verbs use them too. */
+static int  ash_connect(int port);
+static void ash_send_frame(int fd, const char* body);
+
 /* ------------------------------------------------------------------ */
 /* The core: --serve                                                   */
 /* ------------------------------------------------------------------ */
@@ -104,13 +108,220 @@ static bool ash_exe_directory(char* out, size_t size)
     return true;
 }
 
-int ash_serve(int port)
+/* ------------------------------------------------------------------ */
+/* Core registry (discovery + the one-core-per-port lock)              */
+/*                                                                    */
+/* A core writes <exe>\runtime\cores\<port>.core with its pid and the  */
+/* program it runs, and removes it on the way out. `--list` reads the  */
+/* directory, `--serve` refuses a port another live core already owns. */
+/* A crashed core leaves a stale file; liveness of the pid is what      */
+/* tells the two apart, and a stale one is simply reclaimed.            */
+/* ------------------------------------------------------------------ */
+
+static bool ash_runtime_cores_dir(char* out, size_t size)
+{
+    char exe_dir[MAX_PATH];
+    char runtime[MAX_PATH];
+
+    if (!ash_exe_directory(exe_dir, sizeof(exe_dir))) {
+        return false;
+    }
+    snprintf(runtime, sizeof(runtime), "%s\\runtime", exe_dir);
+    CreateDirectoryA(runtime, NULL);        /* already there after a run */
+    snprintf(out, size, "%s\\runtime\\cores", exe_dir);
+    CreateDirectoryA(out, NULL);
+    return true;
+}
+
+static bool ash_core_file(int port, char* out, size_t size)
+{
+    char dir[MAX_PATH];
+
+    if (!ash_runtime_cores_dir(dir, sizeof(dir))) {
+        return false;
+    }
+    snprintf(out, size, "%s\\%d.core", dir, port);
+    return true;
+}
+
+static bool ash_pid_alive(DWORD pid)
+{
+    HANDLE h = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
+    bool   alive;
+
+    if (!h) {
+        return false;
+    }
+    alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    CloseHandle(h);
+    return alive;
+}
+
+/* The pid a core's registry file names, or 0 when there is none. */
+static DWORD ash_core_pid(int port)
+{
+    char  path[MAX_PATH];
+    char  line[256];
+    DWORD pid = 0;
+    FILE* f;
+
+    if (!ash_core_file(port, path, sizeof(path))) {
+        return 0;
+    }
+    f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "pid=%lu", &pid) == 1) {
+            break;
+        }
+    }
+    fclose(f);
+    return pid;
+}
+
+static void ash_core_register(int port, const char* shell)
+{
+    char  path[MAX_PATH];
+    FILE* f;
+
+    if (!ash_core_file(port, path, sizeof(path))) {
+        return;
+    }
+    f = fopen(path, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "port=%d\npid=%lu\nshell=%s\nstarted=%llu\n",
+            port, (unsigned long)GetCurrentProcessId(), shell,
+            (unsigned long long)GetTickCount64());
+    fclose(f);
+}
+
+static void ash_core_unregister(int port)
+{
+    char path[MAX_PATH];
+
+    if (ash_core_file(port, path, sizeof(path))) {
+        DeleteFileA(path);
+    }
+}
+
+/* Is a live core already on this port? A stale registration is reclaimed. */
+static bool ash_core_up(int port)
+{
+    DWORD pid = ash_core_pid(port);
+
+    if (!pid) {
+        return false;
+    }
+    if (ash_pid_alive(pid)) {
+        return true;
+    }
+    ash_core_unregister(port);
+    return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* The rootfs lock                                                     */
+/*                                                                    */
+/* `runtime/rootfs` is the persisted writable layer, and its state is  */
+/* not safe for two machines at once - two cores on different ports    */
+/* would still share it. One lock file beside the tree (with the pid)  */
+/* serializes them, the same way the port registry does for a port.    */
+/* ------------------------------------------------------------------ */
+
+static bool ash_lock_path(char* out, size_t size)
+{
+    char exe_dir[MAX_PATH];
+    char runtime[MAX_PATH];
+
+    if (!ash_exe_directory(exe_dir, sizeof(exe_dir))) {
+        return false;
+    }
+    snprintf(runtime, sizeof(runtime), "%s\\runtime", exe_dir);
+    CreateDirectoryA(runtime, NULL);
+    snprintf(out, size, "%s\\ash-core.lock", runtime);
+    return true;
+}
+
+static DWORD ash_lock_pid(const char* path)
+{
+    FILE* f = fopen(path, "r");
+    char  line[128];
+    DWORD pid = 0;
+
+    if (!f) {
+        return 0;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "pid=%lu", &pid) == 1) {
+            break;
+        }
+    }
+    fclose(f);
+    return pid;
+}
+
+/* Take the rootfs lock for this process: false when another live core holds
+ * it. A stale lock (a core that died) is reclaimed. */
+static bool ash_rootfs_lock(char* out, size_t size)
+{
+    char path[MAX_PATH];
+
+    if (!ash_lock_path(path, sizeof(path))) {
+        return true;   /* cannot locate it: do not block a run over it */
+    }
+    if (strlen(path) + 1 > size) {
+        return true;
+    }
+    strcpy(out, path);
+
+    DWORD holder = ash_lock_pid(path);
+    if (holder && holder != GetCurrentProcessId() && ash_pid_alive(holder)) {
+        return false;
+    }
+    FILE* f = fopen(path, "w");
+    if (!f) {
+        return true;
+    }
+    fprintf(f, "pid=%lu\n", (unsigned long)GetCurrentProcessId());
+    fclose(f);
+    return true;
+}
+
+static void ash_rootfs_unlock(const char* path)
+{
+    char mine[MAX_PATH];
+
+    if (ash_lock_path(mine, sizeof(mine)) && strcmp(mine, path) == 0 &&
+        ash_lock_pid(mine) == GetCurrentProcessId()) {
+        DeleteFileA(mine);
+    }
+}
+
+int ash_serve(int port, int idle_s)
 {
     const char* env_shell = getenv("RVVM_ASH_SHELL");
     const char* shell     = ash_default_core_shell();
     char        port_buf[16];
-    char*       guest[3];
+    char        idle_buf[16];
+    char*       guest[4];
     int         rc;
+
+    /* One core per port: the lock is the registry, and it fails before a second
+     * machine is built only to lose the port race inside the guest. */
+    if (ash_core_up(port)) {
+        fprintf(stderr, "ash --serve: a core is already up on 127.0.0.1:%d\n", port);
+        return 1;
+    }
+
+    char lock[MAX_PATH];
+    if (!ash_rootfs_lock(lock, sizeof(lock))) {
+        fprintf(stderr, "ash --serve: this release's rootfs is in use by another core\n");
+        return 1;
+    }
 
     /* The default shell is a relative guest path, so the host has to be standing
      * in the release directory when the image is opened. An explicit
@@ -123,27 +334,118 @@ int ash_serve(int port)
     }
 
     snprintf(port_buf, sizeof(port_buf), "%d", port);
+    snprintf(idle_buf, sizeof(idle_buf), "%d", idle_s > 0 ? idle_s : 0);
     guest[0] = (char*)shell;
     guest[1] = port_buf;
-    guest[2] = NULL;
+    guest[2] = idle_buf;
+    guest[3] = NULL;
 
     if (!win32_host_init_console(0, 0, 0)) {
         fprintf(stderr, "ash --serve: could not initialize the host\n");
+        ash_rootfs_unlock(lock);
         return 1;
     }
     /* A core is a daemon: it must not put the terminal it was started from into
      * raw mode or eat its input (the sessions are on the socket, not here). */
     win32_host_no_stdin();
-    if (!win32_host_start_guest(2, guest)) {
+    if (!win32_host_start_guest(3, guest)) {
         fprintf(stderr, "ash --serve: could not start %s\n", shell);
         win32_host_shutdown();
+        ash_rootfs_unlock(lock);
         return 1;
     }
 
-    fprintf(stderr, "ash: core up (shell %s, port %d) - connect with `ash`\n", shell, port);
+    ash_core_register(port, shell);
+    fprintf(stderr, "ash: core up (shell %s, port %d%s%s) - connect with `ash`\n",
+            shell, port, idle_s > 0 ? ", idle " : "", idle_s > 0 ? idle_buf : "");
     rc = win32_host_wait_guest();
+    ash_core_unregister(port);
+    ash_rootfs_unlock(lock);
     win32_host_shutdown();
     return rc;
+}
+
+/* `ash --list`: the cores this release directory has registrations for. */
+int ash_list(void)
+{
+    char             dir[MAX_PATH];
+    char             pattern[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE           h;
+    int              found = 0;
+
+    if (!ash_runtime_cores_dir(dir, sizeof(dir))) {
+        fprintf(stderr, "ash: cannot locate the runtime directory\n");
+        return 1;
+    }
+    snprintf(pattern, sizeof(pattern), "%s\\*.core", dir);
+    h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        printf("no cores running\n");
+        return 0;
+    }
+    do {
+        int   port = atoi(fd.cFileName);   /* "<port>.core" */
+        DWORD pid  = ash_core_pid(port);
+        char  shell[128] = "";
+        char  path[MAX_PATH];
+
+        if (!pid) {
+            continue;
+        }
+        if (ash_core_file(port, path, sizeof(path))) {
+            FILE* f = fopen(path, "r");
+            if (f) {
+                char line[256];
+                while (fgets(line, sizeof(line), f)) {
+                    if (!strncmp(line, "shell=", 6)) {
+                        sscanf(line, "shell=%127s", shell);
+                    }
+                }
+                fclose(f);
+            }
+        }
+        if (ash_pid_alive(pid)) {
+            printf("up     port=%-5d pid=%-6lu shell=%s\n", port, (unsigned long)pid, shell);
+        } else {
+            printf("stale  port=%-5d (reclaimed)\n", port);
+            ash_core_unregister(port);
+        }
+        found++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+
+    if (!found) {
+        printf("no cores running\n");
+    }
+    return 0;
+}
+
+/* `ash --shutdown`: ask the core on @port to stop. The request is the session
+ * protocol's `Q` frame, so no pid or signal is needed. */
+int ash_shutdown(int port)
+{
+    int   fd = ash_connect(port);
+    char  buf[256];
+
+    if (fd < 0) {
+        fprintf(stderr, "ash: no core on 127.0.0.1:%d\n", port);
+        return 1;
+    }
+    ash_send_frame(fd, "Q");
+    /* Drain until the core closes the socket (it is on its way out). */
+    for (int i = 0; i < 200; i++) {
+        int r = win_socket_wait(fd, WIN_POLLIN, 50);
+        if (r < 0) {
+            break;
+        }
+        if (r > 0 && win_socket_read(fd, buf, sizeof(buf)) <= 0) {
+            break;
+        }
+    }
+    win_socket_close(fd);
+    fprintf(stderr, "ash: asked the core on %d to stop\n", port);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
