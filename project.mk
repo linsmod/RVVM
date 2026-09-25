@@ -379,6 +379,7 @@ override bin_libs_rvvm_winhost := rvvm zlib
 # every source but the entry point - the bridge keeps its window, GL, audio and
 # sensor code behind win32_host_init(), which this one never calls.
 override bin_src_rvvm_ash     := $(SRCDIR)/virtpass/win32-host/ash_main.c \
+                                 $(SRCDIR)/virtpass/win32-host/ash_client.c \
                                  $(filter-out $(SRCDIR)/virtpass/win32-host/win32_main.c,$(bin_src_rvvm_winhost))
 override bin_libs_rvvm_ash    := rvvm zlib
 endif

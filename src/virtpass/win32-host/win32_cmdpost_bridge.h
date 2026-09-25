@@ -68,6 +68,15 @@ void win32_host_set_assets_dir(const char* dir);
 bool win32_host_init_console(int virt_w, int virt_h, int virt_ppi);
 
 /*
+ * Do not pump this process's stdin into the guest console, and leave the
+ * console in the mode it was found in. For a host that is a daemon rather than
+ * an interactive shell (`rvvm_ash --serve`): its sessions arrive over the
+ * network, so the terminal it was started from is not one of them. Call before
+ * win32_host_start_guest().
+ */
+void win32_host_no_stdin(void);
+
+/*
  * Block until the guest exits and return its exit code. The console host's
  * equivalent of win32_host_message_loop(): with the guest, the stdin pump and
  * the console geometry poller all on threads of their own, there is no message

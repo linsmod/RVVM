@@ -1,19 +1,18 @@
 /*
-ash_main.c - rvvm_ash: a console-only host that boots the bundle's shell
+ash_main.c - rvvm_ash: the console host, split WSL-style into a core and clients
 
-The WinHost is a windowed host that also owns a console; this is the other half
-of the same bridge: no window, no GL, no audio, no sensors - just the guest's
-terminal, wired to this console. It is the bash.exe to the WinHost's wsl.exe:
+rvvm_ash is the bash.exe of this project, but the WSL shape needs two roles:
 
-    rvvm_ash.exe                 interactive shell on the bundle's rootfs
-    rvvm_ash.exe -c "ls /bin"    one command; the exit code is the guest's
-    rvvm_ash.exe script.sh       arguments are handed to the shell
+    rvvm_ash --serve        the core: one run (one machine, one rootfs) kept up,
+                            booting the session server so clients can attach
+    rvvm_ash                a client: attach to the core (start one if none) and
+                            be the terminal for a new session
+    rvvm_ash --direct       boot the guest shell straight on this console - the
+                            old behaviour, kept for the regression tools
 
-While the guest runs the console is in raw mode - no echo, no line assembly, and
-^C arrives as a byte so the guest's own line discipline decides what it means
-(a shell gets its SIGINT, vi gets a literal ^Z) - and it is put back the way it
-was found on the way out. The guest sees this console's real geometry, and a
-resize of it as SIGWINCH.
+A client is a thin terminal over the session server's wire protocol (see
+ash_client.c); a core is the run the sessions live in. "--serve is the run
+boundary, a client is a session boundary."
 */
 
 #include <stdio.h>
@@ -22,61 +21,118 @@ resize of it as SIGWINCH.
 
 #include "win32_cmdpost_bridge.h"
 
+/* Implemented in ash_client.c */
+int ash_serve(int port);
+int ash_client(int port, const char* one_cmd, bool autostart);
+
 #define ASH_GUEST_ARGS_MAX 32
+#define ASH_PORT_DEFAULT   7900
+
+static int ash_port(void)
+{
+    const char* env = getenv("RVVM_ASH_PORT");
+    if (env && *env) {
+        int p = atoi(env);
+        if (p > 0 && p <= 65535) {
+            return p;
+        }
+    }
+    return ASH_PORT_DEFAULT;
+}
 
 static void print_usage(const char* self)
 {
     fprintf(stderr,
-            "usage: %s [-c <command>] [args...]\n"
+            "usage: %s [--serve] [--direct] [--port N] [-c <command>] [args...]\n"
             "\n"
-            "A shell on the bundle's rootfs (busybox ash), on this console:\n"
-            "  %s                  interactive shell\n"
-            "  %s -c \"ls /bin\"      one command, exit with the guest's code\n"
+            "  %s                  connect to the run's core (start one if none);"
+            " a new session\n"
+            "  %s --serve          run the core: one run, kept up for clients\n"
+            "  %s --direct         boot the guest shell on this console (old mode)\n"
+            "  %s -c \"ls /bin\"      run one command in a session\n"
             "\n"
-            "It runs on the bundle next to this binary\n"
-            "(bundle/{rootfs,apps}.tar.gz, see `make dist`). RVVM_ASH_SHELL\n"
-            "overrides the shell to run (default /bin/sh).\n",
-            self, self, self);
+            "Options: --port N (default %d, RVVM_ASH_PORT). RVVM_ASH_SHELL overrides\n"
+            "the shell: for --direct the guest to boot, for --serve the core program\n"
+            "(default guest-assets\\vpsessiond.exe).\n",
+            self, self, self, self, self, ASH_PORT_DEFAULT);
 }
 
 int main(int argc, char** argv)
 {
-    const char* shell = getenv("RVVM_ASH_SHELL");
-    char* guest[ASH_GUEST_ARGS_MAX];
-    int n = 0;
-    int i = 1;
-    int rc;
+    bool        serve  = false;
+    bool        direct = false;
+    const char* one_cmd = NULL;
+    int         port   = ash_port();
+    int         i      = 1;
+    int         rc;
 
-    if (!shell || !*shell) {
-        shell = "/bin/sh";
-    }
-    if (i < argc && (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))) {
-        print_usage(argv[0]);
-        return 0;
+    /* Host options first; the first argument that is not one of them starts the
+     * guest arguments (--direct) or the client's command. */
+    for (; i < argc; i++) {
+        const char* a = argv[i];
+        if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+            print_usage(argv[0]);
+            return 0;
+        }
+        if (!strcmp(a, "--serve")) {
+            serve = true;
+        } else if (!strcmp(a, "--direct")) {
+            direct = true;
+        } else if (!strcmp(a, "--port") && i + 1 < argc) {
+            port = atoi(argv[++i]);
+        } else if (!strncmp(a, "--port=", 7)) {
+            port = atoi(a + 7);
+        } else {
+            break;
+        }
     }
 
-    /* argv[0] is the guest program; everything else is handed to the shell
-     * unchanged - "-c <command>" included, which is the shell's own spelling. */
-    guest[n++] = (char*)shell;
-    for (; i < argc && n < ASH_GUEST_ARGS_MAX; i++, n++) {
-        guest[n] = argv[i];
-    }
-    if (i < argc) {
-        fprintf(stderr, "%s: too many arguments (max %d)\n", argv[0], ASH_GUEST_ARGS_MAX - 1);
-        return 1;
+    if (serve) {
+        return ash_serve(port);
     }
 
-    if (!win32_host_init_console(0, 0, 0)) {
-        fprintf(stderr, "%s: could not initialize the host\n", argv[0]);
-        return 1;
-    }
-    if (!win32_host_start_guest(n, guest)) {
-        fprintf(stderr, "%s: could not start %s\n", argv[0], shell);
+    /* Backward compatibility: a caller that set RVVM_ASH_SHELL (the regression
+     * tools) asked for a direct run of that guest, not for a client. */
+    if (direct || getenv("RVVM_ASH_SHELL")) {
+        const char* shell = getenv("RVVM_ASH_SHELL");
+        char* guest[ASH_GUEST_ARGS_MAX];
+        int   n = 0;
+
+        if (!shell || !*shell) {
+            shell = "/bin/sh";
+        }
+        guest[n++] = (char*)shell;
+        for (; i < argc && n < ASH_GUEST_ARGS_MAX; i++, n++) {
+            guest[n] = argv[i];
+        }
+        if (i < argc) {
+            fprintf(stderr, "%s: too many arguments (max %d)\n",
+                    argv[0], ASH_GUEST_ARGS_MAX - 1);
+            return 1;
+        }
+
+        if (!win32_host_init_console(0, 0, 0)) {
+            fprintf(stderr, "%s: could not initialize the host\n", argv[0]);
+            return 1;
+        }
+        if (!win32_host_start_guest(n, guest)) {
+            fprintf(stderr, "%s: could not start %s\n", argv[0], shell);
+            win32_host_shutdown();
+            return 1;
+        }
+        rc = win32_host_wait_guest();
         win32_host_shutdown();
-        return 1;
+        return rc;
     }
 
-    rc = win32_host_wait_guest();
-    win32_host_shutdown();
-    return rc;
+    /* Client mode. `-c <command>` asks the core for a one-shot session. */
+    if (i < argc && !strcmp(argv[i], "-c") && i + 1 < argc) {
+        one_cmd = argv[i + 1];
+    } else if (i < argc) {
+        fprintf(stderr, "%s: unexpected argument '%s' (did you mean --direct?)\n",
+                argv[0], argv[i]);
+        print_usage(argv[0]);
+        return 1;
+    }
+    return ash_client(port, one_cmd, true);
 }

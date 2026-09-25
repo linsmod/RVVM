@@ -617,9 +617,13 @@ int main(int argc, char** argv)
             if (!s->used) {
                 continue;
             }
-            if (!s->child_done) {
-                session_drain_pty(s);
-            }
+            /* Drain even after the child is gone. A one-shot command
+             * (`sh -c 'echo hi'`, `ash -c`) writes its output and exits in the
+             * same instant, so the round that reaps it must still read the
+             * master - the drain stops on EOF/EIO, which is also what marks the
+             * session finished, and the last output is the whole reason the
+             * session exists. */
+            session_drain_pty(s);
             session_pump_out(s);
             if (!s->used) {
                 continue;

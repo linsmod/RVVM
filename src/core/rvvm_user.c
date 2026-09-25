@@ -4222,7 +4222,7 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
     ctx->fds[fd].shared  = shared;
     ctx->fds[fd].console = console;
     ctx->fds[fd].flags   = flags;
-    if (fd >= FD_TRACE_LO && fd <= FD_TRACE_HI) {
+    if (path_trace_enabled() && fd >= FD_TRACE_LO && fd <= FD_TRACE_HI) {
         rvvm_warn("fd_wr[%s] ctx=%p fd=%d used=%d host=%d clo=%d sh=%d con=%d fl=%x",
                   op, (void*)ctx, fd, (int)used, host_fd,
                   (int)cloexec, (int)shared, (int)console, flags);
@@ -4231,7 +4231,7 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
 
 static void userland_fd_dump(rvvm_userland_t* ctx, const char* tag)
 {
-    if (!ctx) return;
+    if (!path_trace_enabled() || !ctx) return;
     rvvm_warn("fd_dump[%s] ctx=%p uctx=%p", tag, (void*)ctx, (void*)uctx());
     for (int fd = FD_TRACE_LO; fd <= FD_TRACE_HI; ++fd) {
         if (ctx->fds[fd].used) {
@@ -10648,7 +10648,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                  * nothing to return to, so re-enter the interpreter instead. */
                 continue;
             }
-            if ((int64_t)a0 < 0) {
+            if ((int64_t)a0 < 0 && path_trace_enabled()) {
                 rvvm_warn("Syscall %ld failed: %ld", a7, a0);
             }
             rvvm_info("  nr=%ld -> %lx", a7, a0);

@@ -1164,6 +1164,15 @@ static void console_restore_mode(void)
     }
 }
 
+/* Set by a daemon host (rvvm_ash --serve): its sessions are on the socket, and
+ * the terminal it was started from must be left alone. */
+static bool g_no_stdin_pump = false;
+
+void win32_host_no_stdin(void)
+{
+    g_no_stdin_pump = true;
+}
+
 /* Start the pump once per process, if there is a stdin to read at all. */
 static void stdin_pump_start(void)
 {
@@ -1171,7 +1180,7 @@ static void stdin_pump_start(void)
     HANDLE hin = GetStdHandle(STD_INPUT_HANDLE);
     DWORD type;
 
-    if (started || !hin || hin == INVALID_HANDLE_VALUE) {
+    if (g_no_stdin_pump || started || !hin || hin == INVALID_HANDLE_VALUE) {
         return;
     }
     type = GetFileType(hin);
