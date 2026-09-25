@@ -1627,7 +1627,6 @@ static void user_tty_vt_write(rvvm_userland_t* ctx, const char* buf, size_t len)
 
 /* Defined further down with the path trace (wrap_guest_path_ex); shared by the
  * TCSETS trace here so one env var turns on both. */
-static bool path_trace_enabled(void);
 static THREAD_LOCAL rvvm_addr_t tls_cur_syscall;   // definition lives with it
 #define UAPI_TIOCGWINSZ 0x5413
 #define UAPI_TIOCSWINSZ 0x5414
@@ -1719,13 +1718,11 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg, int32_t pid)
             /* isatty() is exactly this probe succeeding; without the trace a
              * "console looks dead" symptom cannot be told apart from a guest
              * that went non-interactive because TCGETS never landed here. */
-            if (path_trace_enabled()) {
-                rvvm_warn("tty:  syscall %ld TCGETS -> console isatty=yes (canon=%d echo=%d isig=%d)",
+                RVVM_TRC(RVVM_TRC_TTY, "tty:  syscall %ld TCGETS -> console isatty=yes (canon=%d echo=%d isig=%d)",
                           (long)tls_cur_syscall,
                           (int)!!(t.c_lflag & TTY_LFLAG_ICANON),
                           (int)!!(t.c_lflag & TTY_LFLAG_ECHO),
                           (int)!!(t.c_lflag & TTY_LFLAG_ISIG));
-            }
             return 0;
         }
         case UAPI_TIOCGWINSZ: {
@@ -1760,12 +1757,10 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg, int32_t pid)
                 const uapi_termios_t* t = arg;
                 uctx()->tty_lflag = t->c_lflag;
                 uctx()->tty_iflag = t->c_iflag;
-                if (path_trace_enabled()) {
-                    rvvm_warn("tty:  syscall %ld TCSETS lflag=%lx (canon=%d echo=%d)",
+                    RVVM_TRC(RVVM_TRC_TTY, "tty:  syscall %ld TCSETS lflag=%lx (canon=%d echo=%d)",
                               (long)tls_cur_syscall, (unsigned long)t->c_lflag,
                               (int)!!(t->c_lflag & TTY_LFLAG_ICANON),
                               (int)!!(t->c_lflag & TTY_LFLAG_ECHO));
-                }
             }
             return 0;
         case UAPI_TIOCSWINSZ:
@@ -2132,10 +2127,8 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
             } else if (c == 'R' && ctx->tty_esc_hold_len < sizeof(ctx->tty_esc_hold)) {
                 // A complete cursor-position report: control traffic, not
                 // typing. Drop it whole - nothing echoed, nothing delivered.
-                if (path_trace_enabled()) {
-                    rvvm_warn("tty:  dropped cursor report ESC[%.*sR",
+                    RVVM_TRC(RVVM_TRC_TTY, "tty:  dropped cursor report ESC[%.*sR",
                               (int)ctx->tty_esc_hold_len, (const char*)ctx->tty_esc_hold);
-                }
                 ctx->tty_esc_state = 0;
                 ctx->tty_esc_hold_len = 0;
                 continue;
@@ -2269,7 +2262,6 @@ static int64_t user_tty_read(rvvm_userland_t* ctx, void* buf, size_t count, bool
         if (ctx->tty_cooked_len) {
             size_t n = tty_cooked_pop(ctx, buf, count);
             spin_unlock(&ctx->tty_in_lock);
-            if (path_trace_enabled()) {
                 /* What the guest's read(0) actually gets: the byte-level
                  * truth about control characters (0x03/0x04/DEL/ESC...) the
                  * guest's line editor has to make sense of. */
@@ -2287,8 +2279,7 @@ static int64_t user_tty_read(rvvm_userland_t* ctx, void* buf, size_t count, bool
                     }
                 }
                 shown[s] = 0;
-                rvvm_warn("tty:  read(0) -> %u \"%s\"", (unsigned)n, shown);
-            }
+                RVVM_TRC(RVVM_TRC_TTY, "tty:  read(0) -> %u \"%s\"", (unsigned)n, shown);
             return (int64_t)n;
         }
         if (ctx->tty_eof_pending) {
@@ -2445,12 +2436,12 @@ static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, b
     rvvm_addr_t addr = ctx->guest_bump;
     ctx->guest_bump += size;
     if (size >= (1u << 20)) {
-        rvvm_warn("DBG alloc: zeroing %llx bytes at %llx (mmap_end %llx)", (long long)size, (long long)addr,
+        RVVM_TRC(RVVM_TRC_MMAP, "DBG alloc: zeroing %llx bytes at %llx (mmap_end %llx)", (long long)size, (long long)addr,
                   (long long)ctx->guest_mmap_end);
     }
     memset(to_ptr(addr), 0, size);
     if (size >= (1u << 20)) {
-        rvvm_warn("DBG alloc: zeroed ok");
+        RVVM_TRC(RVVM_TRC_MMAP, "DBG alloc: zeroed ok");
     }
     *out = addr;
     return true;
@@ -3236,18 +3227,6 @@ static bool guest_path_absolutize(char* out, size_t size, const char* path)
  * early boot). */
 static THREAD_LOCAL rvvm_addr_t tls_cur_syscall = (rvvm_addr_t)-1;
 
-/* Path-access tracing, enabled by RVVM_TRACE_PATH in the environment. Printed
- * at warn level on purpose: the point is to interleave with the
- * "Syscall N failed" warnings (also warn level) so the failing syscall and the
- * path it tripped on sit next to each other in the log. */
-static bool path_trace_enabled(void)
-{
-    static int enabled = -1;
-    if (enabled < 0) {
-        enabled = getenv("RVVM_TRACE_PATH") != NULL;
-    }
-    return enabled;
-}
 
 /* The entry point every guest path syscall argument goes through.
  *
@@ -3267,17 +3246,13 @@ static const char* wrap_guest_path_ex(char* buffer, int dirfd, const char* path,
         char abs[UAPI_PATH_MAX];
         if (guest_path_absolutize(abs, sizeof(abs), path)) {
             const char* mapped = map_abs_path_ex(buffer, abs, follow_final);
-            if (path_trace_enabled()) {
-                rvvm_warn("path: syscall %ld dirfd=%d follow=%d \"%s\" -> \"%s\"",
+                RVVM_TRC(RVVM_TRC_PATH, "path: syscall %ld dirfd=%d follow=%d \"%s\" -> \"%s\"",
                           (long)tls_cur_syscall, dirfd, follow_final, path, mapped ? mapped : "(null)");
-            }
             return mapped;
         }
     }
-    if (path_trace_enabled()) {
-        rvvm_warn("path: syscall %ld dirfd=%d follow=%d \"%s\" (passthrough)",
+        RVVM_TRC(RVVM_TRC_PATH, "path: syscall %ld dirfd=%d follow=%d \"%s\" (passthrough)",
                   (long)tls_cur_syscall, dirfd, follow_final, path);
-    }
     return path;
 }
 
@@ -4057,9 +4032,7 @@ static void userland_proc_register(rvvm_userland_t* ctx, rvvm_process_t* proc)
  * is dropped, so the caller does not double-free. */
 static bool userland_proc_forget(rvvm_userland_t* ctx, rvvm_process_t* proc)
 {
-    if (path_trace_enabled()) {
-        rvvm_warn("forget: ctx=%p pid=%u", (void*)ctx, proc->pid);
-    }
+        RVVM_TRC(RVVM_TRC_JOB, "forget: ctx=%p pid=%u", (void*)ctx, proc->pid);
     bool found = false;
     spin_lock(&ctx->proc_lock);
     vector_foreach_back(ctx->procs, i) {
@@ -4103,9 +4076,7 @@ static void userland_reap_orphan_zombies(rvvm_userland_t* ctx, rvvm_process_t* p
             !atomic_load_uint32(&child->exited)) {
             continue;
         }
-        if (path_trace_enabled()) {
-            rvvm_warn("reap orphan zombie: pid=%u ppid=%u", child->pid, proc->pid);
-        }
+            RVVM_TRC(RVVM_TRC_JOB, "reap orphan zombie: pid=%u ppid=%u", child->pid, proc->pid);
         vector_erase(proc_ctx->procs, i);
         userland_proc_unref(child);
     }
@@ -4222,8 +4193,8 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
     ctx->fds[fd].shared  = shared;
     ctx->fds[fd].console = console;
     ctx->fds[fd].flags   = flags;
-    if (path_trace_enabled() && fd >= FD_TRACE_LO && fd <= FD_TRACE_HI) {
-        rvvm_warn("fd_wr[%s] ctx=%p fd=%d used=%d host=%d clo=%d sh=%d con=%d fl=%x",
+    if (fd >= FD_TRACE_LO && fd <= FD_TRACE_HI) {
+        RVVM_TRC(RVVM_TRC_FD, "fd_wr[%s] ctx=%p fd=%d used=%d host=%d clo=%d sh=%d con=%d fl=%x",
                   op, (void*)ctx, fd, (int)used, host_fd,
                   (int)cloexec, (int)shared, (int)console, flags);
     }
@@ -4231,11 +4202,11 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
 
 static void userland_fd_dump(rvvm_userland_t* ctx, const char* tag)
 {
-    if (!path_trace_enabled() || !ctx) return;
-    rvvm_warn("fd_dump[%s] ctx=%p uctx=%p", tag, (void*)ctx, (void*)uctx());
+    if (!ctx) return;
+    RVVM_TRC(RVVM_TRC_FD, "fd_dump[%s] ctx=%p uctx=%p", tag, (void*)ctx, (void*)uctx());
     for (int fd = FD_TRACE_LO; fd <= FD_TRACE_HI; ++fd) {
         if (ctx->fds[fd].used) {
-            rvvm_warn("fd_dump[%s]: fd=%d host=%d clo=%d sh=%d",
+            RVVM_TRC(RVVM_TRC_FD, "fd_dump[%s]: fd=%d host=%d clo=%d sh=%d",
                       tag, fd, ctx->fds[fd].fd,
                       (int)ctx->fds[fd].cloexec, (int)ctx->fds[fd].shared);
         }
@@ -4622,9 +4593,7 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
  * tree of its own (see rvvm_sys_clone). */
 static void userland_procs_reset(rvvm_userland_t* ctx)
 {
-    if (path_trace_enabled()) {
-        rvvm_warn("procs_reset: ctx=%p n=%u", (void*)ctx, (unsigned)vector_size(ctx->procs));
-    }
+        RVVM_TRC(RVVM_TRC_JOB, "procs_reset: ctx=%p n=%u", (void*)ctx, (unsigned)vector_size(ctx->procs));
     spin_lock(&ctx->proc_lock);
     vector_foreach(ctx->procs, i) {
         userland_proc_unref(vector_at(ctx->procs, i));
@@ -4785,13 +4754,13 @@ static void userland_park_if_suspended(rvvm_user_thread_t* thread)
 #ifdef RVVM_USER_PARK_TRACE
     // Low-frequency (once per park/unpark) but still a debug aid, not
     // production logging - opt in when chasing suspend/resume races.
-    rvvm_warn("DBG park: guest thread parking (suspend=%u)", atomic_load_uint32(&ctx->userland_suspend));
+    RVVM_TRC(RVVM_TRC_JOB, "DBG park: guest thread parking (suspend=%u)", atomic_load_uint32(&ctx->userland_suspend));
 #endif
     while (atomic_load_uint32(&ctx->userland_suspend) && !atomic_load_uint32(&thread->finished)) {
         rvvm_futex_wait(&ctx->userland_suspend, 1, USERLAND_SUSPEND_POLL_NS);
     }
 #ifdef RVVM_USER_PARK_TRACE
-    rvvm_warn("DBG park: guest thread resumed");
+    RVVM_TRC(RVVM_TRC_JOB, "DBG park: guest thread resumed");
 #endif
     atomic_sub_uint32(&ctx->userland_parked, 1);
 }
@@ -5077,16 +5046,14 @@ static void userland_exit_process(rvvm_userland_t* ctx, int code, rvvm_user_thre
          * eagerly so it does not leak in the registry. */
         userland_reap_orphan_zombies(ctx, proc);
         if (!proc->run_root && !userland_parent_alive(proc)) {
-            if (path_trace_enabled()) {
-                rvvm_warn("reap orphan: pid=%u ppid=%u (parent gone)",
+                RVVM_TRC(RVVM_TRC_JOB, "reap orphan: pid=%u ppid=%u (parent gone)",
                           proc->pid, proc->ppid);
-            }
             userland_proc_forget(proc->parent_ctx, proc);
         }
     }
 
     if (!proc || proc->run_root) {
-        rvvm_warn("exit_early: ctx=%p proc=%p run_root=%d", (void*)ctx, (void*)proc, proc ? (int)proc->run_root : -1);
+        RVVM_TRC(RVVM_TRC_JOB, "exit_early: ctx=%p proc=%p run_root=%d", (void*)ctx, (void*)proc, proc ? (int)proc->run_root : -1);
         if (ctx->exit_callback) {
             /* An embedded host owns the run: tell it and let it tear down. */
             userland_process_exit(ctx, code, self);
@@ -5476,9 +5443,7 @@ static int rvvm_sys_clone(rvvm_user_thread_t* self, rvvm_hart_t* cpu, uint32_t f
     }
     userland_proc_register(child, record);
     record->child_ctx = child;
-    if (path_trace_enabled()) {
-        rvvm_warn("fork: parent=%u child=%u", parent_pid, child_pid);
-    }
+        RVVM_TRC(RVVM_TRC_JOB, "fork: parent=%u child=%u", parent_pid, child_pid);
 
     /* The child's descriptors: the parent's slots, never host-closed by the
      * child (see userland_fd_close). */
@@ -5584,10 +5549,8 @@ static rvvm_addr_t rvvm_sys_wait4(rvvm_userland_t* ctx, rvvm_user_thread_t* self
     bool            want_stop  = (options & UAPI_WUNTRACED) != 0;
     bool            want_cont  = (options & UAPI_WCONTINUED) != 0;
 
-    if (path_trace_enabled()) {
-        DO_ONCE(rvvm_warn("job: wait4(pid=%d opt=%x) from pid=%u",
+        DO_ONCE(RVVM_TRC(RVVM_TRC_JOB, "job: wait4(pid=%d opt=%x) from pid=%u",
                   upid, options, self_proc ? self_proc->pid : 0));
-    }
     if (!self_proc) {
         return -UAPI_ECHILD;
     }
@@ -5633,18 +5596,16 @@ static rvvm_addr_t rvvm_sys_wait4(rvvm_userland_t* ctx, rvvm_user_thread_t* self
         if (!child && !spare) {
             /* Nothing of ours matches: what Linux reports for a pid that is not
              * one of our children, and for one that was already reaped. */
-            if (path_trace_enabled()) {
-                rvvm_warn("wait4: ECHILD self=%u upid=%d procs=%u",
+                RVVM_TRC(RVVM_TRC_JOB, "wait4: ECHILD self=%u upid=%d procs=%u",
                           self_proc->pid, upid, (unsigned)vector_size(ctx->procs));
                 spin_lock(&ctx->proc_lock);
                 vector_foreach(ctx->procs, i) {
                     rvvm_process_t* proc = vector_at(ctx->procs, i);
-                    rvvm_warn("  proc pid=%u ppid=%u exited=%u host_pid=%d",
+                    RVVM_TRC(RVVM_TRC_JOB, "  proc pid=%u ppid=%u exited=%u host_pid=%d",
                               proc->pid, proc->ppid,
                               atomic_load_uint32(&proc->exited), proc->host_pid);
                 }
                 spin_unlock(&ctx->proc_lock);
-            }
             return -UAPI_ECHILD;
         }
         if (child) {
@@ -6411,12 +6372,12 @@ static rvvm_addr_t rvvm_sys_mmap(rvvm_addr_t addr, size_t size, int prot, int fl
         /* File-backed mapping: the guest can only see its own buffer, so read
          * the requested window in. Write-back to the file is not emulated. */
         if (size >= (1u << 20)) {
-            rvvm_warn("DBG mmap: pread %llx bytes fd=%d off=%llx -> guest %llx",
+            RVVM_TRC(RVVM_TRC_MMAP, "DBG mmap: pread %llx bytes fd=%d off=%llx -> guest %llx",
                       (long long)size, fd, (long long)offset, (long long)ret);
         }
         ssize_t rd = pread(fd, to_ptr(ret), size, (off_t)offset);
         if (size >= (1u << 20)) {
-            rvvm_warn("DBG mmap: pread returned %lld (short read = past EOF)", (long long)rd);
+            RVVM_TRC(RVVM_TRC_MMAP, "DBG mmap: pread returned %lld (short read = past EOF)", (long long)rd);
         }
         if (rd < 0) {
             rvvm_warn("sys_mmap: pread failed (fd=%d off=%llx size=%llx)",
@@ -6524,10 +6485,8 @@ static rvvm_addr_t rvvm_sys_chdir(const char* path)
     if (!guest_path_absolutize(abs, sizeof(abs), path)) {
         return -UAPI_ENAMETOOLONG;
     }
-    if (path_trace_enabled()) {
-        rvvm_warn("path: syscall %ld dirfd=AT_FDCWD follow=true \"%s\" -> \"%s\"",
+        RVVM_TRC(RVVM_TRC_PATH, "path: syscall %ld dirfd=AT_FDCWD follow=true \"%s\" -> \"%s\"",
                   (long)tls_cur_syscall, path, map_abs_path(host, abs));
-    }
     if (stat(map_abs_path(host, abs), &st) != 0) {
         return last_errno();
     }
@@ -6811,9 +6770,7 @@ static void userland_proc_stop(rvvm_userland_t* ctx, rvvm_process_t* proc, int s
     if (atomic_load_uint32(&proc->exited) || atomic_load_uint32(&proc->stopped)) {
         return;
     }
-    if (path_trace_enabled()) {
-        rvvm_warn("job: pid=%u pgid=%u STOP sig=%d", proc->pid, proc->pgid, sig);
-    }
+        RVVM_TRC(RVVM_TRC_JOB, "job: pid=%u pgid=%u STOP sig=%d", proc->pid, proc->pgid, sig);
     proc->stop_signal   = sig;
     proc->stop_reported = 0;
     atomic_store_uint32(&proc->stopped, 1);
@@ -6832,9 +6789,7 @@ static void userland_proc_cont(rvvm_userland_t* ctx, rvvm_process_t* proc)
         return;
     }
     if (atomic_swap_uint32(&proc->stopped, 0)) {
-        if (path_trace_enabled()) {
-            rvvm_warn("job: pid=%u pgid=%u CONT", proc->pid, proc->pgid);
-        }
+            RVVM_TRC(RVVM_TRC_JOB, "job: pid=%u pgid=%u CONT", proc->pid, proc->pgid);
         proc->stop_signal = 0;
         userland_ctx_continue(userland_proc_ctx(ctx, proc));
         atomic_store_uint32(&proc->continued, 1);
@@ -6882,9 +6837,7 @@ static size_t userland_signal_group(rvvm_userland_t* ctx, uint32_t pgid, uint32_
         return 0;   // No group, or a liveness probe rather than a signal
     }
     userland_group_collect(userland_family_root(ctx), pgid, &group, 0);
-    if (path_trace_enabled()) {
-        rvvm_warn("job: group %u <- sig %u, %u member(s)", pgid, sig, (unsigned)group.count);
-    }
+        RVVM_TRC(RVVM_TRC_JOB, "job: group %u <- sig %u, %u member(s)", pgid, sig, (unsigned)group.count);
 
     for (size_t i = 0; i < group.count; ++i) {
         userland_proc_signal(ctx, group.proc[i], sig);
@@ -6922,9 +6875,7 @@ static rvvm_addr_t userland_signal_pid(rvvm_userland_t* ctx, rvvm_user_thread_t*
              * ESRCH is honest, quietly signalling the whole family is not. */
             return -UAPI_ESRCH;
         }
-        if (path_trace_enabled()) {
-            rvvm_warn("job: kill(%d, %u) from pgid=%u", pid, sig, own_pgid);
-        }
+            RVVM_TRC(RVVM_TRC_JOB, "job: kill(%d, %u) from pgid=%u", pid, sig, own_pgid);
         if (sig == 0) {
             // kill(-pgid, 0): a liveness probe for the group, not a signal
             if (pgid && pgid == own_pgid) {
@@ -7603,8 +7554,8 @@ static size_t userland_pty_master_put(struct userland_pty* pty, const uint8_t* s
         if (icrnl && c == '\r') {
             c = '\n';
         }
-        if (path_trace_enabled() && (c == TTY_CC_VINTR || c == TTY_CC_VSUSP)) {
-            rvvm_warn("pty: %s from the master (lflag %lx isig %d fg_pgid %u)",
+        if ((c == TTY_CC_VINTR || c == TTY_CC_VSUSP)) {
+            RVVM_TRC(RVVM_TRC_PTY, "pty: %s from the master (lflag %lx isig %d fg_pgid %u)",
                       c == TTY_CC_VINTR ? "INTR" : "SUSP", (unsigned long)pty->lflag, (int)isig,
                       pty->fg_pgid);
         }
@@ -7930,8 +7881,8 @@ static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* bu
         if (ring->len) {
             size_t n = pty_ring_get(ring, buf, count);
             spin_unlock(&pty->lock);
-            if (path_trace_enabled() && master) {
-                rvvm_warn("pty master read: %zu byte(s)", n);
+            if (master) {
+                RVVM_TRC(RVVM_TRC_PTY, "pty master read: %zu byte(s)", n);
             }
             /* Room appeared: a writer parked because the ring was full has to
              * hear about it (a session's output outrunning its client is the
@@ -7962,9 +7913,7 @@ static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* bu
         if (!block) {
             return 0;
         }
-        if (path_trace_enabled()) {
-            rvvm_warn("pty %s read: nothing yet, parking", master ? "master" : "slave");
-        }
+            RVVM_TRC(RVVM_TRC_PTY, "pty %s read: nothing yet, parking", master ? "master" : "slave");
         /* Wake on new bytes or a hangup; the timeout is only so a signal
          * arriving while we wait is noticed. */
         rvvm_event_wait(&pty->event, 5000000ULL);
@@ -7988,23 +7937,19 @@ static int64_t userland_pty_write(struct userland_pty* pty, bool master, const v
      * reports EAGAIN, and a pty whose far end is gone reports EIO - all three
      * the way a real terminal answers. */
     for (;;) {
-        if (path_trace_enabled()) {
-            rvvm_warn("pty %s write: %zu byte(s) from %02x", master ? "master" : "slave", count,
+            RVVM_TRC(RVVM_TRC_PTY, "pty %s write: %zu byte(s) from %02x", master ? "master" : "slave", count,
                       (unsigned)((const uint8_t*)buf)[0]);
-        }
         size_t done = master ? userland_pty_master_put(pty, buf, count, ctx)
                              : userland_pty_slave_put(pty, buf, count);
         if (done) {
-            if (path_trace_enabled() && done != count) {
-                rvvm_warn("pty %s write: %zu of %zu (ring full)", master ? "master" : "slave", done,
+            if (done != count) {
+                RVVM_TRC(RVVM_TRC_PTY, "pty %s write: %zu of %zu (ring full)", master ? "master" : "slave", done,
                           count);
             }
             return (int64_t)done;
         }
-        if (path_trace_enabled()) {
-            rvvm_warn("pty %s write: no room for %zu (%s)", master ? "master" : "slave", count,
+            RVVM_TRC(RVVM_TRC_PTY, "pty %s write: no room for %zu (%s)", master ? "master" : "slave", count,
                       block ? "parking" : "EAGAIN");
-        }
         if (!block) {
             return -UAPI_EAGAIN;
         }
@@ -9312,9 +9257,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 64: { // write
                     void* wbuf = a2 ? to_ptr_sz(a1, a2) : NULL;
                     if (a2 && !wbuf) {
-                        if (path_trace_enabled()) {
-                            rvvm_warn("write: fd=%ld EFAULT (ptr %lx len %lx)", a0, a1, a2);
-                        }
+                            RVVM_TRC(RVVM_TRC_SYS, "write: fd=%ld EFAULT (ptr %lx len %lx)", a0, a1, a2);
                         a0 = -UAPI_EFAULT;
                         break;
                     }
@@ -9339,11 +9282,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                         struct userland_pty* pty = NULL;
                         bool master = false;
                         int dev = -1;
-                        if (path_trace_enabled()) {
-                            rvvm_warn("sys_write(guest fd=%ld host=%d) = %lu byte(s) from %02x",
+                            RVVM_TRC(RVVM_TRC_SYS, "sys_write(guest fd=%ld host=%d) = %lu byte(s) from %02x",
                                       a0, host_fd, (unsigned long)a2,
                                       a2 ? (unsigned)((const uint8_t*)wbuf)[0] : 0);
-                        }
                         if (userland_pty_by_fd(host_fd, &pty, &master)) {
                             a0 = (rvvm_addr_t)userland_pty_write(pty, master, wbuf, a2, uctx(),
                                                                  userland_fd_write_blocks(uctx(), (int)a0));
@@ -9358,10 +9299,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                         } else {
                             a0 = errno_ret(write(host_fd, wbuf, a2));
                         }
-                        if (path_trace_enabled()) {
-                            rvvm_warn("sys_write(guest fd=%d host=%d) = %ld (errno %d)",
+                            RVVM_TRC(RVVM_TRC_SYS, "sys_write(guest fd=%d host=%d) = %ld (errno %d)",
                                       wfd, host_fd, (long)a0, (long)a0 < 0 ? errno : 0);
-                        }
                     }
                     break;
                 }
@@ -9376,13 +9315,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                     const struct uapi_iovec* giov = to_ptr_sz(a1, a2 * sizeof(*giov));
                     struct iovec* hiov = giov ? rvvm_iovec_from_guest(giov, a2, stack_iov) : NULL;
                     if (!hiov) {
-                        if (path_trace_enabled()) {
-                            rvvm_warn("sys_writev(guest fd=%ld) EFAULT: array=%p iovs=%lu "
+                            RVVM_TRC(RVVM_TRC_SYS, "sys_writev(guest fd=%ld) EFAULT: array=%p iovs=%lu "
                                       "(iov_base=%lx iov_len=%lx)",
                                       a0, (void*)giov, (unsigned long)a2,
                                       giov ? (unsigned long)giov[0].base : 0ul,
                                       giov ? (unsigned long)giov[0].len : 0ul);
-                        }
                         a0 = -UAPI_EFAULT;
                         break;
                     }
@@ -9439,11 +9376,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                     } else if (a7 == 66 && iov_own) {
                         ssize_t total = 0;
                         bool block = userland_fd_write_blocks(uctx(), (int)a0);
-                        if (path_trace_enabled()) {
-                            rvvm_warn("sys_writev(guest fd=%ld host=%d) iovs=%lu first from %02x",
+                            RVVM_TRC(RVVM_TRC_SYS, "sys_writev(guest fd=%ld host=%d) iovs=%lu first from %02x",
                                       a0, iov_fd, (unsigned long)a2,
                                       (unsigned)((const uint8_t*)hiov[0].iov_base)[0]);
-                        }
                         for (int i = 0; i < (int)a2; i++) {
                             ssize_t r = iov_pty
                                 ? (ssize_t)userland_pty_write(iov_pty, iov_master,
@@ -9659,7 +9594,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                             a0 = errno_ret(fstat(hfd, &st));
                         }
                     }
-                    rvvm_warn("DBG newfstat fd=%ld ret=%ld host_size=%lld", fd, (long)a0, (long long)st.st_size);
+                    RVVM_TRC(RVVM_TRC_FD, "DBG newfstat fd=%ld ret=%ld host_size=%lld", fd, (long)a0, (long long)st.st_size);
                     uapi_stat_convert(out, &st);
                     break;
                 }
@@ -9683,7 +9618,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = 0;
                     break;
                 case 93: // exit
-                    rvvm_warn("sys_exit(%ld) ctx=%p thread=%p main=%p match=%d",
+                    RVVM_TRC(RVVM_TRC_SYS, "sys_exit(%ld) ctx=%p thread=%p main=%p match=%d",
                               (long)a0, (void*)uctx(), (void*)thread,
                               (void*)uctx()->userland_main_thread,
                               (int)(thread == uctx()->userland_main_thread));
@@ -9696,7 +9631,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     break;
                 case 94: // exit_group
-                    rvvm_warn("sys_exit_group(%ld) ctx=%p", (long)a0, (void*)uctx());
+                    RVVM_TRC(RVVM_TRC_SYS, "sys_exit_group(%ld) ctx=%p", (long)a0, (void*)uctx());
                     userland_exit_process(uctx(), (int)a0, thread);
                     break;
                 case 96: // set_tid_address
@@ -9706,7 +9641,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 98: // futex
                 {
                     uint32_t* faddr = to_ptr(a0);
-                    rvvm_warn("DBG futex: uaddr=%llx op=%llx val=%llx timeout=%llx uaddr2=%llx val3=%llx word=%x ra=%llx sp=%llx",
+                    RVVM_TRC(RVVM_TRC_SYS, "DBG futex: uaddr=%llx op=%llx val=%llx timeout=%llx uaddr2=%llx val3=%llx word=%x ra=%llx sp=%llx",
                               (long long)a0, (long long)a1, (long long)a2, (long long)a3, (long long)a4, (long long)a5,
                               faddr ? *faddr : 0xdeadbeef,
                               (long long)rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 1),
@@ -9897,18 +9832,18 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = 0;
                     break;
                 case 129: // kill
-                    rvvm_warn("sys_kill(%lx, %lx)", a0, a1);
+                    RVVM_TRC(RVVM_TRC_SIGNAL, "sys_kill(%lx, %lx)", a0, a1);
                     a0 = userland_signal_pid(uctx(), thread, (int32_t)a0, (uint32_t)a1);
                     break;
                 case 130: // tkill
-                    rvvm_warn("sys_tkill(%lx, %lx)", a0, a1);
+                    RVVM_TRC(RVVM_TRC_SIGNAL, "sys_tkill(%lx, %lx)", a0, a1);
                     /* Thread-directed: a guest handler cannot be run on one
                      * particular thread, so the signal routes through the process
                      * that owns the tid (see userland_signal_tid). */
                     a0 = userland_signal_tid(uctx(), thread, (int32_t)a0, (uint32_t)a1);
                     break;
                 case 131: // tgkill
-                    rvvm_warn("sys_tgkill(%lx, %lx, %ld)", a0, a1, a2);
+                    RVVM_TRC(RVVM_TRC_SIGNAL, "sys_tgkill(%lx, %lx, %ld)", a0, a1, a2);
                     a0 = userland_signal_pid(uctx(), thread, (int32_t)a0, (uint32_t)a2);
                     break;
                 case 133: { // rt_sigsuspend
@@ -9929,10 +9864,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * wakes. */
                     rvvm_userland_t* ctx = uctx();
                     rvvm_info("sys_rt_sigsuspend(%lx, %lx)", a0, a1);
-                    if (path_trace_enabled()) {
-                        rvvm_warn("job: rt_sigsuspend(pid=%u) blocking",
+                        RVVM_TRC(RVVM_TRC_JOB, "job: rt_sigsuspend(pid=%u) blocking",
                                   thread->proc ? thread->proc->pid : 0);
-                    }
                     while (!atomic_load_uint32(&ctx->sig_pending) &&
                            !atomic_load_uint32(&thread->finished) &&
                            !atomic_load_uint32(&ctx->userland_suspend) &&
@@ -9943,13 +9876,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                          * poll but the event it wakes. */
                         rvvm_event_wait(&ctx->tty_in_event, USERLAND_WAIT_POLL_NS);
                     }
-                    if (path_trace_enabled()) {
-                        rvvm_warn("job: rt_sigsuspend woke (pending=%u sat=%u stop=%u fin=%u)",
+                        RVVM_TRC(RVVM_TRC_JOB, "job: rt_sigsuspend woke (pending=%u sat=%u stop=%u fin=%u)",
                                   atomic_load_uint32(&ctx->sig_pending),
                                   atomic_load_uint32(&ctx->sig_inflight),
                                   atomic_load_uint32(&ctx->userland_stop_req),
                                   atomic_load_uint32(&thread->finished));
-                    }
                     a0 = -UAPI_EINTR;
                     break;
                 }
@@ -10111,7 +10042,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = userland_setsid(uctx(), thread->proc);
                     break;
                 case 158: // getgroups
-                    rvvm_warn("sys_getgroups(%lx, %lx)", a0, a1);
+                    RVVM_TRC(RVVM_TRC_SYS, "sys_getgroups(%lx, %lx)", a0, a1);
                     a0 = errno_ret(getgroups(a0, to_ptr(a1)));
                     break;
                 case 159: // setgroups
@@ -10648,8 +10579,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                  * nothing to return to, so re-enter the interpreter instead. */
                 continue;
             }
-            if ((int64_t)a0 < 0 && path_trace_enabled()) {
-                rvvm_warn("Syscall %ld failed: %ld", a7, a0);
+            if ((int64_t)a0 < 0) {
+                RVVM_TRC(RVVM_TRC_SYS, "Syscall %ld failed: %ld", a7, a0);
             }
             rvvm_info("  nr=%ld -> %lx", a7, a0);
             rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 10, a0);
@@ -10737,7 +10668,7 @@ static void* rvvm_user_thread_wrap(void* arg)
         rvvm_sys_futex(thread->child_cleartid, UAPI_FUTEX_WAKE, 1, 0, NULL, 0);
     }
 
-    rvvm_warn("thread_exit: ctx=%p pid=%u", (void*)uctx(), thread->proc ? thread->proc->pid : 0);
+    RVVM_TRC(RVVM_TRC_JOB, "thread_exit: ctx=%p pid=%u", (void*)uctx(), thread->proc ? thread->proc->pid : 0);
     userland_fd_dump(uctx(), "thread_exit");
     userland_thread_unregister(thread);
 

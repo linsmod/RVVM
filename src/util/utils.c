@@ -866,6 +866,121 @@ PRINT_FORMAT void rvvm_warn(const char* format_str, ...)
     }
 }
 
+/* ---------------------------------------------------------------- *
+ * Trace categories (see utils.h)
+ * ---------------------------------------------------------------- */
+
+static uint32_t rvvm_trace_mask  = 0;
+static bool     rvvm_trace_ready = false;
+
+static const struct {
+    uint32_t    bit;
+    const char* name;
+} rvvm_trace_names[] = {
+    { RVVM_TRC_PATH,   "path"   },
+    { RVVM_TRC_FD,     "fd"     },
+    { RVVM_TRC_PTY,    "pty"    },
+    { RVVM_TRC_JOB,    "job"    },
+    { RVVM_TRC_TTY,    "tty"    },
+    { RVVM_TRC_SIGNAL, "signal" },
+    { RVVM_TRC_MMAP,   "mmap"   },
+    { RVVM_TRC_SYS,    "sys"    },
+    { RVVM_TRC_DEV,    "dev"    },
+};
+
+/* A name (or "all") to its bit, 0 when unknown. Length-bounded so the value in
+ * the environment can be sliced in place. */
+static uint32_t rvvm_trace_lookup(const char* name, size_t len)
+{
+    if (len == 3 && !strncmp(name, "all", 3)) {
+        return RVVM_TRC_ALL;
+    }
+    for (size_t i = 0; i < sizeof(rvvm_trace_names) / sizeof(rvvm_trace_names[0]); i++) {
+        if (strlen(rvvm_trace_names[i].name) == len &&
+            !strncmp(name, rvvm_trace_names[i].name, len)) {
+            return rvvm_trace_names[i].bit;
+        }
+    }
+    return 0;
+}
+
+PUBLIC void rvvm_trace_init(void)
+{
+    const char* env;
+    const char* at;
+
+    if (rvvm_trace_ready) {
+        return;
+    }
+    rvvm_trace_ready = true;
+
+    /* The switch this system replaced: RVVM_TRACE_PATH meant "the path trace". */
+    if (getenv("RVVM_TRACE_PATH")) {
+        rvvm_trace_mask |= RVVM_TRC_PATH;
+    }
+    env = getenv("RVVM_TRACE");
+    if (!env || !*env) {
+        return;
+    }
+
+    at = env;
+    while (*at) {
+        const char* start;
+        size_t      len;
+        bool        off;
+        uint32_t    bit;
+
+        while (*at == ',' || *at == ' ' || *at == '\t') {
+            at++;
+        }
+        if (!*at) {
+            break;
+        }
+        off   = *at == '-';
+        at   += off ? 1 : 0;
+        start = at;
+        while (*at && *at != ',' && *at != ' ' && *at != '\t') {
+            at++;
+        }
+        len = (size_t)(at - start);
+        if (!len) {
+            continue;
+        }
+        bit = rvvm_trace_lookup(start, len);
+        if (!bit) {
+            rvvm_warn("RVVM_TRACE: unknown category '%.*s'", (int)len, start);
+            continue;
+        }
+        if (off) {
+            rvvm_trace_mask &= ~bit;
+        } else {
+            rvvm_trace_mask |= bit;
+        }
+    }
+}
+
+PUBLIC bool rvvm_trace_enabled(uint32_t cat)
+{
+    if (unlikely(!rvvm_trace_ready)) {
+        rvvm_trace_init();
+    }
+    return (rvvm_trace_mask & cat) != 0;
+}
+
+/* Independent of loglevel on purpose: the category IS the switch, and asking
+ * for one should not also require the noise of the others (which is what a
+ * higher loglevel would bring). */
+PUBLIC PRINT_FORMAT_ARG2 void rvvm_trace(uint32_t cat, const char* format_str, ...)
+{
+    va_list args;
+    if (!rvvm_trace_enabled(cat)) {
+        return;
+    }
+    va_start(args, format_str);
+    log_print(log_has_colors() ? "\033[36;1mTRACE\033[0;1m: " : "TRACE: ", format_str, &args);
+    va_end(args);
+}
+
 PRINT_FORMAT void rvvm_error(const char* format_str, ...)
 {
     if (rvvm_loglevel >= LOG_ERROR) {

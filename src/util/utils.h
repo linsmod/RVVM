@@ -354,6 +354,45 @@ PUBLIC PRINT_FORMAT void rvvm_warn(const char* format_str, ...);
 PUBLIC PRINT_FORMAT void rvvm_error(const char* format_str, ...);
 PUBLIC PRINT_FORMAT void rvvm_fatal(const char* format_str, ...); // Aborts the process
 
+#if GNU_ATTRIBUTE(__format__)
+#define PRINT_FORMAT_ARG2 __attribute__((__format__(printf, 2, 3)))
+#else
+#define PRINT_FORMAT_ARG2 GNU_DUMMY_ATTRIBUTE
+#endif
+
+/*
+ * Trace logging, by category.
+ *
+ * A trace is not a warning: it is a fact worth seeing only when the subsystem
+ * it belongs to is being looked at, and several may be looked at at once. Each
+ * category is one bit, selected from the RVVM_TRACE environment variable - a
+ * comma/space separated list of names, "all" for every one, and "-name" to turn
+ * one back off (RVVM_TRACE=all,-fd). RVVM_TRACE_PATH is kept as an alias for
+ * "path", the switch this replaced.
+ *
+ * rvvm_warn() stays what it is: a message that belongs in every run.
+ */
+enum rvvm_trace_cat {
+    RVVM_TRC_PATH   = 1u << 0,   // path resolution (wrap_guest_path, shadow)
+    RVVM_TRC_FD     = 1u << 1,   // the fd table: install/close/dump, fstat
+    RVVM_TRC_PTY    = 1u << 2,   // pty reads/writes, line discipline
+    RVVM_TRC_JOB    = 1u << 3,   // processes: fork/wait/kill/stop, proc table
+    RVVM_TRC_TTY    = 1u << 4,   // the console line discipline
+    RVVM_TRC_SIGNAL = 1u << 5,   // signal delivery and return
+    RVVM_TRC_MMAP   = 1u << 6,   // mmap/brk and their host backing
+    RVVM_TRC_SYS    = 1u << 7,   // generic syscall enter/exit traces
+    RVVM_TRC_DEV    = 1u << 8,   // synthetic devices
+    RVVM_TRC_ALL    = 0xffffffffu,
+};
+
+/* Parse RVVM_TRACE once. Idempotent, and called lazily by the helpers below. */
+PUBLIC void rvvm_trace_init(void);
+PUBLIC bool rvvm_trace_enabled(uint32_t cat);
+PUBLIC PRINT_FORMAT_ARG2 void rvvm_trace(uint32_t cat, const char* format_str, ...);
+
+#define RVVM_TRC(cat, ...) \
+    do { if (unlikely(rvvm_trace_enabled(cat))) rvvm_trace((cat), __VA_ARGS__); } while (0)
+
 /*
  * Initialization/deinitialization
  */
