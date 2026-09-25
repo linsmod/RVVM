@@ -667,6 +667,9 @@ static int  userland_pty_open_slave(uint32_t index);
 static void userland_clear_ctty(struct rvvm_userland* ctx);
 static bool userland_dev_by_fd(int fd, int* out_dev);
 static int  userland_dev_fd(int dev);
+/* The thread on this host thread was ended (see current_user_thread). Used by
+ * the blocking read helpers above its definition. */
+static bool userland_thread_finished(void);
 static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* buf,
                                  size_t count, bool block);
 static int64_t userland_pty_write(struct userland_pty* pty, bool master, const void* buf,
@@ -2252,10 +2255,11 @@ static int64_t user_tty_read(rvvm_userland_t* ctx, void* buf, size_t count, bool
 
     for (;;) {
         spin_lock(&ctx->tty_in_lock);
-        if (atomic_load_uint32(&ctx->sig_pending)) {
-            // A signal arrived while the guest was parked on read(0): return
-            // -EINTR so the vCPU reaches the delivery boundary. The handler
-            // runs before the guest observes the EINTR.
+        if (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished()) {
+            // A signal arrived while the guest was parked on read(0) - or the
+            // thread was ended: return -EINTR so the vCPU reaches the delivery
+            // boundary / unwinds. The handler runs before the guest observes
+            // the EINTR.
             spin_unlock(&ctx->tty_in_lock);
             return -UAPI_EINTR;
         }
@@ -3764,6 +3768,20 @@ void sig_handler(int signal)
 #define THREAD_LOCAL
 #endif
 static THREAD_LOCAL rvvm_hart_t* current_user_hart = NULL;
+
+/* The guest thread running on this host thread (1:1, like the hart). Blocking
+ * helpers that park inside a host wait - a pty read, the console - need it: a
+ * thread ended while it was parked (SIGINT's default disposition, exec cutting
+ * the siblings down) has to notice and stop serving, or a killed process keeps
+ * reading the terminal after the shell thinks it is gone. */
+static THREAD_LOCAL rvvm_user_thread_t* current_user_thread = NULL;
+
+/* Has the thread on this host thread been ended? See current_user_thread. */
+static bool userland_thread_finished(void)
+{
+    rvvm_user_thread_t* self = current_user_thread;
+    return self && atomic_load_uint32(&self->finished);
+}
 
 /* Name of the marshalled GL/EGL call currently being serviced, or NULL when
  * the guest is running its own code. The win32 GL dispatch writes it (see
@@ -7870,9 +7888,11 @@ static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* bu
     }
 
     for (;;) {
-        if (atomic_load_uint32(&ctx->sig_pending)) {
-            /* A signal arrived while the guest was parked here: -EINTR gets the
-             * vCPU to the delivery boundary, where the handler runs first. */
+        if (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished()) {
+            /* A signal arrived while the guest was parked here - or the thread
+             * was ended (a SIGINT with the default disposition): -EINTR gets the
+             * vCPU to the delivery boundary / unwinds it, instead of the dead
+             * process staying parked and stealing the next reader's input. */
             return -UAPI_EINTR;
         }
 
@@ -7913,7 +7933,7 @@ static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* bu
         if (!block) {
             return 0;
         }
-            RVVM_TRC(RVVM_TRC_PTY, "pty %s read: nothing yet, parking", master ? "master" : "slave");
+            RVVM_TRC(RVVM_TRC_PTY_VERBOSE, "pty %s read: nothing yet, parking", master ? "master" : "slave");
         /* Wake on new bytes or a hangup; the timeout is only so a signal
          * arriving while we wait is noticed. */
         rvvm_event_wait(&pty->event, 5000000ULL);
@@ -7960,7 +7980,7 @@ static int64_t userland_pty_write(struct userland_pty* pty, bool master, const v
         if (hangup) {
             return -UAPI_EIO;
         }
-        if (atomic_load_uint32(&ctx->sig_pending)) {
+        if (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished()) {
             return -UAPI_EINTR;
         }
         rvvm_event_wait(&pty->event, 5000000ULL);
@@ -8475,6 +8495,7 @@ static void* rvvm_user_thread_wrap(void* arg)
     bool running = true;
 
     current_user_hart = cpu;
+    current_user_thread = thread;
     // Bind this guest thread to its instance context (see uctx())
     tls_userland = rvvm_userland_ctx(cpu->machine);
 

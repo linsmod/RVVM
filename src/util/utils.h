@@ -382,6 +382,7 @@ enum rvvm_trace_cat {
     RVVM_TRC_MMAP   = 1u << 6,   // mmap/brk and their host backing
     RVVM_TRC_SYS    = 1u << 7,   // generic syscall enter/exit traces
     RVVM_TRC_DEV    = 1u << 8,   // synthetic devices
+    RVVM_TRC_PTY_VERBOSE = 1u << 9,  // pty poll-loop noise (parking), off unless asked
     RVVM_TRC_ALL    = 0xffffffffu,
 };
 

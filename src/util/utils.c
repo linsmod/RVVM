@@ -880,6 +880,7 @@ static const struct {
     { RVVM_TRC_PATH,   "path"   },
     { RVVM_TRC_FD,     "fd"     },
     { RVVM_TRC_PTY,    "pty"    },
+    { RVVM_TRC_PTY_VERBOSE,    "[V] pty"    },
     { RVVM_TRC_JOB,    "job"    },
     { RVVM_TRC_TTY,    "tty"    },
     { RVVM_TRC_SIGNAL, "signal" },
