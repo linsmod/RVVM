@@ -60,7 +60,6 @@ param(
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Exe).Path
 $fails = 0
-$script:failList = @()
 . (Join-Path $PSScriptRoot 'ash_drive.ps1')
 
 # The harness's own lines carry the clock too: they are read next to the core's
@@ -82,7 +81,6 @@ function Check($ok, $what, $detail) {
             "     got: " + (($shown -replace "`r", '' -replace "`n", '|'))
         }
         $script:fails++
-        $script:failList += $what
     }
 }
 
@@ -317,7 +315,6 @@ Check ($sessions -ge $want) "the core started $sessions session(s) without exiti
 ($err -split "`n" | Where-Object { $_ -and $_ -notmatch 'Syscall \d+ failed' }) -join "`n"
 
 if ($fails) {
-    "--- failed checks: " + ($script:failList -join ' | ')
     "=== FAIL: $fails check(s) ==="
     exit 1
 }

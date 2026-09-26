@@ -823,11 +823,16 @@ int write(int fd, const void* buf, unsigned int count)
     return _write(fd, buf, count);
 }
 
+/* Guest O_TMPFILE lifecycle, defined near openat() below */
+static void shim_tmpfile_unregister(int fd, bool unlink_file);
+
 int close(int fd)
 {
     if (win_socket_is_fd(fd)) {
         return win_socket_close(fd);
     }
+    /* An O_TMPFILE file that was never published goes away with its last fd */
+    shim_tmpfile_unregister(fd, true);
     if (shim_epoll_anchor_release(fd)) {
         return 0;
     }
@@ -1240,6 +1245,166 @@ DIR* fdopendir(int fd)
 /* *at() family                                                        */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Guest O_TMPFILE emulation.
+ *
+ * The kernel's O_TMPFILE hands out a writable fd to an unnamed file in the
+ * @dirfd directory; the guest publishes it later with
+ * linkat(fd, "", dirfd, name, AT_EMPTY_PATH). The CRT has no equivalent, and
+ * dropping the bit (as the flag translation did) turned the call into
+ * "open the directory itself for writing" - the write then failed with EBADF
+ * and apk could never fetch an index.
+ *
+ * Emulated here as a privately named file in the same directory:
+ *   - openat(): a marker word in @flags routes here; the file is created
+ *     with FILE_SHARE_DELETE so the publish rename works while it is open,
+ *     and registered under its host fd.
+ *   - linkat(AT_EMPTY_PATH, ""): rename the registered file into place and
+ *     unregister it.
+ *   - close(): an unregistered-at-close file was never published, so it is
+ *     unlinked - the unnamed-tempfile "gone when the last fd closes" rule.
+ */
+#define SHIM_O_TMPFILE_MARK 0x410000u /* guest __O_TMPFILE|O_DIRECTORY */
+
+#define SHIM_TMPREG_MAX 32
+static struct {
+    int  fd;
+    char path[MAX_PATH + 64];
+} shim_tmpreg[SHIM_TMPREG_MAX];
+static SRWLOCK         shim_tmpreg_lock = SRWLOCK_INIT;
+static volatile LONG   shim_tmpreg_seq  = 0;
+
+static int shim_tmpfile_register(int fd, const char* path)
+{
+    int slot = -1;
+    int i;
+    AcquireSRWLockExclusive(&shim_tmpreg_lock);
+    for (i = 0; i < SHIM_TMPREG_MAX; i++) {
+        if (shim_tmpreg[i].fd < 0 && slot < 0) {
+            slot = i;
+        }
+    }
+    if (slot >= 0) {
+        shim_tmpreg[slot].fd = fd;
+        snprintf(shim_tmpreg[slot].path, sizeof(shim_tmpreg[slot].path), "%s", path);
+    }
+    ReleaseSRWLockExclusive(&shim_tmpreg_lock);
+    if (slot < 0) {
+        errno = EMFILE;
+        return -1;
+    }
+    return 0;
+}
+
+static const char* shim_tmpfile_lookup(int fd)
+{
+    static char path[MAX_PATH + 64]; /* single-threaded syscalls per hart */
+    int i;
+    int found = -1;
+    AcquireSRWLockShared(&shim_tmpreg_lock);
+    for (i = 0; i < SHIM_TMPREG_MAX; i++) {
+        if (shim_tmpreg[i].fd == fd) {
+            found = i;
+            break;
+        }
+    }
+    if (found >= 0) {
+        snprintf(path, sizeof(path), "%s", shim_tmpreg[found].path);
+    }
+    ReleaseSRWLockShared(&shim_tmpreg_lock);
+    return found >= 0 ? path : NULL;
+}
+
+static void shim_tmpfile_unregister(int fd, bool unlink_file)
+{
+    int i;
+    AcquireSRWLockExclusive(&shim_tmpreg_lock);
+    for (i = 0; i < SHIM_TMPREG_MAX; i++) {
+        if (shim_tmpreg[i].fd == fd) {
+            if (unlink_file) {
+                _unlink(shim_tmpreg[i].path);
+            }
+            shim_tmpreg[i].fd = -1;
+            shim_tmpreg[i].path[0] = 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&shim_tmpreg_lock);
+}
+
+static int shim_tmpfile_open(int dirfd, mode_t mode)
+{
+    char dir[MAX_PATH + 16];
+    char full[MAX_PATH + 64];
+    int  fd = -1;
+    int  attempt;
+
+    if (at_path(dirfd, ".", dir, sizeof(dir))) {
+        return -1;
+    }
+    /* at_path() hands back "<dir>\." - the trailing dot is harmless for the
+     * CRT, but the name is built by hand here anyway. */
+    {
+        size_t len = strlen(dir);
+        if (len >= 2 && dir[len - 2] == '\\' && dir[len - 1] == '.') {
+            dir[len - 2] = 0;
+        }
+    }
+    for (attempt = 0; attempt < 64 && fd < 0; attempt++) {
+        ULONG seq = InterlockedIncrement(&shim_tmpreg_seq);
+        HANDLE h;
+        snprintf(full, sizeof(full), "%s\\rvvm_tmp.%lu.%lu", dir,
+                 (unsigned long)GetCurrentProcessId(), (unsigned long)seq);
+        /* FILE_SHARE_DELETE: the publish step renames the file while this
+         * handle is still open, and a rename needs the sharing bit. */
+        h = CreateFileA(full, GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            win_set_errno();
+            continue;
+        }
+        fd = _open_osfhandle((intptr_t)h, _O_RDWR | _O_BINARY);
+        if (fd < 0) {
+            CloseHandle(h);
+            win_set_errno();
+            return -1;
+        }
+        _chmod(full, mode & 0777);
+    }
+    if (fd < 0) {
+        return -1;
+    }
+    if (shim_tmpfile_register(fd, full)) {
+        _close(fd);
+        _unlink(full);
+        return -1;
+    }
+    return fd;
+}
+
+/* linkat(fd, "", dirfd, name, AT_EMPTY_PATH): publish the unnamed file under
+ * @name. A rename, not a hard link - the kernel's anonymous inode has no path
+ * to link from, and the rename gives the same observable result. */
+static int shim_tmpfile_publish(int fd, int dirfd, const char* path)
+{
+    const char* from = shim_tmpfile_lookup(fd);
+    char        to[MAX_PATH + 64];
+
+    if (!from) {
+        errno = EBADF;
+        return -1;
+    }
+    if (at_path(dirfd, path, to, sizeof(to))) {
+        return -1;
+    }
+    if (!MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING)) {
+        win_set_errno();
+        return -1;
+    }
+    shim_tmpfile_unregister(fd, false);
+    return 0;
+}
+
 int openat(int dirfd, const char* path, int flags, ...)
 {
     char full[MAX_PATH + 16];
@@ -1252,6 +1417,9 @@ int openat(int dirfd, const char* path, int flags, ...)
         va_start(ap, flags);
         mode = va_arg(ap, int);
         va_end(ap);
+    }
+    if ((flags & SHIM_O_TMPFILE_MARK) == SHIM_O_TMPFILE_MARK) {
+        return shim_tmpfile_open(dirfd, mode);
     }
     if (at_path(dirfd, path, full, sizeof(full))) {
         return -1;
@@ -1417,6 +1585,11 @@ ssize_t linkat(int fd1, const char* path1, int fd2, const char* path2, int flags
     if (!path1 || !path2) {
         errno = EFAULT;
         return -1;
+    }
+    /* An O_TMPFILE fd is published through AT_EMPTY_PATH: no source name
+     * exists, the registered private name is the file. */
+    if ((flags & AT_EMPTY_PATH) && path1[0] == 0) {
+        return shim_tmpfile_publish(fd1, fd2, path2);
     }
     if (at_path(fd1, path1, from, sizeof(from)) ||
         at_path(fd2, path2, to, sizeof(to))) {

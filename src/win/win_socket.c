@@ -58,7 +58,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include "utils.h"
 #include "win_socket.h"
 
 #ifndef AF_UNIX
@@ -242,28 +242,6 @@ static void wsock_set_errno(void)
     errno = wsock_errno_of(WSAGetLastError());
 }
 
-/* Anchor/socket lifecycle trace, for chasing descriptor-number collisions
- * between this layer's CRT anchors and a guest's descriptor table. Off unless
- * WIN_SOCKET_TRACE is set. */
-static int wsock_trace_on = -1;
-
-static void wsock_trace(const char* fmt, ...)
-{
-    va_list ap;
-    if (wsock_trace_on < 0) {
-        wsock_trace_on = getenv("WIN_SOCKET_TRACE") != NULL;
-    }
-    if (!wsock_trace_on) {
-        return;
-    }
-    fprintf(stderr, "[wsock] ");
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    fputc('\n', stderr);
-    fflush(stderr);
-}
-
 /* ------------------------------------------------------------------------ */
 /* Anchors                                                                   */
 /* ------------------------------------------------------------------------ */
@@ -277,13 +255,13 @@ int win_socket_alloc_anchor(void)
         errno = EMFILE;
         return -1;
     }
-    wsock_trace("alloc anchor %d", fd);
+    RVVM_TRC(RVVM_TRC_WSOCK, "alloc anchor %d", fd);
     return fd;
 }
 
 void win_socket_free_anchor(int fd)
 {
-    wsock_trace("free anchor %d", fd);
+    RVVM_TRC(RVVM_TRC_WSOCK,  "free anchor %d", fd);
     _close(fd);
 }
 
@@ -301,7 +279,7 @@ static int wsock_fd_alloc(SOCKET s)
     AcquireSRWLockExclusive(&wsock_lock);
     wsock_fds[fd] = s;
     ReleaseSRWLockExclusive(&wsock_lock);
-    wsock_trace("fd %d <- socket %p", fd, (void*)s);
+    RVVM_TRC(RVVM_TRC_WSOCK,  "fd %d <- socket %p", fd, (void*)s);
     return fd;
 }
 
@@ -595,7 +573,7 @@ int win_socket_pair(int domain, int type, int protocol, int sv[2])
         getsockname(listener, (struct sockaddr*)&la, &ll);
         struct sockaddr_in ca = {}; int cl = sizeof(ca);
         getpeername(server, (struct sockaddr*)&ca, &cl);
-        wsock_trace("pair: listener port %d, server peer 127.0.0.1:%d",
+        RVVM_TRC(RVVM_TRC_WSOCK,  "pair: listener port %d, server peer 127.0.0.1:%d",
                     ntohs(la.sin_port), ntohs(ca.sin_port));
     }
     closesocket(listener);
@@ -659,7 +637,7 @@ int win_socket_dup(int fd)
 int win_socket_close(int fd)
 {
     SOCKET s = wsock_fd_take(fd);
-    wsock_trace("close anchor %d (socket %p)", fd, (void*)s);
+    RVVM_TRC(RVVM_TRC_WSOCK,  "close anchor %d (socket %p)", fd, (void*)s);
     if (s == INVALID_SOCKET) {
         errno = ENOTSOCK;
         return -1;
@@ -672,19 +650,19 @@ int win_socket_close(int fd)
         if (getpeername(s, (struct sockaddr*)&peer, &plen) == 0) {
             struct sockaddr_in* in = (struct sockaddr_in*)&peer;
             unsigned char* ip = (unsigned char*)&in->sin_addr;
-            wsock_trace("close: peer=%d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], ntohs(in->sin_port));
+            RVVM_TRC(RVVM_TRC_WSOCK,  "close: peer=%d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], ntohs(in->sin_port));
         } else {
-            wsock_trace("close: getpeername err=%d (not connected?)", WSAGetLastError());
+            RVVM_TRC(RVVM_TRC_WSOCK,  "close: getpeername err=%d (not connected?)", WSAGetLastError());
         }
     }
     if (closesocket(s) == SOCKET_ERROR) {
         int err = WSAGetLastError();
-        wsock_trace("closesocket FAILED on fd %d (socket %p) err=%d", fd, (void*)s, err);
+        RVVM_TRC(RVVM_TRC_WSOCK,  "closesocket FAILED on fd %d (socket %p) err=%d", fd, (void*)s, err);
         _close(fd);
         errno = wsock_errno_of(err);
         return -1;
     }
-    wsock_trace("closesocket OK on fd %d (socket %p)", fd, (void*)s);
+    RVVM_TRC(RVVM_TRC_WSOCK,  "closesocket OK on fd %d (socket %p)", fd, (void*)s);
     _close(fd);
     return 0;
 }
@@ -776,7 +754,7 @@ int win_socket_accept(int fd, void* addr, int* len, int flags)
     if (nfd < 0) {
         closesocket(n);
     }
-    wsock_trace("accept -> anchor %d (socket %p)", nfd, (void*)n);
+    RVVM_TRC(RVVM_TRC_WSOCK,  "accept -> anchor %d (socket %p)", nfd, (void*)n);
     return nfd;
 }
 
@@ -947,13 +925,13 @@ long win_socket_read(int fd, void* buf, size_t len)
     }
     n = recv(s, (char*)buf, (int)len, 0);
     if (n == 0) {
-        wsock_trace("recv EOF on fd %d (socket %p)", fd, (void*)s);
+        RVVM_TRC(RVVM_TRC_WSOCK,  "recv EOF on fd %d (socket %p)", fd, (void*)s);
     }
     if (n == SOCKET_ERROR) {
         int werr = WSAGetLastError();
         wsock_set_errno();
         if (werr != WSAEWOULDBLOCK) {
-            wsock_trace("recv err %d on fd %d (socket %p) errno=%d", werr, fd, (void*)s, errno);
+            RVVM_TRC(RVVM_TRC_WSOCK,  "recv err %d on fd %d (socket %p) errno=%d", werr, fd, (void*)s, errno);
         }
         return -1;
     }

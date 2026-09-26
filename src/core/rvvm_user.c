@@ -3933,6 +3933,14 @@ static int uapi_open_flags(int flags)
     if (flags & 0x80)   host |= _O_EXCL;    /* guest O_EXCL */
     if (flags & 0x200)  host |= _O_TRUNC;   /* guest O_TRUNC */
     if (flags & 0x400)  host |= _O_APPEND;  /* guest O_APPEND */
+    if ((flags & 0x410000) == 0x410000) {
+        /* Guest O_TMPFILE (__O_TMPFILE|O_DIRECTORY): the CRT has no
+         * equivalent, and dropping the bit left a bare O_RDWR that made the
+         * shim open the *directory* itself - writes then failed with EBADF
+         * (apk's index fetch). Kept as a marker word: the shim's openat()
+         * recognizes it and emulates the unnamed temp file. */
+        host |= 0x410000;
+    }
     return host;
 #else
     return flags;

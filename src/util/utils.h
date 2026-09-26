@@ -383,6 +383,7 @@ enum rvvm_trace_cat {
     RVVM_TRC_SYS    = 1u << 7,   // generic syscall enter/exit traces
     RVVM_TRC_DEV    = 1u << 8,   // synthetic devices
     RVVM_TRC_PTY_VERBOSE = 1u << 9,  // pty poll-loop noise (parking), off unless asked
+    RVVM_TRC_WSOCK = 1u << 10,  
     RVVM_TRC_ALL    = 0xffffffffu,
 };
 

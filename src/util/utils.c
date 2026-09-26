@@ -887,6 +887,7 @@ static const struct {
     { RVVM_TRC_MMAP,   "mmap"   },
     { RVVM_TRC_SYS,    "sys"    },
     { RVVM_TRC_DEV,    "dev"    },
+    { RVVM_TRC_WSOCK,    "wsock"    },
 };
 
 /* A name (or "all") to its bit, 0 when unknown. Length-bounded so the value in

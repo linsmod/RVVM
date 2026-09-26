@@ -39,6 +39,7 @@ The wire protocol is the session server's, not a new one:
 
 #include "win/win_socket.h"
 #include "win32_cmdpost_bridge.h"
+#include "utils.h" /* rvvm_set_loglevel: RVVM_VERBOSE in the core */
 #include "virtpass/vp_rootfs.h" /* VP_GUEST_SESSIOND: the core's guest path */
 
 #define ASH_PORT_DEFAULT 7900
@@ -375,6 +376,10 @@ int ash_serve(int port, int idle_s)
     guest[1] = port_buf;
     guest[2] = idle_buf;
     guest[3] = NULL;
+
+    /* Same switch as rvvm_winhost (win32_main.c): RVVM_VERBOSE=1 lifts the log
+     * to LOG_INFO so the per-syscall lines (sys_openat etc.) reach stderr. */
+    rvvm_set_loglevel(getenv("RVVM_VERBOSE") ? LOG_INFO : LOG_WARN);
 
     if (!win32_host_init_console(0, 0, 0)) {
         fprintf(stderr, "ash --serve: could not initialize the host\n");
