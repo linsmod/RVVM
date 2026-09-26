@@ -3850,6 +3850,72 @@ static size_t unwrap_path(char* buffer, const char* path, size_t size)
     return rvvm_strlcpy(buffer, path, size);
 }
 
+/* ============================================================
+ * AF_UNIX addresses and the guest namespace
+ *
+ * A pathname AF_UNIX address carries a *guest* path - vpsessiond binds
+ * /cores/vpsessiond-7900.sock - and that path is a filesystem name like any
+ * other, so it has to go through the same guest->host mapping as every other
+ * syscall path. Without it the host would create the socket next to its drive
+ * root. Abstract sockets (sun_path[0] == '\0') have no filesystem name and are
+ * passed through untouched.
+ * ============================================================ */
+
+#define UAPI_UNIX_PATH_MAX 108
+
+struct uapi_sockaddr_un {
+    unsigned short sun_family;
+    char           sun_path[UAPI_UNIX_PATH_MAX];
+};
+
+/* bind()/connect(): rewrite a guest AF_UNIX pathname for the host. Returns
+ * @scratch when it was rewritten (and updates @len), the original address when
+ * there is nothing to map (not AF_UNIX, abstract, no prefix, or too long). */
+static const void* wrap_guest_sockaddr(char* path_buf,
+                                       struct uapi_sockaddr_un* scratch,
+                                       const void* addr, unsigned int* len)
+{
+    const struct uapi_sockaddr_un* un = addr;
+    const char* mapped;
+    size_t      mapped_len;
+
+    if (!addr || *len < sizeof(un->sun_family) || un->sun_family != AF_UNIX) {
+        return addr;
+    }
+    if (un->sun_path[0] == '\0') {
+        return addr; /* abstract or unnamed: not a filesystem name */
+    }
+    mapped = wrap_guest_path(path_buf, UAPI_AT_FDCWD, un->sun_path);
+    mapped_len = rvvm_strlen(mapped);
+    if (mapped == un->sun_path || mapped_len >= sizeof(scratch->sun_path)) {
+        return addr; /* nothing to map, or it will not fit the ABI struct */
+    }
+    memset(scratch, 0, sizeof(*scratch));
+    scratch->sun_family = AF_UNIX;
+    memcpy(scratch->sun_path, mapped, mapped_len + 1);
+    *len = (unsigned int)sizeof(*scratch);
+    return scratch;
+}
+
+/* getsockname()/getpeername()/accept(): hand the path back in the guest
+ * namespace, so the host layout never leaks into the guest's own name for it. */
+static void unwrap_guest_sockaddr(void* addr, unsigned int* len)
+{
+    struct uapi_sockaddr_un* un = addr;
+    char guest[UAPI_UNIX_PATH_MAX * 2];
+
+    if (!addr || !len || *len < sizeof(un->sun_family) || un->sun_family != AF_UNIX) {
+        return;
+    }
+    if (un->sun_path[0] == '\0') {
+        return;
+    }
+    unwrap_path(guest, un->sun_path, sizeof(guest));
+    memset(un->sun_path, 0, sizeof(un->sun_path));
+    rvvm_strlcpy(un->sun_path, guest, sizeof(un->sun_path));
+    *len = (unsigned int)sizeof(*un);
+}
+
 /* Guest open(2) flags -> host open() flags.
  *
  * On a Linux host the two sets are identical, so this passes through. The
@@ -11698,19 +11764,26 @@ case 179: // sysinfo
                 }
                 /* The socket calls below all take the guest's number first, and
                  * every one of them goes to the table for the host's. */
-                case 200: // bind
-                    // TODO struct conversion
+                case 200: { // bind
+                    /* An AF_UNIX pathname carries a guest path: map it before the
+                     * host sees it (see wrap_guest_sockaddr). */
+                    char pbuf[UAPI_PATH_MAX];
+                    struct uapi_sockaddr_un scratch;
+                    unsigned int len = (unsigned int)a2;
+                    const void*  sa  = wrap_guest_sockaddr(pbuf, &scratch, to_ptr(a1), &len);
                     rvvm_info("sys_bind(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(bind(userland_fd_host(uctx(), (int)a0), to_ptr(a1), a2));
+                    a0 = errno_ret(bind(userland_fd_host(uctx(), (int)a0), sa, (socklen_t)len));
                     break;
+                }
                 case 201: // listen
                     rvvm_info("sys_listen(%ld, %lx)", a0, a1);
                     a0 = errno_ret(listen(userland_fd_host(uctx(), (int)a0), a1));
                     break;
-                case 202: // accept
-                    // TODO: struct conversion(?)
+                case 202: { // accept
+                    void*      sa = to_ptr(a1);
+                    socklen_t* lp = to_ptr(a2);
                     rvvm_info("sys_accept(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(accept(userland_fd_host(uctx(), (int)a0), to_ptr(a1), to_ptr(a2)));
+                    a0 = errno_ret(accept(userland_fd_host(uctx(), (int)a0), sa, lp));
                     if ((int64_t)a0 >= 0) {
                         /* accept(2) has no flag argument: the new descriptor
                          * never carries FD_CLOEXEC, exactly like Linux - and it
@@ -11723,23 +11796,47 @@ case 179: // sysinfo
                         }
                         a0 = (rvvm_addr_t)guest_fd;
                         userland_fd_set_flags(uctx(), guest_fd, UAPI_O_RDWR);
+                        if (sa && lp) {
+                            unsigned int ulen = (unsigned int)*lp;
+                            unwrap_guest_sockaddr(sa, &ulen);
+                            *lp = (socklen_t)ulen;
+                        }
                     }
                     break;
-                case 203: // connect
-                    // TODO: struct conversion(?)
+                }
+                case 203: { // connect
+                    char pbuf[UAPI_PATH_MAX];
+                    struct uapi_sockaddr_un scratch;
+                    unsigned int len = (unsigned int)a2;
+                    const void*  sa  = wrap_guest_sockaddr(pbuf, &scratch, to_ptr(a1), &len);
                     rvvm_info("sys_connect(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(connect(userland_fd_host(uctx(), (int)a0), to_ptr(a1), a2));
+                    a0 = errno_ret(connect(userland_fd_host(uctx(), (int)a0), sa, (socklen_t)len));
                     break;
-                case 204: // getsockname
-                    // TODO: struct conversion(?)
+                }
+                case 204: { // getsockname
+                    void*      sa  = to_ptr(a1);
+                    socklen_t* lp  = to_ptr(a2);
                     rvvm_info("sys_getsockname(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(getsockname(userland_fd_host(uctx(), (int)a0), to_ptr(a1), to_ptr(a2)));
+                    a0 = errno_ret(getsockname(userland_fd_host(uctx(), (int)a0), sa, lp));
+                    if ((int64_t)a0 == 0 && sa && lp) {
+                        unsigned int ulen = (unsigned int)*lp;
+                        unwrap_guest_sockaddr(sa, &ulen);
+                        *lp = (socklen_t)ulen;
+                    }
                     break;
-                case 205: // getpeername
-                    // TODO: struct conversion(?)
+                }
+                case 205: { // getpeername
+                    void*      sa  = to_ptr(a1);
+                    socklen_t* lp  = to_ptr(a2);
                     rvvm_info("sys_getpeername(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(getpeername(userland_fd_host(uctx(), (int)a0), to_ptr(a1), to_ptr(a2)));
+                    a0 = errno_ret(getpeername(userland_fd_host(uctx(), (int)a0), sa, lp));
+                    if ((int64_t)a0 == 0 && sa && lp) {
+                        unsigned int ulen = (unsigned int)*lp;
+                        unwrap_guest_sockaddr(sa, &ulen);
+                        *lp = (socklen_t)ulen;
+                    }
                     break;
+                }
                 case 206: // sendto
                     // TODO: struct conversion(?)
                     rvvm_info("sys_sendto(%ld, %lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4, a5);

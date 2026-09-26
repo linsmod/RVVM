@@ -30,6 +30,7 @@ int ash_serve(int port, int idle_s);
 int ash_client(int port, const char* one_cmd, bool autostart);
 int ash_list(void);
 int ash_shutdown(int port);
+int ash_sock_path(int port);
 
 #define ASH_PORT_DEFAULT 7900
 
@@ -49,7 +50,7 @@ static void print_usage(const char* self)
 {
     fprintf(stderr,
             "usage: %s [--serve [--idle S]] [--list] [--shutdown]\n"
-            "          [--port N] [-c <command>]\n"
+            "          [--port N] [-c <command>] [--sock-path]\n"
             "\n"
             "  %s                  connect to the run's core (start one if none);"
             " a new session\n"
@@ -57,11 +58,13 @@ static void print_usage(const char* self)
             "  %s -c \"ls /bin\"      run one command in a session\n"
             "  %s --list           list the cores registered in this release tree\n"
             "  %s --shutdown       ask the core on the port to stop\n"
+            "  %s --sock-path      print the core's AF_UNIX endpoint and exit\n"
             "\n"
-            "Options: --port N (default %d, RVVM_ASH_PORT); --serve --idle S stops a\n"
-            "core after S seconds with no session (0 = never). The core program is\n"
-            "/sbin/vpsessiond, from the bundle.\n",
-            self, self, self, self, self, self, ASH_PORT_DEFAULT);
+            "Options: --port N (default %d, RVVM_ASH_PORT) is the core's logical id\n"
+            "and names its endpoint; --serve --idle S stops a core after S seconds\n"
+            "with no session (0 = never). The core program is /sbin/vpsessiond, from\n"
+            "the bundle.\n",
+            self, self, self, self, self, self, self, ASH_PORT_DEFAULT);
 }
 
 int main(int argc, char** argv)
@@ -69,6 +72,7 @@ int main(int argc, char** argv)
     bool        serve    = false;
     bool        list     = false;
     bool        shutdown = false;
+    bool        sockpath = false;
     const char* one_cmd  = NULL;
     int         idle     = 0;
     int         port     = ash_port();
@@ -88,6 +92,8 @@ int main(int argc, char** argv)
             list = true;
         } else if (!strcmp(a, "--shutdown")) {
             shutdown = true;
+        } else if (!strcmp(a, "--sock-path")) {
+            sockpath = true;
         } else if (!strcmp(a, "--idle") && i + 1 < argc) {
             idle = atoi(argv[++i]);
         } else if (!strncmp(a, "--idle=", 7)) {
@@ -106,6 +112,9 @@ int main(int argc, char** argv)
     }
     if (shutdown) {
         return ash_shutdown(port);
+    }
+    if (sockpath) {
+        return ash_sock_path(port);
     }
     if (serve) {
         return ash_serve(port, idle);

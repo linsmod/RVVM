@@ -41,6 +41,7 @@ $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Exe).Path
 $dir = Split-Path $exe
 $fails = 0
+. (Join-Path $PSScriptRoot 'ash_sock.ps1')
 
 function TS() { "[" + ([Environment]::TickCount64).ToString().PadLeft(9) + " ms] " }
 function Check($ok, $what) {
@@ -61,18 +62,13 @@ $core = Start-Process -FilePath $exe -ArgumentList '--serve', '--port', "$Port" 
                       -WorkingDirectory $dir -PassThru `
                       -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow
 
-# Ready when the port answers, not when a log line shows up.
+# Ready when the endpoint answers, not when a log line shows up.
 $up = $false
 for ($i = 0; $i -lt 120; $i++) {
-    try {
-        $probe = New-Object System.Net.Sockets.TcpClient
-        $probe.Connect('127.0.0.1', $Port)
-        $probe.Close()
-        $up = $true
-        break
-    } catch { Start-Sleep -Milliseconds 100 }
+    if (Test-AshUp -Exe $exe -Port $Port) { $up = $true; break }
+    Start-Sleep -Milliseconds 100
 }
-Check $up "the core (ash --serve) listens on 127.0.0.1:$Port"
+Check $up "the core (ash --serve) publishes its endpoint (port $Port)"
 if (-not $up) {
     try { $core.Kill() } catch { }
     "--- core output ---"; Get-Content $out -ErrorAction SilentlyContinue
@@ -80,6 +76,7 @@ if (-not $up) {
     exit 1
 }
 
+try {
 # --- one client, one session ---------------------------------------------
 $r = Client 'echo ash-hello-42'
 Check ($r -match 'ash-hello-42') 'a client runs a command in the core'
@@ -111,9 +108,12 @@ Start-Sleep -Milliseconds 600
 $r = Client 'echo autostarted'
 Check ($r -match 'autostarted') 'with no core running, a client starts one (wsl autostart)'
 
-# Cleanup: kill whatever core is listening now (the autostarted one included).
-Get-Process -Name 'rvvm_ash_x86_64' -ErrorAction SilentlyContinue |
-    Stop-Process -Force -ErrorAction SilentlyContinue
+} finally {
+    # Cleanup: kill whatever core is listening now (the autostarted one included),
+    # even when a check threw - a lingering core would hold the rootfs lock.
+    Get-Process -Name 'rvvm_ash_x86_64' -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+}
 
 if ($fails) {
     "=== FAIL: $fails check(s) ==="

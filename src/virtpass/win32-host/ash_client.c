@@ -46,9 +46,10 @@ The wire protocol is the session server's, not a new one:
 #define ASH_FRAME_HEAD   "\x1b]999;"
 #define ASH_FRAME_END    0x07
 
-/* AF_INET / SOCK_STREAM, in the Linux numbering win_socket.c translates from. */
-#define ASH_AF_INET      2
+/* AF_UNIX / SOCK_STREAM, in the Linux numbering win_socket.c translates from. */
+#define ASH_AF_UNIX      1
 #define ASH_SOCK_STREAM  1
+#define ASH_SUN_PATH_MAX 108
 
 /* Defined with the client below; the core's control verbs use them too. */
 static int  ash_connect(int port);
@@ -136,6 +137,53 @@ static bool ash_core_file(int port, char* out, size_t size)
     }
     snprintf(out, size, "%s\\%d.core", dir, port);
     return true;
+}
+
+/* The AF_UNIX endpoint a core publishes. It is the guest path the session
+ * server binds (/cores/vpsessiond-<port>.sock, see vpsessiond.c) mapped through
+ * the guest prefix: the run's persisted rootfs, <exe>\runtime\rootfs - the same
+ * tree the bundle installs. Client and core agree without either learning the
+ * other's layout, and it is a filesystem object, not a TCP port. */
+static bool ash_session_sock_path(int port, char* out, size_t size)
+{
+    char exe_dir[MAX_PATH];
+
+    if (!ash_exe_directory(exe_dir, sizeof(exe_dir))) {
+        return false;
+    }
+    if (snprintf(out, size, "%s\\runtime\\rootfs\\cores\\vpsessiond-%d.sock",
+                 exe_dir, port) >= (int)size) {
+        return false;
+    }
+    return true;
+}
+
+/* Discovery broker (stub).
+ *
+ * The client should not have to know the release layout: the eventual shape is
+ * WSL's - a well-known local pipe (\\.\pipe\rvvm-ash-broker) that a machine-wide
+ * service answers with the endpoint of the active distro ("list", or
+ * "resolve <id>" -> the socket path). Until that service exists, this resolves
+ * the one layout that does: this executable's own release tree, which is also
+ * what --serve registered. Keeping it a single call here means the broker lands
+ * as one function, not as a change at every connect site. */
+static bool ash_broker_resolve(int port, char* out, size_t size)
+{
+    return ash_session_sock_path(port, out, size);
+}
+
+/* Print the endpoint, so a test harness does not have to re-derive the layout
+ * (the same single source of truth the broker will serve). */
+int ash_sock_path(int port)
+{
+    char path[MAX_PATH];
+
+    if (!ash_broker_resolve(port, path, sizeof(path))) {
+        fprintf(stderr, "ash: cannot locate the run directory\n");
+        return 1;
+    }
+    printf("%s\n", path);
+    return 0;
 }
 
 static bool ash_pid_alive(DWORD pid)
@@ -306,7 +354,7 @@ int ash_serve(int port, int idle_s)
     /* One core per port: the lock is the registry, and it fails before a second
      * machine is built only to lose the port race inside the guest. */
     if (ash_core_up(port)) {
-        fprintf(stderr, "ash --serve: a core is already up on 127.0.0.1:%d\n", port);
+        fprintf(stderr, "ash --serve: a core is already up on port %d\n", port);
         return 1;
     }
 
@@ -417,7 +465,7 @@ int ash_shutdown(int port)
     char  buf[256];
 
     if (fd < 0) {
-        fprintf(stderr, "ash: no core on 127.0.0.1:%d\n", port);
+        fprintf(stderr, "ash: no core on port %d\n", port);
         return 1;
     }
     ash_send_frame(fd, "Q");
@@ -440,32 +488,44 @@ int ash_shutdown(int port)
 /* The client                                                          */
 /* ------------------------------------------------------------------ */
 
-/* 16-byte AF_INET 127.0.0.1:port, laid out as win_socket.c (and WinSock) expect:
- * family, port in network order, address in network order. Kept as bytes so this
- * file never has to include a socket header next to <windows.h>. */
-static void ash_sockaddr_loopback(void* out, int port)
+/* sockaddr_un, laid out as win_socket.c (and WinSock) expect: a 2-byte family
+ * then the pathname. Kept as bytes so this file never has to include a socket
+ * header next to <windows.h>. Returns the address length, or -1 when the path
+ * does not fit the ABI struct. */
+static int ash_sockaddr_unix(void* out, const char* path)
 {
     uint8_t* p = (uint8_t*)out;
-    memset(p, 0, 16);
-    p[0] = ASH_AF_INET;
-    p[2] = (uint8_t)((port >> 8) & 0xFF);
-    p[3] = (uint8_t)(port & 0xFF);
-    p[4] = 127;
-    p[7] = 1;
+    size_t   n = strlen(path);
+
+    if (n + 1 > ASH_SUN_PATH_MAX) {
+        return -1;
+    }
+    memset(p, 0, 2 + ASH_SUN_PATH_MAX);
+    p[0] = ASH_AF_UNIX;
+    memcpy(p + 2, path, n + 1);
+    return 2 + ASH_SUN_PATH_MAX;
 }
 
 static int ash_connect(int port)
 {
-    int fd;
-    uint8_t sa[16];
+    char    path[MAX_PATH];
+    uint8_t sa[2 + ASH_SUN_PATH_MAX];
+    int     fd;
+    int     len;
 
+    if (!ash_broker_resolve(port, path, sizeof(path))) {
+        return -1;
+    }
+    len = ash_sockaddr_unix(sa, path);
+    if (len < 0) {
+        return -1;
+    }
     win_socket_init();
-    fd = win_socket_create(ASH_AF_INET, ASH_SOCK_STREAM, 0);
+    fd = win_socket_create(ASH_AF_UNIX, ASH_SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
     }
-    ash_sockaddr_loopback(sa, port);
-    if (win_socket_connect(fd, sa, (int)sizeof(sa)) < 0) {
+    if (win_socket_connect(fd, sa, len) < 0) {
         win_socket_close(fd);
         return -1;
     }
@@ -646,7 +706,7 @@ int ash_client(int port, const char* one_cmd, bool autostart)
             started = ash_spawn_core(exe_path, exe_dir, port);
         }
         if (!started) {
-            fprintf(stderr, "ash: no core on 127.0.0.1:%d and could not start one (err %lu)\n",
+            fprintf(stderr, "ash: no core on port %d and could not start one (err %lu)\n",
                     port, (unsigned long)GetLastError());
             return 1;
         }
@@ -659,7 +719,7 @@ int ash_client(int port, const char* one_cmd, bool autostart)
             return 1;
         }
     } else if (fd < 0) {
-        fprintf(stderr, "ash: cannot reach a core on 127.0.0.1:%d (start `ash --serve`)\n", port);
+        fprintf(stderr, "ash: cannot reach a core on port %d (start `ash --serve`)\n", port);
         return 1;
     }
 

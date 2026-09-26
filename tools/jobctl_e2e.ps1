@@ -7,9 +7,9 @@
     A plain pipe cannot reproduce "a key pressed while a command runs", which is
     the whole point of ^C / ^Z / jobs / fg. This driver starts one core
     (`rvvm_ash --serve`, which boots /sbin/vpsessiond) and drives a *session*
-    over raw TCP - the session server's own interface, not the interactive
-    ash client's console handling - writing bytes exactly the way a terminal
-    would deliver typing. Every assertion is the shell's own output read off
+    over the core's AF_UNIX endpoint - the session server's own interface, not
+    the interactive ash client's console handling - writing bytes exactly the
+    way a terminal would deliver typing. Every assertion is the shell's own output read off
     the socket.
 
     The session is output-event driven, not time driven. The socket is read
@@ -75,6 +75,14 @@ param(
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Exe).Path
 
+# The session driving layer - socket, action queue, output-event waits - now
+# lives in ash_drive.ps1. This driver is one session for the whole run: queue
+# the writes/waits, then `Invoke-Session` (no -On) replays them against the
+# current session and returns its whole transcript.
+. (Join-Path $PSScriptRoot 'ash_drive.ps1')
+
+# Defined after dot-sourcing ash_drive.ps1, which ships its own plain Check: a
+# driver's own version (counters here) must be the last one loaded.
 $script:pass = 0
 $script:fail = 0
 
@@ -88,188 +96,7 @@ function Check([bool]$ok, [string]$what) {
     }
 }
 
-# The scenario is an action queue. A write action types a burst; a wait action
-# blocks until the session output reaches a position. Both are enqueued here
-# and replayed by Invoke-Session, so a scenario reads top-to-bottom.
-$script:actions = @()
-function Reset-Steps { $script:actions = @() }
-function Add-Action($a) { $script:actions += , $a }
-function Step([int]$ms, [string]$text) { Add-Action @('sleep', $ms); Add-Action @('txt', $text) }
-function Key([int]$ms, [int]$byte) { Add-Action @('sleep', $ms); Add-Action @('key', $byte) }
-
-# Wait primitives (enqueued, executed in order by Invoke-Session).
-function Expect-Pattern([string]$regex, [int]$timeout = 5000) { Add-Action @('wait', 'pattern', $regex, $timeout) }
-function Expect-Newlines([int]$n, [int]$timeout = 5000) { Add-Action @('wait', 'newlines', $n, $timeout) }
-function Expect-Offset([int]$n, [int]$timeout = 5000) { Add-Action @('wait', 'offset', $n, $timeout) }
-function Expect-Quiet([int]$ms = 300, [int]$timeout = 5000) { Add-Action @('wait', 'quiet', $ms, $timeout) }
-
-# --- incremental reader state ----------------------------------------------
-$script:stream = $null
-$script:client = $null
-$script:buf = $null
-$script:decoder = $null
-$script:readEnded = $false
-$script:sampleSw = $null
-$script:rate = @{}
-
-function Record-Sample([int]$n) {
-    if ($n -le 0 -or $null -eq $script:sampleSw) { return }
-    $sec = [int]($script:sampleSw.ElapsedMilliseconds / 1000)
-    if (-not $script:rate.ContainsKey($sec)) { $script:rate[$sec] = 0 }
-    $script:rate[$sec] += $n
-}
-
-# One bounded non-blocking read. Poll tells us whether data is waiting (or the
-# peer closed) without throwing on timeout; a ready socket with 0 available is
-# EOF. Returns $true if bytes arrived, $false on timeout or EOF.
-function Read-Chunk([int]$timeoutMs) {
-    if ($script:readEnded) { return $false }
-    $sock = $script:client.Client
-    if (-not $sock.Poll($timeoutMs * 1000, [System.Net.Sockets.SelectMode]::SelectRead)) {
-        return $false
-    }
-    $avail = $sock.Available
-    if ($avail -le 0) { $script:readEnded = $true; return $false }
-    $tmp = New-Object byte[] ([Math]::Min($avail, 4096))
-    $n = 0
-    try {
-        $n = $script:stream.Read($tmp, 0, $tmp.Length)
-    } catch {
-        $script:readEnded = $true
-        return $false
-    }
-    if ($n -le 0) { $script:readEnded = $true; return $false }
-    $chars = New-Object char[] 8192
-    $c = $script:decoder.GetChars($tmp, 0, $n, $chars, 0)
-    if ($c -gt 0) { [void]$script:buf.Append($chars, 0, $c) }
-    Record-Sample $c
-    return $true
-}
-
-function Write-Bytes([byte[]]$b) {
-    if ($script:readEnded) { return }
-    try {
-        $script:stream.Write($b, 0, $b.Length)
-        $script:stream.Flush()
-    } catch {
-        $script:readEnded = $true
-    }
-}
-
-function Count-Newlines { ([regex]::Matches($script:buf.ToString(), "`n")).Count }
-
-function Get-NewlineOffsets([string]$text) {
-    $offs = @()
-    for ($i = 0; $i -lt $text.Length; $i++) { if ($text[$i] -eq "`n") { $offs += $i } }
-    return , $offs
-}
-
-function Assert-Pattern([string]$regex, [int]$timeoutMs) {
-    $t = [Diagnostics.Stopwatch]::StartNew()
-    while ($true) {
-        $m = [regex]::Match($script:buf.ToString(), $regex)
-        if ($m.Success) { $script:lastHit = $m; return $true }
-        if ($script:readEnded) { break }
-        if ($t.ElapsedMilliseconds -ge $timeoutMs) { break }
-        Read-Chunk 100 | Out-Null
-    }
-    Check $false "wait: pattern '$regex' (timeout ${timeoutMs}ms)"
-    return $false
-}
-
-function Assert-Newlines([int]$n, [int]$timeoutMs) {
-    $t = [Diagnostics.Stopwatch]::StartNew()
-    while ($true) {
-        if ((Count-Newlines) -ge $n) { return $true }
-        if ($script:readEnded) { break }
-        if ($t.ElapsedMilliseconds -ge $timeoutMs) { break }
-        Read-Chunk 100 | Out-Null
-    }
-    Check $false "wait: $n newline(s) (timeout ${timeoutMs}ms)"
-    return $false
-}
-
-function Assert-Offset([int]$n, [int]$timeoutMs) {
-    $t = [Diagnostics.Stopwatch]::StartNew()
-    while ($true) {
-        if ($script:buf.Length -ge $n) { return $true }
-        if ($script:readEnded) { break }
-        if ($t.ElapsedMilliseconds -ge $timeoutMs) { break }
-        Read-Chunk 100 | Out-Null
-    }
-    Check $false "wait: offset >= $n (timeout ${timeoutMs}ms)"
-    return $false
-}
-
-# Quiet: return once no output has arrived for quietMs. This is the only valid
-# signal for a command that emits nothing (a bare `sleep` starting, `wait`
-# blocking); it is also what makes the transition adaptive instead of fixed.
-function Assert-Quiet([int]$quietMs, [int]$timeoutMs) {
-    $quiet = [Diagnostics.Stopwatch]::StartNew()
-    $total = [Diagnostics.Stopwatch]::StartNew()
-    while ($true) {
-        if ($script:readEnded) { return $true }
-        if ($quiet.ElapsedMilliseconds -ge $quietMs) { return $true }
-        if ($total.ElapsedMilliseconds -ge $timeoutMs) {
-            Check $false "wait: quiet for ${quietMs}ms (timeout ${timeoutMs}ms)"
-            return $false
-        }
-        $slice = [Math]::Min(50, [Math]::Max(10, $quietMs - [int]$quiet.ElapsedMilliseconds))
-        if (Read-Chunk $slice) { $quiet.Restart() }
-    }
-}
-
-# The whole scenario is one TCP session. The frame makes the server start the
-# shell immediately (rather than after its own grace delay); the actions then
-# type into it and wait on its output. Reading is incremental and interleaved
-# with writing, so the scenario can react to the shell reaching a position -
-# no fixed schedule, and no tail loss: after `exit` we drain to EOF.
-function Invoke-Session {
-    $client = New-Object System.Net.Sockets.TcpClient
-    $client.Connect('127.0.0.1', $Port)
-    $script:client = $client
-    $script:stream = $client.GetStream()
-    $script:buf = New-Object System.Text.StringBuilder
-    $script:decoder = [Text.Encoding]::UTF8.GetDecoder()
-    $script:readEnded = $false
-    $script:rate = @{}
-    $script:sampleSw = [Diagnostics.Stopwatch]::StartNew()
-
-    $frame = [Text.Encoding]::ASCII.GetBytes(([string][char]27) + ']999;R24;80' + ([string][char]7))
-    Write-Bytes $frame
-
-    foreach ($a in $script:actions) {
-        if ($script:readEnded) { break }
-        switch ($a[0]) {
-            'sleep' { if ($a[1]) { Start-Sleep -Milliseconds $a[1] } }
-            'txt'   { Write-Bytes ([Text.Encoding]::ASCII.GetBytes($a[1])) }
-            'key'   { Write-Bytes ([byte[]]@([byte]$a[1])) }
-            'wait'  {
-                switch ($a[1]) {
-                    'pattern'  { Assert-Pattern $a[2] $a[3] | Out-Null }
-                    'newlines' { Assert-Newlines $a[2] $a[3] | Out-Null }
-                    'offset'   { Assert-Offset $a[2] $a[3] | Out-Null }
-                    'quiet'    { Assert-Quiet $a[2] $a[3] | Out-Null }
-                }
-            }
-        }
-    }
-
-    # The shell exits on `exit`; that ends the read at EOF. A scenario that
-    # forgets to exit (or a command that hangs) is bounded here so a bug is a
-    # failure, not an infinite wait.
-    $drain = [Diagnostics.Stopwatch]::StartNew()
-    while (-not $script:readEnded -and $drain.ElapsedMilliseconds -lt 8000) {
-        Read-Chunk 200 | Out-Null
-    }
-
-    try { $script:stream.Close() } catch { }
-    try { $client.Close() } catch { }
-
-    $text = $script:buf.ToString()
-    $script:lastOut = $text
-    return $text
-}
+# $sess is opened below, once the core has published its endpoint.
 
 # --- one core for the whole run --------------------------------------------
 Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($exe)) -ErrorAction SilentlyContinue |
@@ -284,15 +111,11 @@ $core = Start-Process -FilePath $exe -ArgumentList '--serve', '--port', "$Port" 
 
 $up = $false
 for ($i = 0; $i -lt 150; $i++) {
-    try {
-        $probe = New-Object System.Net.Sockets.TcpClient
-        $probe.Connect('127.0.0.1', $Port)
-        $probe.Close()
+    if (Test-AshUp -Exe $exe -Port $Port) {
         $up = $true
         break
-    } catch {
-        Start-Sleep -Milliseconds 100
     }
+    Start-Sleep -Milliseconds 100
 }
 if (-not $up) {
     $core.Kill()
@@ -301,8 +124,25 @@ if (-not $up) {
     exit 1
 }
 
-$sw = [Diagnostics.Stopwatch]::StartNew()
+# The one session for the run. The frame makes the server start the shell
+# immediately (rather than after its own grace delay). Opened now that the
+# endpoint is live, so Connect-AshSession has something to talk to.
+$sess = New-AshSession -Exe $exe -Port $Port -Frame 'R24;80'
 
+# Always leave the port/rootfs free, even when a scenario throws mid-session:
+# a lingering core would hold the one-core-per-rootfs lock and the endpoint.
+function Stop-Core {
+    & $exe --port $Port --shutdown 2>$null | Out-Null
+    Start-Sleep -Milliseconds 500
+    if ($core -and -not $core.HasExited) {
+        if (-not $core.WaitForExit(3000)) { try { $core.Kill() } catch { } }
+    }
+}
+
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$err = $null
+
+try {
 switch ($Scenario) {
     'sigint' {
         Reset-Steps
@@ -461,22 +301,19 @@ switch ($Scenario) {
     }
     default { throw "unknown scenario $Scenario" }
 }
+} catch {
+    $err = $_
+    $script:fail++
+    "[FAIL] scenario threw: $err"
+} finally {
+    Stop-Core
+}
 
 $sw.Stop()
 "elapsed_ms=$($sw.ElapsedMilliseconds)"
 
 if ($ShowRate) {
-    "--- output rate (chars/second) ---"
-    $script:rate.GetEnumerator() | Sort-Object { [int]$_.Key } | ForEach-Object {
-        "  t=$($_.Key)s  $($_.Value) chars"
-    }
-}
-
-# --- tear down --------------------------------------------------------------
-& $exe --port $Port --shutdown 2>$null | Out-Null
-Start-Sleep -Milliseconds 500
-if (-not $core.HasExited) {
-    if (-not $core.WaitForExit(3000)) { try { $core.Kill() } catch { } }
+    Show-SessionRate $sess
 }
 
 if ($script:fail -eq 0) {

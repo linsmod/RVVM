@@ -6,10 +6,14 @@
 .DESCRIPTION
     Runs vpsessiond as the run root (the bundle's default /sbin/vpsessiond),
     so the machine is a *core* that stays up instead of a one-shot shell, and
-    drives it with real TCP clients. This is the shape the WSL-style split needs:
+    drives it with real socket clients. This is the shape the WSL-style split needs:
     the core holds the state, each client gets its own session.
 
-    Every assertion is the guest's own output, read from the socket:
+    Every assertion is the guest's own output, read from the socket. The
+    driving is the shared ash_drive.ps1 layer (output-event driven, no fixed
+    sleeps): each check is a short queued scenario replayed against its session,
+    and the reader accumulates, so a pattern never slips past the end of a
+    chunk.
 
       prompt       a client connects, sends its window size (the R frame) and
                    gets an interactive shell prompt back.
@@ -39,6 +43,10 @@
 .PARAMETER Keep
     Leave the core running after the checks (for poking at it by hand).
 
+.PARAMETER Multi
+    Also run the second-session checks (they are off by default to keep the
+    ordinary run to one session).
+
 .EXAMPLE
     pwsh ./tools/session_e2e.ps1
 #>
@@ -52,8 +60,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Exe).Path
 $fails = 0
-$ESC = [char]27
-$BEL = [char]7
+$script:failList = @()
+. (Join-Path $PSScriptRoot 'ash_drive.ps1')
 
 # The harness's own lines carry the clock too: they are read next to the core's
 # trace and the daemon's log, and a session's trouble is usually a race between
@@ -69,104 +77,26 @@ function Check($ok, $what, $detail) {
         "$(TS)FAIL $what"
         # What the socket answered, so a failing check can be read without
         # re-running the driver.
-        $shown = if ($detail) { $detail } else { $script:lastRead }
+        $shown = if ($detail) { $detail } else { $script:lastOut }
         if ($shown) {
             "     got: " + (($shown -replace "`r", '' -replace "`n", '|'))
         }
         $script:fails++
+        $script:failList += $what
     }
 }
 
-function New-Client() {
-    $c = [pscustomobject]@{ Tcp = $null; Buf = $null }
-    $c.Tcp = New-Object System.Net.Sockets.TcpClient
-    $c.Tcp.Connect('127.0.0.1', $Port)
-    $c.Tcp.NoDelay = $true
-    $c.Buf = New-Object System.Text.StringBuilder
-    return $c
+# Run one check against a session: replay the queued steps and keep the shell
+# alive (a long-lived session, one assertion at a time). Each replay starts from
+# its own buffer, so "wait for X" means "wait for X from here".
+function Run-Session($d) {
+    $t = Invoke-Session $d -KeepOpen
+    $script:lastOut = $t
+    return $t
 }
 
-function Send-Text($c, [string]$s) {
-    $b = [Text.Encoding]::UTF8.GetBytes($s)
-    $c.Tcp.GetStream().Write($b, 0, $b.Length)
-    $c.Tcp.GetStream().Flush()
-}
-
-function Send-Key($c, [byte]$k) {
-    Send-Text $c ([string][char]$k)
-}
-
-# One control frame: ESC ] 999 ; <body> BEL. Never forwarded to the shell.
-function Send-Frame($c, [string]$body) {
-    Send-Text $c ($ESC + ']999;' + $body + $BEL)
-}
-
-# Read until @pattern shows up in what arrived *since the last call*, or the
-# timeout runs out. What arrived is returned either way, so a failing check can
-# print it. The full history stays in $c.Buf for a look at the end.
-function Read-Until($c, [string]$pattern, [int]$timeoutMs) {
-    $deadline = [Environment]::TickCount64 + $timeoutMs
-    $seen = New-Object System.Text.StringBuilder
-    $buf = New-Object byte[] 4096
-    while ([Environment]::TickCount64 -lt $deadline) {
-        if ($c.Tcp.Available -gt 0) {
-            $n = $c.Tcp.GetStream().Read($buf, 0, $buf.Length)
-            if ($n -le 0) { break }
-            $text = [Text.Encoding]::UTF8.GetString($buf, 0, $n)
-            [void]$seen.Append($text)
-            [void]$c.Buf.Append($text)
-            # Match on the text with ANSI sequences stripped: the shell
-            # emits ESC[6n (and friends) right after a prompt, and a pattern
-            # like '# ' would then never see its space.
-            $plain = $seen.ToString() -replace "`e\[[0-9;]*[A-Za-z]", ''
-            if ($plain -match $pattern) { break }
-        } else {
-            Start-Sleep -Milliseconds 20
-        }
-    }
-    $script:lastRead = $seen.ToString()
-    return $seen.ToString()
-}
-
-# Read whatever is there until the socket goes away (or the timeout).
-function Read-Until-Closed($c, [int]$timeoutMs) {
-    $deadline = [Environment]::TickCount64 + $timeoutMs
-    $buf = New-Object byte[] 4096
-    $seen = New-Object System.Text.StringBuilder
-    while ([Environment]::TickCount64 -lt $deadline) {
-        if ($c.Tcp.Available -gt 0) {
-            $n = $c.Tcp.GetStream().Read($buf, 0, $buf.Length)
-            if ($n -le 0) {
-                # The peer closed: anything already read is what the caller
-                # gets to look at when the check fails.
-                $script:lastRead = $seen.ToString()
-                return $true
-            }
-            $text = [Text.Encoding]::UTF8.GetString($buf, 0, $n)
-            [void]$seen.Append($text)
-            [void]$c.Buf.Append($text)
-            continue
-        }
-        # Available == 0 and the peer is gone is what a closed socket looks
-        # like: probe with a zero-length read.
-        try {
-            if ($c.Tcp.Client.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead) -and
-                $c.Tcp.Available -eq 0) {
-                $script:lastRead = $seen.ToString()
-                return $true
-            }
-        } catch {
-            $script:lastRead = $seen.ToString()
-            return $true
-        }
-        Start-Sleep -Milliseconds 20
-    }
-    $script:lastRead = $seen.ToString()
-    return $false
-}
-
-function Close-Client($c) {
-    try { $c.Tcp.Close() } catch { }
+function New-Client([string]$frame) {
+    return (New-AshSession -Exe $exe -Port $Port -Frame $frame -NoCurrent)
 }
 
 # --- the core: vpsessiond as the run root -------------------------------
@@ -183,21 +113,14 @@ $p = [System.Diagnostics.Process]::Start($psi)
 $outTask = $p.StandardOutput.ReadToEndAsync()
 $errTask = $p.StandardError.ReadToEndAsync()
 
-# Ready when the listener answers, not when a log line shows up: the port is the
-# contract, and reading the pipe would mean waiting for the whole run.
+# Ready when the endpoint answers, not when a log line shows up: the socket is
+# the contract, and reading the pipe would mean waiting for the whole run.
 $up = $false
 for ($i = 0; $i -lt 150; $i++) {
-    try {
-        $probe = New-Object System.Net.Sockets.TcpClient
-        $probe.Connect('127.0.0.1', $Port)
-        $probe.Close()
-        $up = $true
-        break
-    } catch {
-        Start-Sleep -Milliseconds 100
-    }
+    if (Test-AshUp -Exe $exe -Port $Port) { $up = $true; break }
+    Start-Sleep -Milliseconds 100
 }
-Check $up "vpsessiond listens on 127.0.0.1:$Port"
+Check $up "vpsessiond publishes its endpoint (port $Port)"
 if (-not $up) {
     try { $p.Kill() } catch { }
     "--- core output ---"
@@ -205,52 +128,75 @@ if (-not $up) {
     exit 1
 }
 
-$nl = "`n"
-
+try {
 # --- one client, one shell ----------------------------------------------
-$A = New-Client
-Send-Frame $A 'R30;100'
-$r = Read-Until $A '/ #' 10000
-Check ($r -match '/ #') 'a client gets a prompt of its own'
+$A = New-Client 'R30;100'
 
-Send-Text $A ('echo A-UNIQ-$((6*7))' + $nl)
-$r = Read-Until $A 'A-UNIQ-42' 5000
-Check ($r -match 'A-UNIQ-42') 'the session runs what the client types'
+Reset-Steps -On $A
+Expect-Pattern -On $A '/ #' 10000
+$out = Run-Session $A
+Check ($out -match '/ #') 'a client gets a prompt of its own'
 
-Send-Text $A ('stty size' + $nl)
-$r = Read-Until $A '30 100' 5000
-Check ($r -match '30 100') 'stty size is the size the client asked for (the R frame)'
+Reset-Steps -On $A
+Step -On $A 0 ('echo A-UNIQ-$((6*7))' + "`n")
+Expect-Pattern -On $A 'A-UNIQ-42' 5000
+$out = Run-Session $A
+Check ($out -match 'A-UNIQ-42') 'the session runs what the client types'
 
-Send-Text $A ('echo via-dev-tty > /dev/tty' + $nl)
-$r = Read-Until $A 'via-dev-tty' 5000
-Check ($r -match 'via-dev-tty') '/dev/tty in the session answers its own pty, not the console'
+Reset-Steps -On $A
+Step -On $A 0 ('stty size' + "`n")
+Expect-Pattern -On $A '30 100' 5000
+$out = Run-Session $A
+Check ($out -match '30 100') 'stty size is the size the client asked for (the R frame)'
 
-Send-Text $A ('cd /tmp && pwd' + $nl)
-$r = Read-Until $A '/tmp' 5000
-Check ($r -match '/tmp') 'the session keeps its own state (cwd)'
+Reset-Steps -On $A
+Step -On $A 0 ('echo via-dev-tty > /dev/tty' + "`n")
+Expect-Pattern -On $A 'via-dev-tty' 5000
+$out = Run-Session $A
+Check ($out -match 'via-dev-tty') '/dev/tty in the session answers its own pty, not the console'
+
+Reset-Steps -On $A
+Step -On $A 0 ('cd /tmp && pwd' + "`n")
+Expect-Pattern -On $A '/tmp' 5000
+$out = Run-Session $A
+Check ($out -match '/tmp') 'the session keeps its own state (cwd)'
 
 # --- one session, one file ----------------------------------------------
 # The shape a shared filesystem stands on: a session redirects into a file
 # (which hands the shell's fd 1 to a host descriptor) and then reads it back.
 # Checked in *one* session first, so a failure here says "a session cannot read
 # what it wrote" rather than "the other session cannot see it".
-Send-Text $A ('echo selfcheck-content > /tmp/selfcheck.txt' + $nl)
-Start-Sleep -Milliseconds 400
-Send-Text $A ('ls -l /tmp/selfcheck.txt' + $nl)
-$r = Read-Until $A 'selfcheck.txt' 5000
-"$(TS)DIAG: ls -l: " + ($r -replace "`r", '' -replace "`n", '|')
-Send-Text $A ('cat /tmp/selfcheck.txt' + $nl)
-$r = Read-Until $A 'selfcheck-content' 5000
-Check ($r -match 'selfcheck-content') 'a session reads back the file it wrote'
-Send-Text $A ('wc -c < /tmp/selfcheck.txt' + $nl)
-$r = Read-Until $A 'selfcheck-content|\d+' 5000
-Check ($r -match '(?m)^\s*18\s*$') 'the file the session wrote has 18 bytes in it'
-Send-Text $A ('rm -f /tmp/selfcheck.txt' + $nl)
-Start-Sleep -Milliseconds 300
+Reset-Steps -On $A
+Step -On $A 0 ('echo selfcheck-content > /tmp/selfcheck.txt' + "`n")
+Expect-Quiet -On $A 400
+Step -On $A 0 ('ls -l /tmp/selfcheck.txt' + "`n")
+Expect-Pattern -On $A 'selfcheck.txt' 5000
+$out = Run-Session $A
+"$(TS)DIAG: ls -l: " + ($out -replace "`r", '' -replace "`n", '|')
+Check ($out -match 'selfcheck.txt') 'a session writes a file to the core fs'
 
-Send-Text $A ('echo pid-a=$$' + $nl)
-$r = Read-Until $A 'pid-a=[0-9]+' 5000
-$pidA = if ($r -match 'pid-a=([0-9]+)') { $Matches[1] } else { '' }
+Reset-Steps -On $A
+Step -On $A 0 ('cat /tmp/selfcheck.txt' + "`n")
+Expect-Pattern -On $A 'selfcheck-content' 5000
+$out = Run-Session $A
+Check ($out -match 'selfcheck-content') 'a session reads back the file it wrote'
+
+Reset-Steps -On $A
+Step -On $A 0 ('wc -c < /tmp/selfcheck.txt' + "`n")
+Expect-Pattern -On $A '(?m)^\s*18\s*$' 5000
+$out = Run-Session $A
+Check ($out -match '(?m)^\s*18\s*$') 'the file the session wrote has 18 bytes in it'
+
+Reset-Steps -On $A
+Step -On $A 0 ('rm -f /tmp/selfcheck.txt' + "`n")
+Expect-Quiet -On $A 300
+$out = Run-Session $A
+
+Reset-Steps -On $A
+Step -On $A 0 ('echo pid-a=$$' + "`n")
+Expect-Pattern -On $A 'pid-a=[0-9]+' 5000
+$out = Run-Session $A
+$pidA = if ($out -match 'pid-a=([0-9]+)') { $Matches[1] } else { '' }
 Check ($pidA -ne '') "the session shell reports a pid ($pidA)"
 
 # --- a second client is a second session --------------------------------
@@ -258,74 +204,94 @@ Check ($pidA -ne '') "the session shell reports a pid ($pidA)"
 # shared-core checks (they pass - the fd-reuse and sendfile bugs they once
 # reproduced are fixed, see handover.md §6).
 if ($Multi) {
-    $B = New-Client
-    $r = Read-Until $B '/ #' 10000
-    Check ($r -match '/ #') 'a second client gets a prompt too'
+    $B = New-Client 'R30;100'
+    Reset-Steps -On $B
+    Expect-Pattern -On $B '/ #' 10000
+    $out = Run-Session $B
+    Check ($out -match '/ #') 'a second client gets a prompt too'
 
-    Send-Text $B ('echo pid-b=$$' + $nl)
-    $r = Read-Until $B 'pid-b=[0-9]+' 5000
-    $pidB = if ($r -match 'pid-b=([0-9]+)') { $Matches[1] } else { '' }
+    Reset-Steps -On $B
+    Step -On $B 0 ('echo pid-b=$$' + "`n")
+    Expect-Pattern -On $B 'pid-b=[0-9]+' 5000
+    $out = Run-Session $B
+    $pidB = if ($out -match 'pid-b=([0-9]+)') { $Matches[1] } else { '' }
     Check ($pidB -ne '' -and $pidB -ne $pidA) "it is a different shell (pid $pidB vs $pidA)"
 
-    Send-Text $A ('echo shared-core-state > /tmp/session-shared.txt' + $nl)
-    Start-Sleep -Milliseconds 400
     # A reads its own file back first: this separates "cat with an argument is
     # broken in a session" from "the second session cannot see the file".
-    Send-Text $A ('cat /tmp/session-shared.txt' + $nl)
-    $r = Read-Until $A 'shared-core-state' 5000
-    Check ($r -match 'shared-core-state') 'the writing session reads the file back'
+    Reset-Steps -On $A
+    Step -On $A 0 ('echo shared-core-state > /tmp/session-shared.txt' + "`n")
+    Expect-Quiet -On $A 400
+    Reset-Steps -On $A
+    Step -On $A 0 ('cat /tmp/session-shared.txt' + "`n")
+    Expect-Pattern -On $A 'shared-core-state' 5000
+    $out = Run-Session $A
+    Check ($out -match 'shared-core-state') 'the writing session reads the file back'
 
-    Send-Text $B ('cat /tmp/session-shared.txt' + $nl)
-    $r = Read-Until $B 'shared-core-state' 5000
-    Check ($r -match 'shared-core-state') 'both sessions share one filesystem (the core state)'
+    Reset-Steps -On $B
+    Step -On $B 0 ('cat /tmp/session-shared.txt' + "`n")
+    Expect-Pattern -On $B 'shared-core-state' 5000
+    $out = Run-Session $B
+    Check ($out -match 'shared-core-state') 'both sessions share one filesystem (the core state)'
 } else {
     "skip second-session checks (pass -Multi to run them)"
 }
 
 # --- job control, driven from outside the machine -----------------------
-Send-Text $A ('sleep 30' + $nl)
-Start-Sleep -Milliseconds 900
-Send-Key $A 0x03
-$r = Read-Until $A '\^C' 5000
-Check ($r -match '\^C') '^C written to the socket reaches the session (ISIG on the pty)'
-$r = Read-Until $A '#\s*' 5000
-Check ($r -match '# ') 'the shell survives its command being interrupted'
+# ^C and the prompt it triggers can land in the same chunk; the matching runs
+# over the whole accumulated buffer, so the second wait still sees it.
+Reset-Steps -On $A
+Step -On $A 0 ('sleep 30' + "`n")
+Expect-Quiet -On $A 400
+Key -On $A 0 0x03
+Expect-Pattern -On $A '\^C' 5000
+Expect-Pattern -On $A '#\s*' 5000
+$out = Run-Session $A
+Check ($out -match '\^C') '^C written to the socket reaches the session (ISIG on the pty)'
+Check ($out -match '# ') 'the shell survives its command being interrupted'
 
-Send-Text $A ('sleep 30' + $nl)
-Start-Sleep -Milliseconds 900
-Send-Key $A 0x1A
-$r = Read-Until $A '\^Z' 5000
-Check ($r -match '\^Z') '^Z stops the job'
-Send-Text $A ('jobs' + $nl)
-$r = Read-Until $A 'Stopped' 5000
-Check ($r -match 'Stopped') 'jobs reports it as stopped'
-Send-Text $A ('kill -KILL %1' + $nl)
-$r = Read-Until $A '#\s*' 5000
-Check ($r -match '# ') 'the stopped job can be killed and the shell carries on'
+Reset-Steps -On $A
+Step -On $A 0 ('sleep 30' + "`n")
+Expect-Quiet -On $A 400
+Key -On $A 0 0x1A
+Expect-Pattern -On $A '\^Z' 5000
+$out = Run-Session $A
+Check ($out -match '\^Z') '^Z stops the job'
+
+Reset-Steps -On $A
+Step -On $A 0 ('jobs' + "`n")
+Expect-Pattern -On $A 'Stopped' 5000
+$out = Run-Session $A
+Check ($out -match 'Stopped') 'jobs reports it as stopped'
+
+Reset-Steps -On $A
+Step -On $A 0 ('kill -KILL %1' + "`n")
+Expect-Pattern -On $A '#\s*' 5000
+$out = Run-Session $A
+Check ($out -match '# ') 'the stopped job can be killed and the shell carries on'
 
 # --- a client leaving is not the core leaving ---------------------------
-# Let the previous command (`kill -KILL %1`) finish draining before the exit
-# goes in: the pty is byte-ordered, and an `exit` sent while its output is
-# still in flight races the driver's own read (it would see the trailing
-# prompt of the *previous* command and call the session still open).
-$r = Read-Until $A '#\s*' 5000
-Start-Sleep -Milliseconds 300
+# The 400ms settle lets the previous command finish draining, then `exit` goes
+# in and the peer closes the socket: Expect-Closed is the assertion, no prompt
+# guess needed (the shell is idle between invocations, so it will not re-emit
+# its prompt).
+Reset-Steps -On $A
+Step -On $A 400 ('exit' + "`n")
+Expect-Closed -On $A 8000
 $tsExit = [Environment]::TickCount64
-Send-Text $A ('exit' + $nl)
-$rc = Read-Until-Closed $A 8000
+$out = Invoke-Session $A
 $tsDone = [Environment]::TickCount64
-$pollR = $A.Tcp.Client.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead)
-$pollW = $A.Tcp.Client.Poll(0, [System.Net.Sockets.SelectMode]::SelectWrite)
-$localPort = ($A.Tcp.Client.LocalEndPoint).Port
-"$(TS)DIAG: A.localPort=$localPort exitSent=$tsExit elapsed=$($tsDone-$tsExit)ms rc=$rc pollR=$pollR pollW=$pollW"
-Check $rc 'the client that exits has its session closed'
+"$(TS)DIAG: A.path=$($A.Path) exitSent=$tsExit elapsed=$($tsDone-$tsExit)ms closed=$($A.Closed)"
+Check $A.Closed 'the client that exits has its session closed'
 
 if ($Multi) {
-    Send-Text $B ('echo B-ALIVE' + $nl)
-    $r = Read-Until $B 'B-ALIVE' 5000
-    Check ($r -match 'B-ALIVE') 'the other session is untouched (the core stayed up)'
+    Reset-Steps -On $B
+    Step -On $B 0 ('echo B-ALIVE' + "`n")
+    Expect-Pattern -On $B 'B-ALIVE' 5000
+    $out = Run-Session $B
+    Check ($out -match 'B-ALIVE') 'the other session is untouched (the core stayed up)'
 
-    Close-Client $B
+    Close-AshSession $B
 }
 Start-Sleep -Milliseconds 500
 
@@ -351,8 +317,16 @@ Check ($sessions -ge $want) "the core started $sessions session(s) without exiti
 ($err -split "`n" | Where-Object { $_ -and $_ -notmatch 'Syscall \d+ failed' }) -join "`n"
 
 if ($fails) {
+    "--- failed checks: " + ($script:failList -join ' | ')
     "=== FAIL: $fails check(s) ==="
     exit 1
 }
 "=== PASS: sessions ==="
 exit 0
+} finally {
+    # Whatever a check threw, leave no session socket and - unless -Keep - no
+    # core behind: a lingering core holds the rootfs lock and the endpoint.
+    try { Close-AshSession $A } catch { }
+    if ($B) { try { Close-AshSession $B } catch { } }
+    if (-not $Keep) { try { $p.Kill() } catch { } }
+}

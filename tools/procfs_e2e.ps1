@@ -37,6 +37,7 @@ $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Exe).Path
 $dir = Split-Path $exe
 $fails = 0
+. (Join-Path $PSScriptRoot 'ash_sock.ps1')
 
 function TS() { "[" + ([Environment]::TickCount64).ToString().PadLeft(9) + " ms] " }
 function Check($ok, $what) {
@@ -65,15 +66,10 @@ $core = Start-Process -FilePath $exe -ArgumentList '--serve', '--port', "$Port" 
 
 $up = $false
 for ($i = 0; $i -lt 120; $i++) {
-    try {
-        $probe = New-Object System.Net.Sockets.TcpClient
-        $probe.Connect('127.0.0.1', $Port)
-        $probe.Close()
-        $up = $true
-        break
-    } catch { Start-Sleep -Milliseconds 100 }
+    if (Test-AshUp -Exe $exe -Port $Port) { $up = $true; break }
+    Start-Sleep -Milliseconds 100
 }
-Check $up "the core (ash --serve) listens on 127.0.0.1:$Port"
+Check $up "the core (ash --serve) publishes its endpoint (port $Port)"
 if (-not $up) {
     try { $core.Kill() } catch { }
     "--- core output ---"; Get-Content $out -ErrorAction SilentlyContinue
@@ -81,6 +77,7 @@ if (-not $up) {
     exit 1
 }
 
+try {
 # --- the /proc listing ----------------------------------------------------
 $r = Client 'ls /proc'
 Check ($r -match '(?m)^.*\bself\b' -and $r -match '\buptime\b' -and $r -match '\bstat\b' -and $r -match '\bmounts\b') `
@@ -142,9 +139,11 @@ Check ($ft -eq $mt) "free (sysinfo) and meminfo report the same total ($ft kB)"
 $r = Client 'cat /proc/version'
 Check ($r -match 'Linux version') "/proc/version names the kernel"
 
-# Cleanup.
-Get-Process -Name 'rvvm_ash_x86_64' -ErrorAction SilentlyContinue |
-    Stop-Process -Force -ErrorAction SilentlyContinue
+} finally {
+    # Cleanup, even when a check threw - a lingering core holds the rootfs lock.
+    Get-Process -Name 'rvvm_ash_x86_64' -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+}
 
 if ($fails) {
     "=== FAIL: $fails check(s) ==="

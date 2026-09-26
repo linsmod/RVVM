@@ -33,23 +33,29 @@
  * forwarded as data. Clients (the rvvm_ash relay, the test harness) write a
  * frame in a single call, which is what this expects.
  *
- * Usage: vpsessiond [port]     (default 7900, loopback only)
+ * Usage: vpsessiond [port]     (default 7900)
  *        SHELL=/bin/sh          (the shell each session runs)
+ *
+ * The listener is an AF_UNIX socket at /cores/vpsessiond-<port>.sock, a *guest*
+ * path: the host maps it into its own namespace (that is the one rendezvous the
+ * client and this server agree on), so nothing is exposed as a TCP port.
  */
 
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
-#include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -58,6 +64,10 @@
 #define SESSION_MAX     16
 #define DEFAULT_PORT  7900
 #define PORT_MAX     65535
+
+/* Where the core publishes its endpoint, as a guest path. */
+#define SOCK_DIR      "/cores"
+#define SOCK_FMT      SOCK_DIR "/vpsessiond-%d.sock"
 
 /* How long a fresh connection may hold its shell back while a first frame is in
  * flight. Long enough for a client's preamble on loopback, short enough that an
@@ -525,32 +535,41 @@ int main(int argc, char** argv)
         shell_path = env_shell;
     }
 
-    listener = socket(AF_INET, SOCK_STREAM, 0);
+    /* The endpoint lives in the guest's own tree; the host maps the path into
+     * its namespace. mkdir()/unlink() go through the same mapping, so both see
+     * one object. A stale socket file from a previous run would refuse bind(),
+     * so it is removed first. */
+    if (mkdir(SOCK_DIR, 0777) < 0 && errno != EEXIST) {
+        dlog("mkdir(%s): %s", SOCK_DIR, strerror(errno));
+        return 1;
+    }
+    char sock_path[sizeof(((struct sockaddr_un*)0)->sun_path)];
+    snprintf(sock_path, sizeof(sock_path), SOCK_FMT, port);
+    unlink(sock_path);
+
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
     if (listener < 0) {
         dlog("socket(): %s", strerror(errno));
         return 1;
     }
-    int on = 1;
-    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     /* Every descriptor this daemon owns is closed at execve() of the session it
      * forks: a shell that kept a client's socket (or another session's) would
      * hold its refcount up forever, and the client waiting for the FIN of a
      * session that ended would wait for a close that never comes. */
     fcntl(listener, F_SETFD, FD_CLOEXEC);
 
-    struct sockaddr_in addr;
+    struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons((unsigned short)port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), SOCK_FMT, port);
     if (bind(listener, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
         listen(listener, SESSION_MAX) < 0) {
-        dlog("bind/listen(%d): %s", port, strerror(errno));
+        dlog("bind/listen(%s): %s", sock_path, strerror(errno));
         return 1;
     }
 
-    dlog("listening on 127.0.0.1:%d, shell %s (in %d, out %d, idle %d s)",
-         port, shell_path, IN_MAX, OUT_MAX, idle_s);
+    dlog("listening on %s, shell %s (in %d, out %d, idle %d s)",
+         sock_path, shell_path, IN_MAX, OUT_MAX, idle_s);
     fflush(stdout);
 
     long last_active = loop_ms();
@@ -590,9 +609,7 @@ int main(int argc, char** argv)
                 if (kind[i] < 0) {
                     /* A new client: its shell waits for a first frame or for the
                      * grace to run out, whichever comes first (see the tick). */
-                    struct sockaddr_in peer;
-                    socklen_t          plen = sizeof(peer);
-                    int                c    = accept(listener, (struct sockaddr*)&peer, &plen);
+                    int c = accept(listener, NULL, NULL);
                     if (c < 0) {
                         continue;
                     }
