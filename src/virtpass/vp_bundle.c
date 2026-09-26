@@ -165,7 +165,7 @@ static bool bundle_write_session_files(const char* dest)
 /* deviation (§6).                                                     */
 /* ------------------------------------------------------------------ */
 
-static bool bundle_stamp_path(const char* dest, char* out, size_t size)
+static bool bundle_stamp_path(const char* dest, const char* stamp, char* out, size_t size)
 {
     char dir[BUNDLE_PATH_MAX];
 
@@ -173,10 +173,10 @@ static bool bundle_stamp_path(const char* dest, char* out, size_t size)
         return false;
     }
     bundle_mkdir(dir);
-    return bundle_join(out, size, dir, "install");
+    return bundle_join(out, size, dir, stamp);
 }
 
-static bool bundle_stamp_ok(const char* dest, const char* archive)
+static bool bundle_stamp_ok(const char* dest, const char* stamp, const char* archive)
 {
     struct stat ast;
     char        path[BUNDLE_PATH_MAX];
@@ -185,7 +185,7 @@ static bool bundle_stamp_ok(const char* dest, const char* archive)
     size_t      n;
     FILE*       f;
 
-    if (stat(archive, &ast) != 0 || !bundle_stamp_path(dest, path, sizeof(path))) {
+    if (stat(archive, &ast) != 0 || !bundle_stamp_path(dest, stamp, path, sizeof(path))) {
         return false;   /* no archive to fingerprint: extract and find out */
     }
     f = fopen(path, "rb");
@@ -200,13 +200,13 @@ static bool bundle_stamp_ok(const char* dest, const char* archive)
     return strcmp(want, got) == 0;
 }
 
-static void bundle_stamp_write(const char* dest, const char* archive)
+static void bundle_stamp_write(const char* dest, const char* stamp, const char* archive)
 {
     struct stat ast;
     char        path[BUNDLE_PATH_MAX];
     FILE*       f;
 
-    if (stat(archive, &ast) != 0 || !bundle_stamp_path(dest, path, sizeof(path))) {
+    if (stat(archive, &ast) != 0 || !bundle_stamp_path(dest, stamp, path, sizeof(path))) {
         return;
     }
     f = fopen(path, "wb");
@@ -223,6 +223,11 @@ static void bundle_stamp_write(const char* dest, const char* archive)
 
 static vp_rootfs_t* g_mounted = NULL;
 
+static void bundle_remove_tree(const char* path);
+static void bundle_mkdir_p(const char* path);
+static bool bundle_provision_apps(const char* apps_tar_gz, const char* dest,
+                                  size_t* installed, const char** error);
+
 void vp_bundle_unmount(void)
 {
     if (g_mounted) {
@@ -231,8 +236,52 @@ void vp_bundle_unmount(void)
     }
 }
 
-bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz, const char* dest,
-                     vp_bundle_stats_t* stats, const char** error)
+/* Extract one optional bundle layer into @dest the first time (or after the
+ * archive changes), stamped under <dest>/.vp/<stamp>. Regular files and
+ * directories only: the shadow index is the base archive's business, and a
+ * system/apps layer is plain payload. A NULL/empty @tar_gz is a host without
+ * that layer, which is not an error. On a fresh install *files reports what was
+ * written; a repeat of an unchanged archive writes nothing and reports 0. */
+static bool bundle_install_layer(const char* tar_gz, const char* dest, const char* stamp,
+                                 size_t* files, const char** error)
+{
+    const char* local_error = NULL;
+    vp_rootfs_t* layer;
+
+    if (!error) {
+        error = &local_error;
+    }
+    *error = NULL;
+    if (files) {
+        *files = 0;
+    }
+    if (!tar_gz || !*tar_gz) {
+        return true;
+    }
+
+    layer = vp_rootfs_open(tar_gz, error);
+    if (!layer) {
+        return false;
+    }
+    if (!bundle_stamp_ok(dest, stamp, tar_gz)) {
+        size_t written = vp_rootfs_extract(layer, dest, error);
+        if (!written) {
+            vp_rootfs_close(layer);
+            return false;
+        }
+        bundle_stamp_write(dest, stamp, tar_gz);
+        if (files) {
+            *files = written;
+        }
+    }
+    vp_rootfs_release_data(layer);
+    vp_rootfs_close(layer);
+    return true;
+}
+
+bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz,
+                     const char* system_tar_gz, const char* apps_tar_gz,
+                     const char* dest, vp_bundle_stats_t* stats, const char** error)
 {
     const char* local_error = NULL;
     vp_rootfs_t* rootfs;
@@ -245,6 +294,8 @@ bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz, const c
     if (stats) {
         stats->entries = 0;
         stats->files = 0;
+        stats->system_files = 0;
+        stats->apps = 0;
     }
     if (!machine || !rootfs_tar_gz || !dest) {
         *error = "no bundle was named";
@@ -262,13 +313,13 @@ bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz, const c
      * left it (that tree is the writable layer). An updated archive - a
      * different size or mtime - re-extracts. */
     size_t written = 0;
-    if (!bundle_stamp_ok(dest, rootfs_tar_gz)) {
+    if (!bundle_stamp_ok(dest, "install", rootfs_tar_gz)) {
         written = vp_rootfs_extract(rootfs, dest, error);
         if (!written) {
             vp_rootfs_close(rootfs);
             return false;
         }
-        bundle_stamp_write(dest, rootfs_tar_gz);
+        bundle_stamp_write(dest, "install", rootfs_tar_gz);
     }
     /* The tree is materialized on disk and the shadow is what the guest is
      * answered from; the inflated archive was only needed to write the files,
@@ -303,6 +354,21 @@ bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz, const c
                 vp_shadow_set_hidden_store(vp_rootfs_shadow(rootfs), hidden);
             }
         }
+    }
+
+    /* The system layer: host-provided system programs laid out at their guest
+     * paths (sbin/vpsessiond, ...), flattened over the base. Like the base, the
+     * host owns these - an updated archive overwrites them. */
+    if (!bundle_install_layer(system_tar_gz, dest, "system",
+                              stats ? &stats->system_files : NULL, error)) {
+        return false;
+    }
+
+    /* The apps: every app the archive declares, installed once and persistently
+     * under /data/app (the system image holds its apps). Rebuilt only when the
+     * archive changes, so an app it dropped does not linger. */
+    if (!bundle_provision_apps(apps_tar_gz, dest, stats ? &stats->apps : NULL, error)) {
+        return false;
     }
     return true;
 }
@@ -386,77 +452,112 @@ bool vp_bundle_app_id_from_guest_path(const char* guest_path, char* out, size_t 
     return strcmp(out, ".") != 0 && strcmp(out, "..") != 0;
 }
 
-bool vp_bundle_install_app(const char* apps_tar_gz, const char* dest, const char* app_id,
-                           char* assets_root, size_t assets_root_size, const char** error)
+/* Install every app @apps_tar_gz declares into <dest>/data/app/<id>, and create
+ * each app's writable state <dest>/data/data/<id>. A run boots one of them; the
+ * rest stay installed, the way a preinstalled image holds its apps - nothing is
+ * emptied between runs. The archive's set is authoritative, so when it changes
+ * the whole tree is rebuilt: an app it dropped does not linger. Stamped against
+ * the archive, so an unchanged apps.tar.gz is a no-op. A NULL/empty archive is a
+ * host without apps, which is not an error. */
+static bool bundle_provision_apps(const char* apps_tar_gz, const char* dest,
+                                  size_t* installed, const char** error)
 {
     const char* local_error = NULL;
-    char app_tree[BUNDLE_PATH_MAX];
-    char app_dir[BUNDLE_PATH_MAX];
-    char data_dir[BUNDLE_PATH_MAX];
-    char assets[BUNDLE_PATH_MAX];
+    vp_app_t* list = NULL;
     vp_rootfs_t* apps;
-    vp_app_t manifest;
-    struct stat st;
-    size_t written;
+    char app_tree[BUNDLE_PATH_MAX];
+    size_t found, n, i;
 
     if (!error) {
         error = &local_error;
     }
     *error = NULL;
-    if (assets_root && assets_root_size) {
-        assets_root[0] = 0;
+    if (installed) {
+        *installed = 0;
     }
-    if (!apps_tar_gz || !dest) {
-        *error = "no bundle was named";
-        return false;
-    }
-
-    /* Isolation first: whatever a previous run left there goes, so this run can
-     * only ever see the app it was given - and a run with no app sees none. */
-    if (bundle_join(app_tree, sizeof(app_tree), dest, "data/app")) {
-        bundle_remove_tree(app_tree);
-    }
-    if (!app_id || !*app_id) {
+    if (!apps_tar_gz || !*apps_tar_gz) {
         return true;
+    }
+    if (bundle_stamp_ok(dest, "apps", apps_tar_gz)) {
+        return true;   /* provisioned by an earlier run of the same archive */
     }
 
     apps = vp_rootfs_open(apps_tar_gz, error);
     if (!apps) {
         return false;
     }
-    if (!vp_rootfs_app_manifest(apps, app_id, &manifest)) {
-        *error = "the archive declares no such app";
+    /* The archive is authoritative: drop what a previous archive installed so a
+     * removed app is really gone. */
+    if (bundle_join(app_tree, sizeof(app_tree), dest, "data/app")) {
+        bundle_remove_tree(app_tree);
+    }
+
+    /* Heap, not the stack: tens of kilobytes, and this is a once-per-archive
+     * install, not a hot path. */
+    list = calloc(VP_BUNDLE_APPS_MAX, sizeof(*list));
+    if (!list) {
+        *error = "out of memory";
         vp_rootfs_close(apps);
         return false;
     }
-    if (!bundle_join(app_dir, sizeof(app_dir), app_tree, app_id)) {
-        *error = "the app id is too long for the host destination";
-        vp_rootfs_close(apps);
-        return false;
-    }
-    written = vp_rootfs_install_app(apps, app_id, app_dir, error);
-    vp_rootfs_close(apps);
-    if (!written) {
-        return false;
-    }
+    found = vp_rootfs_apps(apps, list, VP_BUNDLE_APPS_MAX);
+    n = (found < (size_t)VP_BUNDLE_APPS_MAX) ? found : (size_t)VP_BUNDLE_APPS_MAX;
 
-    /* The app's writable state, and the app's own resources: the caller points
-     * the asset mount at the latter, which is what makes /assets per-app. */
-    if (snprintf(data_dir, sizeof(data_dir), "%s/data/data/%s", dest, app_id) >=
-        (int)sizeof(data_dir)) {
-        *error = "the app id is too long for the host destination";
-        return false;
-    }
-    bundle_mkdir_p(data_dir);
+    for (i = 0; i < n; i++) {
+        char app_dir[BUNDLE_PATH_MAX];
+        char data_dir[BUNDLE_PATH_MAX];
+        size_t written;
 
-    if (assets_root && assets_root_size) {
-        if (snprintf(assets, sizeof(assets), "%s/assets", app_dir) < 0 ||
-            stat(assets, &st) != 0 || !S_ISDIR(st.st_mode)) {
-            assets[0] = 0;
-        } else {
-            snprintf(assets_root, assets_root_size, "%s", assets);
+        if (!bundle_join(app_dir, sizeof(app_dir), app_tree, list[i].id)) {
+            *error = "the app id is too long for the host destination";
+            free(list);
+            vp_rootfs_close(apps);
+            return false;
         }
+        written = vp_rootfs_install_app(apps, list[i].id, app_dir, error);
+        if (!written) {
+            free(list);
+            vp_rootfs_close(apps);
+            return false;
+        }
+        /* The app's private, writable state - kept across reinstalls, the way
+         * Android keeps /data/data through an update. */
+        if (snprintf(data_dir, sizeof(data_dir), "%s/data/data/%s", dest, list[i].id) >=
+            (int)sizeof(data_dir)) {
+            *error = "the app id is too long for the host destination";
+            free(list);
+            vp_rootfs_close(apps);
+            return false;
+        }
+        bundle_mkdir_p(data_dir);
     }
+
+    free(list);
+    vp_rootfs_close(apps);
+    bundle_stamp_write(dest, "apps", apps_tar_gz);
+    if (installed) {
+        *installed = n;
+    }
+    return true;
+}
+
+bool vp_bundle_app_assets_path(const char* dest, const char* app_id, char* out, size_t size)
+{
+    char app_dir[BUNDLE_PATH_MAX];
+    char assets[BUNDLE_PATH_MAX];
+    struct stat st;
+
+    if (!dest || !app_id || !*app_id || !out || !size) {
+        return false;
+    }
+    if (!bundle_join(app_dir, sizeof(app_dir), dest, "data/app")) {
+        return false;
+    }
+    if (snprintf(assets, sizeof(assets), "%s/%s/assets", app_dir, app_id) >= (int)sizeof(assets) ||
+        stat(assets, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return false;
+    }
+    snprintf(out, size, "%s", assets);
     return true;
 }
 

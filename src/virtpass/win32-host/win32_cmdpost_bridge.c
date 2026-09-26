@@ -3100,10 +3100,10 @@ static bool win32_exe_directory(char* out, size_t size)
 /* ============================================================
  * Apps: /data/app/<id>
  *
- * A run boots one app, and only that app: vp_bundle_install_app() unpacks it
- * into the run's own rootfs at <guest>/data/app/<id> after emptying the app
- * tree, so there is nothing else there for the guest to name, and it reports the
- * app's own assets/ directory for the /assets mount root. That is what makes
+ * Every app the bundle declares is provisioned once, persistently, at
+ * <guest>/data/app/<id> (vp_bundle_mount), the way a preinstalled image holds
+ * its apps; a run boots one of them or none. An app's own assets/ directory is
+ * what the /assets mount points at for that run, which is what makes
  * AAssetManager_* per-app without touching the guest ABI - and it is the same
  * code the Android host runs, which is the point of it living in vp_bundle.
  * ============================================================ */
@@ -3113,9 +3113,10 @@ static void win32_guest_rootfs_mount(rvvm_machine_t* machine, const char* app_id
 {
     char exe_dir[MAX_PATH];
     char archive[MAX_PATH];
+    char system_archive[MAX_PATH];
     char apps_archive[MAX_PATH];
     char dest[MAX_PATH];
-    char assets_root[MAX_PATH];
+    char assets[MAX_PATH];
     vp_bundle_stats_t stats;
     const char* error = NULL;
 
@@ -3123,29 +3124,25 @@ static void win32_guest_rootfs_mount(rvvm_machine_t* machine, const char* app_id
         return;
     }
     snprintf(archive, sizeof(archive), "%s\\%s\\%s", exe_dir, VP_BUNDLE_DIR, VP_ROOTFS_TAR_GZ);
+    snprintf(system_archive, sizeof(system_archive), "%s\\%s\\%s", exe_dir, VP_BUNDLE_DIR, VP_SYSTEM_TAR_GZ);
     snprintf(apps_archive, sizeof(apps_archive), "%s\\%s\\%s", exe_dir, VP_BUNDLE_DIR, VP_APPS_TAR_GZ);
     snprintf(dest, sizeof(dest), "%s\\runtime\\rootfs", exe_dir);
 
-    if (!vp_bundle_mount(machine, archive, dest, &stats, &error)) {
+    if (!vp_bundle_mount(machine, archive,
+                         GetFileAttributesA(system_archive) != INVALID_FILE_ATTRIBUTES ? system_archive : NULL,
+                         GetFileAttributesA(apps_archive) != INVALID_FILE_ATTRIBUTES ? apps_archive : NULL,
+                         dest, &stats, &error)) {
         winhost_log("rootfs: %s could not be mounted (%s) - running without a guest rootfs",
                     archive, error ? error : "?");
         return;
     }
-    winhost_log("rootfs: %zu archive entries, %zu files at %s", stats.entries, stats.files, dest);
+    winhost_log("rootfs: %zu archive entries, %zu files, %zu system file(s), %zu app(s) at %s",
+                stats.entries, stats.files, stats.system_files, stats.apps, dest);
 
-    /* The app this run boots: named by --guest /data/app/<id>/... (or by the
-     * picker's own entry path), and by nothing else. The app tree is emptied
-     * either way, so a run with no app has no /data/app to look at. */
-    if (!vp_bundle_install_app(apps_archive, dest, app_id, assets_root, sizeof(assets_root), &error)) {
-        winhost_log("apps: %s: %s", (app_id && *app_id) ? app_id : "(no app)",
-                    error ? error : "?");
-    } else if (app_id && *app_id) {
-        winhost_log("apps: %s installed at %s\\data\\app\\%s", app_id, dest, app_id);
-    }
-    /* An app's own resources are the /assets tree. Without one the mount root
-     * stays whatever the launcher was pointed at (--assets / RVVM_ASSETS). */
-    if (assets_root[0]) {
-        vp_bundle_set_assets_root(assets_root);
+    /* An app's own resources are its /assets tree. The app is already installed
+     * (provisioned with the bundle); this only points the mount at it. */
+    if (app_id && *app_id && vp_bundle_app_assets_path(dest, app_id, assets, sizeof(assets))) {
+        vp_bundle_set_assets_root(assets);
     }
 }
 

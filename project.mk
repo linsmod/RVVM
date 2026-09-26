@@ -537,9 +537,10 @@ android-assets: guest-assets
 override ANDROID_BUNDLE_DIR := $(ANDROID_ASSETS_DIR)/bundle
 
 .PHONY: android-bundle # Stage the release bundle (rootfs + apps) into the APK assets
-android-bundle: pack-apps fetch-rootfs
+android-bundle: pack-apps pack-system fetch-rootfs
 	$(call println,$(TEXT)[$(GREEN)STAGE$(TEXT)] $(ANDROID_BUNDLE_DIR) $(RESET))
 	$(call install_file,$(ROOTFS_TAR),$(ANDROID_BUNDLE_DIR)/$(notdir $(ROOTFS_TAR)),0644)
+	$(call install_file,$(SYSTEM_TAR),$(ANDROID_BUNDLE_DIR)/$(notdir $(SYSTEM_TAR)),0644)
 	$(call install_file,$(APPS_TAR),$(ANDROID_BUNDLE_DIR)/$(notdir $(APPS_TAR)),0644)
 
 .PHONY: android       # Build the Android APK (Java + librvvm_jni.so + the bundle)
@@ -558,26 +559,29 @@ android-clean:
 	$(call shell_esc,cd $(ANDROID_HOST) && $(ANDROID_GRADLE) $(ANDROID_GRADLE_OPTS) clean)
 
 #
-# Bundle: the two archives a released host reads at runtime
+# Bundle: the three archives a released host reads at runtime
 #
 # They sit next to the host binary (win32: the exe's own directory, resolved
 # with GetModuleFileNameA because the guest chdir()s away; Android: the APK's
-# assets/), under one directory, and neither is ever visible to the guest:
+# assets/), under one directory, and none is ever visible to the guest:
 #
 #   <bundle>/rootfs.tar.gz   the guest's `/` (Alpine minirootfs)
+#   <bundle>/system.tar.gz   system programs, laid out at their guest paths
 #   <bundle>/apps.tar.gz     the sample apps (one directory each + app.json)
 #
-# Both are gitignored (the repo ignores the whole root), so a release - and any
+# All are gitignored (the repo ignores the whole root), so a release - and any
 # end-to-end run - has to fetch or pack them first. These variables mirror the C
 # literals in src/virtpass/vp_rootfs.h; change them together.
 #
 override VP_BUNDLE_DIR    := bundle
 override VP_ROOTFS_TAR_GZ := rootfs.tar.gz
+override VP_SYSTEM_TAR_GZ := system.tar.gz
 override VP_APPS_TAR_GZ   := apps.tar.gz
 
 # Recursive on purpose: BUILDDIR is not defined yet while project.mk is parsed.
 override BUNDLE_DIR = $(BUILDDIR)/$(VP_BUNDLE_DIR)
 override ROOTFS_TAR = $(BUNDLE_DIR)/$(VP_ROOTFS_TAR_GZ)
+override SYSTEM_TAR = $(BUNDLE_DIR)/$(VP_SYSTEM_TAR_GZ)
 override APPS_TAR   = $(BUNDLE_DIR)/$(VP_APPS_TAR_GZ)
 
 ALPINE_MIRROR  ?= https://dl-cdn.alpinelinux.org/alpine
@@ -595,27 +599,43 @@ fetch-rootfs:
 	@:
 
 #
-# The apps archive: one directory per guest program
+# The system layer and the apps archive
 #
-# Each app is packed as apps/<id>/{app.json,bin/<id>.exe,assets/...} and the host
-# installs exactly one of them per run at <guest>/data/app/<id> - which is what
-# keeps one app from seeing another's payload or assets. Nothing in an app is
-# host-specific, so this one archive serves both hosts: the ELFs come from the
-# build tree, the shared resources from the source tree they live in.
+# A system program is not an app: pack_system.py declares the list (source name
+# -> guest path) and lays each one out at its guest path in system.tar.gz
+# (sbin/vpsessiond), so the host extracts the archive as a layer and the guest
+# names it like any other program - no manifest, no per-id directory. pack-apps
+# reads that same archive back (--exclude-from), so a system program is never
+# also packed as an app: the archive is the single source of truth.
 #
+# An app is packed as apps/<id>/{app.json,bin/<id>.exe,assets/...} and installed
+# under <guest>/data/app/<id>. Nothing in an app is host-specific, so this one
+# archive serves both hosts: the ELFs come from the build tree, the shared
+# resources from the source tree they live in.
+#
+override SYSTEM_PACKER    ?= python $(CURDIR)/tools/pack_system.py
+
 override APPS_PACKER     ?= python $(CURDIR)/tools/pack_apps.py
 override APPS_SRC_DIR    ?= $(GUEST_ASSETS_DIR)
 override APPS_ASSET_ROOT ?= $(ANDROID_ASSETS_DIR)
 override APPS_ASSET_DIRS ?= fonts
 override APPS_ONLY       ?=
 
+.PHONY: pack-system # Pack the system programs into the bundle's system.tar.gz
+pack-system: guest-assets
+	$(call create_dirs,$(BUNDLE_DIR))
+	$(call println,$(TEXT)[$(GREEN)PACK$(TEXT)] $(SYSTEM_TAR) $(RESET))
+	@$(call shell_esc,$(SYSTEM_PACKER) --src $(call path_shell,$(GUEST_ASSETS_DIR))\
+		--out $(call path_shell,$(SYSTEM_TAR)))
+
 .PHONY: pack-apps # Pack the guest programs into the bundle's apps.tar.gz
-pack-apps: guest-assets
+pack-apps: guest-assets pack-system
 	$(call create_dirs,$(BUNDLE_DIR))
 	$(call println,$(TEXT)[$(GREEN)PACK$(TEXT)] $(APPS_TAR) $(RESET))
 	@$(call shell_esc,$(APPS_PACKER) --src $(call path_shell,$(APPS_SRC_DIR))\
 		$(foreach name,$(APPS_ASSET_DIRS),$(if $(wildcard $(APPS_ASSET_ROOT)/$(name)),--asset $(name)=$(call path_shell,$(APPS_ASSET_ROOT)/$(name))))\
 		$(if $(APPS_ONLY),--only $(APPS_ONLY))\
+		--exclude-from $(call path_shell,$(SYSTEM_TAR))\
 		--out $(call path_shell,$(APPS_TAR)))
 
 #
@@ -623,19 +643,21 @@ pack-apps: guest-assets
 #
 #   $(DIST_DIR)/
 #     rvvm_winhost_<arch>.exe        (and every other host binary this build made)
-#     bundle/{rootfs.tar.gz,apps.tar.gz}
+#     bundle/{rootfs.tar.gz,system.tar.gz,apps.tar.gz}
 #
 # The host resolves bundle/ next to its own binary (GetModuleFileNameA, never the
 # cwd: the guest chdir()s away the moment it starts), so this is not just a
 # packaging convention - it is what the binary looks for. The guest ELFs are
-# deliberately absent: apps.tar.gz is the only thing a host boots them from.
+# deliberately absent: apps.tar.gz and system.tar.gz are the only things a host
+# installs them from.
 #
 override DIST_DIR ?= $(BUILDDIR)/dist
 
 .PHONY: dist # Assemble a release: the host binaries and the bundle they boot from
-dist: bin pack-apps fetch-rootfs
+dist: bin pack-apps pack-system fetch-rootfs
 	$(call create_dirs,$(DIST_DIR)/$(VP_BUNDLE_DIR))
 	$(foreach bin,$(BIN_TARGETS),$(call install_file,$(bin),$(DIST_DIR)/$(notdir $(bin)),0755))
 	$(call install_file,$(ROOTFS_TAR),$(DIST_DIR)/$(VP_BUNDLE_DIR)/$(notdir $(ROOTFS_TAR)),0644)
+	$(call install_file,$(SYSTEM_TAR),$(DIST_DIR)/$(VP_BUNDLE_DIR)/$(notdir $(SYSTEM_TAR)),0644)
 	$(call install_file,$(APPS_TAR),$(DIST_DIR)/$(VP_BUNDLE_DIR)/$(notdir $(APPS_TAR)),0644)
 	$(call println,$(TEXT)[$(GREEN)DIST$(TEXT)] $(DIST_DIR) $(RESET))

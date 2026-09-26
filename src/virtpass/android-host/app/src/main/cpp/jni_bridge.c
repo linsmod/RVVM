@@ -1965,11 +1965,11 @@ static void jni_register_cmdpost_callbacks(vp_cmdpost_t* inst)
 /* ==================================================================
  * The bundle
  *
- * A release ships bundle/rootfs.tar.gz and bundle/apps.tar.gz inside the APK -
+ * A release ships bundle/{rootfs,system,apps}.tar.gz inside the APK -
  * the same archives the WinHost reads. vp_rootfs opens them by path, and an APK
  * asset is not a path, so they are unpacked once into the app's private storage;
- * the guest's rootfs is then materialized per run under <files>/runtime/rootfs,
- * and the run's app out of the apps archive. Both of those are the shared
+ * the guest's rootfs is then materialized under <files>/runtime/rootfs with the
+ * system layer and every app, all one-time and persistent. That is the shared
  * vp_bundle code (vp_bundle.h), so the two hosts give a guest the same view.
  *
  * A build whose APK has no bundle is not an error: the guest then runs with its
@@ -1981,6 +1981,7 @@ static void jni_register_cmdpost_callbacks(vp_cmdpost_t* inst)
 
 static char g_bundle_dir[ANDROID_BUNDLE_PATH] = "";
 static char g_bundle_rootfs[ANDROID_BUNDLE_PATH] = "";
+static char g_bundle_system[ANDROID_BUNDLE_PATH] = "";
 static char g_bundle_apps[ANDROID_BUNDLE_PATH] = "";
 
 /* Unpack one APK asset into @dest, unless an identical file is already there:
@@ -2064,11 +2065,16 @@ static void android_bundle_prepare(const char* files_dir)
     snprintf(dir, sizeof(dir), "%s/bundle", files_dir);
     mkdir(dir, 0755);
     snprintf(g_bundle_rootfs, sizeof(g_bundle_rootfs), "%s/%s", dir, VP_ROOTFS_TAR_GZ);
+    snprintf(g_bundle_system, sizeof(g_bundle_system), "%s/%s", dir, VP_SYSTEM_TAR_GZ);
     snprintf(g_bundle_apps, sizeof(g_bundle_apps), "%s/%s", dir, VP_APPS_TAR_GZ);
 
     if (!android_asset_unpack("bundle/" VP_ROOTFS_TAR_GZ, g_bundle_rootfs)) {
         LOGI("bundle: no rootfs archive in this APK - guests run without one");
         g_bundle_rootfs[0] = 0;
+    }
+    if (!android_asset_unpack("bundle/" VP_SYSTEM_TAR_GZ, g_bundle_system)) {
+        LOGI("bundle: no system archive in this APK - no system programs");
+        g_bundle_system[0] = 0;
     }
     if (!android_asset_unpack("bundle/" VP_APPS_TAR_GZ, g_bundle_apps)) {
         LOGI("bundle: no apps archive in this APK - the list falls back to the assets");
@@ -2752,11 +2758,10 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
      * of these syscalls. */
     rvvm_user_set_host_ctx(run->machine, run->cmdpost);
 
-    /* The bundle, when this build has one: the guest gets the archive's `/`, and
-     * the one app whose guest path it was booted with. Both are per run - the
-     * rootfs is materialized under this app's own runtime directory and the app
-     * tree is emptied first - so two guests in the process cannot see each
-     * other's payload or resources. */
+    /* The bundle, when this build has one: the guest gets the archive's `/`, the
+     * system layer and every app it declares (all provisioned once and kept, the
+     * way a preinstalled image holds them). A run just boots one of those apps
+     * or, for no app, whatever the system layer installed. */
     if (g_bundle_rootfs[0]) {
         char dest[ANDROID_BUNDLE_PATH];
         char app_id[VP_APP_ID_MAX];
@@ -2767,27 +2772,25 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
 
         wrote = snprintf(dest, sizeof(dest), "%s/runtime/rootfs", g_bundle_dir);
         if (wrote > 0 && (size_t)wrote < sizeof(dest)) {
-            if (vp_bundle_mount(run->machine, g_bundle_rootfs, dest, &stats, &error)) {
-                LOGI("bundle: %zu entries, %zu files at %s", stats.entries, stats.files, dest);
+            if (vp_bundle_mount(run->machine, g_bundle_rootfs,
+                                g_bundle_system[0] ? g_bundle_system : NULL,
+                                g_bundle_apps[0] ? g_bundle_apps : NULL,
+                                dest, &stats, &error)) {
+                LOGI("bundle: %zu entries, %zu files, %zu system file(s), %zu app(s) at %s",
+                     stats.entries, stats.files, stats.system_files, stats.apps, dest);
             } else {
                 LOGE("bundle: %s could not be mounted: %s", g_bundle_rootfs,
                      error ? error : "?");
             }
             /* "/data/app/<id>/<entry>" is both the guest's path and how the host
-             * knows which app this run is about. */
+             * knows which app this run is about. The app is already installed;
+             * this only points the asset mount at its resources. */
             bool have_app = vp_bundle_app_id_from_guest_path(run->elf_path, app_id,
                                                              sizeof(app_id));
-            if (vp_bundle_install_app(g_bundle_apps, dest, have_app ? app_id : NULL,
-                                      assets_root, sizeof(assets_root), &error)) {
-                if (have_app) {
-                    LOGI("bundle: app %s installed at %s/data/app/%s", app_id, dest, app_id);
-                }
-                if (assets_root[0]) {
-                    free(run->assets_root);
-                    run->assets_root = strdup(assets_root);
-                }
-            } else {
-                LOGE("bundle: app install failed: %s", error ? error : "?");
+            if (have_app && vp_bundle_app_assets_path(dest, app_id, assets_root,
+                                                      sizeof(assets_root))) {
+                free(run->assets_root);
+                run->assets_root = strdup(assets_root);
             }
         }
     }

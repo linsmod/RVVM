@@ -87,12 +87,27 @@ def tar_tree(tar, arcroot, hostroot):
     return total
 
 
-def find_ids(src, only):
-    if only:
-        return [x for x in only.split(",") if x]
-    if not os.path.isdir(src):
-        return []
-    return sorted(n[:-4] for n in os.listdir(src) if n.endswith(".exe"))
+def system_names(archive):
+    """Source names held by a system layer: one entry per program file.
+
+    pack_system.py lays a program out at its guest path (sbin/vpsessiond), so
+    the basename is the program's own name - exactly the app id it must not be
+    packed under."""
+    if not archive or not os.path.isfile(archive):
+        return set()
+    names = set()
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar.getmembers():
+            if member.isfile():
+                names.add(os.path.basename(member.name))
+    return names
+
+
+def find_ids(src, only, skip):
+    ids = [x for x in only.split(",") if x] if only else (
+        sorted(n[:-4] for n in os.listdir(src) if n.endswith(".exe"))
+        if os.path.isdir(src) else [])
+    return [i for i in ids if i not in skip]
 
 
 def main():
@@ -104,6 +119,10 @@ def main():
     ap.add_argument("--args", action="append", default=[], metavar="ID=ARGS",
                     help="default arguments for one app (repeatable)")
     ap.add_argument("--only", default="", help="comma-separated app ids to pack")
+    ap.add_argument("--exclude", default="",
+                    help="comma-separated app ids to leave out (system programs)")
+    ap.add_argument("--exclude-from", default="", metavar="SYSTEM_TAR",
+                    help="a system.tar.gz whose programs are not packed as apps")
     ap.add_argument("--list", action="store_true", help="print the app ids and stop")
     opts = ap.parse_args()
 
@@ -120,7 +139,8 @@ def main():
         if app_id:
             args_by_id[app_id] = value
 
-    ids = find_ids(opts.src, opts.only)
+    skip = set(x for x in opts.exclude.split(",") if x) | system_names(opts.exclude_from)
+    ids = find_ids(opts.src, opts.only, skip)
     if not ids:
         return die("no guest programs found in %s" % opts.src)
 

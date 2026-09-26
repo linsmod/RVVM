@@ -59,7 +59,7 @@ static void print_usage(const char* self)
             "Options: --port N (default %d, RVVM_ASH_PORT); --serve --idle S stops a\n"
             "core after S seconds with no session (0 = never). RVVM_ASH_SHELL overrides\n"
             "the shell: for --direct the guest to boot, for --serve the core program\n"
-            "(default guest-assets\\vpsessiond.exe).\n",
+            "(default /sbin/vpsessiond).\n",
             self, self, self, self, self, self, self, ASH_PORT_DEFAULT);
 }
 

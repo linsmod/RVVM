@@ -131,7 +131,8 @@ WSL user expects:
 
 `--port N` / `RVVM_ASH_PORT` pick the port (default 7900). `RVVM_ASH_SHELL`
 overrides the shell - for `--direct` the guest to boot, for `--serve` the core
-program (default `guest-assets\vpsessiond.exe`). A core registers under
+program (default `/sbin/vpsessiond`, a *guest* path installed from the bundle's
+system layer - see below). A core registers under
 `runtime/cores/` and holds a rootfs lock, so `--list`/`--shutdown` find it and a
 second core cannot take the same writable layer. `--direct` also answers the
 regression tools (`RVVM_ASH_SHELL=guest-assets\test_*.exe`).
@@ -256,8 +257,12 @@ Build the guests first (`mingw32-make guest-assets`, zig/musl - see
 `release.<os>.<arch>/guest-assets/`, then:
 
 A release carries no loose ELF at all: `mingw32-make dist` puts the host binary
-next to `bundle/{rootfs,apps}.tar.gz`, and the host boots an app out of that
-archive (`--guest /data/app/<id>/<entry>`).
+next to `bundle/{rootfs,system,apps}.tar.gz`, and the host installs all three
+into its `runtime/rootfs` (once, persistently): the base `/`, the system
+programs (`/sbin/vpsessiond`), and every app under `/data/app/<id>`. A run then
+boots one of those paths (`--guest /data/app/<id>/<entry>`, or the default
+`/sbin/vpsessiond`). The layers are flattened at install time - see
+`src/virtpass/README.md`.
 
 ```powershell
 # one specific guest
@@ -514,10 +519,13 @@ Debug switches:
 4. **Assets.** The host mounts a directory at `/assets`. Which one:
 
    - when the run booted an app out of the bundle, **that app's own `assets/`**
-     (`<rootfs>/data/app/<id>/assets`) - which is what keeps one app from reading
-     another's resources;
+     (`<rootfs>/data/app/<id>/assets`, from `vp_bundle_app_assets_path()`);
    - otherwise the tree the picker lists guests from (`--assets DIR` /
      `RVVM_ASSETS`, default `<exe dir>/guest-assets`).
+
+   Note the app model is Android's, not per-run: *every* app in the bundle is
+   provisioned once, persistently, under `/data/app/<id>`, and a run just points
+   the mount at the one it booted. No tree is emptied between runs.
 
    The guest's `AAssetManager_*` calls are a shell over that mount. Because the
    tree is a real directory here, every mount op is a plain file call: `open()` hands

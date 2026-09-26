@@ -34,9 +34,20 @@ module at all, so it is excluded from librvvm and built into a host that links
 
 #include "virtpass/vp_shadow.h"
 
-// Bundle layout under the release root.
+// Bundle layout under the release root. Three archives, three roles:
+//
+//   rootfs.tar.gz   the guest's `/` (Alpine minirootfs) - the base layer
+//   system.tar.gz   host-provided *system programs*, laid out at their guest
+//                   paths (sbin/vpsessiond) - the middle layer, no manifest
+//   apps.tar.gz     the apps, one directory each, installed under /data/app
+//
+// They are extracted in order into the run's own directory, so a later layer
+// wins over an earlier one; the flattening happens at install time because the
+// core answers paths from one materialized tree (and Windows cannot express the
+// archive's symlinks anyway).
 #define VP_BUNDLE_DIR    "bundle"
 #define VP_ROOTFS_TAR_GZ "rootfs.tar.gz"
+#define VP_SYSTEM_TAR_GZ "system.tar.gz"
 #define VP_APPS_TAR_GZ   "apps.tar.gz"
 
 // Where the guest sees the app model, and where the app payload lives inside
@@ -51,6 +62,12 @@ module at all, so it is excluded from librvvm and built into a host that links
 #define VP_GUEST_DATA_DIR  "/data/data"
 #define VP_APPS_MEMBER_DIR "apps"
 #define VP_APP_MANIFEST    "app.json"
+
+// The session server: a host-provided system program (the first entry of
+// system.tar.gz), installed into a run's rootfs at this guest path. A core
+// boots it by the path, like any other program - never as a host-relative
+// loose ELF. tools/pack_system.py declares the same path when packing.
+#define VP_GUEST_SESSIOND  "/sbin/vpsessiond"
 
 typedef struct vp_rootfs vp_rootfs_t;
 

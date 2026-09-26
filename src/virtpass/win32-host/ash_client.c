@@ -39,6 +39,7 @@ The wire protocol is the session server's, not a new one:
 
 #include "win/win_socket.h"
 #include "win32_cmdpost_bridge.h"
+#include "virtpass/vp_rootfs.h" /* VP_GUEST_SESSIOND: the core's guest path */
 
 #define ASH_PORT_DEFAULT 7900
 
@@ -57,19 +58,17 @@ static void ash_send_frame(int fd, const char* body);
 /* The core: --serve                                                   */
 /* ------------------------------------------------------------------ */
 
-/* The guest program a core boots. It has to be reachable the way any guest
- * image is: a path `map_abs_path()` leaves alone, i.e. relative to the host's
- * working directory (an absolute path is read as a guest path and prefixed).
- * So the default names the dev build's copy relative to the release directory,
- * and --serve chdir()s there before launching. A bundle build overrides it with
- * RVVM_ASH_SHELL (e.g. an app entry). */
+/* The guest program a core boots: a *guest* path, resolved inside the run's
+ * rootfs - the session server is a system program installed from the bundle at
+ * /sbin/vpsessiond (system.tar.gz), not a loose host ELF. RVVM_ASH_SHELL still
+ * overrides it, for a regression run that names a guest path of its own. */
 static const char* ash_default_core_shell(void)
 {
     const char* env = getenv("RVVM_ASH_SHELL");
     if (env && *env) {
         return env;
     }
-    return "guest-assets\\vpsessiond.exe";
+    return VP_GUEST_SESSIOND;
 }
 
 /* The full path of this executable. CreateProcess wants the program itself
@@ -303,8 +302,7 @@ static void ash_rootfs_unlock(const char* path)
 
 int ash_serve(int port, int idle_s)
 {
-    const char* env_shell = getenv("RVVM_ASH_SHELL");
-    const char* shell     = ash_default_core_shell();
+    const char* shell = ash_default_core_shell();
     char        port_buf[16];
     char        idle_buf[16];
     char*       guest[4];
@@ -323,15 +321,10 @@ int ash_serve(int port, int idle_s)
         return 1;
     }
 
-    /* The default shell is a relative guest path, so the host has to be standing
-     * in the release directory when the image is opened. An explicit
-     * RVVM_ASH_SHELL is the caller's path to place, so it is not second-guessed. */
-    if (!env_shell || !*env_shell) {
-        char exe_dir[MAX_PATH];
-        if (ash_exe_directory(exe_dir, sizeof(exe_dir))) {
-            SetCurrentDirectoryA(exe_dir);
-        }
-    }
+    /* The shell is a guest path now (sbin/vpsessiond), resolved inside the run's
+     * rootfs - so the core no longer has to be standing in the release directory
+     * for the image to be found: the bundle is located by the executable's own
+     * directory, never the cwd. */
 
     snprintf(port_buf, sizeof(port_buf), "%d", port);
     snprintf(idle_buf, sizeof(idle_buf), "%d", idle_s > 0 ? idle_s : 0);

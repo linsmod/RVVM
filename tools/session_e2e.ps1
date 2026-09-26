@@ -4,7 +4,7 @@
     Session-server end-to-end driver: one guest daemon, several clients.
 
 .DESCRIPTION
-    Runs vpsessiond as the run root (RVVM_ASH_SHELL=guest-assets\vpsessiond.exe),
+    Runs vpsessiond as the run root (RVVM_ASH_SHELL=/sbin/vpsessiond),
     so the machine is a *core* that stays up instead of a one-shot shell, and
     drives it with real TCP clients. This is the shape the WSL-style split needs:
     the core holds the state, each client gets its own session.
@@ -177,7 +177,7 @@ $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
-$psi.EnvironmentVariables['RVVM_ASH_SHELL'] = 'guest-assets\vpsessiond.exe'
+$psi.EnvironmentVariables['RVVM_ASH_SHELL'] = '/sbin/vpsessiond'
 
 $p = [System.Diagnostics.Process]::Start($psi)
 $outTask = $p.StandardOutput.ReadToEndAsync()
