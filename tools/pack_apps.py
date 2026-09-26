@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
-"""pack_apps.py - build the apps.tar.gz half of a VirtPass bundle.
+"""pack_apps.py - build the app packages of a VirtPass bundle.
 
-The archive carries one directory per app:
+An app is a *package*: one `<id>.vapp` file, an APK-shaped zip with its own
+manifest
 
-    apps/<id>/app.json       {"id", "entry", "args"} - how the host boots it
-    apps/<id>/bin/<entry>    the guest program
-    apps/<id>/assets/...     the app's own resources (the AAssetManager tree)
+    meta.json            {"id","version","entry","args"} - the manifest
+    files/bin/<id>.exe   the payload, laid out as the app's own directory
+    files/assets/...     the app's resources
 
-The host unpacks exactly one app per run, into <guest>/data/app/<id>: that, and
-nothing else, is what keeps one app from seeing another's payload or assets.
+The host installs a package under <guest>/data/app/<id> and boots it from the
+manifest (vp_app.h), so an app is never run by being handed a path.
 
-The archive is built deterministically - sorted names, zero mtime, no owner - so
-repacking an unchanged tree produces the same bytes. A release artifact should
-not churn just because it was rebuilt.
+The packages are delivered *nested*: this script packs them as `<id>.vapp`
+members inside apps.tar.gz - the tar is the bundle's delivery container, the zip
+is the app package. The two formats are both kept: the tar is what a release
+ships and a host reads in one go (the pre-deployment form), the zip is what one
+`pm install` will take later.
+
+A system program is not an app (tools/pack_system.py): this script is pointed
+at the system archive with --exclude-from and skips those names, so a program
+that is a system program is never also packed as an app.
+
+The archive is built deterministically - sorted names, zero mtime, no owner -
+so repacking an unchanged tree produces the same bytes.
 
 Usage:
-    pack_apps.py --src <dir with <id>.exe> --asset fonts=<dir> --out apps.tar.gz
-    pack_apps.py --src <dir> --list              # just print the app ids
+    pack_apps.py --src <dir with <id>.exe> --out <apps.tar.gz>
+                 [--asset fonts=<dir>] [--exclude-from system.tar.gz]
+    pack_apps.py --src <dir> --list    # just print the ids
 """
 
 import argparse
@@ -26,8 +37,15 @@ import json
 import os
 import sys
 import tarfile
+import zipfile
 
-MANIFEST = "app.json"
+MANIFEST = "meta.json"
+FILES = "files"
+EXT = ".vapp"
+MEMBER_DIR = "apps"
+# A fixed DOS timestamp keeps the zip bytes stable across builds (zip has no
+# "zero" date; 1980-01-01 is its own epoch).
+DOS_TIME = (1980, 1, 1, 0, 0, 0)
 
 
 def die(msg):
@@ -35,64 +53,11 @@ def die(msg):
     return 1
 
 
-def tar_dir(tar, arcname):
-    info = tarfile.TarInfo(arcname)
-    info.type = tarfile.DIRTYPE
-    info.mode = 0o755
-    info.mtime = 0
-    info.uid = info.gid = 0
-    info.uname = info.gname = ""
-    tar.addfile(info)
-
-
-def tar_bytes(tar, arcname, payload, mode=0o644):
-    info = tarfile.TarInfo(arcname)
-    info.size = len(payload)
-    info.mode = mode
-    info.mtime = 0
-    info.uid = info.gid = 0
-    info.uname = info.gname = ""
-    tar.addfile(info, io.BytesIO(payload))
-
-
-def tar_file(tar, arcname, path, mode=None):
-    st = os.stat(path)
-    info = tarfile.TarInfo(arcname)
-    info.size = st.st_size
-    # A guest program has to be executable; everything else is a resource.
-    info.mode = mode if mode is not None else (0o755 if path.endswith(".exe") else 0o644)
-    info.mtime = 0
-    info.uid = info.gid = 0
-    info.uname = info.gname = ""
-    with open(path, "rb") as fh:
-        tar.addfile(info, fh)
-    return st.st_size
-
-
-def tar_tree(tar, arcroot, hostroot):
-    """Add @hostroot under @arcroot, sorted, directories included.
-
-    Directories matter: an empty one is part of an app's shape (a place it will
-    write to), and the host's installer creates exactly what the archive holds.
-    """
-    total = 0
-    for dirpath, dirnames, filenames in os.walk(hostroot):
-        dirnames.sort()
-        filenames.sort()
-        rel = os.path.relpath(dirpath, hostroot)
-        arc = arcroot if rel == "." else arcroot + "/" + rel.replace(os.sep, "/")
-        tar_dir(tar, arc)
-        for name in filenames:
-            total += tar_file(tar, arc + "/" + name, os.path.join(dirpath, name))
-    return total
-
-
 def system_names(archive):
-    """Source names held by a system layer: one entry per program file.
+    """Source names held by a system layer: the basename of each program file.
 
     pack_system.py lays a program out at its guest path (sbin/vpsessiond), so
-    the basename is the program's own name - exactly the app id it must not be
-    packed under."""
+    the basename is exactly the app id it must not be packed under."""
     if not archive or not os.path.isfile(archive):
         return set()
     names = set()
@@ -108,6 +73,74 @@ def find_ids(src, only, skip):
         sorted(n[:-4] for n in os.listdir(src) if n.endswith(".exe"))
         if os.path.isdir(src) else [])
     return [i for i in ids if i not in skip]
+
+
+def zip_dir(zf, arcname, mode=0o755):
+    info = zipfile.ZipInfo(arcname + "/", date_time=DOS_TIME)
+    info.external_attr = (mode << 16) | 0x10  # Unix mode + DOS directory bit
+    zf.writestr(info, b"")
+
+
+def zip_file(zf, arcname, path, mode=None):
+    with open(path, "rb") as fh:
+        payload = fh.read()
+    info = zipfile.ZipInfo(arcname, date_time=DOS_TIME)
+    # A guest program has to be executable; everything else is a resource.
+    info.external_attr = (mode if mode is not None else
+                          (0o755 if path.endswith(".exe") else 0o644)) << 16
+    info.compress_type = zipfile.ZIP_DEFLATED
+    zf.writestr(info, payload)
+    return len(payload)
+
+
+def zip_tree(zf, arcroot, hostroot):
+    """Add @hostroot under @arcroot, sorted, directories included."""
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(hostroot):
+        dirnames.sort()
+        filenames.sort()
+        rel = os.path.relpath(dirpath, hostroot)
+        arc = arcroot if rel == "." else arcroot + "/" + rel.replace(os.sep, "/")
+        zip_dir(zf, arc)
+        for name in filenames:
+            total += zip_file(zf, arc + "/" + name, os.path.join(dirpath, name))
+    return total
+
+
+def build_vapp(app_id, exe, assets, args):
+    """The `<id>.vapp` package's bytes."""
+    entry = "bin/%s.exe" % app_id
+    manifest = json.dumps({
+        "id": app_id,
+        "version": 1,
+        "entry": entry,
+        "args": args,
+    }, separators=(",", ":"), sort_keys=True)
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        zip_dir(zf, "bin")
+        info = zipfile.ZipInfo(MANIFEST, date_time=DOS_TIME)
+        info.external_attr = 0o644 << 16
+        zf.writestr(info, (manifest + "\n").encode("utf-8"))
+        zip_file(zf, FILES + "/" + entry, exe, 0o755)
+        if assets:
+            for name, path in assets:
+                zip_tree(zf, FILES + "/assets/" + name, path)
+        override = os.path.join(os.path.dirname(exe), app_id + ".assets")
+        if os.path.isdir(override):
+            zip_tree(zf, FILES + "/assets", override)
+    return out.getvalue()
+
+
+def tar_dir(tar, arcname):
+    info = tarfile.TarInfo(arcname)
+    info.type = tarfile.DIRTYPE
+    info.mode = 0o755
+    info.mtime = 0
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    tar.addfile(info)
 
 
 def main():
@@ -148,7 +181,6 @@ def main():
         for app_id in ids:
             print(app_id)
         return 0
-
     if not opts.out:
         return die("--out is required unless --list is used")
 
@@ -157,61 +189,47 @@ def main():
 
     packed = []
     # gzip's own header carries an mtime, and tarfile would set it to "now": the
-    # whole point of packing this way is that the bytes only change when the
-    # input does, so the stream is opened here with mtime=0.
+    # bytes should only change when the input does, so the stream is opened here
+    # with mtime=0.
     with open(opts.out, "wb") as raw:
         with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
             with tarfile.open(fileobj=gz, mode="w", format=tarfile.GNU_FORMAT) as tar:
-                tar_dir(tar, "apps")
+                tar_dir(tar, MEMBER_DIR)
                 for app_id in ids:
                     exe = os.path.join(opts.src, app_id + ".exe")
                     if not os.path.isfile(exe):
                         return die("%s: no such guest program" % exe)
-
-                    root = "apps/" + app_id
-                    entry = "bin/%s.exe" % app_id
-                    tar_dir(tar, root)
-                    tar_dir(tar, root + "/bin")
-
-                    manifest = json.dumps({
-                        "id": app_id,
-                        "entry": entry,
-                        "args": args_by_id.get(app_id, ""),
-                    }, separators=(",", ":"), sort_keys=True)
-                    tar_bytes(tar, root + "/" + MANIFEST,
-                              (manifest + "\n").encode("utf-8"))
-
-                    size = tar_file(tar, root + "/" + entry, exe, 0o755)
-
-                    # The app's own resources: the shared trees first, then
-                    # <src>/<id>.assets/ on top, which is how one app overrides
-                    # or extends what the others share.
-                    if assets:
-                        tar_dir(tar, root + "/assets")
-                        for name, path in assets:
-                            size += tar_tree(tar, root + "/assets/" + name, path)
-                    override = os.path.join(opts.src, app_id + ".assets")
-                    if os.path.isdir(override):
-                        size += tar_tree(tar, root + "/assets", override)
-
-                    packed.append((app_id, entry, size))
+                    vapp = build_vapp(app_id, exe, assets, args_by_id.get(app_id, ""))
+                    arcname = "%s/%s%s" % (MEMBER_DIR, app_id, EXT)
+                    info = tarfile.TarInfo(arcname)
+                    info.size = len(vapp)
+                    info.mode = 0o644
+                    info.mtime = 0
+                    info.uid = info.gid = 0
+                    info.uname = info.gname = ""
+                    tar.addfile(info, io.BytesIO(vapp))
+                    packed.append((app_id, arcname, len(vapp)))
 
     with open(opts.out, "rb") as fh:
         total = len(fh.read())
 
-    # Read it back: a tar written by a script is worth verifying before a host
-    # is asked to mount it.
+    # Read every package back: a tar/zip written by a script is worth verifying
+    # before a host is asked to install it.
     with tarfile.open(opts.out, "r:gz") as tar:
         members = tar.getnames()
-        for app_id, entry, _ in packed:
-            want = "apps/%s/%s" % (app_id, entry)
-            if want not in members:
-                return die("verification failed: %s is missing from %s" % (want, opts.out))
+        for app_id, arcname, _ in packed:
+            if arcname not in members:
+                return die("verification failed: %s is missing from %s" % (arcname, opts.out))
+            with zipfile.ZipFile(io.BytesIO(tar.extractfile(arcname).read())) as zf:
+                manifest = json.loads(zf.read(MANIFEST).decode("utf-8"))
+                if manifest.get("id") != app_id:
+                    return die("verification failed: %s declares id %r"
+                               % (arcname, manifest.get("id")))
 
-    for app_id, entry, size in packed:
-        print("app %-16s /data/app/%s/%s  %d byte(s) of payload"
-              % (app_id, app_id, entry, size))
-    print("wrote %s: %d app(s), %d member(s), %d byte(s)"
+    for app_id, arcname, size in packed:
+        print("app %-16s /data/app/%s/bin/%s.exe  %d byte(s) of payload"
+              % (app_id, app_id, app_id, size))
+    print("wrote %s: %d package(s), %d member(s), %d byte(s)"
           % (opts.out, len(packed), len(members), total))
     return 0
 

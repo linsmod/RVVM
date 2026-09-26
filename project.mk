@@ -213,7 +213,7 @@ override lib_src_virtpass_guest := $(SRCDIR)/virtpass/vp_ndk_stub.c $(SRCDIR)/vi
 # instead of librvvm, which stays free of the dependency. vp_shadow.c is the
 # plain index the core queries and has no such dependency, so it does live in
 # librvvm.
-override lib_src_virtpass_nonhost := $(SRCDIR)/virtpass/guest-samples/% $(SRCDIR)/virtpass/android-host/% $(SRCDIR)/virtpass/win32-host/% $(SRCDIR)/virtpass/vp-sdk/% $(SRCDIR)/virtpass/vp_rootfs.c $(SRCDIR)/virtpass/vp_bundle.c
+override lib_src_virtpass_nonhost := $(SRCDIR)/virtpass/guest-samples/% $(SRCDIR)/virtpass/android-host/% $(SRCDIR)/virtpass/win32-host/% $(SRCDIR)/virtpass/vp-sdk/% $(SRCDIR)/virtpass/vp_rootfs.c $(SRCDIR)/virtpass/vp_zip.c $(SRCDIR)/virtpass/vp_app.c $(SRCDIR)/virtpass/vp_bundle.c
 
 # virtpass_stub bundles those guest-side stubs so guest programs can link them
 # against the virtpass passthrough. It is only buildable on a native riscv64
@@ -369,6 +369,8 @@ override bin_src_rvvm_winhost  := $(SRCDIR)/virtpass/win32-host/win32_main.c \
                                   $(SRCDIR)/virtpass/win32-host/win32_aaudio_wasapi.c \
                                   $(SRCDIR)/virtpass/win32-host/win32_sensor_stub.c \
                                   $(SRCDIR)/virtpass/vp_rootfs.c \
+                                  $(SRCDIR)/virtpass/vp_zip.c \
+                                  $(SRCDIR)/virtpass/vp_app.c \
                                   $(SRCDIR)/virtpass/vp_bundle.c
 # zlib: vp_rootfs.c inflates the bundle archives (pkg-config module name is
 # "zlib", not "z")
@@ -536,7 +538,7 @@ android-assets: guest-assets
 # carries what the host binary of that release boots from.
 override ANDROID_BUNDLE_DIR := $(ANDROID_ASSETS_DIR)/bundle
 
-.PHONY: android-bundle # Stage the release bundle (rootfs + apps) into the APK assets
+.PHONY: android-bundle # Stage the release bundle (rootfs + system + apps) into the APK assets
 android-bundle: pack-apps pack-system fetch-rootfs
 	$(call println,$(TEXT)[$(GREEN)STAGE$(TEXT)] $(ANDROID_BUNDLE_DIR) $(RESET))
 	$(call install_file,$(ROOTFS_TAR),$(ANDROID_BUNDLE_DIR)/$(notdir $(ROOTFS_TAR)),0644)
@@ -567,7 +569,7 @@ android-clean:
 #
 #   <bundle>/rootfs.tar.gz   the guest's `/` (Alpine minirootfs)
 #   <bundle>/system.tar.gz   system programs, laid out at their guest paths
-#   <bundle>/apps.tar.gz     the sample apps (one directory each + app.json)
+#   <bundle>/apps.tar.gz     the pre-deployed apps: apps/<id>.vapp members
 #
 # All are gitignored (the repo ignores the whole root), so a release - and any
 # end-to-end run - has to fetch or pack them first. These variables mirror the C

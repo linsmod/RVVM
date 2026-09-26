@@ -273,23 +273,15 @@ static bool   g_minimized    = false;
 #define LAUNCH_BTN_STEP  (LAUNCH_BTN_W + LAUNCH_CTRL_GAP)
 #define LAUNCH_SUSP_W    88
 
-/* Known sample guests; used when the assets directory holds no .exe files
- * (e.g. the assets haven't been built yet). */
-static const char* LAUNCHER_DEFAULT_GUESTS[] = {
-    "test_render", "test_game_activity", "test_sensor_guest",
-    "test_render_gles", "test_audio",
-};
-
 /* Directory the running executable lives in. Defined with the bundle install
  * further down; declared here because the picker reads the same bundle. */
 static bool win32_exe_directory(char* out, size_t size);
 
 static char g_assets_dir[MAX_PATH] = ".";
 static char g_guest_names[MAX_GUESTS][MAX_GUEST_NAME];
-/* The launch target of each picker entry when it is a *guest* path rather than a
- * host file: an app is booted as /data/app/<id>/<entry>, and its payload is
- * unpacked from the bundle at launch time. Empty for a loose .exe entry, which
- * is still resolved against g_assets_dir. */
+/* The launch target of each picker entry: an app is booted as
+ * /data/app/<id>/<entry>, its payload unpacked from the bundle's package at
+ * launch time. There is no loose-ELF entry - a guest is only ever a package. */
 static char g_guest_paths[MAX_GUESTS][MAX_PATH + 96];
 static int  g_guest_count   = 0;
 static bool g_launcher      = false; /* launcher UI enabled (only when no
@@ -2327,15 +2319,14 @@ static void tty_paint(HDC cdc)
 
 /* Guest environment.
  *
- * The guest gets a deliberately narrow view of the host: its own prefix plus
- * the RVVM_GL_* bring-up switches (test sizes, GL backend tracing) that are
- * meant to be settable from the shell that launched the WinHost. The whole
- * host environ is not forwarded - the guest would inherit unrelated variables
- * and the set would differ per machine.
+ * The guest gets a deliberately narrow view of the host: the RVVM_GL_*
+ * bring-up switches (test sizes, GL backend tracing) that are meant to be
+ * settable from the shell that launched the WinHost. The whole host environ is
+ * not forwarded - the guest would inherit unrelated variables and the set would
+ * differ per machine.
  *
  * The entries must outlive the guest thread, hence file scope and strdup'd
  * copies collected in guest_env_build()/guest_env_free(). */
-#define GUEST_ENV_PREFIX "RVVM_USER_PREFIX="
 static char** g_guest_envp = NULL;
 
 /* Host variables handed to the guest, by prefix. */
@@ -2363,27 +2354,12 @@ static void guest_env_free(void)
 }
 
 /* Copy the forwarded host variables into a NULL-terminated array of
- * "NAME=value" strings, and expose the same prefix to our own getenv. */
+ * "NAME=value" strings. */
 static bool guest_env_build(void)
 {
     size_t cap = 8, n = 0;
     char** env = (char**)calloc(cap, sizeof(char*));
     if (!env) return false;
-
-    /* Hand the guest the same prefix the host resolved (empty = host paths pass
-     * through). The host side reads it through rvvm_user_set_prefix() rather
-     * than putenv(): MinGW's putenv("NAME=") removes the variable instead of
-     * setting it empty, which rvvm_user.c reads as "use the build-time
-     * default". */
-    {
-        static char env_prefix[1024];
-        const char* host_prefix = getenv("RVVM_USER_PREFIX");
-        snprintf(env_prefix, sizeof(env_prefix), GUEST_ENV_PREFIX "%s",
-                 (host_prefix && host_prefix[0]) ? host_prefix : "");
-        env[n] = _strdup(env_prefix);
-        if (!env[n]) { free(env); return false; }
-        n++;
-    }
 
     /* The guest's terminal is this console, and a program that cares what it is
      * talking to (a full-screen one, or anything reading terminfo) has to be
@@ -2480,11 +2456,11 @@ static DWORD WINAPI guest_thread_main(LPVOID arg)
 /* Public API                                                          */
 /* ------------------------------------------------------------------ */
 
-/* The picker lists what the bundle offers. When apps.tar.gz is there, that is
- * one entry per app - each booted at /data/app/<id>/<entry>, and each seeing
- * only its own payload and resources. Otherwise the loose .exe files of an
- * assets directory, which is how the samples ran before there was an app model
- * (and still do for a one-off regression run). */
+/* The picker lists what the bundle offers. When the apps archive holds
+ * `<id>.vapp` packages, that is one entry per app - each booted at
+ * /data/app/<id>/<entry>, from its own manifest. Otherwise the loose .exe files
+ * of an assets directory, which is how the samples ran before there was an app
+ * model (and still do for a one-off regression run). */
 static bool launcher_scan_apps(void)
 {
     char exe_dir[MAX_PATH];
@@ -2521,56 +2497,15 @@ static bool launcher_scan_apps(void)
 
 static void launcher_scan_guests(void)
 {
-    char pattern[MAX_PATH + 4];
-    WIN32_FIND_DATAA fd;
-    HANDLE h;
-    int n = 0;
-
     g_guest_count = 0;
     memset(g_guest_paths, 0, sizeof(g_guest_paths));
 
-    if (launcher_scan_apps()) {
-        return;
+    /* The picker lists exactly what the bundle offers: the `<id>.vapp` packages
+     * of apps.tar.gz. There is no loose-ELF fallback - a guest is only ever an
+     * app package, so a bundle-less host has nothing to list. */
+    if (!launcher_scan_apps()) {
+        winhost_log("launcher: no apps in the bundle");
     }
-
-    /* Nothing was named with --assets: the guest ELFs the build produced sit
-     * next to this binary (<exe dir>/guest-assets), which is the one place a
-     * host with no bundle looks for a loose one. */
-    {
-        char exe_dir[MAX_PATH];
-        if (!strcmp(g_assets_dir, ".") && win32_exe_directory(exe_dir, sizeof(exe_dir))) {
-            char built[MAX_PATH];
-            snprintf(built, sizeof(built), "%s\\guest-assets", exe_dir);
-            if (GetFileAttributesA(built) != INVALID_FILE_ATTRIBUTES) {
-                win32_host_set_assets_dir(built);
-            }
-        }
-    }
-
-    snprintf(pattern, sizeof(pattern), "%s\\*.exe", g_assets_dir);
-    h = FindFirstFileA(pattern, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            char* ext = strrchr(fd.cFileName, '.');
-            if (ext) *ext = '\0';               /* strip ".exe" */
-            if (fd.cFileName[0] != '\0' && n < MAX_GUESTS) {
-                snprintf(g_guest_names[n], MAX_GUEST_NAME, "%s", fd.cFileName);
-                n++;
-            }
-        } while (FindNextFileA(h, &fd) && n < MAX_GUESTS);
-        FindClose(h);
-    }
-
-    /* Missing/empty assets dir: fall back to the known sample names so the
-     * picker is usable even before the guest assets have been built. */
-    if (n == 0) {
-        size_t n_def = sizeof(LAUNCHER_DEFAULT_GUESTS) / sizeof(LAUNCHER_DEFAULT_GUESTS[0]);
-        for (n = 0; n < (int)n_def && n < MAX_GUESTS; n++) {
-            snprintf(g_guest_names[n], MAX_GUEST_NAME, "%s", LAUNCHER_DEFAULT_GUESTS[n]);
-        }
-    }
-    g_guest_count = n;
-    winhost_log("launcher: %d guest(s) in %s", g_guest_count, g_assets_dir);
 }
 
 /* Put the guest-only controls back into their idle state: the Suspend toggle
@@ -3146,6 +3081,29 @@ static void win32_guest_rootfs_mount(rvvm_machine_t* machine, const char* app_id
     }
 }
 
+/* The controlled launcher's entry point: a package's manifest, read from the
+ * bundle's apps archive (apps.tar.gz -> apps/<id>.vapp) without installing it.
+ * The id is the only thing a caller names - the entry and args come out of the
+ * package, so a launch cannot be pointed at an arbitrary program. */
+bool win32_host_app_manifest(const char* id, vp_app_t* out)
+{
+    char exe_dir[MAX_PATH];
+    char path[MAX_PATH];
+
+    if (!id || !*id || !out || !win32_exe_directory(exe_dir, sizeof(exe_dir))) {
+        return false;
+    }
+    if (snprintf(path, sizeof(path), "%s\\%s\\%s", exe_dir, VP_BUNDLE_DIR, VP_APPS_TAR_GZ) >=
+        (int)sizeof(path)) {
+        return false;
+    }
+    if (!vp_bundle_read_app(path, id, out)) {
+        winhost_log("app: no package '%s' in %s", id, path);
+        return false;
+    }
+    return true;
+}
+
 bool win32_host_start_guest(int argc, char** argv)
 {
     int i;
@@ -3174,29 +3132,22 @@ bool win32_host_start_guest(int argc, char** argv)
      * host_guest_exit_cb). Same role as jni_bridge.c's on_guest_exit. */
     rvvm_user_set_exit_callback(g_guest_machine, host_guest_exit_cb);
 
-    /* Guest filesystem view: host paths pass through unchanged unless the
-     * launching shell asked for a prefix directory (RVVM_USER_PREFIX pointing
-     * at a real rootfs). This must not rely on the environment alone - MinGW's
-     * putenv("NAME=") *removes* the variable instead of setting it empty, and
-     * rvvm_user.c reads a removed variable as "keep the build-time default",
-     * which prefixes every guest absolute path with a directory that does not
-     * exist on this host. */
+    /* Guest filesystem view: the run's own rootfs, provisioned from the bundle.
+     * A guest named /data/app/<id>/... is also the request to boot that app and
+     * nothing else; a guest of any other shape runs on the bare rootfs. A host
+     * with no bundle keeps the pass-through view (nothing is set). There is no
+     * environment override - the rootfs is the bundle's, not a hand-made tree. */
     {
-        const char* host_prefix = getenv("RVVM_USER_PREFIX");
-        if (host_prefix && host_prefix[0]) {
-            /* An explicit prefix wins: that is how a regression run points the
-             * guest at a hand-made tree of its own. */
-            rvvm_user_set_prefix(g_guest_machine, host_prefix);
-        } else {
-            /* Otherwise run on the bundle. A guest named /data/app/<id>/... is
-             * also the request to boot that app and nothing else; a guest of any
-             * other shape runs on the bare rootfs. A host with no bundle keeps
-             * the pass-through view (nothing is set). */
-            char app_id[VP_APP_ID_MAX];
-            bool have_app = vp_bundle_app_id_from_guest_path(argc > 0 ? argv[0] : NULL,
-                                                            app_id, sizeof(app_id));
-            win32_guest_rootfs_mount(g_guest_machine, have_app ? app_id : NULL);
-        }
+        char app_id[VP_APP_ID_MAX];
+        bool have_app;
+
+        /* Default to passthrough (host paths unchanged); the bundle mount below
+         * points the prefix at the run's rootfs when it is there. The core's
+         * build-time default prefix must not leak into a run. */
+        rvvm_user_set_prefix(g_guest_machine, NULL);
+        have_app = vp_bundle_app_id_from_guest_path(argc > 0 ? argv[0] : NULL,
+                                                    app_id, sizeof(app_id));
+        win32_guest_rootfs_mount(g_guest_machine, have_app ? app_id : NULL);
     }
 
     /* Route guest fd 1/2 through the console session so CR / ANSI escapes

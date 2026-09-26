@@ -6,7 +6,8 @@ them), and they are three layers of the guest's file system:
 
     bundle/rootfs.tar.gz    the base: the guest's `/` (Alpine minirootfs)
     bundle/system.tar.gz    host-provided system programs (sbin/vpsessiond)
-    bundle/apps.tar.gz      one directory per app, installed under /data/app
+    bundle/apps.tar.gz      the pre-deployed apps: one `<id>.vapp` package
+                            (vp_app.h) per member, installed under /data/app/<id>
 
 This module is the *host half* of that, in one place because both hosts have to
 do exactly the same thing and nothing else:
@@ -43,6 +44,7 @@ finds its bundle directory: the caller names the archives and the destination.
 #include <stddef.h>
 
 #include "core/rvvm_user.h"
+#include "virtpass/vp_app.h"
 #include "virtpass/vp_rootfs.h"
 
 // What vp_bundle_mount() found and did.
@@ -55,13 +57,15 @@ typedef struct {
 
 // Give @machine the filesystem view of a run: materialize the base rootfs, then
 // the system layer, then provision the apps - each stamped against its own
-// archive, so a repeated run of an unchanged bundle only walks the tree. Writes
+// input, so a repeated run of an unchanged bundle only walks the tree. Writes
 // the session files the base archive does not ship (inittab, /proc/mounts) and
-// creates /dev/pts. @system_tar_gz / @apps_tar_gz may be NULL (a host may have
-// no such layer); a named-but-unreadable archive is an error. Returns false with
-// *error set when the base cannot be read, or a named layer cannot be installed
-// - the caller may then run the guest with no filesystem view at all, which is
-// what a host without a bundle has always done. @stats is optional.
+// creates /dev/pts. @system_tar_gz may be NULL (a host may have no system
+// layer); a named-but-unreadable archive is an error. @apps_tar_gz is the
+// pre-deployment form of the apps: a tar of `<id>.vapp` packages (vp_app.h); it
+// may be NULL for a host without apps. Returns false with *error set when the
+// base cannot be read, or a named layer cannot be installed - the caller may
+// then run the guest with no filesystem view at all, which is what a host
+// without a bundle has always done. @stats is optional.
 bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz,
                      const char* system_tar_gz, const char* apps_tar_gz,
                      const char* dest, vp_bundle_stats_t* stats, const char** error);
@@ -90,10 +94,15 @@ typedef struct {
     char args[VP_APP_ARGS_MAX];
 } vp_bundle_app_t;
 
-// The apps @apps_tar_gz declares, up to @max, in archive order. Returns how many
-// were found (which may exceed @max); 0 for a missing or unreadable archive,
-// which is not an error - a host may run without a bundle.
+// The apps an @apps_tar_gz holds (its `<id>.vapp` members), up to @max, sorted
+// by id. Returns how many were found (which may exceed @max); 0 for a missing or
+// unreadable archive, which is not an error - a host may run without apps.
 size_t vp_bundle_list_apps(const char* apps_tar_gz, vp_bundle_app_t* out, size_t max);
+
+// One app's manifest out of @apps_tar_gz, by id - the controlled launcher's
+// resolver, without installing anything. False when the archive has no such
+// package.
+bool vp_bundle_read_app(const char* apps_tar_gz, const char* id, vp_app_t* out);
 
 // The /assets mount: a real directory tree, which is what both hosts want once
 // an app's payload is on disk. Point it at vp_bundle_app_assets_path() - as the

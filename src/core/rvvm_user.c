@@ -979,10 +979,8 @@ typedef struct rvvm_userland {
     // hands it back through rvvm_user_host_ctx().
     void*                    host_ctx;
     const char*              prefix_path;
-    // Prefix set through rvvm_user_set_prefix(): the string is owned here and
-    // the RVVM_USER_PREFIX environment must not override it
+    // Prefix set through rvvm_user_set_prefix(): the string is owned here
     char*                    prefix_owned;
-    bool                     prefix_forced;
     bool                     fake_root;
     int                      fake_uid;
     int                      fake_gid;
@@ -2829,7 +2827,6 @@ PUBLIC void rvvm_user_set_prefix(rvvm_machine_t* machine, const char* prefix)
     } else {
         ctx->prefix_path = NULL;
     }
-    ctx->prefix_forced = true;
 }
 
 PUBLIC const char* rvvm_user_get_prefix(rvvm_machine_t* machine)
@@ -5414,7 +5411,6 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
     ctx->fake_root    = parent->fake_root;
     ctx->fake_uid     = parent->fake_uid;
     ctx->fake_gid     = parent->fake_gid;
-    ctx->prefix_forced = parent->prefix_forced;
     if (parent->prefix_path) {
         size_t len = rvvm_strlen(parent->prefix_path) + 1;
         ctx->prefix_owned = safe_new_arr(char, len);
@@ -13059,17 +13055,9 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
     userland_fd_table_free(ctx);
     userland_fd_table_init(ctx);
 
-    /* Path prefix override: an empty RVVM_USER_PREFIX passes host paths through
-     * unchanged, unset keeps the build-time default. Resolved here, on the
-     * guest thread, rather than in rvvm_user_create(): hosts putenv() right
-     * before launching this thread, so create() would have read a stale value.
-     * A prefix the host set with rvvm_user_set_prefix() wins: the environment is
-     * a convenience for a command line, not a way to take a bundle away from a
-     * host that mounted one (see prefix_forced). */
-    const char* env_prefix = getenv("RVVM_USER_PREFIX");
-    if (env_prefix && !ctx->prefix_forced) {
-        ctx->prefix_path = env_prefix[0] ? env_prefix : NULL;
-    }
+    /* Path prefix: what the host set with rvvm_user_set_prefix() (NULL = host
+     * paths pass through unchanged). There is no environment override - the
+     * rootfs is the host's to name per machine, not a process-wide env. */
 
     /* The guest starts at its own root. The host process's cwd is not it, and
      * resolving relative guest paths against that host cwd only looked right

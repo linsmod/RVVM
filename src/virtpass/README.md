@@ -48,8 +48,9 @@ backend behind each callback differs.
 
 - Entry: `rvvm_winhost.exe` (`win32_main.c`) — console application: message
   pump, launcher UI, `--display WxH@PPI`, `--assets DIR` (or `RVVM_ASSETS`), and
-  the launch target `--launcher` / `--guest <elf> [args...]` (a bare first
-  non-option argument means `--guest`, none at all means `--launcher`).
+  the launch target `--app <id> [args...]` (an app *package* from the bundle's
+  apps.tar.gz, booted from its manifest) or `--launcher` (the picker). There is
+  no loose-ELF argument: a guest is only ever a package.
 - Console keyboard: `WM_CHAR` plus the arrow / Home / End / Delete keys are
   routed to the guest's fd 0 through `rvvm_user_tty_input()`, the same call the
   Android console tab makes. The line discipline stays in the core
@@ -57,7 +58,7 @@ backend behind each callback differs.
   so a guest like `test_cli` runs as an interactive shell in the window. The
   host's own stdin feeds the same discipline (`stdin_pump_thread()`, which waits
   for `rvvm_user_is_started()` before reading), which is what makes a run
-  scriptable: `printf 'ls /\nexit\n' | rvvm_winhost.exe --guest test_cli.exe`.
+  scriptable: `printf 'ls /\nexit\n' | rvvm_winhost.exe --app test_cli`.
 - GameActivity keys: the same keystrokes are also queued for
   `android_app_swap_input_buffers()` - `cmdpost_queue_key_event()` with the VK
   mapped to an `AKEYCODE_*` value. The queue lives in the shared

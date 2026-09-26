@@ -235,11 +235,8 @@ void rvvm_user_tty_input(rvvm_machine_t* machine, const void* buf, size_t len);
 //   prefix = "/x"  -> guest "/foo" becomes "/x/foo"; "/dev", "/sys", "/proc",
 //                     "/tmp", "/var/tmp" and relative paths still pass through
 //
-// Passing NULL is how a host asks for passthrough. Setting the environment
-// variable RVVM_USER_PREFIX to an empty string means the same, but Win32
-// cannot express "set it to empty": MinGW's putenv("NAME=") *removes* the
-// variable, and a removed variable means "keep the build-time default". A host
-// in that situation must call this instead.
+// Passing NULL is how a host asks for passthrough. The direction of the mount
+// is always the host's, per machine: there is no environment override.
 //
 // The string is copied and may be freed by the caller. Must be called before
 // rvvm_user_linux_ex().

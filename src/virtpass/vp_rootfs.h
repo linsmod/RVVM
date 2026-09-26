@@ -39,29 +39,24 @@ module at all, so it is excluded from librvvm and built into a host that links
 //   rootfs.tar.gz   the guest's `/` (Alpine minirootfs) - the base layer
 //   system.tar.gz   host-provided *system programs*, laid out at their guest
 //                   paths (sbin/vpsessiond) - the middle layer, no manifest
-//   apps.tar.gz     the apps, one directory each, installed under /data/app
+//   apps.tar.gz     the apps pre-deployed for the run: one `<id>.vapp` package
+//                   (vp_app.h) per member, under apps/ in the archive
 //
-// They are extracted in order into the run's own directory, so a later layer
-// wins over an earlier one; the flattening happens at install time because the
-// core answers paths from one materialized tree (and Windows cannot express the
-// archive's symlinks anyway).
-#define VP_BUNDLE_DIR    "bundle"
-#define VP_ROOTFS_TAR_GZ "rootfs.tar.gz"
-#define VP_SYSTEM_TAR_GZ "system.tar.gz"
-#define VP_APPS_TAR_GZ   "apps.tar.gz"
+// The archives are extracted/installed in order into the run's own directory:
+// the two layers are flattened (a later one wins), and each `.vapp` is installed
+// under /data/app/<id> by vp_app. A `.vapp` is itself a zip, so the two formats
+// nest: the tar is the bundle's delivery container, the zip is the app package.
+#define VP_BUNDLE_DIR      "bundle"
+#define VP_ROOTFS_TAR_GZ   "rootfs.tar.gz"
+#define VP_SYSTEM_TAR_GZ   "system.tar.gz"
+#define VP_APPS_TAR_GZ     "apps.tar.gz"
+#define VP_APPS_MEMBER_DIR "apps"
 
-// Where the guest sees the app model, and where the app payload lives inside
-// apps.tar.gz:
-//
-//   apps/<app_id>/app.json       {"id", "entry", "args"} - the declaration
-//   apps/<app_id>/bin/<entry>    the guest ELF
-//   apps/<app_id>/assets/...     the app's own resources
-//
-// which the host installs at <guest>/data/app/<app_id>.
+// Where the guest sees the app model. The apps themselves are `.vapp` packages
+// (vp_app.h), installed by the host at <guest>/data/app/<id>; this header only
+// fixes the paths so the two agree.
 #define VP_GUEST_APP_DIR   "/data/app"
 #define VP_GUEST_DATA_DIR  "/data/data"
-#define VP_APPS_MEMBER_DIR "apps"
-#define VP_APP_MANIFEST    "app.json"
 
 // The session server: a host-provided system program (the first entry of
 // system.tar.gz), installed into a run's rootfs at this guest path. A core
@@ -104,43 +99,11 @@ void vp_rootfs_release_data(vp_rootfs_t* rootfs);
 // false for anything that is not a regular file.
 bool vp_rootfs_extract_to(const vp_rootfs_t* rootfs, uint32_t idx, const char* dest_path);
 
-// ---------------------------------------------------------------------------
-// Apps (the apps.tar.gz half of the bundle)
-//
-// One directory per app, and its manifest is the only place the entry point is
-// named - the guest is booted as /data/app/<id>/<entry>, so the host never has
-// to guess a file name. Everything else in the directory (bin/, assets/) is the
-// app's own payload and is installed as-is.
-// ---------------------------------------------------------------------------
-
-#define VP_APP_ID_MAX    64
-#define VP_APP_ENTRY_MAX 256
-#define VP_APP_ARGS_MAX  256
-
-typedef struct {
-    char id[VP_APP_ID_MAX];
-    char entry[VP_APP_ENTRY_MAX]; // relative to the app dir, e.g. "bin/test_cli.exe"
-    char args[VP_APP_ARGS_MAX];   // default arguments, "" when the manifest has none
-} vp_app_t;
-
-// Copy one entry's bytes into @buffer (NUL-terminated when it fits). Returns the
-// entry's size, or (size_t)-1 when the index holds no such regular file.
-size_t vp_rootfs_read_entry(const vp_rootfs_t* rootfs, uint32_t idx, char* buffer, size_t size);
-
-// The manifest of @id, or false when the archive has no such app. A manifest
-// without "entry" gets the conventional "bin/<id>.exe", so a hand-packed app
-// only has to declare what is unusual about it.
-bool vp_rootfs_app_manifest(vp_rootfs_t* apps, const char* id, vp_app_t* out);
-
-// Every app the archive declares, in archive order, up to @max entries. Returns
-// how many were found, which may exceed @max.
-size_t vp_rootfs_apps(vp_rootfs_t* apps, vp_app_t* out, size_t max);
-
-// Install @id's payload under @dest_app_dir, which becomes the app's root
-// (<dest_app_dir>/bin/<entry>, <dest_app_dir>/assets/...). A file already
-// present with the same size is left alone. Returns the number of files
-// written, or 0 with *error set when the archive has no such app.
-size_t vp_rootfs_install_app(vp_rootfs_t* apps, const char* id, const char* dest_app_dir,
-                             const char** error);
+// Read one indexed entry's bytes into @buffer, which must be at least the
+// entry's size. Returns the entry's size, or (size_t)-1 when the index holds no
+// regular file. What reads a `.vapp` member out of the bundle's apps.tar.gz
+// without a scratch file; the archive's bytes must still be held (i.e. before
+// vp_rootfs_release_data()).
+size_t vp_rootfs_read_entry(const vp_rootfs_t* rootfs, uint32_t idx, void* buffer, size_t size);
 
 #endif

@@ -58,16 +58,11 @@ static void ash_send_frame(int fd, const char* body);
 /* The core: --serve                                                   */
 /* ------------------------------------------------------------------ */
 
-/* The guest program a core boots: a *guest* path, resolved inside the run's
- * rootfs - the session server is a system program installed from the bundle at
- * /sbin/vpsessiond (system.tar.gz), not a loose host ELF. RVVM_ASH_SHELL still
- * overrides it, for a regression run that names a guest path of its own. */
+/* The guest program a core boots: the host-owned system program
+ * /sbin/vpsessiond, installed from the bundle's system layer. A core program is
+ * not selectable - it is part of the system, not an app. */
 static const char* ash_default_core_shell(void)
 {
-    const char* env = getenv("RVVM_ASH_SHELL");
-    if (env && *env) {
-        return env;
-    }
     return VP_GUEST_SESSIOND;
 }
 

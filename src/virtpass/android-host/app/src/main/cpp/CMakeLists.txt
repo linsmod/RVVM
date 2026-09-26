@@ -136,8 +136,11 @@ add_library(rvvm_jni SHARED
     android_gl_host.c
     # Bundle archive reader (gzip + tar): host side, hence linked against zlib
     # here rather than into rvvm_core. vp_bundle.c is the other half of it - the
-    # mount, the app install and the /assets ops, shared with the WinHost.
+    # mount and the /assets ops; vp_app.c / vp_zip.c are the app packages (a
+    # `.vapp` is a zip nested in apps.tar.gz), shared with the WinHost.
     ${RVVM_SRC}/virtpass/vp_rootfs.c
+    ${RVVM_SRC}/virtpass/vp_zip.c
+    ${RVVM_SRC}/virtpass/vp_app.c
     ${RVVM_SRC}/virtpass/vp_bundle.c
 )
 

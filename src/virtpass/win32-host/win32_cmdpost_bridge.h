@@ -19,6 +19,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "virtpass/vp_app.h" /* vp_app_t: the controlled launcher reads a package */
+
 /*
  * Create the host window, initialize the layer-1 virtual display, register
  * vp_cmdpost callbacks. Call before win32_host_start_guest().
@@ -58,6 +60,15 @@ bool win32_host_set_launcher(const char* assets_dir);
  * tries to leave it is refused. Call before the guest starts.
  */
 void win32_host_set_assets_dir(const char* dir);
+
+/*
+ * Resolve a package's manifest by id, from the bundle's apps archive
+ * (apps.tar.gz -> apps/<id>.vapp), without installing it. This is what the
+ * controlled launcher (--app) boots from: the entry point and arguments come
+ * from the package, never from the command line. False when the bundle has no
+ * such package. Call before win32_host_start_guest().
+ */
+bool win32_host_app_manifest(const char* id, vp_app_t* out);
 
 /*
  * Console-only host (rvvm_ash): everything win32_host_init() does except the

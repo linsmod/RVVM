@@ -1070,11 +1070,7 @@ static void* guest_thread_func(void* arg)
     /* Build argc/argv for rvvm_user_linux_ex() */
     /* argv[0] = ELF path, argv[1..] = guest args */
     run->argv[0] = run->elf_path;
-    
-    /* On non-riscv hosts rvvm_user.c defaults prefix_path to a hardcoded
-     * Debian userland path. Disable it so host paths pass through unchanged. */
-    putenv("RVVM_USER_PREFIX=");
-    
+
     int result = rvvm_user_linux_ex(machine, run->argc, run->argv, NULL);
 
     LOGI("Guest thread finished with code: %d", result);
@@ -2757,6 +2753,11 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
      * before the thread starts, since the first thing the guest does may be one
      * of these syscalls. */
     rvvm_user_set_host_ctx(run->machine, run->cmdpost);
+
+    /* Default to passthrough (host paths unchanged); the bundle mount below
+     * points the prefix at this run's materialized rootfs when there is one.
+     * The core's build-time default prefix must not leak into a run. */
+    rvvm_user_set_prefix(run->machine, NULL);
 
     /* The bundle, when this build has one: the guest gets the archive's `/`, the
      * system layer and every app it declares (all provisioned once and kept, the

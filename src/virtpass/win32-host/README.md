@@ -126,18 +126,15 @@ WSL user expects:
 .\release.windows.x86_64\rvvm_ash_x86_64.exe --list             # cores this tree knows
 .\release.windows.x86_64\rvvm_ash_x86_64.exe --shutdown         # ask the core to stop
 .\release.windows.x86_64\rvvm_ash_x86_64.exe --serve --idle 300 # stop after 5 min idle
-.\release.windows.x86_64\rvvm_ash_x86_64.exe --direct           # boot the shell here (old)
 ```
 
-`--port N` / `RVVM_ASH_PORT` pick the port (default 7900). `RVVM_ASH_SHELL`
-overrides the shell - for `--direct` the guest to boot, for `--serve` the core
-program (default `/sbin/vpsessiond`, a *guest* path installed from the bundle's
-system layer - see below). A core registers under
+`--port N` / `RVVM_ASH_PORT` pick the port (default 7900). The core program is
+fixed: `/sbin/vpsessiond`, a *guest* path installed from the bundle's system
+layer - there is no shell override. A core registers under
 `runtime/cores/` and holds a rootfs lock, so `--list`/`--shutdown` find it and a
-second core cannot take the same writable layer. `--direct` also answers the
-regression tools (`RVVM_ASH_SHELL=guest-assets\test_*.exe`).
+second core cannot take the same writable layer.
 
-A client (and `--direct`) puts the console in raw mode - no echo, no line
+A client puts the console in raw mode - no echo, no line
 assembly, `^C` handed to the guest as a byte so *its* line discipline decides (a
 shell gets SIGINT, `vi` a literal `^Z`) - sends the window size as a frame, and
 turns a resize into `SIGWINCH`. The console is restored on the way out.
@@ -175,14 +172,12 @@ foreach ($s in 'sigint','sigtstp','fg-resume','fg-again','bg','killpg','killpg-c
 
 # And the corners a shell cannot be asked about (WCONTINUED, the controlling
 # terminal, and the pty line discipline / resize a session server drives) are a
-# guest sample:
-$env:RVVM_ASH_SHELL='guest-assets\test_jobctl.exe'
-.\release.windows.x86_64\rvvm_ash_x86_64.exe            # 49 checks, PASS
+# guest sample, booted as an app package on the console:
+.\release.windows.x86_64\rvvm_winhost_x86_64.exe --app test_jobctl   # 49 checks, PASS
 
 # A shell's redirect has to survive fork(): open -> dup2 -> close -> fork, and
 # the child (or an execve()d cat) must get a readable descriptor:
-$env:RVVM_ASH_SHELL='guest-assets\test_forkfd.exe'
-.\release.windows.x86_64\rvvm_ash_x86_64.exe            # 17 checks, PASS
+.\release.windows.x86_64\rvvm_winhost_x86_64.exe --app test_forkfd   # 17 checks, PASS
 ```
 
 Known gaps (see `handover.md` §6): `jobs` still shows `Stopped` after a
@@ -259,52 +254,51 @@ Build the guests first (`mingw32-make guest-assets`, zig/musl - see
 A release carries no loose ELF at all: `mingw32-make dist` puts the host binary
 next to `bundle/{rootfs,system,apps}.tar.gz`, and the host installs all three
 into its `runtime/rootfs` (once, persistently): the base `/`, the system
-programs (`/sbin/vpsessiond`), and every app under `/data/app/<id>`. A run then
-boots one of those paths (`--guest /data/app/<id>/<entry>`, or the default
-`/sbin/vpsessiond`). The layers are flattened at install time - see
-`src/virtpass/README.md`.
+programs (`/sbin/vpsessiond`), and every app under `/data/app/<id>`. The apps
+archive is a tar of **`.vapp` packages** - `apps.tar.gz` -> `apps/<id>.vapp`,
+each a zip with its own `meta.json` manifest (`vp_app.h`); the tar is the
+bundle's delivery container, the zip is the app package (both formats nest). The
+layers are flattened/installed at provision time - see `src/virtpass/README.md`.
 
 ```powershell
-# one specific guest
-.\release.windows.x86_64\rvvm_winhost_x86_64.exe --guest `
-    release.windows.x86_64\guest-assets\test_render.exe
+# the controlled way: an app package, by id - its entry and args come from the
+# package's manifest, never from the command line. Extra args are appended.
+.\release.windows.x86_64\rvvm_winhost_x86_64.exe --app test_fibonacci
+.\release.windows.x86_64\rvvm_winhost_x86_64.exe --app test_cli asset fonts/JetBrainsMono-OFL.txt
 
-# the picker
+# the picker (lists the bundle's apps; Run boots one the same way)
 .\release.windows.x86_64\rvvm_winhost_x86_64.exe --launcher
 
 .\release.windows.x86_64\rvvm_winhost_x86_64.exe --help   # options + environment
 ```
 
-The target is named with `--launcher` / `--guest`, and options come before it -
-so a guest argument can never be read as a host option. The older implicit forms
-are equivalent: a first non-option argument means `--guest`, none at all means
-`--launcher`, and a directory does too (it becomes the picker's guest folder).
+A guest is only ever an app package (`--app`); there is no loose-ELF argument, so
+a run cannot be pointed at an arbitrary program. `--launcher` shows the picker.
 
 ### Scripted runs (non-interactive)
 
 The host is a **console application**: its stdout carries the guest's console
 output and its stdin is pumped into the guest's console (see "Interactive
-console"), so a run can be driven through either the guest's argv or its
+console"), so a run can be driven through either the app's extra argv or its
 console. The host exits with the **guest's** exit code, so a check needs nothing
 more than to wait on the process:
 
 ```powershell
 $p = Start-Process -FilePath .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
-     -ArgumentList 'release.windows.x86_64\guest-assets\test_cli.exe',
-                   'asset','fonts/JetBrainsMono-OFL.txt' `
+     -ArgumentList '--app','test_cli','asset','fonts/JetBrainsMono-OFL.txt' `
      -NoNewWindow -PassThru -RedirectStandardOutput guest.log
 $p | Wait-Process -Timeout 45
 $p.ExitCode        # the guest's own code
 ```
 
 A guest that reads its console can be scripted the same way through stdin - the
-same guest, driven by its line protocol instead of its argv:
+same app, driven by its line protocol instead of its argv:
 
 ```powershell
 $in = Join-Path $PWD t_in.txt
 [IO.File]::WriteAllText($in, "ls /`ncalc 6 * 7`nexit`n", [Text.Encoding]::ASCII)
 $p = Start-Process -FilePath .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
-     -ArgumentList '--guest','release.windows.x86_64\guest-assets\test_cli.exe' `
+     -ArgumentList '--app','test_cli' `
      -NoNewWindow -PassThru -RedirectStandardInput $in -RedirectStandardOutput guest.log
 $p | Wait-Process -Timeout 45
 $p.ExitCode        # 0: every command in the script succeeded
@@ -313,8 +307,7 @@ $p.ExitCode        # 0: every command in the script succeeded
 Or straight through a shell pipe:
 
 ```powershell
-"calc 6 + 7`nexit`n" | .\release.windows.x86_64\rvvm_winhost_x86_64.exe `
-    --guest release.windows.x86_64\guest-assets\test_cli.exe
+"calc 6 + 7`nexit`n" | .\release.windows.x86_64\rvvm_winhost_x86_64.exe --app test_cli
 ```
 
 Guest output arrives on the host's stdout unprefixed and as it is written; the
@@ -544,16 +537,13 @@ Debug switches:
    moves it, never the host process's cwd - and is then mapped through the
    prefix; an absolute path is mapped directly. That mapping is a string join, so
    whether a path resolves at all depends on the prefix directory really
-   existing: by default that is the build-time
-   `/home/lekkit/stuff/userland/debian`, and `RVVM_USER_PREFIX` (read by
-   `rvvm_user`, applied via `rvvm_user_set_prefix()` by the WinHost) is what
-   points it at a real rootfs. `/dev`, `/sys`, `/proc`, `/tmp` and `/var/tmp`
+   existing: the WinHost points it at the run's materialized rootfs with
+   `rvvm_user_set_prefix()` (from the bundle). There is no environment override;
+   a host with no bundle asks for passthrough by setting the prefix to NULL.
+   `/dev`, `/sys`, `/proc`, `/tmp` and `/var/tmp`
    are deliberate exceptions that pass through unmapped - and `/dev` and
    `/proc` are then answered by the core itself (`userland_dev_*` /
-   `userland_proc_*` in `rvvm_user.c`), since the host has no such tree. An empty environment
-   value cannot express "no prefix" on Win32, because there `putenv("NAME=")`
-   removes the variable and a removed variable means "keep the build-time
-   default".
+   `userland_proc_*` in `rvvm_user.c`), since the host has no such tree.
 
 ## Suggested next steps
 

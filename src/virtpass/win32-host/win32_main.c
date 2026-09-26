@@ -3,25 +3,21 @@
  *
  * Usage:
  *   rvvm_winhost.exe [options] --launcher
- *   rvvm_winhost.exe [options] --guest <guest-elf> [guest args...]
+ *   rvvm_winhost.exe [options] --app <id> [args...]
  *   rvvm_winhost.exe --help     (options + environment, exits)
  *
- * The launch target is named with --launcher / --guest; options come before
- * it, so a guest argument can never be taken for a host option. The implicit
- * forms mean the same thing and still work:
+ * A guest is only ever run as an app *package*: --app names one from the
+ * bundle (apps.tar.gz -> apps/<id>.vapp) and its entry point and arguments come
+ * from the package's own manifest. There is no way to hand the host a loose ELF
+ * path - the bundle and its packages are the only launch surface, which is what
+ * keeps a run from being pointed at an arbitrary program.
  *
- *   rvvm_winhost.exe [options] <guest-elf> [guest args...]  == --guest
- *   rvvm_winhost.exe [options]           (no guest)         == --launcher
- *   rvvm_winhost.exe [options] <dir>     (a directory)      == --launcher
- *
- * --launcher shows an Android-style picker: a dropdown listing the guest
- * programs in the assets directory plus Run / Stop / Exit. --assets points at
- * that directory (default: src\virtpass\android-host\app\src\main\assets,
- * overridable via the RVVM_ASSETS environment variable).
+ * --launcher shows an Android-style picker: a dropdown listing the bundle's
+ * apps plus Run / Stop / Exit.
  *
  * This is a console application: its stdout carries the guest's console output
  * and its stdin is pumped into the guest's console, so a run can be scripted
- * (`printf 'ls /\nexit\n' | rvvm_winhost.exe --guest test_cli.exe`) while the
+ * (`printf 'ls /\nexit\n' | rvvm_winhost.exe --app test_cli`) while the
  * window keyboard remains the interactive path.
  *
  * Two independent display layers:
@@ -43,6 +39,7 @@
 #include <string.h>
 #include <windows.h> /* MAX_PATH for the launcher assets dir */
 #include "win32_cmdpost_bridge.h"
+#include "virtpass/vp_rootfs.h" /* VP_GUEST_APP_DIR, the app guest path */
 #include "utils.h"
 
 /* Layer-2 OS window default (the presentation viewport). */
@@ -101,28 +98,24 @@ static void print_help(const char* prog)
         "\n"
         "Usage:\n"
         "  %s [options] --launcher\n"
-        "  %s [options] --guest <guest-elf> [guest args...]\n"
-        "  %s [options] <guest-elf> [guest args...]  (same as --guest)\n"
-        "  %s [options] <assets-dir>                 (same as --launcher)\n"
+        "  %s [options] --app <id> [args...]\n"
         "\n"
-        "Options (before the target; everything after <guest-elf> is the guest's):\n"
+        "Options:\n"
         "  --display SPEC   Layer-1 virtual panel geometry: \"WxH\", \"@PPI\" or\n"
         "                   \"WxH@PPI\" (default 640x480@160; env RVVM_VIRT_W/H/PPI)\n"
-        "  --assets DIR     Directory the launcher picker lists guests from\n"
-        "                   (default: <exe dir>/guest-assets, where the\n"
-        "                   build puts the guest ELFs)\n"
-        "                   env RVVM_ASSETS)\n"
+        "  --app ID         Boot an app package from the bundle (apps.tar.gz ->\n"
+        "                   apps/<id>.vapp); its entry and args come from the\n"
+        "                   package, not the command line - the only way to run\n"
+        "  --assets DIR     Tree the guest's AAssetManager_* reads (env RVVM_ASSETS)\n"
         "  --help, -h       Show this help and exit\n"
         "\n"
         "Environment:\n"
         "  RVVM_WIN_W, RVVM_WIN_H       Layer-2 OS window size (default 1024x768)\n"
         "  RVVM_VIRT_W, RVVM_VIRT_H     Layer-1 virtual panel size (default 640x480)\n"
         "  RVVM_VIRT_PPI                Virtual panel density, PPI (default 160)\n"
-        "  RVVM_ASSETS                  Launcher guest directory\n"
-        "  RVVM_USER_PREFIX             Directory the guest's absolute paths resolve\n"
-        "                               against (default: host paths pass through\n"
-        "                               unchanged)\n"
+        "  RVVM_ASSETS                  Asset tree for AAssetManager_*\n"
         "  RVVM_VERBOSE=1               Verbose logging (syscall trace)\n"
+        "  RVVM_TRACE                   Trace categories (e.g. job, all)\n"
         "  RVVM_GL_BACKEND              angle (default) | swiftshader | off\n"
         "  RVVM_GL_DLL_DIR              Directory holding libEGL.dll/libGLESv2.dll\n"
         "                               (or <sdk>\\emulator\\lib64\\gles_<name>)\n"
@@ -130,11 +123,11 @@ static void print_help(const char* prog)
         "\n"
         "Console: the guest's output goes to this process's stdout and this\n"
         "process's stdin is fed to the guest's console, so a run can be scripted:\n"
-        "  printf 'ls /\\nexit\\n' | %s --guest test_cli.exe\n"
+        "  printf 'ls /\\nexit\\n' | %s --app test_cli\n"
         "\n"
-        "Exit status: the guest's exit code in direct mode (1 on a host error);\n"
-        "in launcher mode the window stays open across guests.\n",
-        prog, prog, prog, prog, prog);
+        "Exit status: the guest's exit code (1 on a host error); in launcher mode\n"
+        "the window stays open across guests.\n",
+        prog, prog, prog);
 }
 
 int main(int argc, char** argv)
@@ -144,6 +137,8 @@ int main(int argc, char** argv)
     int virt_w = VIRT_DEF_W, virt_h = VIRT_DEF_H, virt_ppi = VIRT_DEF_PPI;
     char assets_dir[MAX_PATH];
     const char* assets_env = getenv("RVVM_ASSETS");
+    const char* app_id = NULL;
+    bool        launcher = false;
 
     /* Verbose RVVM logging (syscall trace); toggle via env RVVM_VERBOSE=1 */
     rvvm_set_loglevel(getenv("RVVM_VERBOSE") ? LOG_INFO : LOG_WARN);
@@ -155,11 +150,8 @@ int main(int argc, char** argv)
     virt_h   = parse_positive(getenv("RVVM_VIRT_H"), virt_h);
     virt_ppi = parse_positive(getenv("RVVM_VIRT_PPI"), virt_ppi);
 
-    /* No assets directory by default. The launcher names one itself: the samples
-     * the build produced sit next to the binary (<exe dir>/guest-assets), which is
-     * the only place a host with a bundle looks for a loose ELF - and the bundle's
-     * own apps (bundle/apps.tar.gz) are what it lists first in any case.
-     * --assets / RVVM_ASSETS override this, as before. */
+    /* The asset tree AAssetManager_* reads (--assets / RVVM_ASSETS). It has
+     * nothing to do with launching: a guest is only ever an app package. */
     snprintf(assets_dir, sizeof(assets_dir), "%s",
              (assets_env && *assets_env) ? assets_env : "");
 
@@ -180,71 +172,83 @@ int main(int argc, char** argv)
             snprintf(assets_dir, sizeof(assets_dir), "%s", argv[i] + 9);
             continue;
         }
+        if (strcmp(argv[i], "--app") == 0 && i + 1 < argc) {
+            app_id = argv[++i];
+            continue;
+        }
+        if (strncmp(argv[i], "--app=", 6) == 0) {
+            app_id = argv[i] + 6;
+            continue;
+        }
+        if (strcmp(argv[i], "--launcher") == 0) {
+            launcher = true;
+            continue;
+        }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            /* Intercepted before the "first non-option" break below, which
-             * would otherwise treat "--help" as the guest ELF path. */
             print_help(argv[0]);
             return 0;
         }
-        break; /* first non-option argument: the launch target */
+        break; /* first non-option: the app's extra arguments (only with --app) */
     }
 
-    /* Explicit launch target. The options above are parsed before it, so a
-     * guest argument can never be read as a host option - which is what makes
-     * `--guest <elf> --anything` safe: from <elf> on, everything is the
-     * guest's, verbatim. */
-    if (i < argc && strcmp(argv[i], "--launcher") == 0) {
-        i++;
-        if (i < argc) {
-            fprintf(stderr, "winhost: --launcher takes no arguments (got '%s')\n", argv[i]);
-            return 2;
-        }
-        /* i == argc: the picker path below */
-    } else if (i < argc && strcmp(argv[i], "--guest") == 0) {
-        i++;
-        if (i >= argc) {
-            fprintf(stderr, "winhost: --guest needs a guest ELF\n");
-            fprintf(stderr, "run '%s --help' for usage\n", argv[0]);
-            return 2;
-        }
-        /* argv[i..] is the guest ELF and its arguments; leave i on it. */
+    /* A guest only ever comes from a package. A bare path is refused, so a run
+     * cannot be pointed at an arbitrary program. */
+    if (!app_id && i < argc) {
+        fprintf(stderr, "winhost: unexpected argument '%s' (a guest is named with --app)\n",
+                argv[i]);
+        fprintf(stderr, "run '%s --help' for usage\n", argv[0]);
+        return 2;
+    }
+    if (launcher && app_id) {
+        fprintf(stderr, "winhost: --launcher and --app are exclusive\n");
+        return 2;
     }
 
-    /* A directory is not a guest ELF. Handing over the assets folder is an easy
-     * mistake to make (it is exactly what the Android host gets passed): rvopen()
-     * cannot open a directory, so the guest fails to load, exits with -1 at once
-     * and drags the window down with it. Treat it as the picker's guest folder
-     * instead of killing the session. */
-    if (i < argc) {
-        DWORD attr = GetFileAttributesA(argv[i]);
-        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-            snprintf(assets_dir, sizeof(assets_dir), "%s", argv[i]);
-            printf("'%s' is a directory, not a guest ELF - showing the launcher picker\n",
-                   argv[i]);
-            i = argc; /* no guest: launcher mode, see below */
-        }
-    }
-
-    if (!win32_host_init("RVVM WinHost", win_w, win_h, virt_w, virt_h, virt_ppi,
-                         i >= argc)) {
+    if (!win32_host_init("RVVM WinHost", win_w, win_h, virt_w, virt_h, virt_ppi, !app_id)) {
         fprintf(stderr, "Failed to initialize the Win32 host\n");
         return 1;
     }
 
-    /* The picker's guest directory doubles as the guest's asset tree: with no
-     * APK on this host, AAssetManager_* reads files from under it. Set before
-     * either launch path, so both see the same tree. */
+    /* The asset tree the guest's AAssetManager_* reads. Set before either launch
+     * path, so both see the same tree. */
     win32_host_set_assets_dir(assets_dir);
 
-    if (i >= argc) {
-        /* No guest given: show the Android-style picker instead of running a
-         * specific guest. The launcher manages guest launches (Run/Stop) and
+    if (app_id) {
+        /* The controlled launch: the id names a package, and everything about
+         * the run - entry point, default args - comes from its manifest. Extra
+         * command-line arguments are appended after the package's own. */
+        vp_app_t app;
+        char     entry[VP_APP_ID_MAX + VP_APP_ENTRY_MAX + 16];
+        char*    guest[8];
+        int      n = 0;
+
+        if (!win32_host_app_manifest(app_id, &app)) {
+            fprintf(stderr, "winhost: no app package '%s' in the bundle\n", app_id);
+            win32_host_shutdown();
+            return 1;
+        }
+        if (snprintf(entry, sizeof(entry), "%s/%s/%s", VP_GUEST_APP_DIR, app.id, app.entry) >=
+            (int)sizeof(entry)) {
+            fprintf(stderr, "winhost: app '%s' has an unusable entry\n", app_id);
+            win32_host_shutdown();
+            return 1;
+        }
+        guest[n++] = entry;
+        if (app.args[0]) {
+            guest[n++] = app.args;
+        }
+        for (; i < argc && n < (int)(sizeof(guest) / sizeof(guest[0])) - 1; i++) {
+            guest[n++] = argv[i];
+        }
+        if (!win32_host_start_guest(n, guest)) {
+            fprintf(stderr, "Failed to launch the app '%s'\n", app_id);
+            win32_host_shutdown();
+            return 1;
+        }
+    } else {
+        /* No app: the Android-style picker. It manages launches (Run/Stop) and
          * keeps the window open across them. */
         win32_host_set_launcher(assets_dir);
-    } else if (!win32_host_start_guest(argc - i, &argv[i])) {
-        fprintf(stderr, "Failed to launch the guest\n");
-        win32_host_shutdown();
-        return 1;
     }
 
     rc = win32_host_message_loop();

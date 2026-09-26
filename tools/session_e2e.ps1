@@ -4,7 +4,7 @@
     Session-server end-to-end driver: one guest daemon, several clients.
 
 .DESCRIPTION
-    Runs vpsessiond as the run root (RVVM_ASH_SHELL=/sbin/vpsessiond),
+    Runs vpsessiond as the run root (the bundle's default /sbin/vpsessiond),
     so the machine is a *core* that stays up instead of a one-shot shell, and
     drives it with real TCP clients. This is the shape the WSL-style split needs:
     the core holds the state, each client gets its own session.
@@ -172,12 +172,12 @@ function Close-Client($c) {
 # --- the core: vpsessiond as the run root -------------------------------
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $exe
+$psi.Arguments = "--serve --port $Port"
 $psi.WorkingDirectory = [IO.Path]::GetDirectoryName($exe)
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
-$psi.EnvironmentVariables['RVVM_ASH_SHELL'] = '/sbin/vpsessiond'
 
 $p = [System.Diagnostics.Process]::Start($psi)
 $outTask = $p.StandardOutput.ReadToEndAsync()

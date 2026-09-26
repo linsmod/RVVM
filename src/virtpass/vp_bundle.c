@@ -224,7 +224,6 @@ static void bundle_stamp_write(const char* dest, const char* stamp, const char* 
 static vp_rootfs_t* g_mounted = NULL;
 
 static void bundle_remove_tree(const char* path);
-static void bundle_mkdir_p(const char* path);
 static bool bundle_provision_apps(const char* apps_tar_gz, const char* dest,
                                   size_t* installed, const char** error);
 
@@ -364,9 +363,9 @@ bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz,
         return false;
     }
 
-    /* The apps: every app the archive declares, installed once and persistently
-     * under /data/app (the system image holds its apps). Rebuilt only when the
-     * archive changes, so an app it dropped does not linger. */
+    /* The apps: every `<id>.vapp` package in the directory, installed once and
+     * persistently under /data/app (the system image holds its apps). Rebuilt
+     * only when the packages change, so one the bundle dropped does not linger. */
     if (!bundle_provision_apps(apps_tar_gz, dest, stats ? &stats->apps : NULL, error)) {
         return false;
     }
@@ -402,23 +401,6 @@ static void bundle_remove_tree(const char* path)
     bundle_rmdir(path);
 }
 
-static void bundle_mkdir_p(const char* path)
-{
-    char work[BUNDLE_PATH_MAX];
-    char* at;
-
-    snprintf(work, sizeof(work), "%s", path);
-    for (at = work + 1; *at; ++at) {
-        if (*at == '\\' || *at == '/') {
-            char saved = *at;
-            *at = 0;
-            bundle_mkdir(work);
-            *at = saved;
-        }
-    }
-    bundle_mkdir(work);
-}
-
 bool vp_bundle_app_id_from_guest_path(const char* guest_path, char* out, size_t size)
 {
     static const char prefix[] = "data/app/";
@@ -452,21 +434,71 @@ bool vp_bundle_app_id_from_guest_path(const char* guest_path, char* out, size_t 
     return strcmp(out, ".") != 0 && strcmp(out, "..") != 0;
 }
 
-/* Install every app @apps_tar_gz declares into <dest>/data/app/<id>, and create
- * each app's writable state <dest>/data/data/<id>. A run boots one of them; the
- * rest stay installed, the way a preinstalled image holds its apps - nothing is
- * emptied between runs. The archive's set is authoritative, so when it changes
- * the whole tree is rebuilt: an app it dropped does not linger. Stamped against
- * the archive, so an unchanged apps.tar.gz is a no-op. A NULL/empty archive is a
- * host without apps, which is not an error. */
+/* ---- the apps archive: `apps/<id>.vapp` members ----------------------- */
+
+/* A member of the apps archive that is an app package: "/apps/<id>.vapp".
+ * Fills @id (one path component) and returns true. */
+static bool bundle_vapp_member(const char* path, char* id, size_t id_size)
+{
+    static const char prefix[] = "/" VP_APPS_MEMBER_DIR "/";
+    size_t plen = sizeof(prefix) - 1;
+    size_t len = strlen(path);
+    size_t ext = strlen(VP_VAPP_EXT);
+    size_t id_len;
+
+    if (strncmp(path, prefix, plen) != 0 || len <= plen + ext) {
+        return false;
+    }
+    if (strcmp(path + len - ext, VP_VAPP_EXT) != 0) {
+        return false;
+    }
+    id_len = len - plen - ext;
+    if (!id_len || id_len >= id_size || memchr(path + plen, '/', id_len)) {
+        return false;
+    }
+    memcpy(id, path + plen, id_len);
+    id[id_len] = 0;
+    return true;
+}
+
+/* Read one `.vapp` member's bytes: a malloc'd buffer (caller frees) and its
+ * size, or NULL. The archive's bytes must still be held (before release_data). */
+static char* bundle_read_member(const vp_rootfs_t* apps, uint32_t idx, size_t* out_size)
+{
+    const vp_shadow_entry_t* entry = vp_shadow_entry(vp_rootfs_shadow(apps), idx);
+    char* buf;
+
+    if (!entry || entry->kind != VP_SHADOW_FILE || entry->hidden || !entry->size) {
+        return NULL;
+    }
+    buf = malloc((size_t)entry->size);
+    if (!buf) {
+        return NULL;
+    }
+    if (vp_rootfs_read_entry(apps, idx, buf, (size_t)entry->size) == (size_t)-1) {
+        free(buf);
+        return NULL;
+    }
+    *out_size = (size_t)entry->size;
+    return buf;
+}
+
+/* Install every `.vapp` the apps archive holds into <dest>/data/app/<id>. This
+ * is the *pre-deployment* form (apps.tar.gz -> apps/<id>.vapp); a later
+ * `pm install <id>.vapp` reaches the same vp_app_install() primitive with a
+ * loose file. A run boots one of the apps; the rest stay installed, the way a
+ * preinstalled image holds its apps - nothing is emptied between runs. The
+ * archive is authoritative, so when it changes /data/app is rebuilt (an app it
+ * dropped does not linger). A NULL/empty archive is a host without apps, which
+ * is not an error. */
 static bool bundle_provision_apps(const char* apps_tar_gz, const char* dest,
                                   size_t* installed, const char** error)
 {
-    const char* local_error = NULL;
-    vp_app_t* list = NULL;
+    const char*  local_error = NULL;
+    char         app_tree[BUNDLE_PATH_MAX];
     vp_rootfs_t* apps;
-    char app_tree[BUNDLE_PATH_MAX];
-    size_t found, n, i;
+    size_t       count, i, n = 0;
+    bool         ok = true;
 
     if (!error) {
         error = &local_error;
@@ -486,59 +518,50 @@ static bool bundle_provision_apps(const char* apps_tar_gz, const char* dest,
     if (!apps) {
         return false;
     }
-    /* The archive is authoritative: drop what a previous archive installed so a
-     * removed app is really gone. */
+
+    /* The archive is authoritative: drop what a previous archive installed, so a
+     * removed app is really gone (its packages.list entry too). */
     if (bundle_join(app_tree, sizeof(app_tree), dest, "data/app")) {
         bundle_remove_tree(app_tree);
     }
-
-    /* Heap, not the stack: tens of kilobytes, and this is a once-per-archive
-     * install, not a hot path. */
-    list = calloc(VP_BUNDLE_APPS_MAX, sizeof(*list));
-    if (!list) {
-        *error = "out of memory";
-        vp_rootfs_close(apps);
-        return false;
-    }
-    found = vp_rootfs_apps(apps, list, VP_BUNDLE_APPS_MAX);
-    n = (found < (size_t)VP_BUNDLE_APPS_MAX) ? found : (size_t)VP_BUNDLE_APPS_MAX;
-
-    for (i = 0; i < n; i++) {
-        char app_dir[BUNDLE_PATH_MAX];
-        char data_dir[BUNDLE_PATH_MAX];
-        size_t written;
-
-        if (!bundle_join(app_dir, sizeof(app_dir), app_tree, list[i].id)) {
-            *error = "the app id is too long for the host destination";
-            free(list);
-            vp_rootfs_close(apps);
-            return false;
+    {
+        char list_path[BUNDLE_PATH_MAX];
+        if (bundle_join(list_path, sizeof(list_path), dest, "data/system/packages.list")) {
+            remove(list_path);
         }
-        written = vp_rootfs_install_app(apps, list[i].id, app_dir, error);
-        if (!written) {
-            free(list);
-            vp_rootfs_close(apps);
-            return false;
-        }
-        /* The app's private, writable state - kept across reinstalls, the way
-         * Android keeps /data/data through an update. */
-        if (snprintf(data_dir, sizeof(data_dir), "%s/data/data/%s", dest, list[i].id) >=
-            (int)sizeof(data_dir)) {
-            *error = "the app id is too long for the host destination";
-            free(list);
-            vp_rootfs_close(apps);
-            return false;
-        }
-        bundle_mkdir_p(data_dir);
     }
 
-    free(list);
+    count = vp_rootfs_count(apps);
+    for (i = 0; i < count && ok; i++) {
+        const vp_shadow_entry_t* entry = vp_shadow_entry(vp_rootfs_shadow(apps), i);
+        char   id[VP_APP_ID_MAX];
+        char*  bytes;
+        size_t size = 0;
+
+        if (!entry || !bundle_vapp_member(entry->path, id, sizeof(id))) {
+            continue;
+        }
+        bytes = bundle_read_member(apps, (uint32_t)i, &size);
+        if (!bytes) {
+            *error = "an app package could not be read from the archive";
+            ok = false;
+            break;
+        }
+        ok = vp_app_install_memory(bytes, size, dest, error);
+        free(bytes);
+        if (ok) {
+            n++;
+        }
+    }
+
     vp_rootfs_close(apps);
-    bundle_stamp_write(dest, "apps", apps_tar_gz);
-    if (installed) {
-        *installed = n;
+    if (ok) {
+        bundle_stamp_write(dest, "apps", apps_tar_gz);
+        if (installed) {
+            *installed = n;
+        }
     }
-    return true;
+    return ok;
 }
 
 bool vp_bundle_app_assets_path(const char* dest, const char* app_id, char* out, size_t size)
@@ -563,33 +586,83 @@ bool vp_bundle_app_assets_path(const char* dest, const char* app_id, char* out, 
 
 size_t vp_bundle_list_apps(const char* apps_tar_gz, vp_bundle_app_t* out, size_t max)
 {
-    const char* error = NULL;
+    const char*  error = NULL;
     vp_rootfs_t* apps;
-    /* Heap, not the stack: VP_BUNDLE_APPS_MAX entries is tens of kilobytes, and
-     * this is a picker-time read, not a hot path. */
-    vp_app_t* list = calloc(VP_BUNDLE_APPS_MAX, sizeof(*list));
-    size_t found, n, i;
+    size_t       found = 0, count, i;
 
-    if (!apps_tar_gz || !out || !max || !list) {
-        free(list);
+    if (!apps_tar_gz || !out || !max) {
         return 0;
     }
     apps = vp_rootfs_open(apps_tar_gz, &error);
     if (!apps) {
-        free(list);
-        return 0; // no bundle is not an error: a host may run without one
+        return 0;   /* no bundle is not an error: a host may run without one */
     }
-    found = vp_rootfs_apps(apps, list, VP_BUNDLE_APPS_MAX);
-    n = (found < (size_t)VP_BUNDLE_APPS_MAX) ? found : (size_t)VP_BUNDLE_APPS_MAX;
-    for (i = 0; i < n && i < max; i++) {
-        snprintf(out[i].id, sizeof(out[i].id), "%s", list[i].id);
-        snprintf(out[i].guest_path, sizeof(out[i].guest_path), "%s/%s/%s",
-                 VP_GUEST_APP_DIR, list[i].id, list[i].entry);
-        snprintf(out[i].args, sizeof(out[i].args), "%s", list[i].args);
+    count = vp_rootfs_count(apps);
+    for (i = 0; i < count; i++) {
+        const vp_shadow_entry_t* entry = vp_shadow_entry(vp_rootfs_shadow(apps), i);
+        char     id[VP_APP_ID_MAX];
+        char*    bytes;
+        size_t   size = 0;
+        vp_app_t app;
+
+        if (!entry || !bundle_vapp_member(entry->path, id, sizeof(id))) {
+            continue;
+        }
+        bytes = bundle_read_member(apps, (uint32_t)i, &size);
+        if (!bytes) {
+            continue;
+        }
+        if (vp_app_read_memory(bytes, size, &app, &error)) {
+            if (found < max) {
+                snprintf(out[found].id, sizeof(out[found].id), "%s", app.id);
+                snprintf(out[found].guest_path, sizeof(out[found].guest_path), "%s/%s/%s",
+                         VP_GUEST_APP_DIR, app.id, app.entry);
+                snprintf(out[found].args, sizeof(out[found].args), "%s", app.args);
+            }
+            found++;
+        }
+        free(bytes);
     }
     vp_rootfs_close(apps);
-    free(list);
-    return n;
+    return found;
+}
+
+bool vp_bundle_read_app(const char* apps_tar_gz, const char* id, vp_app_t* out)
+{
+    const char*  error = NULL;
+    vp_rootfs_t* apps;
+    char         path[BUNDLE_PATH_MAX];
+    char*        bytes;
+    size_t       size = 0;
+    uint32_t     idx;
+    bool         ok;
+
+    if (!apps_tar_gz || !id || !*id || !out) {
+        return false;
+    }
+    apps = vp_rootfs_open(apps_tar_gz, &error);
+    if (!apps) {
+        return false;
+    }
+    if (snprintf(path, sizeof(path), "/%s/%s%s", VP_APPS_MEMBER_DIR, id, VP_VAPP_EXT) >=
+        (int)sizeof(path)) {
+        vp_rootfs_close(apps);
+        return false;
+    }
+    idx = vp_shadow_index(vp_rootfs_shadow(apps), path);
+    if (idx == VP_SHADOW_NONE) {
+        vp_rootfs_close(apps);
+        return false;
+    }
+    bytes = bundle_read_member(apps, idx, &size);
+    if (!bytes) {
+        vp_rootfs_close(apps);
+        return false;
+    }
+    ok = vp_app_read_memory(bytes, size, out, &error);
+    free(bytes);
+    vp_rootfs_close(apps);
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
