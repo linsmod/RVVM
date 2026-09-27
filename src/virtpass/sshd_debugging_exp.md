@@ -14,10 +14,16 @@
 | 模拟器稳定性（HOST FAULT / 挂死） | ✅ 已修复，HOST FAULT 归零，e2e 不再挂死 |
 | 回归（`procfs_e2e` / `ash_e2e`） | ✅ 22/22、7/7 通过 |
 | sshd 启动 / 守护化 | ✅ 通过 |
+| sshd 启动前的客户端连接 I/O | ❌ 对客户端连接的 `sent`/`recv` 统计为 **0**，banner 从未互换（§6.3.1） |
+| privsep monitor 通道 | ✅ socketpair 上双向一字节不差走通 |
 | SSH 握手（pubkey 会话） | ❌ 仍失败：`kex_exchange_identification: Connection reset by peer` |
 
-已修复 6 个模拟器缺陷（见 §5），其中 3 个是"任意程序都可能踩到"的通用 bug：
+已修复 7 个模拟器缺陷（见 §5、§5A），其中 3 个是"任意程序都可能踩到"的通用 bug：
 writev 零长度 iovec、地址空间 UAF、win32 带超时 futex 等待可能永久阻塞。
+
+**当前阻塞点**：sshd 在 fork 之前、在父进程里，对刚 accept 的客户端连接不做任何
+I/O —— 既不写自己的 banner，也不读客户端的（§6.3.1）。monitor 那条 socketpair
+反倒完全正常，所以问题不在 privsep，而在 banner 互换之前那一步。
 
 ---
 
@@ -43,6 +49,9 @@ rvvm_ash_x86_64.exe --port 7897 -c 'echo hello'
 
 - __trace 走 core 的 stderr__（每个进程自己的 stderr，不是 stdout）。`TRACE:` 行带 `[pid:tid]` （本次新增，见 §4.1），`INFO:` 行不带 pid。
 - `RVVM_TRACE` 分类：`pty` / `job` / `fd` / `wsock` / `sys` / `signal` / `tty` / `dev` / `mmap`； `all` 全开，`-name` 关掉某个。
+- __收发 trace 里的 socket 指针不是身份__：释放后地址立刻被复用，跨行甚至跨轮次
+  都会撞上另一个 socket。**只有 peer（`sent 3605 byte(s) on fd 6 (peer 127.0.0.1:49526)`）
+  是查询出来的真值** —— 认连接一律认 peer，见 §6.3.1 的教训。
 - __sshd 的日志甩进 guest 文件，而不是靠 pty 转发__（见 §1.3）。这条是 daemonize 路径下唯一
   能拿到日志的办法，且不依赖会话存活。
 - __抓栈__（最有价值的一步）：
@@ -267,16 +276,11 @@ socket 锚点是 `_open("NUL")`，宿主 stat 会给出字符设备。已加分�
 
 - 影响：任何按 pid 索引的结构都会认错人 —— `wait4(pid)` 可能等到别人的孩子、
   `kill(pid)` / 信号投递找错记录、进程组/会话搜索（`tty_fg_pgid` 那套）跨子树失配、
-  `/proc` 枚举出现重名。**sshd 的 privsep monitor 正是重度依赖 pid 语义**：
-  它 fork 出的子进程与客户端的子进程在号段上重叠，是当前握手失败的
-  高优先级嫌疑点（客户端这次报的是 `banner exchange: invalid format`，
-  与 §6.1 的 `Connection reset` 不同，疑似同一根因的不同表现）。
+  `/proc` 枚举出现重名。
 
-- 修复方向：把 id 分配器提到**全 run 共享**（挂在一处所有地址空间都能到达的结构上，
-  例如 run root 的 `procs` 注册表 + 一把独立的锁），并让
-  `userland_task_id_alloc()` 拒绝分配**当前仍被任何存活记录占用**的号
-  （扫一遍 `procs` 即可，进程数是 guest 级的，量很小）。
-  `userland_child_create()` 里那句 `next_task_id = pid + 1` 相应去掉。
+- **已修复**（commit `851622d`）：改成全 run 共享的、带引用计数的单调计数器。
+  fork 序列恢复严格单调，无碰撞。**但它不是握手失败的原因** —— 回到未改动的源码
+  重建后，e2e 仍是同样 3 个 FAIL。
 
 ---
 
@@ -304,6 +308,8 @@ Connection from 127.0.0.1 port 51888 with IP opts:  80 00 00 00
 
 ### 6.3 模拟器 trace（按 pid 归因）
 
+⚠️ **下面这段旧记录是错的**，原因见 §6.3.1。保留原文只为对照。
+
 ```javascript
 # sshd 侧
 [103:103] accept -> guest fd 8
@@ -324,9 +330,51 @@ __即：__
 - 子进程完成 monitor 握手&#x540E;__&#x4ECE;未向客户端连接写过一个字&#x8282;__&#x5C31;退出了；
 - 监视进程随之退出 → 连接最后一个描述符关闭 → Windows 回 RST → 客户端看到 `Connection reset`。
 
-### 6.4 下一步
+### 6.3.1 更正：privsep 的 monitor 通道**完全正常**，错的是客户端连接
 
-以 `RVVM_TRACE=fd,job,wsock,sys` + `RVVM_VERBOSE=1` 跑同一场景， __按子进程 pid 提取它在 monitor 握手之后、退出之前的最后几条 syscall__——失败点就在那几行里。 候选：monitor 协议首包 `mm_request_receive` 的收发语义、紧随其后的某个 stat/检查 （`S_ISSOCK` 已修但不是它），或某个被我们映射成 0 成功/失败的系统调用。
+`win_socket.c` 的收发 trace 现在会带上 peer（commit `c14043f`）。带上 peer 重跑，
+结论和上面**相反**：
+
+```javascript
+# 客户端临时端口 49525；socketpair：server 端 49526，client 端 49527
+[105:105]: sent 22 byte(s) on fd 7 (peer 127.0.0.1:2240)      ← 客户端发出自己的 banner
+[103:103]: fork: parent=103 child=106                          ← privsep 子进程
+[106:106]: sent 3605 byte(s) on fd 6 (peer 127.0.0.1:49526)    ← 子进程写 monitorsock[0]（local 49527）
+[106:106]: sent 2252 byte(s) on fd 6 (peer 127.0.0.1:49526)
+[103:103]: recv 4 byte(s) on fd 8 (peer 127.0.0.1:49527)       ← 监视进程从 monitorsock[1] 读
+[103:103]: recv 3601 byte(s) on fd 8 (peer 127.0.0.1:49527)
+[103:103]: recv 4 byte(s) on fd 8 (peer 127.0.0.1:49527)
+[103:103]: recv 2248 byte(s) on fd 8 (peer 127.0.0.1:49527)
+[105:105]: recv err 10054 on fd 7 errno=108                     ← 客户端只拿到 RST
+```
+
+- **旧结论错在哪**：`fd_wr[inherit_dup]` / `close anchor` 那些行里的 **socket 指针不可信** ——
+  socket 释放后地址立刻被复用（`close anchor 8 (socket 0x1e4)` 紧跟着
+  `fd 8 <- socket 0x1e4` 就是同一个地址换了对象）。**只有 `close: peer=` 是查询出来的、
+  跨 fork 依然成立的真值**。我按指针跨轮次对照 peer，推出了"写到 monitor 去了"这个
+  假象。教训同 §3 坑 #2：**不要拿可复用的地址当身份**。
+- `accept -> anchor 8` 也被误读了：那是 `win_socket_pair()` **内部**的 accept
+  （它自己 listen/connect/accept 一条回环 TCP），不是 sshd 收客户端连接那次。
+- **真正的现象**：整轮 trace 里，对客户端连接（peer 49525）的
+  `sent`/`recv` 统计是 **0**。既没人写出 banner，也没人读客户端发来的 banner。
+  而 monitor 那条 socketpair 上的 privsep 握手**一字节不差地双向走通**
+  （4+3601 与 4+2248 长度前缀消息，配对精确）。
+- 所以阻塞点要重述为：__**sshd 从不对客户端连接做任何 I/O**__。
+  按 OpenSSH 的流程，`sshd_exchange_identification()`（banner 互换）发生在
+  **fork 之前、在父进程里**，父进程此时还没进 privsep。它写完 banner、
+  读完客户端的 banner，才 fork。现象正好是"父进程手里那条客户端连接是死的"。
+
+### 6.4 下一步（已按 §6.3.1 更新）
+
+要查的是：**父进程（monitor，pid 103）在 fork 之前，对客户端连接那个 guest fd
+做的读写去了哪里**。具体：
+
+1. sshd accept 客户端连接后，guest fd 是几？（注意别把 `win_socket_pair()` 内部的
+   accept 认成它 —— 看 peer 是不是 socketpair 那两个端口）
+2. 那个 fd 上第一次 `read`/`write` 是哪一条 syscall、返回什么？
+   父进程此刻还没 fork，**没有 `inherit_dup` 的干扰**，是整个问题里最干净的一段。
+3. 候选：`dup2`/`dup3` 把客户端 socket 挪到 0/1/2 的那几条
+   （trace 里能看到 `sys_dup3(N, 0, 0)`），以及 `set_nonblock`。
 
 观测手段见 §1.3：__不要用 `-d -d`__（它让 sshd 不 fork，privsep 路径根本不走），
 要 daemonize + `> /tmp/sshdbg.log 2>&1`，再从 `runtime/rootfs/tmp/sshdbg.log` 读。
