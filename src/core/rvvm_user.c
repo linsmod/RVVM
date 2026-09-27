@@ -11122,6 +11122,24 @@ static void* rvvm_user_thread_wrap(void* arg)
 #endif
                 case 23: { // dup
                     rvvm_info("sys_dup(%ld)", a0);
+                    /* What the slot says, and what the descriptor resolves to,
+                     * are two different questions and dup() acts on the second
+                     * while the trace above reports the first. When they
+                     * disagree the copy reaches the wrong object entirely, and
+                     * the symptom is a program dup()ing a descriptor and getting
+                     * back a pty - so say both, every time. */
+                    {
+                        int      src = (int)a0;
+                        bool     tracked = userland_fd_tracked(uctx(), src);
+                        unsigned backend  = tracked ? (unsigned)uctx()->fds[src].backend : 0xffffffffu;
+                        int      slot_fd  = tracked ? uctx()->fds[src].fd : -1;
+                        RVVM_TRC(RVVM_TRC_FD,
+                                  "dup: fd=%d tracked=%d backend=%u slot_fd=%d "
+                                  "resolved=%d gen=%llu",
+                                  src, (int)tracked, backend, slot_fd,
+                                  userland_fd_host(uctx(), src),
+                                  tracked ? (unsigned long long)uctx()->fds[src].anchor_gen : 0ull);
+                    }
                     /* A descriptor of ours (a console, a pty end) has no host fd to
                      * copy: the copy is another reference to the same object. A
                      * console is the case that matters - its host number is the
@@ -11129,6 +11147,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * a second name for it instead of a second console. */
                     int own = userland_own_fd_dup(uctx(), (int)a0,
                                                   userland_fd_host(uctx(), (int)a0), 0, false);
+                    RVVM_TRC(RVVM_TRC_FD, "dup: own_fd_dup -> %d", own);
                     if (own != -2) {
                         a0 = own >= 0 ? (rvvm_addr_t)own : (rvvm_addr_t)-UAPI_EMFILE;
                         break;
