@@ -9994,11 +9994,24 @@ static void userland_proc_snapshot_walk(rvvm_userland_t* ctx, uint32_t* pids, ui
  * tear, so it should not be this - but it is the one write to the field that is
  * not serialised against this read, and it is the last unexamined edge. */
 static rvvm_process_t* userland_proc_find_family_walk(rvvm_userland_t* ctx, uint32_t pid,
-                                                      rvvm_userland_t** home, int depth)
+                                                      rvvm_userland_t** home, int depth,
+                                                      rvvm_userland_t** path, int path_len)
 {
     if (!ctx || depth > USERLAND_FAMILY_DEPTH_MAX) {
         return NULL;
     }
+    /* Already on this path: the graph has a loop, and nothing below it can hold a
+     * pid that has not been looked for already. Returning here is what makes
+     * acyclicity an optimisation rather than a precondition - the depth cap alone
+     * did not, and 256 frames of a 2KB frame is 512KB of host stack. */
+    for (int k = 0; k < path_len; k++) {
+        if (path[k] == ctx) {
+            return NULL;
+        }
+    }
+    path[path_len] = ctx;
+    path_len++;
+
     rvvm_process_t* found = NULL;
     rvvm_userland_t* kids[RVVM_PROC_PID_MAX];
     uint32_t nkids = 0;
@@ -10011,7 +10024,28 @@ static rvvm_process_t* userland_proc_find_family_walk(rvvm_userland_t* ctx, uint
             if (home) {
                 *home = userland_proc_ctx(ctx, p);
             }
-        } else if (p->child_ctx && nkids < RVVM_PROC_PID_MAX) {
+        } else if (p->child_ctx && p->child_ctx != ctx && nkids < RVVM_PROC_PID_MAX) {
+            /* Not `p->child_ctx != ctx`. Every forked process's record is
+             * registered into the procs vector of the context it forked (see
+             * userland_proc_register(child, record)) *and* names that same
+             * context as its own child_ctx, so the naive graph has a self-loop at
+             * every fork: walking ctx finds the record, collects ctx back out of
+             * it, and recurses into itself.
+             *
+             * Nothing noticed, because the only bound on the walk is depth, and a
+             * self-loop is 256 levels of it - which is what finally did it. Each
+             * frame carries two RVVM_PROC_PID_MAX arrays (2KB here), so 256 of
+             * them is 512KB of host stack, and the core faults in this function's
+             * spin_lock with si_addr 0 in the middle of an sshd session: a guest
+             * doing nothing more than looking up its own /proc entry. A stack
+             * overflow is reported at whatever frame happens to touch memory
+             * first, so the fault lands in the lock, not in the recursion.
+             *
+             * A self-loop cannot hold the pid being looked for - ctx's own procs
+             * were just scanned - so skipping it loses nothing. Longer cycles
+             * would need a record naming a context other than its own, and
+             * child_ctx is written in exactly one place, so the depth cap still
+             * bounds the walk. */
             kids[nkids++] = p->child_ctx;
         }
     }
@@ -10021,7 +10055,7 @@ static rvvm_process_t* userland_proc_find_family_walk(rvvm_userland_t* ctx, uint
         return found;
     }
     for (uint32_t i = 0; i < nkids; i++) {
-        found = userland_proc_find_family_walk(kids[i], pid, home, depth + 1);
+        found = userland_proc_find_family_walk(kids[i], pid, home, depth + 1, path, path_len);
         if (found) {
             return found;
         }
@@ -10032,7 +10066,12 @@ static rvvm_process_t* userland_proc_find_family_walk(rvvm_userland_t* ctx, uint
 static rvvm_process_t* userland_proc_find_family(rvvm_userland_t* ctx, uint32_t pid,
                                                  rvvm_userland_t** home)
 {
-    return userland_proc_find_family_walk(userland_family_root(ctx), pid, home, 0);
+    /* One path array for the whole walk, rather than one per frame: the loop
+     * check is O(depth) and the depth is a guest's choice, but the array itself
+     * is only this one frame's worth. */
+    rvvm_userland_t* path[USERLAND_FAMILY_DEPTH_MAX + 1];
+    return userland_proc_find_family_walk(userland_family_root(ctx), pid, home, 0,
+                                          path, 0);
 }
 
 static uint32_t userland_proc_thread_count(rvvm_userland_t* home)
