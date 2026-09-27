@@ -103,6 +103,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #define LK_IPPROTO_IP     0
 #define LK_IPPROTO_TCP    6
 #define LK_IPPROTO_IPV6   41
+/* Linux netinet/in.h: IP_TOS 1, IP_TTL 2, IP_HDRINCL 3, IP_OPTIONS 4.
+ * WinSock's IP_OPTIONS is 1, so this value must not be forwarded as-is. */
+#define LK_IP_OPTIONS     4
 
 #define LK_MSG_OOB        1
 #define LK_MSG_PEEK       2
@@ -1007,6 +1010,25 @@ int win_socket_getsockopt(int fd, int level, int opt, void* val, int* len)
     if (s == INVALID_SOCKET) {
         errno = ENOTSOCK;
         return -1;
+    }
+    /* IP_OPTIONS is the one option whose *get* has to be synthesised.
+     *
+     * Linux reports the IP options the peer actually put on the connection, and
+     * for a plain TCP peer there are none: the call succeeds and reports a
+     * length of 0. WinSock instead succeeds with a length of 4 and leaves the
+     * caller's buffer untouched, so the guest reads back whatever was on its
+     * stack. Guest sockets here are direct loopback forwards, so no peer can
+     * ever attach options: report the empty answer Linux would.
+     *
+     * This is not cosmetic. OpenSSH's check_ip_options() treats a non-zero
+     * length as a routing-source attack and calls fatal() - so sshd exited 255
+     * on the "Connection from ... with IP opts: 80 00 00 00" line, before
+     * sshd_exchange_identification() ever sent a banner, and the client saw a
+     * bare RST (kex_exchange_identification: Connection reset by peer).
+     */
+    if (level == LK_IPPROTO_IP && opt == LK_IP_OPTIONS) {
+        *len = 0;
+        return 0;
     }
     wopt = lk_sockopt_to_win(level, opt);
     if (wopt < 0) {
