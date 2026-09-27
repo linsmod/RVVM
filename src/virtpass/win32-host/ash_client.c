@@ -39,6 +39,7 @@ The wire protocol is the session server's, not a new one:
 
 #include "win/win_socket.h"
 #include "win32_cmdpost_bridge.h"
+#include "ash_core.h" /* the --serve exit codes this file returns */
 #include "utils.h" /* rvvm_set_loglevel: RVVM_VERBOSE in the core */
 #include "core/rvvm_user.h" /* rvvm_user_set_mode_store: persisted guest modes */
 #include "virtpass/vp_rootfs.h" /* VP_GUEST_SESSIOND: the core's guest path */
@@ -370,16 +371,18 @@ int ash_serve(int port, int idle_s, const char* dlog)
     int         rc;
 
     /* One core per port: the lock is the registry, and it fails before a second
-     * machine is built only to lose the port race inside the guest. */
+     * machine is built only to lose the port race inside the guest. The code says
+     * which refusal this was, because the two want different remedies - another
+     * port, or another core gone. */
     if (ash_core_up(port)) {
         fprintf(stderr, "ash --serve: a core is already up on port %d\n", port);
-        return 1;
+        return ASH_EXIT_PORT_BUSY;
     }
 
     char lock[MAX_PATH];
     if (!ash_rootfs_lock(lock, sizeof(lock))) {
         fprintf(stderr, "ash --serve: this release's rootfs is in use by another core\n");
-        return 1;
+        return ASH_EXIT_ROOTFS_BUSY;
     }
 
     /* The shell is a guest path now (sbin/vpsessiond), resolved inside the run's
@@ -421,7 +424,7 @@ int ash_serve(int port, int idle_s, const char* dlog)
     if (!win32_host_init_console(0, 0, 0)) {
         fprintf(stderr, "ash --serve: could not initialize the host\n");
         ash_rootfs_unlock(lock);
-        return 1;
+        return ASH_EXIT_HOST_INIT;
     }
     /* A core is a daemon: it must not put the terminal it was started from into
      * raw mode or eat its input (the sessions are on the socket, not here). */
@@ -430,17 +433,22 @@ int ash_serve(int port, int idle_s, const char* dlog)
         fprintf(stderr, "ash --serve: could not start %s\n", shell);
         win32_host_shutdown();
         ash_rootfs_unlock(lock);
-        return 1;
+        return ASH_EXIT_NO_GUEST;
     }
 
     ash_core_register(port, shell);
     fprintf(stderr, "ash: core up (shell %s, port %d%s%s) - connect with `ash`\n",
             shell, port, idle_s > 0 ? ", idle " : "", idle_s > 0 ? idle_buf : "");
     rc = win32_host_wait_guest();
+    /* The guest's status is recorded, not returned: the exit code is the core's
+     * own vocabulary (see ash_core.h), and a code that can mean either thing is
+     * a code nobody can branch on. The line goes to the core's stderr beside the
+     * log that explains the run, so nothing is lost by not returning it. */
+    fprintf(stderr, "ash: core stopped (the guest program left with %d)\n", rc);
     ash_core_unregister(port);
     ash_rootfs_unlock(lock);
     win32_host_shutdown();
-    return rc;
+    return rc == 0 ? ASH_EXIT_OK : ASH_EXIT_GUEST_NONZERO;
 }
 
 /* `ash --list`: the cores this release directory has registrations for. */
@@ -454,7 +462,7 @@ int ash_list(void)
 
     if (!ash_runtime_cores_dir(dir, sizeof(dir))) {
         fprintf(stderr, "ash: cannot locate the runtime directory\n");
-        return 1;
+        return ASH_EXIT_USAGE;
     }
     snprintf(pattern, sizeof(pattern), "%s\\*.core", dir);
     h = FindFirstFileA(pattern, &fd);

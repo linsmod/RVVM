@@ -24,14 +24,8 @@ app package (rvvm_winhost --app <id>). Debugging is RVVM_TRACE / RVVM_VERBOSE.
 #include <string.h>
 
 #include "win32_cmdpost_bridge.h"
+#include "ash_core.h" /* the --serve exit codes, and the prototypes below */
 #include "utils.h" /* rvvm_set_loglevel: RVVM_VERBOSE, as the client path uses */
-
-/* Implemented in ash_client.c */
-int ash_serve(int port, int idle_s, const char* dlog);
-int ash_client(int port, const char* one_cmd, bool autostart);
-int ash_list(void);
-int ash_shutdown(int port);
-int ash_sock_path(int port);
 
 #define ASH_PORT_DEFAULT 7900
 

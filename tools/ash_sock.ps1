@@ -52,17 +52,61 @@ function Test-AshUp {
     }
 }
 
+# The pid of the live core registered on @Port, or $null when none owns it.
+#
+# The registry is written by the core itself, once it has won the port, and
+# removed when it stops (runtime/cores/<port>.core - `--list` reads it). That
+# makes it the host's own answer to "is the core on this port mine?": compare it
+# with the pid of the process the driver started and the loop is closed. A port
+# that merely *answers* says nothing - the endpoint is a filesystem socket, so a
+# core left over from another run answers just as well, and every check a driver
+# makes afterwards then describes a run it never set up.
+#
+# `--list` is used rather than reading the file, so the release layout stays
+# where it already is: in the binary, the same reason `--sock-path` exists.
+function Get-AshCorePid {
+    param([Parameter(Mandatory)][string]$Exe, [Parameter(Mandatory)][int]$Port)
+    $line = & $Exe --list 2>$null |
+            Where-Object { $_ -match "^\s*up\s+port=$Port(\s|$)" } | Select-Object -First 1
+    if ($line -and $line -match 'pid=(\d+)') { return [int]$Matches[1] }
+    return $null
+}
+
+# Ask the core on @Port to stop and report how it ended: its exit code when it
+# stopped on its own, $null when it had to be killed - a killed process has no
+# exit status worth reading, and reporting the kill as a code would be a lie.
+#
+# The code is the core's own vocabulary (see src/virtpass/win32-host/ash_core.h):
+# 0 for a clean stop, 64/65 for the two refusals that want different remedies. It
+# never carries the guest program's status, which the core prints on its own
+# stderr instead - separating the two is the whole point.
+function Stop-AshCore {
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][Diagnostics.Process]$Process,
+        [int]$TimeoutMs = 5000
+    )
+    $exePath = (Resolve-Path -LiteralPath $Exe).Path
+    $ask = Start-Process -FilePath $exePath `
+        -ArgumentList '--no-autostart', '--port', "$Port", '--shutdown' `
+        -WorkingDirectory ([IO.Path]::GetDirectoryName($exePath)) -PassThru -NoNewWindow `
+        -RedirectStandardOutput (Join-Path $env:TEMP 'ash_stop_out.txt') `
+        -RedirectStandardError  (Join-Path $env:TEMP 'ash_stop_err.txt')
+    $ask.WaitForExit(3000) | Out-Null
+    if (-not $ask.HasExited) { try { $ask.Kill() } catch { } }
+    if ($Process.WaitForExit($TimeoutMs)) { return $Process.ExitCode }
+    try { $Process.Kill() } catch { }
+    $Process.WaitForExit(2000) | Out-Null
+    return $null
+}
+
 # Stop every core left behind in this release tree, and say which ones.
 #
-# A leftover core is worse than no core. The endpoint is a filesystem socket
-# rather than a port, so a stale one still answers Test-AshUp: the readiness
-# probe below latches onto it and the whole run then drives somebody else's
-# session server - a different run, with its own rootfs and nothing bounding how
-# long it lives. That is not hypothetical. Two session_e2e -Multi runs failed
-# their four shared-core checks that way, while the identical steps replayed by
-# hand against a fresh core passed every time; the failure also misdescribed
-# itself, since the file the second session looked for was never created at all
-# rather than created empty.
+# A leftover core is worse than no core: the endpoint is a filesystem socket, so a
+# stale one still answers Test-AshUp and the run drives that core's session server
+# instead of its own. Planted on purpose, this driver passed all 27 of its checks
+# against a core it had not started, and reported PASS.
 #
 # The sweep is narrow on purpose, because it runs unconditionally:
 #
@@ -72,8 +116,8 @@ function Test-AshUp {
 #
 # Each core is asked to stop before it is killed, because a core that stops
 # cleanly drops its endpoint, the rootfs lock and the sockets it forwarded for
-# the guest; only one that will not go is killed. Returns one line per core, so
-# a driver can print what it cleared instead of doing it silently.
+# the guest. Returns one line per core, so a driver can print what it cleared
+# instead of doing it silently.
 function Stop-AshCores {
     param([Parameter(Mandatory)][string]$Exe, [int]$GraceMs = 2000)
     $exePath = (Resolve-Path -LiteralPath $Exe).Path
@@ -87,14 +131,10 @@ function Stop-AshCores {
     foreach ($core in $cores) {
         $id   = $core.ProcessId
         $port = if ($core.CommandLine -match '--port\s+(\d+)') { [int]$Matches[1] } else { 0 }
+        $how  = 'stopped'
         if ($port -gt 0) {
-            $ask = Start-Process -FilePath $exePath `
-                -ArgumentList '--no-autostart', '--port', "$port", '--shutdown' `
-                -WorkingDirectory ([IO.Path]::GetDirectoryName($exePath)) -PassThru -NoNewWindow `
-                -RedirectStandardOutput (Join-Path $env:TEMP 'ash_stale_stop.txt') `
-                -RedirectStandardError  (Join-Path $env:TEMP 'ash_stale_stop.err')
-            $ask.WaitForExit($GraceMs) | Out-Null
-            if (-not $ask.HasExited) { try { $ask.Kill() } catch { } }
+            $p = Get-Process -Id $id -EA SilentlyContinue
+            if ($p) { Stop-AshCore -Exe $exePath -Port $port -Process $p -TimeoutMs $GraceMs | Out-Null }
         }
         for ($i = 0; $i -lt 50; $i++) {
             if (-not (Get-Process -Id $id -EA SilentlyContinue)) { break }
@@ -102,8 +142,6 @@ function Stop-AshCores {
         }
         if (Get-Process -Id $id -EA SilentlyContinue) {
             try { Stop-Process -Id $id -Force -EA Stop; $how = 'killed' } catch { $how = 'would not stop' }
-        } else {
-            $how = 'stopped'
         }
         $stopped += "port $port (pid $id) $how"
     }

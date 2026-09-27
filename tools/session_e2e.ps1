@@ -178,6 +178,14 @@ if ($p.HasExited) {
     exit 1
 }
 
+# And the positive half: the core that *registered* this port is this driver's
+# process. The check above is a liveness test, so it passes for a process that is
+# alive but has nothing to do with the port; this compares identities. The
+# registration is written by the core itself once it owns the port
+# (runtime/cores/<port>.core), so a match is the core naming itself.
+$owner = Get-AshCorePid -Exe $exe -Port $Port
+Check ($owner -eq $p.Id) "the core registered on port $Port is this driver's process (pid $($p.Id))"
+
 try {
 # --- one client, one shell ----------------------------------------------
 $A = New-Client 'R30;100'
@@ -345,9 +353,14 @@ if ($Multi) {
 }
 Start-Sleep -Milliseconds 500
 
+# Stop the core the way a client would, and keep how it ended. This is also the
+# only point at which "is it still up?" means anything: above, the process is
+# still running because the run has not asked it to stop yet, so a core that died
+# half way through is only visible as a pile of failed session checks, none of
+# which says why.
+$coreExit = $null
 if (-not $Keep) {
-    try { $p.Kill() } catch { }
-    $p.WaitForExit(5000) | Out-Null
+    $coreExit = Stop-AshCore -Exe $exe -Port $Port -Process $p
 }
 
 $out = $outTask.Result
@@ -371,6 +384,22 @@ $sessions = ([regex]::Matches($log, 'session \d+ started')).Count
 $want = if ($Multi) { 2 } else { 1 }
 Check ($sessions -ge $want) "the core started $sessions session(s) without exiting"
 Check ($log -match 'listening on') 'the daemon logged its endpoint'
+
+# The core's own ending, which is the one thing the checks above cannot see: a
+# core that died half way through only shows up as a pile of failed session
+# checks, none of which says why. Three shapes, and they are worth telling apart:
+# stopped when asked, killed by somebody, or gone on its own.
+if (-not $Keep) {
+    if ($null -eq $coreExit) {
+        Check $false 'the core ended under its own steam' 'it did not stop when asked and had to be killed, so it never reported an exit code'
+    } elseif ($coreExit -lt 0) {
+        # Windows reports a killed process as a negative code. So this is a core
+        # that died mid-run - not one that was stopped, and not one that refused.
+        Check $false 'the core ended under its own steam' "it was killed while the run was still going (exit $coreExit)"
+    } else {
+        Check ($coreExit -eq 0) "the core stopped when asked (exit $coreExit)"
+    }
+}
 
 "--- core console ---"
 $out

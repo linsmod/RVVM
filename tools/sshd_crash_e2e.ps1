@@ -233,7 +233,20 @@ for ($r = 1; $r -le $Rounds; $r++) {
     if ($core.HasExited) {
         $crashed = $true
         $crashRound = $r
-        "     round ${r}: core DIED after $ms ms (exit $($core.ExitCode))"
+        # The core's exit code is its own vocabulary (src/virtpass/win32-host/
+        # ash_core.h), not the guest's status, so it says what happened to the
+        # core rather than what killed the guest. The guest's own status is on
+        # the core's stderr, in the fault block below - which is the half worth
+        # reading anyway, since the code cannot say which fault it was.
+        $why = switch ($core.ExitCode) {
+            64 { 'another core already owns that port' }
+            65 { 'another core holds this release rootfs' }
+            69 { 'the guest program left non-zero - a fault, most likely' }
+            66 { 'the host could not be initialized' }
+            67 { 'the guest program would not start' }
+            default { "the core is gone (exit $($core.ExitCode))" }
+        }
+        "     round ${r}: core DIED after $ms ms (exit $($core.ExitCode): $why)"
         break
     }
     $sess = if ($o -match 'CRASH-ROUND-OK') { 'session ok' } else { 'no session' }
