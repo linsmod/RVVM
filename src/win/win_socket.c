@@ -265,6 +265,42 @@ void win_socket_free_anchor(int fd)
     _close(fd);
 }
 
+/* The far end of @s as "host:port", or "?" when it has none. Every address space
+ * of a run shares this one anchor table, so a bare anchor number does not say
+ * *which* connection a descriptor is - this is what makes a trace readable
+ * when a guest forks and both sides hold ends of the same connection. */
+static const char* wsock_peer_str(SOCKET s)
+{
+    static char buf[64];
+    struct sockaddr_in6 a6;
+    struct sockaddr_in  a4;
+    int len;
+
+    if (s == INVALID_SOCKET) {
+        return "?";
+    }
+    len = sizeof(a6);
+    if (getpeername(s, (struct sockaddr*)&a6, &len) == 0) {
+        if (a6.sin6_family == AF_INET6) {
+            char ip[64];
+            if (inet_ntop(AF_INET6, &a6.sin6_addr, ip, sizeof(ip))) {
+                rvvm_snprintf(buf, sizeof(buf), "[%s]:%u", ip, ntohs(a6.sin6_port));
+                return buf;
+            }
+        }
+    }
+    len = sizeof(a4);
+    if (getpeername(s, (struct sockaddr*)&a4, &len) == 0 &&
+        a4.sin_family == AF_INET) {
+        char ip[32];
+        if (inet_ntop(AF_INET, &a4.sin_addr, ip, sizeof(ip))) {
+            rvvm_snprintf(buf, sizeof(buf), "%s:%u", ip, ntohs(a4.sin_port));
+            return buf;
+        }
+    }
+    return "?";
+}
+
 static int wsock_fd_alloc(SOCKET s)
 {
     int fd = win_socket_alloc_anchor();
@@ -927,7 +963,7 @@ long win_socket_read(int fd, void* buf, size_t len)
     if (n == 0) {
         RVVM_TRC(RVVM_TRC_WSOCK,  "recv EOF on fd %d (socket %p)", fd, (void*)s);
     } else if (n > 0) {
-        RVVM_TRC(RVVM_TRC_WSOCK, "recv %ld byte(s) on fd %d", n, fd);
+        RVVM_TRC(RVVM_TRC_WSOCK, "recv %ld byte(s) on fd %d (peer %s)", n, fd, wsock_peer_str(s));
     }
     if (n == SOCKET_ERROR) {
         int werr = WSAGetLastError();
@@ -956,7 +992,7 @@ long win_socket_write(int fd, const void* buf, size_t len)
         wsock_set_errno();
         return -1;
     }
-    RVVM_TRC(RVVM_TRC_WSOCK, "sent %ld byte(s) on fd %d", n, fd);
+    RVVM_TRC(RVVM_TRC_WSOCK, "sent %ld byte(s) on fd %d (peer %s)", n, fd, wsock_peer_str(s));
     return n;
 }
 
