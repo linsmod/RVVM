@@ -964,26 +964,57 @@ debug1: network sockets: -1, -1 [preauth]
 main: fcntl(-1, F_SETFD, FD_CLOEXEC): Bad file descriptor [preauth]
 ```
 
-也就是 `dup(STDIN_FILENO)` 回了 -1。trace 里前后矛盾得很明确:
+### 6B.4.1 `dup(0)` 拿到的是 EBADF,不是 pty
+
+`case 23: dup` 上补了一条 trace(打出槽位说的和解析出来的),一次就定了性:
 
 ```
-fd_dump[execve_post]: fd=0 host=16 clo=0 sh=0        ← fd 0 是 socket anchor
-sys_dup(0)
-fd_wr[install] pid=108 fd=5 host=2080374784 be=1     ← 复制出来却是 pty(0x7C000000)
-sys_dup3(5, 0, 0)
-fd_wr[close] pid=108 fd=0 host=16 be=0 fl=802        ← 这里又说 fd 0 是 host 16
+TRACE[108:108]: dup: fd=0 tracked=1 backend=0 slot_fd=16 resolved=-1 gen=30
 ```
 
-`userland_own_fd_dup()`(`rvvm_user.c:5353`)负责"没有宿主 fd 可复制"的那几种对象,
-最后一行返回 -2 让调用方自己去 dup 宿主 fd。`userland_pty_by_fd()` 只接受
-`>= RVVM_PTY_FD_BASE` 的号,所以它不可能把 16 变成 0x7C000000 —— 只能是
-**传进去的 `host_fd` 本身就是 0x7C000000**,也就是 `userland_fd_host(ctx, 0)`
-在这一刻返回了槽位里没有的值。
+**`resolved=-1`** —— 槽位记的是 host 16、gen 30,但 `userland_fd_host()` 因为
+**anchor 的 generation 对不上**而返回 -1(就是 `ac9041b` 加的那道 `fd_stale` 保险)。
+所以 `dup(0)` 回 EBADF,`sshd-auth` 的 `dup(STDIN_FILENO)` 自然是 -1。
 
-**下一步**:在 `case 23: dup` 上补一条 trace,打出 `source_fd` /
-`userland_fd_host()` 的结果 / 走了哪个分支。这比继续读代码可靠 —— 前面两轮的
-教训就是读 trace 猜语义会猜错,而这里矛盾点已经小到一条 trace 就能定位。
-(`-d -d` 本身只是诊断用的单连接模式;守护进程那条路径已经全通,它的价值现在主要
-是"出错时能拿到完整 transcript"。)
+(顺带更正:在加这条 trace 之前,我从 trace 的先后顺序推断"`dup(0)` 复制出了一个
+pty"——**那是错的**。`sys_dup(0)` 后面那条 `fd_wr[install]` 是 `stdfd_devnull()` 开
+`/dev/null`,不是 dup 的结果。教训还是 §3 坑 #1。)
+
+### 6B.4.2 根因:anchor 引用计数失衡,号码被提前还给 CRT
+
+为什么 gen 对不上?把这一段 anchor 的生命周期全捞出来:
+
+```
+[581044969] [104] close anchor 16 (socket 0x1cc)
+[581044969] [104] free anchor 16 (last reference)   ← unref #1 → 计数归 0,_close(16)
+[581044995] [104] free anchor 16 (last reference)   ← unref #2,中间没有任何 alloc
+[581044995] [108] alloc anchor 16                   ← _open("NUL") 把 16 原样发回来
+[581044997] [108] alloc anchor 16                   ← ★ 又一次,而 fd 0 还指着它
+```
+
+`win_socket_alloc_anchor()` 是 `_open("NUL", ...)` —— **它问 CRT 要号,而 CRT 只认
+自己的空闲表**。引用计数(`wsock_fds_refs`)只能保证 anchor 的 CRT 句柄在最后一个
+使用者消失前不被 `_close`,一旦被 `_close` 过,_open 就会把同一个号再发出来。
+
+这里 pid 104( sshd monitor)**对同一个 anchor 释放了两次**,中间没有 alloc。
+多出来的那次 unref 说明**某条 close 路径把引用放多了** —— 这是要查的地方。
+
+### 6B.4.3 试过并否掉的一个改法
+
+第一反应是给 `wsock_anchor_release()` 加护栏:计数已经 ≤0 时不再 `_close`
+(`--0` 会变成 -1,被 `<= 0` 判成"最后一个引用",于是对**可能已经被别的 `open()`
+重新持有的 CRT 号**再关一次)。**这个改法让 e2e 从 1 FAIL 变成 2 FAIL,已回退。**
+
+回退的理由很有价值:**"计数为 0 时也关"是 load-bearing 的**——
+`win_socket_free_anchor()` 的注释写明它服务于"不是 guest 持有的槽位(分配失败、
+dup 没能绑定)"这种路径,那时计数就是 0,需要一次真正的 `_close` 收干净。
+所以护栏不能加在 release 侧,**要修的是那个多出来的 unref**。
+
+**下一步**:找出 pid 104 在 26ms 内对同一个 anchor 释放两次的那条路径
+(`userland_fd_close()` / `win_socket_close()` / inherit 三者之一)。
+判据已经有了:`free anchor N (last reference)` 在没有 `alloc anchor N` 的情况下
+出现第二次。`dup` 的那条 trace 建议保留 —— 它把"槽位说的"和"实际解析出来的"
+分开打出来,正是它把这一条从"猜"变成"看"。
+
 
 
