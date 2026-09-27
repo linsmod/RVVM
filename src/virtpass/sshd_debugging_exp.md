@@ -12,23 +12,21 @@
 | 阶段 | 状态 |
 |---|---|
 | 模拟器稳定性（HOST FAULT / 挂死） | ✅ 已修复，HOST FAULT 归零，e2e 不再挂死 |
-| 回归（`procfs_e2e` / `ash_e2e` / `session_e2e` / `jobctl`） | ✅ 22/22、7/7、PASS、PASS |
+| 回归（`procfs_e2e` / `ash_e2e` / `session_e2e` / `jobctl`） | ✅ 全 PASS（`-Multi` 的 4 个失败是既有的，见下） |
 | sshd 启动 / 守护化 | ✅ 通过 |
 | SSH banner 互换 | ✅ 通过（此前"banner 从未互换"是 sshd 自己 `fatal()` 了，见 §6A.1） |
 | privsep monitor 通道 | ✅ socketpair 上双向一字节不差走通 |
-| KEX + 公钥校验 | ✅ 通过，`SSH2_MSG_EXT_INFO` 已发出，公钥 test 通过 |
-| 建立会话（`exec` 远端命令） | ❌ 仍失败，卡在 `initgroups`（§6A.5，已排除 `initgroups`/`getgrouplist` 本身） |
+| KEX + 公钥校验 | ✅ 通过 |
+| **公钥会话 + 执行远端命令** | ✅ **通过**（`openssh-e2e-ok`，守护进程路径） |
+| **第二个会话复用同一守护进程** | ✅ **通过**（`openssh-e2e-ok2`） |
+| `sshd -d -d` 单连接调试模式 | ❌ 仍失败：privsep 子进程 `dup(0)` 拿到 pty 而非客户端 socket（§6B） |
 
-已修复 12 个模拟器缺陷（见 §5、§5A、§6A），其中 7 个是"任意程序都可能踩到"的通用 bug：
+`openssh_e2e` **6/7**。剩下的一条是 `-d -d` 调试模式，见 §6B。
+
+已修复 14 个模拟器缺陷（见 §5、§5A、§6A、§6B），其中 9 个是"任意程序都可能踩到"的通用 bug：
 writev 零长度 iovec、地址空间 UAF、win32 带超时 futex 等待可能永久阻塞、
 `socket` anchor 号码被回收、`chroot(2)` 缺失、guest 凭证不分 real/effective id、
-数据报 `connect(0.0.0.0)` 语义。
-
-**当前阻塞点**：`temporarily_use_uid()` 里的 `initgroups()` 返回 -1，sshd 以
-`initgroups: root: Network is down` 退出 255。已反汇编排除 `initgroups` 与
-`getgrouplist` 本身（前者只调 malloc/getgrouplist/setgroups/free），失败那轮里
-`/etc/group` 甚至没被打开；剩下未归因的是 `initgroups` 之前那两次 UDP 探测
-（§6A.5.1）。
+数据报 `connect(0.0.0.0)` 语义、AF_UNIX `connect` 缺路径的 errno、**创建文件不应用 umask**。
 
 ---
 
@@ -429,11 +427,11 @@ __即：__
 ## 7. 涉及文件
 
 - `tools/openssh_e2e.ps1`（新增）：OpenSSH 端到端用例
-- `src/core/rvvm_user.c`：trace id 钩子注册、ctx children 注册表与 detach 走查、writev 零长度段、 写 helper 的空写语义、SIGCHLD 通知语义、socket 的 fstat、**`chroot(2)`**（§6A.2）、**guest 凭证的 real/effective id 与 `setres*`/`getres*`**（§6A.3）、**`prlimit64(2)`**（§6A.4）、**`sys_connect` 的目标地址 trace**（§6A.6）
+- `src/core/rvvm_user.c`：trace id 钩子注册、ctx children 注册表与 detach 走查、writev 零长度段、 写 helper 的空写语义、SIGCHLD 通知语义、socket 的 fstat、**`chroot(2)`**（§6A.2）、**guest 凭证的 real/effective id 与 `setres*`/`getres*`**（§6A.3）、**`prlimit64(2)`**（§6A.4）、**`sys_connect` 的目标地址 trace**（§6A.6）、**per-ctx umask 与创建时套用**（§6B.2）
 - `src/util/threading.c`：win32 带超时等待的上限 + timer 装配校验
 - `src/util/vma_ops.c`：`seh_handler` 不再取 `seh_lock`
 - `src/util/utils.{h,c}`：trace 行身份前缀（后扩到所有日志级别，见 §4.1）
-- `src/win/win_socket.c`：收发 trace、anchor 引用计数与 generation 校验、**`getsockopt(IP_OPTIONS)` 的 Linux 语义**（§6A.1）
+- `src/win/win_socket.c`：收发 trace、anchor 引用计数与 generation 校验、**`getsockopt(IP_OPTIONS)` 的 Linux 语义**（§6A.1）、**数据报 `connect(0.0.0.0)` 视为本机**（§6A.6）、**AF_UNIX `connect` 缺路径回 ENOENT**（§6B.1）
 
 
 
@@ -629,8 +627,10 @@ match=False raw=[[...] vpsessiond:   [slot 0] open sock=4|[...] client connected
 | `0dfc951` | wsock: `getsockopt(IP_OPTIONS)` 按 Linux 语义返回"无选项"(§6A.1) |
 | `75b9c76` | userland: chroot / real-vs-effective id / prlimit64(§6A.2-4) |
 | `626173d` | wsock: 数据报 `connect(0.0.0.0)` 视为本机 + connect 目标 trace(§6A.6) |
-| (本轮) | util: 所有日志级别都带 `[pid:tid]`,`INFO:` 不再无法归因(§4.1、坑 #9) |
-| (本轮) | 文档订正:§0/§6/§6.4 的结论作废,新增 §6A |
+| `f553308` | util: 所有日志级别都带 `[pid:tid]`(§4.1、坑 #9) |
+| `4ed92f0` | wsock: AF_UNIX `connect` 缺路径回 ENOENT,`getgrouplist` 才肯读 `/etc/group`(§6B.1) |
+| `144c2ea` | userland: 创建文件应用 umask,私钥不再 world-readable(§6B.2) |
+| (本轮) | 文档:新增 §6B,openssh_e2e 6/7,剩下 `-d -d` 一条(§6B.4) |
 
 
 ---
@@ -856,5 +856,134 @@ trace 里长得一模一样。
 `/proc/self/status` 的 Uid 与 `ps` 输出均未受影响;A.6 动的是 `connect()` 的
 目标地址替换,guest 侧所有 connect 路径都过一遍,`session_e2e` 的 AF_UNIX 监听
 和 `apk` 的 HTTPS 都照常。
-`openssh_e2e` 仍是 3/7,但失败点已从"banner 都没互换"推进到 §6A.5。
+
+---
+
+# 第四轮:打通了 —— 6/7
+
+## 6B.0 两个新缺陷,都是"静默地错"
+
+`initgroups` 那条查到最后不是 guest 的问题,是我们把 errno 答错了。**这两个都属于
+最难查的一类:不报错,只是结果不对,而且对大部分程序无害。**
+
+### 6B.1 AF_UNIX `connect()` 缺路径必须是 ENOENT
+
+拿到 musl 源码(`gh api repos/ifduyue/musl` —— 注意目录是 `src/passwd/`,不是
+`src/grp/`)之后,`__nscd_query()` 一眼就说明了:
+
+```c
+	if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+		/* If there isn't a running nscd we simulate a "not found" result */
+		if (errno == EACCES || errno == ECONNREFUSED || errno == ENOENT) {
+			errno = errno_save;
+			return f;
+		}
+		goto error;          /* 任何别的 errno -> 返回 NULL */
+	}
+```
+
+而 `getgrouplist()` 拿到 NULL 就直接 `goto cleanup` 返回 -1,**连 `/etc/group`
+都不会去开**。WinSock 对一个不存在的 unix 路径回 `WSAENETDOWN`,不在那三个之列。
+
+**这影响的是每一个 guest 进程,只是大部分程序不 care:**
+
+```
+guest 里 $ id -G root
+0                    ← root 明明在十几个组里;真机上是一长串
+```
+
+busybox 自己解析 `/etc/group`(所以它的 `id -G` 一直"看起来正常"),`getgrouplist`
+只有 OpenSSH 这种把它当前置条件的程序才会炸。修法是照 Linux 的语义自己做存在性
+判断,不赌宿主会回哪个码。
+
+### 6B.2 创建文件不应用 umask
+
+修完 6B.1 之后,握手已经全通,客户-side 报了另一件事:
+
+```
+Permissions 0644 for '/root/.ssh/id_e2e' are too open.
+Load key "/root/.ssh/id_e2e": bad permissions
+root@127.0.0.1: Permission denied (publickey,keyboard-interactive).
+```
+
+`umask` 在 guest 里是 0000,于是去 trace 里看 `ssh-keygen` 怎么建的文件:
+
+```
+sys_umask(3f)                              ← umask(0177)
+sys_openat(-100, /root/.ssh/k1, 8241, 1a4) ← mode 0644
+sys_umask(0)
+```
+
+**`ssh-keygen` 故意不传 0600,而是靠 umask。** 内核会 `mode & ~umask`,所以真机上
+私有 key 是 0600;我们的 `openat` 把调用方的 mode 原样记下来,而 `umask(2)` 被转发
+给了宿主 CRT —— 那边的值这里根本没人读。两个缺陷叠加,私钥就 world-readable 了。
+
+顺带也是个小隔离问题:转发的 `umask()` 改的是 **CRT 自己的** umask,也就是宿主侧
+建文件时遵守的那个,guest 能去动它。现在改成 per-address-space(和 Linux 的
+per-process 一致,fork 继承),并在 `openat`/`mkdirat`/`mknodat` 上套用。
+
+## 6B.3 现在的状态
+
+```
+ok   the core (ash --serve) publishes its endpoint
+ok   install: openssh present in the guest (apk)
+ok   setup: host keys, privsep dir/user, client key authorized
+FAIL sshd (single-connection debug) serves a pubkey session
+ok   sshd starts and daemonizes (fork/setsid)
+ok   sshd serves a pubkey session and runs a remote command      ← openssh-e2e-ok
+ok   a second session reaches the same running daemon             ← openssh-e2e-ok2
+```
+
+**客户端 + sshd 打通了**:真的公钥会话、真的执行远端命令、真的第二个会话复用同一个
+守护进程。回归:`procfs_e2e` / `ash_e2e` / `session_e2e` / `jobctl` 全 PASS。
+`session_e2e -Multi` 的 4 个失败**是既有的**——已在改动前后各跑一次对比确认一致。
+
+## 6B.4 剩下的一条:`sshd -d -d` 调试模式
+
+契约已经从源码确认(`sshd-session.c` 的 `privsep_preauth()`,以及 `sshd-auth.c`
+的 `main()`):
+
+```c
+	/* 子进程必须摆成: 0/1 = 网络 socket, 3 = monitor socket, 4 = log socket */
+	if (... != STDIN_FILENO && dup2(ssh_packet_get_connection_in(ssh), STDIN_FILENO) == -1)
+		fatal("dup2 stdin failed: %s", strerror(errno));
+	...
+	closefrom(PRIVSEP_MIN_FREE_FD);      /* = 5 */
+	execv(options.sshd_auth_path, saved_argv);
+```
+```c
+/* sshd-auth.c: 连接就是 stdin */
+	sock_in = sock_out = dup(STDIN_FILENO);
+	debug("network sockets: %d, %d", sock_in, sock_out);
+```
+
+现象是这两行:
+
+```
+debug1: network sockets: -1, -1 [preauth]
+main: fcntl(-1, F_SETFD, FD_CLOEXEC): Bad file descriptor [preauth]
+```
+
+也就是 `dup(STDIN_FILENO)` 回了 -1。trace 里前后矛盾得很明确:
+
+```
+fd_dump[execve_post]: fd=0 host=16 clo=0 sh=0        ← fd 0 是 socket anchor
+sys_dup(0)
+fd_wr[install] pid=108 fd=5 host=2080374784 be=1     ← 复制出来却是 pty(0x7C000000)
+sys_dup3(5, 0, 0)
+fd_wr[close] pid=108 fd=0 host=16 be=0 fl=802        ← 这里又说 fd 0 是 host 16
+```
+
+`userland_own_fd_dup()`(`rvvm_user.c:5353`)负责"没有宿主 fd 可复制"的那几种对象,
+最后一行返回 -2 让调用方自己去 dup 宿主 fd。`userland_pty_by_fd()` 只接受
+`>= RVVM_PTY_FD_BASE` 的号,所以它不可能把 16 变成 0x7C000000 —— 只能是
+**传进去的 `host_fd` 本身就是 0x7C000000**,也就是 `userland_fd_host(ctx, 0)`
+在这一刻返回了槽位里没有的值。
+
+**下一步**:在 `case 23: dup` 上补一条 trace,打出 `source_fd` /
+`userland_fd_host()` 的结果 / 走了哪个分支。这比继续读代码可靠 —— 前面两轮的
+教训就是读 trace 猜语义会猜错,而这里矛盾点已经小到一条 trace 就能定位。
+(`-d -d` 本身只是诊断用的单连接模式;守护进程那条路径已经全通,它的价值现在主要
+是"出错时能拿到完整 transcript"。)
+
 
