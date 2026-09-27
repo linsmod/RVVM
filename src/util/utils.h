@@ -387,6 +387,17 @@ enum rvvm_trace_cat {
     RVVM_TRC_ALL    = 0xffffffffu,
 };
 
+/*
+ * Optional identity appended to every trace line: the userland layer registers
+ * a formatter that writes the calling guest thread's "[pid:tid]" (or "[host]"
+ * outside any guest), so interleaved lines from two in-process fork()ed
+ * processes - a socketpair close on one side, a recv on the other - can be
+ * told apart even when they share a millisecond timestamp. No formatter, or
+ * an empty buffer, keeps the plain "TRACE: " form.
+ */
+typedef void (*rvvm_trace_id_fn)(char* buf, size_t size);
+PUBLIC void rvvm_trace_set_id_fn(rvvm_trace_id_fn fn);
+
 /* Parse RVVM_TRACE once. Idempotent, and called lazily by the helpers below. */
 PUBLIC void rvvm_trace_init(void);
 PUBLIC bool rvvm_trace_enabled(uint32_t cat);

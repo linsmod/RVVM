@@ -101,13 +101,20 @@ static void seh_revert_handler(void)
 static LONG CALLBACK seh_handler(EXCEPTION_POINTERS* ptrs)
 {
     LONG ret = 0;
-    scoped_spin_lock_slow (&seh_lock) {
-        if (ptrs->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-            seh_revert_handler();
-            ret = -1;
-        } else if (seh_prev_handler) {
-            ret = seh_prev_handler(ptrs);
-        }
+    /* Deliberately NOT taking seh_lock here. The filter is installed by the
+     * thread that is inside vma_clean() and it exists to catch exactly the
+     * faults that window provokes - so the common case is a fault raised by
+     * the very thread holding that lock. Taking it here would self-deadlock:
+     * the thread would hang while holding the lock, and every later
+     * vma_clean() (any execve's JIT flush) would queue up behind it forever,
+     * wedging the whole emulator. Reading seh_prev_handler unlocked is fine:
+     * it is a single pointer, and a stale read at worst calls a filter that
+     * has already been replaced. */
+    if (ptrs->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        seh_revert_handler();
+        ret = -1;
+    } else if (seh_prev_handler) {
+        ret = seh_prev_handler(ptrs);
     }
     return ret;
 }

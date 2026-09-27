@@ -427,12 +427,16 @@ static void* const volatile dll_callback_ptr = dll_callback;
 static void* const volatile dll_callback_ptr __attribute__((__used__, __section__(".CRT$XLB"))) = dll_callback;
 #endif
 
-static inline void tls_timer_set(HANDLE timer, uint64_t ns)
+static inline bool tls_timer_set(HANDLE timer, uint64_t ns)
 {
     LARGE_INTEGER delay = {
-        .QuadPart = -(ns / 100ULL),
+        .QuadPart = -(int64_t)(ns / 100ULL),
     };
-    set_wtimer(timer, &delay, 0, NULL, NULL, false);
+    /* A failure here leaves the timer in whatever state it was in, which for
+     * a manual-reset timer means either "still signaled" (an instant spurious
+     * return out of every wait) or "never fires" (a wait that never ends).
+     * Report it, so the caller uses the millisecond-precision wait instead. */
+    return set_wtimer(timer, &delay, 0, NULL, NULL, false) != 0;
 }
 
 static slow_path HANDLE tls_timer_init(void)
@@ -519,8 +523,14 @@ HANDLE thread_local_waitable_timer(uint64_t ns)
         tls_timer = timer;
     }
     if (likely(timer)) {
-        tls_timer_set(timer, ns);
-        return timer;
+        if (likely(tls_timer_set(timer, ns))) {
+            return timer;
+        }
+        /* A timer that would not re-arm is worse than no timer at all: retire
+         * it for good and let every later wait take the plain timeout path. */
+        CloseHandle(timer);
+        tls_timer        = NULL;
+        tls_timer_avail  = false;
     }
 #endif
     UNUSED(ns);
@@ -704,14 +714,19 @@ static inline void futex_emu_waiter_wait(futex_emu_queue_t* queue, futex_emu_wai
     } else if (waiter->event) {
         HANDLE timer = thread_local_waitable_timer(ns);
         if (timer) {
-            // High-resolution timeout via waitable timer
+            // Wait on both the event and the timer. The timeout is ALSO passed
+            // to the wait itself: the timer is a precision aid (it can wake us
+            // in under a millisecond), never the only thing that ends this
+            // wait. A wait that hangs forever because a shared, manual-reset
+            // timer failed to re-arm is what turns a 100 ms poll into a stuck
+            // guest process.
             HANDLE hndls[] = {waiter->event, timer};
             size_t hndls_l = STATIC_ARRAY_SIZE(hndls);
-            // Wait on both event & timer handles
-            WaitForMultipleObjects(hndls_l, hndls, FALSE, INFINITE);
+            DWORD  wait_ms = (DWORD)EVAL_MAX(ns / 1000000ULL, 1);
+            WaitForMultipleObjects((DWORD)hndls_l, hndls, FALSE, wait_ms);
         } else {
             // Fallback to millisecond-precision timeout
-            WaitForSingleObject(waiter->event, EVAL_MAX(ns / 1000000ULL, 1));
+            WaitForSingleObject(waiter->event, (DWORD)EVAL_MAX(ns / 1000000ULL, 1));
         }
     }
     futex_emu_lock(queue);

@@ -1,0 +1,228 @@
+````markdown
+# sshd 在 RVVM (Win32) 上的调试记录
+
+> 目标：让 guest 里的 OpenSSH (`/usr/sbin/sshd` + `/usr/bin/ssh`, OpenSSH_10.3p1) 端到端跑通。
+> 配套 e2e：`tools/openssh_e2e.ps1`。
+> 本文记录复现方法、观测手段、踩过的坑、已修复的模拟器缺陷，以及仍然存在的阻塞点。
+
+---
+
+## 0. 结论速览
+
+| 阶段 | 状态 |
+|---|---|
+| 模拟器稳定性（HOST FAULT / 挂死） | ✅ 已修复，HOST FAULT 归零，e2e 不再挂死 |
+| 回归（`procfs_e2e` / `ash_e2e`） | ✅ 22/22、7/7 通过 |
+| sshd 启动 / 守护化 | ✅ 通过 |
+| SSH 握手（pubkey 会话） | ❌ 仍失败：`kex_exchange_identification: Connection reset by peer` |
+
+已修复 6 个模拟器缺陷（见 §5），其中 3 个是"任意程序都可能踩到"的通用 bug：
+writev 零长度 iovec、地址空间 UAF、win32 带超时 futex 等待可能永久阻塞。
+
+---
+
+## 1. 怎么复现和驱动
+
+### 1.1 core + client
+
+```powershell
+# 起一个 core（run 边界），后台运行并重定向日志
+$env:RVVM_TRACE='pty,job,fd,wsock,sys'   # 按需；'' 表示关闭
+$env:RVVM_VERBOSE='1'                    # 每个 syscall 的 INFO 行
+rvvm_ash_x86_64.exe --serve --port 7897 >$env:TEMP\core_out.txt 2>$env:TEMP\core_err.txt &
+
+# 用同一个二进制当客户端，跑一条命令
+rvvm_ash_x86_64.exe --port 7897 -c 'echo hello'
+````
+
+- `-c` 的命令体由 vpsessiond __原&#x6837;__&#x4EA4;给 `sh -c`（`execl(shell, "-c", s->cmd)`），所以 shell 引号照常生效。
+- __命令里只能用单引号__：PowerShell 传 native 参数时会把内嵌双引号吃掉，guest 侧就变成了语法错误。 PowerShell 脚本里想写一个单引号要用 `''`（例：`-N ''` 想传空串，要写 `-N ''''`）。
+- 长时间跑的 guest 程序要显式收尾：`< /dev/null` 结束 stdin，否则 `-c` 会话会挂住 （ssh-keygen 问 "Overwrite (y/n)?" 就把整个会话冻住过——这是 e2e 里 `rm -f` 掉旧密钥 + `< /dev/null` 的原因）。
+
+### 1.2 观测
+
+- __trace 走 core 的 stderr__（每个进程自己的 stderr，不是 stdout）。`TRACE:` 行带 `[pid:tid]` （本次新增，见 §4.1），`INFO:` 行不带 pid。
+- `RVVM_TRACE` 分类：`pty` / `job` / `fd` / `wsock` / `sys` / `signal` / `tty` / `dev` / `mmap`； `all` 全开，`-name` 关掉某个。
+- __抓栈__（最有价值的一步）：
+
+```powershell
+# 方式 A：让 core 跑在 gdb 里，用 gdb 脚本跑到崩溃就停
+gdb --batch -x cmds.txt --args rvvm_ash_x86_64.exe --serve --port 7919
+# cmds.txt:
+#   set pagination off
+#   set environment _NO_DEBUG_HEAP 1
+#   handle SIGTRAP nostop noprint pass
+#   run
+#   bt
+#   info registers rip rsp
+#   thread apply all bt
+#   quit
+# 另开一个 shell 用 client 驱动 guest
+
+# 方式 B：core 已经卡住时直接附加
+gdb --batch -p <pid> -ex "set pagination off" -ex "thread apply all bt"
+```
+
+---
+
+## 2. 观测手段里两个必须知道的坑
+
+### 2.1 gdb 会打开 Windows debug heap —— 它会掩盖真正的崩溃
+
+带 gdb 跑时，未定义行为会变成：
+
+```javascript
+warning: HEAP[rvvm_ash_x86_64.exe]: Free Heap block 00000000006D4F50 modified at 00000000006E5F00 after it was freed
+```
+
+或者直接一个 `SIGTRAP`（调试堆的检查陷阱），__而不&#x662F;__&#x771F;正的 SIGSEGV。 所以脚本里一定要 `set environment _NO_DEBUG_HEAP 1`，让破坏保持潜伏、直到真正的崩溃点。
+
+（这一步是定位 §5.4 的关键：只有关掉它，才会停在真正的调用栈上。）
+
+### 2.2 陈旧 core 会污染一切结论
+
+- client 在连不上时&#x4F1A;__&#x81EA;动拉起一个 core__（wsl 式 autostart）；
+- 手工排查时经常残留 core/client，于是"新的实验"实际连到了旧 core 上， 日志描述的是另一个 guest 运行，结论完全错乱（本次就因此误判过好几轮）。
+
+__规矩：每轮实验前 `Get-Process rvvm* | Stop-Process -Force`，并且换个端口。__
+
+---
+
+## 3. 定位过程中踩的坑（方法论）
+
+1. __误认 accept__：`vpsessiond` 的监听器是 guest 里的 AF_UNIX socket，它的 `accept(addr=NULL, len=0)` 和 sshd 的 `accept(addr, addrlen)` 在日志里长得一样。真正的 sshd accept 是 `sys_accept(guest N, host M, <非零指针>, <非零指针>)` 那一条。 认错这个，把"会话建立的流量"当成"SSH 连接的流量"，会把结论带偏一整轮。
+2. __grep 被 ANSI 转义打断__：trace 行实际是 `\e[36;1mTRACE\e[0;1m[103:103]: ...`， `TRACE[(\d+):` 匹配不到。要用 `[(\d+):\d+]:` 匹配。
+3. __`nr=` 行是十六进制返回值__：`rvvm_info(" nr=%ld -> %lx", a7, a0)`，所以 `nr=220 -> 68` 是 `clone` 返回 `0x68 = 104`（pid），不是 68。
+4. __guest 日志会经 pty 转发__：sshd 的 stderr 是会话 pty，客户端可见； 但 daemonize 之后 stderr 仍挂在那个已关闭的会话上，日志就丢了 —— 所以排查 一律用 `sshd -d -d`（前台调试）并让会话活着。
+5. __子命令要能自己结束__：`tail -50` 会等到 EOF 才输出，掩盖真实进度； 把输出重定向到 guest 内文件、再用另一条 `-c` 去 `cat`，两边日志都拿得到。
+
+---
+
+## 4. 基础设施改动
+
+### 4.1 trace 带 `[pid:tid]`
+
+`src/util/utils.{h,c}`：新增 `rvvm_trace_set_id_fn()` 钩子；`rvvm_user_thread_wrap` 里注册一次， 回调输出 `[pid:tid]`（guest 进程/线程），非 guest 线程输出 `[host]`。没有它， 多进程 fork/exec 的日志完全无法归因（本次多个误判都源于此）。
+
+### 4.2 `win_socket` 收发可见性
+
+`src/win/win_socket.c`：`win_socket_read()` / `win_socket_write()` 成功后打 `recv N byte(s) on fd` / `sent N byte(s) on fd`（`RVVM_TRC_WSOCK` 分类）。 此前 socket 路径完全没有数据流可见性，"服务端有没有真的发过 banner"根本看不到。
+
+---
+
+## 5. 已修复的模拟器缺陷
+
+### 5.1 `writev`：零长度 iovec 被判 EFAULT
+
+- 现象：任何以 `{NULL, 0}` 收尾的 writev 整体失败。musl stdio 的提示输出正是这个形状。
+- 根因：writev 的 own-fd（pty / /dev 设备）路&#x5F84;__&#x6CA1;有__ `if (!iov_len) continue;` （readv 路径有），而 `userland_pty_write()` / `userland_dev_write()` 先判 `!buf` 再判 `!count`。
+- 修复：`rvvm_user.c` writev 写循环跳过零长度段；两个写 helper 改为先判 `!count` 返回 0。
+
+### 5.2 地址空间 UAF：`parent_ctx` / `child_ctx` 指向已释放内存
+
+- 现象：`HOST FAULT` 随机出现，崩溃点随机（guest 堆地址、-1、exit code 3 …）。
+- gdb 反汇编给出的现场：
+  ```javascript
+  0x...0033  mov  0x48(%rdi),%rax     ; rax = proc->parent_ctx
+  0x...0037  test %rax,%rax
+  0x...003a  je   ...
+  =>0x...003c cmpq $0x1,0x2a10(%rax)   ; 读 ctx->siga[sig].handler 与 SIG_IGN(1) 比较 → 崩
+  ```
+  即 `userland_exit_process → userland_notify_parent` 把 SIGCHLD 投递&#x7ED9;__&#x5DF2;释放的 ctx__。
+- 场景：会话 shell 退出 → 它的地址空间被 `userland_destroy` 释放 → 而它 fork 出并守护化的 sshd 还在跑，其进程记录仍指向那块内存 → sshd 退出时投递 SIGCHLD 踩空。
+- 修复：给 `rvvm_userland_t` 增加 `children` 注册表（`vector_t(struct rvvm_userland*)` + `children_lock`）， 新增 `userland_detach_records()` / `userland_detach_below()` / `userland_detach_family()`： 销毁时向上清理各祖先注册表里的记录、向下断开所有子空间的 `parent_ctx`； 并且每个 ctx 销毁&#x65F6;__&#x5148;把自己从父的 children 里摘掉__（否则先销毁的子 ctx 会作为野指针留在父的列表里， 父销毁时走进查就崩——这个 bug 就是在修第一版时踩到的）。
+
+### 5.3 win32 带超时的等待可能永久阻塞
+
+- 现象：`sh -c 'cmd & wait $!'` 随机永久挂起（trace 显示 `rt_sigsuspend` 之后再无任何 syscall，CPU 0%）。
+- 根因：`futex_emu_waiter_wait()` 的 Win32 分支用 `WaitForMultipleObjects({event, timer}, INFINITE)`，__超时完全依赖那个线程局部的手动复位 waitable timer 被正确重置__，而 `SetWaitableTimer` 的返回值被丢弃；一旦装配失败， 100ms 的等待就变成永久等待。
+- 修复：等待本身带毫秒级超时上限（计时器只作亚毫秒精度增强）；`thread_local_waitable_timer()` 装配失败则退役该 timer，之后全部走毫秒路径。
+
+### 5.4 SEH 过滤器自死锁 → 整个模拟器卡死
+
+- 现象：一次瞬时 AV 之后，__任何 execve__ 都挂死（core 卡在 `vma_clean` 等锁上，CPU 0%）。
+- gdb 附加现场：
+  ```javascript
+  Thread 6: #5 vma_clean #6 rvjit_flush_cache #7 guest_exec #8 rvvm_sys_execve ...
+            #3 rvvm_futex_wait #4 rvvm_lock_wait_raw        ← 永远等不到
+  Thread 5: shim_veh → user_fault_handler → ... 递归爆栈，卡在 UnhandledExceptionFilter
+  ```
+- 根因：`vma_clean()`（清理 JIT 的 RWX 堆时）持全局 `seh_lock` 并装一个临时异常过滤器来掩盖 "别的线程访问正在被清零的 VMA"；而这个过滤器 `seh_handler()` __又去拿同一把非递归锁__。 被它遮盖的 fault 恰好发生在持锁线程自己身上 → 永久持锁。
+- 修复：`seh_handler()` 不再取 `seh_lock`（无锁读 `seh_prev_handler` 是良性的）。
+
+### 5.5 fault handler 自身会二次 fault
+
+- 现象：HOST FAULT 之后进程不是干净退出，而是卡死在异常过滤机制里。
+- 根因：handler 在栈上开 8KB 缓冲；触发 fault 的线程宿主栈往往已耗尽（guest 深递归会一路穿过 解释器帧），于是 handler 一进去就再 fault，递归到爆栈。
+- 修复：加线程内递归保护（二次 fault 直接 `_Exit`），并把缓冲区改为静态。
+
+### 5.6 SIGCHLD 在默认处置下不投递 → `wait` 永远醒不了
+
+- 现象：`sh -c 'sleep 1 & wait $!; echo ok'` 随机挂死；trace 显示 shell 停在 `job: rt_sigsuspend(pid=…) blocking`，而子进程早已退出。
+- 根因：ash 用 `rt_sigsuspend` 等 SIGCHLD；`userland_deliver_signal()` 在处置为 `SIG_DFL`/`SIG_IGN` &#x65F6;__&#x76F4;接返回 false、不入队__。而 Linux 上 wait 与是否捕获 SIGCHLD 无关地被唤醒。
+- 修复：把 `SIGCHLD` / `SIGCONT` 当作"通知"处理——即使没有 handler 也入 pending 槽 （投递边界遇到 `SIG_DFL`/`SIG_IGN` 照常消费掉、不执行 handler，代价只是一次唤醒）。
+
+### 5.7 附带：win32 上 `fstat(socket)` 报成字符设备
+
+socket 锚点是 `_open("NUL")`，宿主 stat 会给出字符设备。已加分支：命中 wsock 锚点时报 `S_IFSOCK | 0777`（guest 头文件缺 `S_IFSOCK` 时按文件内既有 `S_IFLNK` 的做法补位值）。 __注：这一条修完后 sshd 握手仍失败，说明它不是本次的触发点。__
+
+---
+
+## 6. OpenSSH 现状：精确定位到的阻塞点
+
+### 6.1 客户端侧
+
+```javascript
+debug1: Connection established.
+debug1: Local version string SSH-2.0-OpenSSH_10.3
+kex_exchange_identification: read: Connection reset by peer
+```
+
+### 6.2 服务端侧（`sshd -e -d -d`，即使 `-ddd` 也一样）
+
+```javascript
+debug1: network sockets: 6, 6
+debug2: fd 6 setting TCP_NODELAY
+setsockopt socket 6 IP_TOS 184: Invalid argument
+Connection from 127.0.0.1 port 51888 with IP opts:  80 00 00 00
+<—— 日志到此为止，无任何 fatal/error>
+```
+
+`wait` 得到 __`sshd-status=255`__：是进&#x7A0B;__&#x81EA;己__ `cleanup_exit(255)`，不是被信号杀死 （若被信号杀会是 `128+N`）。
+
+### 6.3 模拟器 trace（按 pid 归因）
+
+```javascript
+# sshd 侧
+[103:103] accept -> guest fd 8
+[103:103] pair: listener port 55898, server peer 127.0.0.1:55899     ← 监视 socketpair 建成
+[103:103] fd_wr[install] fd=9/10                                      ← 监视对两端
+[103:103] close anchor 9 (socket 0x1e8)  peer=127.0.0.1:55898         ← 监视进程关掉一端（正确）
+# privsep 子进程
+[103:103] fd_wr[inherit_dup] ctx=<child> fd=8  host=5   (socket 0x1c4) ← 客户端连接，独立描述符
+[103:103] fd_wr[inherit_dup] ctx=<child> fd=9  host=6   (socket 0x204)
+[103:103] fd_wr[inherit_dup] ctx=<child> fd=10 host=10  (socket 0x20c)
+[104:104] sent 3605 byte(s) on fd 6 ; sent 2253 ...                    ← 与监视器的协议流量
+[104:104] close anchor 5/6/10  → thread_exit                          ← 三个 socket 全关后退出
+```
+
+__即：__
+
+- socketpair 能建、fork 后三个 socket 都&#x4EE5;__&#x72EC;立的 Winsock 描述&#x7B26;__&#x6B63;确继承 （`WSADuplicateSocket` 语义，MSDN 保证"最后一个描述符关闭前底层 socket 不关"）—— §5.2 那个"父进程 close(9) 就 FIN 掉子进程 fd 4"的原始猜&#x60F3;__&#x4E0D;成立__，fd 继承语义本身是对的；
+- 子进程完成 monitor 握手&#x540E;__&#x4ECE;未向客户端连接写过一个字&#x8282;__&#x5C31;退出了；
+- 监视进程随之退出 → 连接最后一个描述符关闭 → Windows 回 RST → 客户端看到 `Connection reset`。
+
+### 6.4 下一步
+
+以 `RVVM_TRACE=fd,job,wsock,sys` + `RVVM_VERBOSE=1` 跑同一场景， __按子进程 pid 提取它在 monitor 握手之后、退出之前的最后几条 syscall__——失败点就在那几行里。 候选：monitor 协议首包 `mm_request_receive` 的收发语义、紧随其后的某个 stat/检查 （`S_ISSOCK` 已修但不是它），或某个被我们映射成 0 成功/失败的系统调用。
+
+---
+
+## 7. 涉及文件
+
+- `tools/openssh_e2e.ps1`（新增）：OpenSSH 端到端用例
+- `src/core/rvvm_user.c`：trace id 钩子注册、ctx children 注册表与 detach 走查、writev 零长度段、 写 helper 的空写语义、SIGCHLD 通知语义、socket 的 fstat
+- `src/util/threading.c`：win32 带超时等待的上限 + timer 装配校验
+- `src/util/vma_ops.c`：`seh_handler` 不再取 `seh_lock`
+- `src/util/utils.{h,c}`：trace 行身份前缀
+- `src/win/win_socket.c`：收发 trace

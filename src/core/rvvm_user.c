@@ -127,6 +127,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "rvvm_user.h" // rvvm_user_io_callback typedef (this file's own public header)
 #include "virtpass/vp_shadow.h" // guest rootfs "shape" index (rvvm_user_set_shadow)
 #include "rvvmlib.h"
+
+#if defined(_WIN32)
+/* win_socket.c owns the WinSock-backed descriptors (see win_socket.h). The
+ * userland asks it whether one of its CRT anchors is a socket, because such an
+ * anchor is a "NUL" device underneath and fstat() would report a character
+ * device for it (see the newfstat case). */
+int win_socket_is_fd(int fd);
+#endif
 #include "elf_load.h"
 #include "mem_ops.h"
 #include "utils.h"
@@ -1448,6 +1456,15 @@ typedef struct rvvm_userland {
     // session's terminal must be able to signal a group whose members live in
     // address spaces other than the one that wrote to it.
     struct rvvm_userland*         parent_ctx;
+    // Every address space this one forked. The family is otherwise only
+    // linked upwards, and that upward link is the one that goes stale: a
+    // child outlives its parent (sshd daemonizing out of the session shell
+    // that started it), so a context that goes away has to be able to reach
+    // the children it leaves behind and cut their link to it. A process
+    // record cannot carry that reach - it may be reaped long before its
+    // child is gone - so the children are filed here.
+    vector_t(struct rvvm_userland*) children;
+    spinlock_t                    children_lock;
     // Park word of a stopped address space: while nonzero every vCPU of this
     // context sits in rvvm_futex_wait() at its wrap-loop boundary. Deliberately
     // separate from userland_suspend - a host suspend must not read as a stopped
@@ -4398,6 +4415,24 @@ static THREAD_LOCAL rvvm_hart_t* current_user_hart = NULL;
  * reading the terminal after the shell thinks it is gone. */
 static THREAD_LOCAL rvvm_user_thread_t* current_user_thread = NULL;
 
+/*
+ * Trace identity for this thread: the guest process and thread ids as
+ * "[pid:tid]", or "[host]" outside any guest (the stdin pump, a flusher
+ * thread). Registered with the trace core by rvvm_user_thread_wrap() so
+ * interleaved lines from two in-process fork()ed processes - a socketpair
+ * close on one side, a recv on the other - can be told apart even when
+ * they share a millisecond timestamp.
+ */
+static void userland_trace_ids(char* buf, size_t size)
+{
+    rvvm_user_thread_t* self = current_user_thread;
+    if (!self) {
+        rvvm_strlcpy(buf, "[host]", size);
+        return;
+    }
+    rvvm_snprintf(buf, size, "[%u:%u]", self->proc ? self->proc->pid : 0, self->tid);
+}
+
 /* Has the thread on this host thread been ended? See current_user_thread. */
 static bool userland_thread_finished(void)
 {
@@ -4436,7 +4471,23 @@ static void user_fault_hex(char** p, uint64_t val)
 
 static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
 {
-    char buf[8192];
+    /* A fault raised while this handler is already running: whatever it was
+     * about to touch is what faulted, so reading it again would just recurse -
+     * and a recursion inside an exception handler unwinds into the filter
+     * machinery until the thread wedges instead of ending the run. Say what
+     * happened once and leave. */
+    static THREAD_LOCAL bool in_handler = false;
+    if (unlikely(in_handler)) {
+        (void)!write(2, "=== HOST FAULT inside the fault handler ===\n", 44);
+        _Exit(128 + sig);
+    }
+    in_handler = true;
+    /* Static, not on the stack: the thread that faulted may well have run the
+     * host stack out (a deep guest call chain recurses through interpreter
+     * frames), and an 8 KiB frame here is then the second fault - the handler
+     * would die before printing a word about the first. This path ends the
+     * process anyway, so sharing one buffer costs nothing. */
+    static char buf[8192];
     char* p = buf;
     UNUSED(ucontext);
     const char* hdr = "=== HOST FAULT inside guest === sig=";
@@ -5711,7 +5762,11 @@ static void userland_exit_process(rvvm_userland_t* ctx, int code, rvvm_user_thre
         if (!proc->run_root && !userland_parent_alive(proc)) {
                 RVVM_TRC(RVVM_TRC_JOB, "reap orphan: pid=%u ppid=%u (parent gone)",
                           proc->pid, proc->ppid);
-            userland_proc_forget(proc->parent_ctx, proc);
+            /* A parent address space that is gone left this record with a NULL
+             * parent_ctx (see userland_detach_procs), so there is no registry
+             * of its own to drop it from - this one filed it too, and is where
+             * it goes. */
+            userland_proc_forget(proc->parent_ctx ? proc->parent_ctx : ctx, proc);
         }
     }
 
@@ -5910,6 +5965,7 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
     rvvm_userland_t* ctx = safe_new_obj(rvvm_userland_t);
     ctx->machine      = machine;
     ctx->next_task_id = pid + 1;   // The child wears pid; its own ids come after
+    vector_init(ctx->children);
 
     /* Filesystem view and credentials: to the guest's files this is the same
      * process. The prefix is copied, since the parent's string may be its own. */
@@ -5948,6 +6004,12 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
      * one that reads the keyboard), and the console's foreground group - the
      * child answers to the same terminal the parent does. */
     ctx->parent_ctx  = parent;
+    /* ...and the other half of that link, filed on the parent: it is the only
+     * record of this address space that outlives the parent (see the children
+     * field, and userland_detach_family). */
+    spin_lock(&parent->children_lock);
+    vector_push_back(parent->children, ctx);
+    spin_unlock(&parent->children_lock);
     ctx->tty_fg_pgid = parent->tty_fg_pgid;
 
     /* The controlling terminal is inherited like the terminal itself: a command
@@ -7317,10 +7379,21 @@ static bool userland_deliver_signal(rvvm_userland_t* ctx, uint32_t sig)
         return false;
     }
     uint64_t handler = ctx->siga[sig].handler;
-    if (handler == (uint64_t)SIG_IGN) {
+    /* Job control is a notification, not a delivery: a parent parked in
+     * sigsuspend() waiting for a job - which is how a shell collects `cmd &` -
+     * has to be woken by the child's exit whether or not it catches SIGCHLD,
+     * exactly as the kernel wakes waiters. Without this, a shell whose SIGCHLD
+     * is at its default disposition waits for a signal this emulator decided
+     * not to raise, and the whole session hangs.
+     *
+     * Posting is free when nothing wants it: the delivery boundary consumes
+     * the slot and runs no handler for SIG_DFL/SIG_IGN (userland_siginject),
+     * so this costs a wakeup and nothing else. */
+    bool notify_only = (sig == UAPI_SIGCHLD || sig == UAPI_SIGCONT);
+    if (handler == (uint64_t)SIG_IGN && !notify_only) {
         return true;   // ignored: consumed, nothing to deliver
     }
-    if (handler != (uint64_t)SIG_DFL) {
+    if (handler != (uint64_t)SIG_DFL || notify_only) {
         atomic_store_uint32(&ctx->sig_pending, sig);
         // Unblock a read(0) parked on the input event - it returns -EINTR
         // and its vCPU walks into the delivery boundary, where the handler
@@ -8443,6 +8516,11 @@ static int64_t userland_dev_read(int dev, void* buf, size_t count, bool block)
 
 static int64_t userland_dev_write(int dev, const void* buf, size_t count)
 {
+    /* The same empty-write rule as the pty writer: no bytes, no work, and the
+     * base pointer is not looked at. */
+    if (!count) {
+        return 0;
+    }
     if (!buf) {
         return -UAPI_EFAULT;
     }
@@ -8618,11 +8696,14 @@ static int64_t userland_pty_read(struct userland_pty* pty, bool master, void* bu
 static int64_t userland_pty_write(struct userland_pty* pty, bool master, const void* buf, size_t count,
                                   rvvm_userland_t* ctx, bool block)
 {
-    if (!buf) {
-        return -UAPI_EFAULT;
-    }
+    /* An empty write is the no-op POSIX says it is, whatever the base pointer
+     * holds: a zero-length iovec may carry a NULL base (musl's stdio builds
+     * them), and rejecting it would fail an otherwise valid writev. */
     if (!count) {
         return 0;
+    }
+    if (!buf) {
+        return -UAPI_EFAULT;
     }
 
     /* Both rings can be full, so a write can come up short - and a short write
@@ -10371,6 +10452,8 @@ static void* rvvm_user_thread_wrap(void* arg)
     current_user_thread = thread;
     // Bind this guest thread to its instance context (see uctx())
     tls_userland = rvvm_userland_ctx(cpu->machine);
+    /* Trace lines from here on carry this thread's [pid:tid] (see utils.h) */
+    rvvm_trace_set_id_fn(userland_trace_ids);
 
     userland_thread_register(thread);
 
@@ -11331,6 +11414,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                                       a0, iov_fd, (unsigned long)a2,
                                       (unsigned)((const uint8_t*)hiov[0].iov_base)[0]);
                         for (int i = 0; i < (int)a2; i++) {
+                            /* A zero-length segment is the no-op POSIX says it is,
+                             * and its base may legitimately be NULL: handing it to
+                             * the writer would fail the whole writev with EFAULT.
+                             * musl's stdio builds segments like that (the "Overwrite
+                             * (y/n)? " prompt is one), which is how a shell's sshd
+                             * dies writing its banner. */
+                            if (!hiov[i].iov_len) {
+                                continue;
+                            }
                             ssize_t r = iov_pty
                                 ? (ssize_t)userland_pty_write(iov_pty, iov_master,
                                                               hiov[i].iov_base, hiov[i].iov_len,
@@ -11624,6 +11716,22 @@ static void* rvvm_user_thread_wrap(void* arg)
                         } else if (userland_dev_by_fd(hfd, &dev)) {
                             userland_dev_fill_stat(dev, &st);
                             a0 = 0;
+#if defined(_WIN32)
+                        } else if (win_socket_is_fd((int)hfd)) {
+                            /* A socket, and on this host the descriptor is a CRT
+                             * anchor opened on "NUL" - so the host stat answers a
+                             * character device for a perfectly good socket. A
+                             * guest that checks the shape walks away from it:
+                             * OpenSSH's privilege-separation monitor refuses to
+                             * continue unless its monitor socket is S_ISSOCK. */
+                            memset(&st, 0, sizeof(st));
+#ifndef S_IFSOCK
+#define S_IFSOCK 0140000   /* Linux's bit value; the host headers may omit it */
+#endif
+                            st.st_mode = S_IFSOCK | 0777;
+                            st.st_nlink = 1;
+                            a0 = 0;
+#endif
                         } else {
                             a0 = errno_ret(fstat(hfd, &st));
                             if (a0 == 0) {
@@ -13636,6 +13744,7 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
 
     rvvm_userland_t* ctx = safe_new_obj(rvvm_userland_t);
     ctx->machine      = machine;
+    vector_init(ctx->children);
     /* The console is already open on 0/1/2 before the guest runs a single
      * instruction, so the table starts out knowing those numbers are taken. */
     userland_fd_table_init(ctx);
@@ -13649,6 +13758,142 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
     ctx->tty_lflag    = TTY_LFLAG_DEFAULT;
     machine->userdata = ctx;
     return machine;
+}
+
+/* ---------------------------------------------------------------- *
+ * Detaching a process record from an address space that is going away
+ * ---------------------------------------------------------------- *
+ *
+ * A process record outlives the address space that filed it: a forked
+ * child keeps running after its parent process exits - sshd daemonizing
+ * out of the session shell that started it is the shape this exists for -
+ * and the record it leaves behind (kept alive by the child's own
+ * registry, which shares the same object) still points at that address
+ * space. The first thing to touch it after the free reads freed memory:
+ * the child's own exit delivers SIGCHLD through proc->parent_ctx, and
+ * userland_parent_alive() walks the parent's registry through it.
+ *
+ * So the records are detached before the space goes: every registry in
+ * the family - the dying context's own, its ancestors', and every
+ * descendant's - is walked and any back-pointer naming the dying
+ * context is cleared. A record whose parent is gone then simply reports
+ * "no parent" (every userland_parent_alive() and userland_notify_parent()
+ * already handles NULL) instead of naming one that is gone.
+ *
+ * The walk starts at the dying context's parent, since the context tree
+ * is only linked upwards; going down from there reaches the dying
+ * context's own registry and everything below it. Children are collected
+ * before their pointer is cleared, so a record still leads the walk into
+ * the space that is going away. */
+/* Bounded walk: a runaway fork tree degrades to "some children keep a stale
+ * link" instead of a host stack overflow. */
+#define USERLAND_DETACH_MAX_KIDS  16
+#define USERLAND_DETACH_MAX_DEPTH 32
+
+/* Drop @child from @parent's children list. Done from the child's own
+ * teardown, while the link is still known good - a context that goes away
+ * must not stay filed under a parent that outlives it, or that parent's own
+ * teardown walks into freed memory looking for it. */
+static void userland_children_remove(rvvm_userland_t* parent, rvvm_userland_t* child)
+{
+    if (!parent || !child) {
+        return;
+    }
+    spin_lock(&parent->children_lock);
+    for (size_t i = vector_size(parent->children); i > 0; i--) {
+        if (vector_at(parent->children, i - 1) == child) {
+            vector_erase(parent->children, i - 1);
+            break;
+        }
+    }
+    spin_unlock(&parent->children_lock);
+}
+
+/* Clear every record in @ctx's registry that names @dying. */
+static void userland_detach_records(rvvm_userland_t* dying, rvvm_userland_t* ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    spin_lock(&ctx->proc_lock);
+    vector_foreach (ctx->procs, i) {
+        rvvm_process_t* proc = vector_at(ctx->procs, i);
+        if (proc->parent_ctx == dying) {
+            proc->parent_ctx = NULL;
+        }
+        if (proc->child_ctx == dying) {
+            proc->child_ctx = NULL;
+        }
+    }
+    spin_unlock(&ctx->proc_lock);
+}
+
+/* Detach @node - which stays alive - and everything forked below it. */
+static void userland_detach_below(rvvm_userland_t* dying, rvvm_userland_t* node, int depth)
+{
+    if (!node || depth > USERLAND_DETACH_MAX_DEPTH) {
+        return;
+    }
+    userland_detach_records(dying, node);
+
+    rvvm_userland_t* kids[USERLAND_DETACH_MAX_KIDS];
+    size_t           nkids = 0;
+    spin_lock(&node->children_lock);
+    while (vector_size(node->children) && nkids < USERLAND_DETACH_MAX_KIDS) {
+        kids[nkids++] = vector_at(node->children, 0);
+    }
+    spin_unlock(&node->children_lock);
+
+    for (size_t i = 0; i < nkids; i++) {
+        userland_detach_below(dying, kids[i], depth + 1);
+    }
+}
+
+/* Cut every link that names @dying, before the caller releases it. */
+static void userland_detach_family(rvvm_userland_t* dying)
+{
+    if (!dying) {
+        return;
+    }
+    /* Upwards: each ancestor still reachable through parent_ctx holds this
+     * address space's own process record, and that record names it. (A live
+     * context's link is either NULL or a live context - that is what the walk
+     * below maintains, so this chain is safe to follow.) */
+    rvvm_userland_t* up = dying->parent_ctx;
+    for (int depth = 0; up && depth <= USERLAND_DETACH_MAX_DEPTH; depth++) {
+        userland_detach_records(dying, up);
+        up = up->parent_ctx;
+    }
+
+    /* Downwards: the address spaces this one forked, which outlive it. They are
+     * unlinked here - a child must never be left naming a parent that is going
+     * away - and everything below them is detached from @dying in turn. */
+    for (;;) {
+        rvvm_userland_t* kids[USERLAND_DETACH_MAX_KIDS];
+        size_t           nkids = 0;
+        bool             more;
+
+        spin_lock(&dying->children_lock);
+        while (vector_size(dying->children) && nkids < USERLAND_DETACH_MAX_KIDS) {
+            rvvm_userland_t* kid = vector_at(dying->children, 0);
+            vector_erase(dying->children, 0);
+            kid->parent_ctx = NULL;
+            kids[nkids++] = kid;
+        }
+        more = vector_size(dying->children) != 0;
+        if (!more) {
+            vector_free(dying->children);
+        }
+        spin_unlock(&dying->children_lock);
+
+        for (size_t i = 0; i < nkids; i++) {
+            userland_detach_records(dying, kids[i]);
+            userland_detach_below(dying, kids[i], 0);
+        }
+        if (!more) {
+            break;
+        }
+    }
 }
 
 // Tear down a userland instance: context, thread registry and machine
@@ -13672,6 +13917,19 @@ static void userland_destroy(rvvm_machine_t* machine)
     /* The descriptors this address space held close with it - including its
      * ends of any pty pair, which release their side here. */
     userland_fd_table_free(ctx);
+    /* Records this instance filed can still be alive elsewhere (see
+     * userland_detach_family): a child that outlived this address space holds
+     * the same object through its own registry, and that record still names
+     * this instance as its parent. Detach it before the memory below goes.
+     *
+     * The parent's side of the family link is dropped first, while it is
+     * still known good: a parent that is already gone cleared this pointer
+     * when it detached its children, so the branch is simply skipped. */
+    rvvm_userland_t* parent = ctx->parent_ctx;
+    ctx->parent_ctx = NULL;
+    userland_children_remove(parent, ctx);
+    userland_detach_family(ctx);
+
     /* Every process record goes: nothing can reference them any more - the
      * threads are gone (see the wait above), so the references they held are not
      * coming back. */

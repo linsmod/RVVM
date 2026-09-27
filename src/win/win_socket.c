@@ -926,6 +926,8 @@ long win_socket_read(int fd, void* buf, size_t len)
     n = recv(s, (char*)buf, (int)len, 0);
     if (n == 0) {
         RVVM_TRC(RVVM_TRC_WSOCK,  "recv EOF on fd %d (socket %p)", fd, (void*)s);
+    } else if (n > 0) {
+        RVVM_TRC(RVVM_TRC_WSOCK, "recv %ld byte(s) on fd %d", n, fd);
     }
     if (n == SOCKET_ERROR) {
         int werr = WSAGetLastError();
@@ -954,6 +956,7 @@ long win_socket_write(int fd, const void* buf, size_t len)
         wsock_set_errno();
         return -1;
     }
+    RVVM_TRC(RVVM_TRC_WSOCK, "sent %ld byte(s) on fd %d", n, fd);
     return n;
 }
 

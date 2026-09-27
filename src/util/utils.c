@@ -804,7 +804,7 @@ static uint64_t log_time_ms(void)
 
 static void log_print(const char* prefix, const char* fmt, const void* argv)
 {
-    char   buffer[256] = {0};
+    char   buffer[384] = {0};
     size_t pos         = rvvm_snprintf(buffer, sizeof(buffer), "[%9llu ms] ",
                                        (unsigned long long)log_time_ms());
     pos = EVAL_MIN(pos, sizeof(buffer) - 1);
@@ -872,6 +872,7 @@ PRINT_FORMAT void rvvm_warn(const char* format_str, ...)
 
 static uint32_t rvvm_trace_mask  = 0;
 static bool     rvvm_trace_ready = false;
+static rvvm_trace_id_fn rvvm_trace_id;   // per-line [pid:tid] formatter, see utils.h
 
 static const struct {
     uint32_t    bit;
@@ -969,6 +970,11 @@ PUBLIC bool rvvm_trace_enabled(uint32_t cat)
     return (rvvm_trace_mask & cat) != 0;
 }
 
+PUBLIC void rvvm_trace_set_id_fn(rvvm_trace_id_fn fn)
+{
+    rvvm_trace_id = fn;
+}
+
 /* Independent of loglevel on purpose: the category IS the switch, and asking
  * for one should not also require the noise of the others (which is what a
  * higher loglevel would bring). */
@@ -978,9 +984,22 @@ PUBLIC PRINT_FORMAT_ARG2 void rvvm_trace(uint32_t cat, const char* format_str, .
     if (!rvvm_trace_enabled(cat)) {
         return;
     }
-    va_start(args, format_str);
-    log_print(log_has_colors() ? "\033[36;1mTRACE\033[0;1m: " : "TRACE: ", format_str, &args);
-    va_end(args);
+    {
+        char prefix_buf[64];
+        const char* prefix = log_has_colors() ? "\033[36;1mTRACE\033[0;1m: " : "TRACE: ";
+        if (rvvm_trace_id) {
+            char ids[40] = {0};
+            rvvm_trace_id(ids, sizeof ids);
+            if (ids[0]) {
+                rvvm_snprintf(prefix_buf, sizeof prefix_buf,
+                              log_has_colors() ? "\033[36;1mTRACE\033[0;1m%s: " : "TRACE%s: ", ids);
+                prefix = prefix_buf;
+            }
+        }
+        va_start(args, format_str);
+        log_print(prefix, format_str, &args);
+        va_end(args);
+    }
 }
 
 PRINT_FORMAT void rvvm_error(const char* format_str, ...)
