@@ -1419,8 +1419,20 @@ typedef struct rvvm_userland {
     // Prefix set through rvvm_user_set_prefix(): the string is owned here
     char*                    prefix_owned;
     bool                     fake_root;
+    // Guest credentials. fake_uid/fake_gid are the *real* (saved) ids and are
+    // what stat() reports as the file owner; the e* twins are what the guest
+    // runs as. They are kept apart because Linux lets an unprivileged process
+    // give a privilege away and never take it back, and a guest that checks
+    // (OpenSSH's permanently_set_uid does, fatally) sees the difference: a
+    // single id would let setuid(0) succeed after the drop.
     int                      fake_uid;
+    int                      fake_euid;
     int                      fake_gid;
+    int                      fake_egid;
+    // Per-address-space resource limits, as prlimit64(2) reports them. Recorded
+    // and reported back, not enforced - see rvvm_sys_prlimit().
+    uint64_t                 rlim_cur[16];
+    uint64_t                 rlim_max[16];
     // Guest-virtual working directory. Relative paths in guest syscalls are
     // resolved against this, never against the host process's own cwd: the host
     // cwd is wherever the emulator happened to be started from, which has
@@ -4353,6 +4365,16 @@ struct uapi_sockaddr_un {
     char           sun_path[UAPI_UNIX_PATH_MAX];
 };
 
+/* Linux and WinSock agree on struct sockaddr_in field for field, including
+ * network byte order; only the family *number* for AF_INET6 differs, which
+ * addr_to_win() handles. Named here so syscall traces can read one. */
+struct uapi_sockaddr_in {
+    unsigned short sin_family;
+    unsigned short sin_port;
+    unsigned int   sin_addr;
+    char           sin_zero[8];
+};
+
 /* bind()/connect(): rewrite a guest AF_UNIX pathname for the host. Returns
  * @scratch when it was rewritten (and updates @len), the original address when
  * there is nothing to map (not AF_UNIX, abstract, no prefix, or too long). */
@@ -6230,7 +6252,11 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
      * process. The prefix is copied, since the parent's string may be its own. */
     ctx->fake_root    = parent->fake_root;
     ctx->fake_uid     = parent->fake_uid;
+    ctx->fake_euid    = parent->fake_euid;
     ctx->fake_gid     = parent->fake_gid;
+    ctx->fake_egid    = parent->fake_egid;
+    memcpy(ctx->rlim_cur, parent->rlim_cur, sizeof(ctx->rlim_cur));
+    memcpy(ctx->rlim_max, parent->rlim_max, sizeof(ctx->rlim_max));
     if (parent->prefix_path) {
         size_t len = rvvm_strlen(parent->prefix_path) + 1;
         ctx->prefix_owned = safe_new_arr(char, len);
@@ -7411,6 +7437,13 @@ static int rvvm_sys_getuid(void)
     return errno_ret(getuid());
 }
 
+static int rvvm_sys_geteuid(void)
+{
+    rvvm_userland_t* ctx = uctx();
+    if (ctx->fake_root) return ctx->fake_euid;
+    return errno_ret(geteuid());
+}
+
 static int rvvm_sys_getgid(void)
 {
     rvvm_userland_t* ctx = uctx();
@@ -7418,12 +7451,30 @@ static int rvvm_sys_getgid(void)
     return errno_ret(getgid());
 }
 
+static int rvvm_sys_getegid(void)
+{
+    rvvm_userland_t* ctx = uctx();
+    if (ctx->fake_root) return ctx->fake_egid;
+    return errno_ret(getegid());
+}
+
+/* setuid(2)/setgid(2) with a fake root. A process holding euid 0 may set all
+ * three ids, exactly as a privileged one does; once the effective id is not 0
+ * the only ids still reachable are the ones it already holds, so anything else
+ * - setuid(0) above all - is EPERM. That irreversibility is the whole point of
+ * dropping privileges, and a guest is entitled to test for it. */
 static int rvvm_sys_setuid(int uid)
 {
     rvvm_userland_t* ctx = uctx();
     if (ctx->fake_root) {
-        ctx->fake_uid = uid;
-        return 0;
+        if (ctx->fake_euid == 0 || uid == ctx->fake_uid || uid == ctx->fake_euid) {
+            if (ctx->fake_euid == 0) {
+                ctx->fake_uid = uid;
+            }
+            ctx->fake_euid = uid;
+            return 0;
+        }
+        return -UAPI_EPERM;
     }
     return errno_ret(setuid(uid));
 }
@@ -7432,25 +7483,89 @@ static int rvvm_sys_setgid(int gid)
 {
     rvvm_userland_t* ctx = uctx();
     if (ctx->fake_root) {
-        ctx->fake_gid = gid;
-        return 0;
+        if (ctx->fake_egid == 0 || gid == ctx->fake_gid || gid == ctx->fake_egid) {
+            if (ctx->fake_egid == 0) {
+                ctx->fake_gid = gid;
+            }
+            ctx->fake_egid = gid;
+            return 0;
+        }
+        return -UAPI_EPERM;
     }
     return errno_ret(setgid(gid));
 }
 
 static int rvvm_sys_getresuid(int* ruid, int* euid, int* suid)
 {
-    if (ruid) *ruid = rvvm_sys_getuid();
-    if (euid) *euid = rvvm_sys_getuid();
-    if (suid) *suid = rvvm_sys_getuid();
+    *ruid = rvvm_sys_getuid();
+    *euid = rvvm_sys_geteuid();
+    *suid = rvvm_sys_getuid();   /* saved set-user-ID tracks the real id */
     return 0;
 }
 
 static int rvvm_sys_getresgid(int* rgid, int* egid, int* sgid)
 {
-    if (rgid) *rgid = rvvm_sys_getgid();
-    if (egid) *egid = rvvm_sys_getgid();
-    if (sgid) *sgid = rvvm_sys_getgid();
+    *rgid = rvvm_sys_getgid();
+    *egid = rvvm_sys_getegid();
+    *sgid = rvvm_sys_getgid();
+    return 0;
+}
+
+/* setresuid(2)/setresgid(2): -1 means "leave this one alone". Privileged (euid
+ * 0) callers may set all three independently; an unprivileged one may only pick
+ * from the ids it already holds, which is the same restriction setuid(2) has
+ * and for the same reason. */
+static int rvvm_sys_setresuid(int ruid, int euid, int suid)
+{
+    rvvm_userland_t* ctx = uctx();
+    if (!ctx->fake_root) {
+#ifdef __linux__
+        return errno_ret(setresuid(ruid, euid, suid));
+#else
+        /* No host syscall to defer to: WinSock hosts always run with a fake
+         * root, so this arm is unreachable there. */
+        (void)ruid; (void)euid; (void)suid;
+        return -UAPI_ENOSYS;
+#endif
+    }
+    if (ctx->fake_euid == 0) {
+        if (ruid != -1) ctx->fake_uid = ruid;
+        if (suid != -1) ctx->fake_uid = suid;
+        if (euid != -1) ctx->fake_euid = euid;
+        return 0;
+    }
+    if (ruid != -1 && ruid != ctx->fake_uid) return -UAPI_EPERM;
+    if (suid != -1 && suid != ctx->fake_uid) return -UAPI_EPERM;
+    if (euid != -1 && euid != ctx->fake_uid && euid != ctx->fake_euid) {
+        return -UAPI_EPERM;
+    }
+    if (euid != -1) ctx->fake_euid = euid;
+    return 0;
+}
+
+static int rvvm_sys_setresgid(int rgid, int egid, int sgid)
+{
+    rvvm_userland_t* ctx = uctx();
+    if (!ctx->fake_root) {
+#ifdef __linux__
+        return errno_ret(setresgid(rgid, egid, sgid));
+#else
+        (void)rgid; (void)egid; (void)sgid;
+        return -UAPI_ENOSYS;
+#endif
+    }
+    if (ctx->fake_egid == 0) {
+        if (rgid != -1) ctx->fake_gid = rgid;
+        if (sgid != -1) ctx->fake_gid = sgid;
+        if (egid != -1) ctx->fake_egid = egid;
+        return 0;
+    }
+    if (rgid != -1 && rgid != ctx->fake_gid) return -UAPI_EPERM;
+    if (sgid != -1 && sgid != ctx->fake_gid) return -UAPI_EPERM;
+    if (egid != -1 && egid != ctx->fake_gid && egid != ctx->fake_egid) {
+        return -UAPI_EPERM;
+    }
+    if (egid != -1) ctx->fake_egid = egid;
     return 0;
 }
 
@@ -7494,6 +7609,101 @@ static rvvm_addr_t rvvm_sys_chdir(const char* path)
         return -UAPI_ENOTDIR;
     }
     rvvm_strlcpy(uctx()->cwd, abs, sizeof(uctx()->cwd));
+    return 0;
+}
+
+/* chroot(2): the host has no equivalent and the guest cannot be given one - a
+ * guest process here runs with the same filesystem reach as the emulator, so
+ * there is nothing left for a chroot to withhold. What a guest can still rely
+ * on is the answer's *meaning*, so the path is resolved and checked exactly as
+ * chdir() checks it (missing -> ENOENT, not a directory -> ENOTDIR, a real
+ * directory -> success) and the root itself is left where it is.
+ *
+ * This is not a corner case. OpenSSH's pre-auth privsep child chroots to
+ * ChrootDirectory/var/empty and treats ENOSYS as fatal, which is why sshd used
+ * to die with "chroot(\"/var/empty\"): Function not implemented" and every
+ * connection ended in a RST. Callers that only chroot to shed privileges are
+ * unaffected; a guest that chroots in order to *isolate* gets no isolation here.
+ */
+/* The guest's struct rlimit: two 64-bit fields, which is also the host's. */
+typedef struct rvvm_rlimit {
+    uint64_t rlim_cur;
+    uint64_t rlim_max;
+} rvvm_rlimit_t;
+
+/* prlimit64(2) - musl routes both getrlimit() and setrlimit() through it.
+ *
+ * Limits are recorded per address space and reported back faithfully, but
+ * nothing is enforced: the emulator already hands a guest the host's entire
+ * filesystem, so capping file size withholds no access that was not already
+ * there. What a guest does get is a truthful answer - a program that lowers a
+ * limit and reads it back sees its own value, and "the hard limit cannot be
+ * raised above what you already have" is enforced, because a guest is entitled
+ * to rely on privilege returning only to a privileged process.
+ *
+ * It has to work at all: OpenSSH's pre-auth sandbox child treats a failing
+ * setrlimit(RLIMIT_FSIZE) as fatal, so with this stubbed out to EINVAL every
+ * sshd connection died a few syscalls after the privsep fork.
+ */
+static rvvm_addr_t rvvm_sys_prlimit(rvvm_addr_t pid, int resource,
+                                    const rvvm_rlimit_t* new_limit,
+                                    rvvm_rlimit_t* old_limit)
+{
+    rvvm_userland_t* ctx = uctx();
+    rvvm_rlimit_t cur;
+
+    if (resource < 0 || resource >= 16) {
+        return -UAPI_EINVAL;
+    }
+    if (pid != 0) {
+        /* Limits live on the address space and there is no lookup by pid here,
+         * so a request naming another process is refused rather than answered
+         * with this process's numbers. */
+        return -UAPI_ESRCH;
+    }
+    if (!new_limit && !old_limit) {
+        return -UAPI_EFAULT;
+    }
+    cur.rlim_cur = ctx->rlim_cur[resource];
+    cur.rlim_max = ctx->rlim_max[resource];
+    if (old_limit) {
+        *old_limit = cur;
+    }
+    if (new_limit) {
+        uint64_t want_max = new_limit->rlim_max;
+        uint64_t want_cur = new_limit->rlim_cur;
+        if (want_max > cur.rlim_max) {
+            return -UAPI_EPERM;
+        }
+        if (want_max < cur.rlim_cur) {
+            want_cur = want_max;   /* lowering the hard limit lowers the soft */
+        }
+        ctx->rlim_cur[resource] = want_cur;
+        ctx->rlim_max[resource] = want_max;
+    }
+    return 0;
+}
+
+static rvvm_addr_t rvvm_sys_chroot(const char* path)
+{
+    char abs[UAPI_PATH_MAX];
+    char host[UAPI_PATH_MAX];
+    struct stat st;
+
+    if (!path) {
+        return -UAPI_EFAULT;
+    }
+    if (!guest_path_absolutize(abs, sizeof(abs), path)) {
+        return -UAPI_ENAMETOOLONG;
+    }
+    RVVM_TRC(RVVM_TRC_PATH, "path: syscall %ld chroot \"%s\" -> \"%s\"",
+              (long)tls_cur_syscall, path, map_abs_path(host, abs));
+    if (stat(map_abs_path(host, abs), &st) != 0) {
+        return last_errno();
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        return -UAPI_ENOTDIR;
+    }
     return 0;
 }
 
@@ -11234,6 +11444,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_fchdir(%ld)", a0);
                     a0 = rvvm_sys_fchdir(userland_fd_host(uctx(), (int)a0));
                     break;
+                case 51: // chroot
+                    rvvm_info("sys_chroot(%s)", to_str(a0));
+                    a0 = rvvm_sys_chroot(to_str(a0));
+                    break;
                 case 52: { // fchmod
                     int hfd = userland_fd_host(uctx(), (int)a0);
                     rvvm_info("sys_fchmod(%ld, %lx)", a0, a1);
@@ -12404,8 +12618,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 146: // setuid
                     a0 = rvvm_sys_setuid(a0);
                     break;
-                case 147: // setresuid - semi stub
-                    a0 = rvvm_sys_setuid(a0);
+                case 147: // setresuid
+                    a0 = rvvm_sys_setresuid((int)a0, (int)a1, (int)a2);
                     break;
                 case 148: { // getresuid - semi stub
                     // Linux has no optional out-parameters here - all three must
@@ -12420,8 +12634,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     break;
                 }
-                case 149: // setresgid - semi stub
-                    a0 = rvvm_sys_setgid(a0);
+                case 149: // setresgid
+                    a0 = rvvm_sys_setresgid((int)a0, (int)a1, (int)a2);
                     break;
                 case 150: { // getresgid - semi stub
                     // Same as getresuid: every pointer is required
@@ -12529,14 +12743,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 174: // getuid
                     a0 = rvvm_sys_getuid();
                     break;
-                case 175: // geteuid - semi stub
-                    a0 = rvvm_sys_getuid();
+                case 175: // geteuid
+                    a0 = rvvm_sys_geteuid();
                     break;
                 case 176: // getgid
                     a0 = rvvm_sys_getgid();
                     break;
-                case 177: // getegid - semi stub
-                    a0 = rvvm_sys_getgid();
+                case 177: // getegid
+                    a0 = rvvm_sys_getegid();
                     break;
                 case 178: // gettid
                     a0 = thread->tid;
@@ -12682,7 +12896,32 @@ case 179: // sysinfo
                     struct uapi_sockaddr_un scratch;
                     unsigned int len = (unsigned int)a2;
                     const void*  sa  = wrap_guest_sockaddr(pbuf, &scratch, to_ptr(a1), &len);
-                    rvvm_info("sys_connect(%ld, %lx, %lx)", a0, a1, a2);
+                    /* Name what was asked for, not just where the bytes live: a
+                     * connect() the guest never meant to make is otherwise
+                     * indistinguishable from one the host refused. */
+                    rvvm_info("sys_connect(%ld, %lx, %lx)",
+                              a0, a1, a2);
+                    {
+                        struct uapi_sockaddr_in probe;
+                        unsigned short fam = 0;
+                        memset(&probe, 0, sizeof(probe));
+                        if (to_ptr_sz(a1, sizeof(probe)))
+                            memcpy(&probe, to_ptr(a1), sizeof(probe));
+                        fam = probe.sin_family;
+                        if (fam == AF_INET) {
+                            unsigned p = ((probe.sin_port & 0xff) << 8) |
+                                         ((probe.sin_port >> 8) & 0xff);
+                            rvvm_info("  connect -> inet %u.%u.%u.%u:%u",
+                                      probe.sin_addr & 255, (probe.sin_addr >> 8) & 255,
+                                      (probe.sin_addr >> 16) & 255,
+                                      (probe.sin_addr >> 24) & 255, p);
+                        } else if (fam == AF_UNIX) {
+                            const struct uapi_sockaddr_un* un = to_ptr(a1);
+                            rvvm_info("  connect -> unix \"%.100s\"", un->sun_path);
+                        } else {
+                            rvvm_info("  connect -> family %u len %u", fam, len);
+                        }
+                    }
                     a0 = errno_ret(connect(userland_fd_host(uctx(), (int)a0), sa, (socklen_t)len));
                     break;
                 }
@@ -12919,11 +13158,11 @@ case 179: // sysinfo
                     a0 = rvvm_sys_wait4(uctx(), thread, (int32_t)a0, status, (int)a2, to_ptr(a3));
                     break;
                 }
-                case 261: // prlimit64 - stub
+                case 261: { // prlimit64
                     rvvm_info("sys_prlimit64(%lx, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    //a0 = errno_ret(prlimit(a0, a1, to_ptr(a2), to_ptr(a3)));
-                    a0 = -UAPI_EINVAL;
+                    a0 = rvvm_sys_prlimit(a0, (int)a1, to_ptr(a2), to_ptr(a3));
                     break;
+                }
 #ifdef __linux__
                 case 269: // sendmmsg
                     // TODO: Struct conversion
@@ -14026,6 +14265,17 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
     userland_fd_table_init(ctx);
     ctx->prefix_path  = USERLAND_DEFAULT_PREFIX;
     ctx->fake_root    = USERLAND_DEFAULT_FAKE_ROOT;
+    /* Guests run as root until they say otherwise, which is what makes the
+     * rootfs writable out of the box; the first setuid/setgid is what makes
+     * them unprivileged, and from there on 0 is out of reach. */
+    ctx->fake_uid     = 0;
+    ctx->fake_euid    = 0;
+    ctx->fake_gid     = 0;
+    ctx->fake_egid    = 0;
+    for (int i = 0; i < 16; i++) {
+        ctx->rlim_cur[i] = UINT64_MAX;
+        ctx->rlim_max[i] = UINT64_MAX;
+    }
     rvvm_strlcpy(ctx->cwd, "/", sizeof(ctx->cwd));
     // The process id space starts where every run of this instance starts
     ctx->taskids = userland_taskids_new(USERLAND_FIRST_TASK_ID);
