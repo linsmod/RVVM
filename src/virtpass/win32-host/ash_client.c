@@ -361,12 +361,12 @@ static void ash_rootfs_unlock(const char* path)
     }
 }
 
-int ash_serve(int port, int idle_s)
+int ash_serve(int port, int idle_s, const char* dlog)
 {
     const char* shell = ash_default_core_shell();
     char        port_buf[16];
     char        idle_buf[16];
-    char*       guest[4];
+    char*       guest[5];
     int         rc;
 
     /* One core per port: the lock is the registry, and it fails before a second
@@ -389,10 +389,21 @@ int ash_serve(int port, int idle_s)
 
     snprintf(port_buf, sizeof(port_buf), "%d", port);
     snprintf(idle_buf, sizeof(idle_buf), "%d", idle_s > 0 ? idle_s : 0);
+    /* argv[3]: the daemon's log, as a guest path, only when one was asked for.
+     * NULL (no --dlog) leaves vpsessiond on its own default, which is what the
+     * plain "ash --serve" wants: one well-known file in the run's /tmp. A driver
+     * that runs several cores, or wants to find its own log without reading a
+     * shared one, names it here. The count follows, because the guest's argv is
+     * what carries it - a fixed count would drop it on the floor. */
+    int  guest_argc = 3;
     guest[0] = (char*)shell;
     guest[1] = port_buf;
     guest[2] = idle_buf;
-    guest[3] = NULL;
+    if (dlog && *dlog) {
+        guest[3] = (char*)dlog;
+        guest_argc = 4;
+    }
+    guest[4] = NULL;
 
     /* Same switch as rvvm_winhost (win32_main.c): RVVM_VERBOSE=1 lifts the log
      * to LOG_INFO so the per-syscall lines (sys_openat etc.) reach stderr. */
@@ -415,7 +426,7 @@ int ash_serve(int port, int idle_s)
     /* A core is a daemon: it must not put the terminal it was started from into
      * raw mode or eat its input (the sessions are on the socket, not here). */
     win32_host_no_stdin();
-    if (!win32_host_start_guest(3, guest)) {
+    if (!win32_host_start_guest(guest_argc, guest)) {
         fprintf(stderr, "ash --serve: could not start %s\n", shell);
         win32_host_shutdown();
         ash_rootfs_unlock(lock);

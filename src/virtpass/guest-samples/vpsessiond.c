@@ -69,10 +69,13 @@
 #define SOCK_DIR      "/cores"
 #define SOCK_FMT      SOCK_DIR "/vpsessiond-%d.sock"
 
-/* The daemon's own log, as a guest path. /tmp is the one directory every run
- * gets (the host makes it under <release>/runtime/rootfs/tmp), so a path that
- * works there works in every run directory without the host being told. */
-#define DLOG_PATH     "/tmp/vpsessiond.log"
+/* The daemon's own log, as a guest path, used when argv[3] does not name one.
+/tmp is the one directory every run gets (the host makes it under
+ * <release>/runtime/rootfs/tmp), so a path that works there works in every run
+ * directory without the host being told. A driver that wants its own log says
+ * so on argv[3] instead of collecting this one out of the shared /tmp - two runs
+ * of the same test would otherwise append to the same file. */
+#define DLOG_DEFAULT "/tmp/vpsessiond.log"
 
 /* How long a fresh connection may hold its shell back while a first frame is in
  * flight. Long enough for a client's preamble on loopback, short enough that an
@@ -153,16 +156,16 @@ static long loop_ms(void)
  * something this program should paper over: a guest that writes its log around a
  * host defect hides the defect, and the harness then reads a log that is missing
  * exactly the lines the defect costs. */
-static void dlog_redirect(void)
+static void dlog_redirect(const char* path)
 {
     /* Best effort: the host creates /tmp for the run, but a rootfs without it
      * must not stop the core from booting. */
     mkdir("/tmp", 0777);
 
-    FILE* f = fopen(DLOG_PATH, "a");
+    FILE* f = fopen(path, "a");
     if (!f) {
         fprintf(stderr, "vpsessiond: cannot open %s, log stays on the console\n",
-                DLOG_PATH);
+                path);
         return;
     }
     /* Only stdout moves. stderr stays on the console, so a startup failure
@@ -568,9 +571,14 @@ static void session_check_child(struct session* s)
 
 int main(int argc, char** argv)
 {
+    /* argv[3], when given, is where this daemon's log goes; without it the log
+     * lands in the run's /tmp under its own name. Parsed first, because the
+     * redirect is the first thing that has to happen. */
+    const char* dlog_path = (argc > 3 && argv[3] && *argv[3]) ? argv[3] : DLOG_DEFAULT;
+
     /* First, before anything can print: this daemon's log is a file, not the
      * host process's stdout, which belongs to whoever asked for a command. */
-    dlog_redirect();
+    dlog_redirect(dlog_path);
 
     int port = DEFAULT_PORT;
     if (argc > 1) {

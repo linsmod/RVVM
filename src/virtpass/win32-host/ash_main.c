@@ -27,7 +27,7 @@ app package (rvvm_winhost --app <id>). Debugging is RVVM_TRACE / RVVM_VERBOSE.
 #include "utils.h" /* rvvm_set_loglevel: RVVM_VERBOSE, as the client path uses */
 
 /* Implemented in ash_client.c */
-int ash_serve(int port, int idle_s);
+int ash_serve(int port, int idle_s, const char* dlog);
 int ash_client(int port, const char* one_cmd, bool autostart);
 int ash_list(void);
 int ash_shutdown(int port);
@@ -50,7 +50,8 @@ static int ash_port(void)
 static void print_usage(const char* self)
 {
     fprintf(stderr,
-            "usage: %s [--serve [--idle S]] [--list] [--shutdown]\n"
+            "usage: %s [--serve [--idle S] [--dlog <guest-path>]] [--list]\n"
+            "          [--shutdown] [--no-autostart]\n"
             "          [--port N] [-c <command>] [--sock-path]\n"
             "\n"
             "  %s                  connect to the run's core (start one if none);"
@@ -63,8 +64,15 @@ static void print_usage(const char* self)
             "\n"
             "Options: --port N (default %d, RVVM_ASH_PORT) is the core's logical id\n"
             "and names its endpoint; --serve --idle S stops a core after S seconds\n"
-            "with no session (0 = never). The core program is /sbin/vpsessiond, from\n"
-            "the bundle.\n",
+            "with no session (0 = never). --serve --dlog <path> puts the session\n"
+            "server's log at that guest path instead of the run's /tmp. The core\n"
+            "program is /sbin/vpsessiond, from the bundle.\n"
+            "\n"
+            "--no-autostart: fail instead of starting a core when none is listening.\n"
+            "A client that starts one by itself is convenient and wrong for a test:\n"
+            "the core it starts is a different run, with its own rootfs, and nothing\n"
+            "bounds how long it lives, so a driver that lost its core would go on to\n"
+            "pass against a run it never set up.\n",
             self, self, self, self, self, self, self, ASH_PORT_DEFAULT);
 }
 
@@ -74,7 +82,11 @@ int main(int argc, char** argv)
     bool        list     = false;
     bool        shutdown = false;
     bool        sockpath = false;
+    /* A client starts a core if none is listening, the way wsl does. A test
+     * driver does not want that: it wants a dead core to say so. */
+    bool        autostart = true;
     const char* one_cmd  = NULL;
+    const char* dlog     = NULL;
     int         idle     = 0;
     int         port     = ash_port();
     int         i        = 1;
@@ -95,6 +107,12 @@ int main(int argc, char** argv)
             shutdown = true;
         } else if (!strcmp(a, "--sock-path")) {
             sockpath = true;
+        } else if (!strcmp(a, "--no-autostart")) {
+            autostart = false;
+        } else if (!strcmp(a, "--dlog") && i + 1 < argc) {
+            dlog = argv[++i];
+        } else if (!strncmp(a, "--dlog=", 7)) {
+            dlog = a + 7;
         } else if (!strcmp(a, "--idle") && i + 1 < argc) {
             idle = atoi(argv[++i]);
         } else if (!strncmp(a, "--idle=", 7)) {
@@ -123,7 +141,7 @@ int main(int argc, char** argv)
          * trouble has to be read from never reach this console - and the core is
          * exactly where they are needed. */
         rvvm_set_loglevel(getenv("RVVM_VERBOSE") ? LOG_INFO : LOG_WARN);
-        return ash_serve(port, idle);
+        return ash_serve(port, idle, dlog);
     }
 
     /* Client mode. `-c <command>` asks the core for a one-shot session. */
@@ -134,5 +152,5 @@ int main(int argc, char** argv)
         print_usage(argv[0]);
         return 1;
     }
-    return ash_client(port, one_cmd, true);
+    return ash_client(port, one_cmd, autostart);
 }
