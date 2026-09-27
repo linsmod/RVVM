@@ -25,6 +25,7 @@ Usage:
 
 import argparse
 import gzip
+import io
 import os
 import sys
 import tarfile
@@ -33,6 +34,15 @@ import tarfile
 # relative - the archive's root is the guest's `/`.
 SYSTEM_PROGRAMS = [
     ("vpsessiond", "sbin/vpsessiond"),
+]
+
+# (guest path, content, mode). Small config files layered over the rootfs -
+# hand-written into the archive, no source file to keep in sync. musl has no
+# built-in resolver config: without /etc/resolv.conf every getaddrinfo falls
+# back to 127.0.0.1, where nobody listens, and apk's fetches all report
+# "DNS: transient error (try again later)".
+SYSTEM_FILES = [
+    ("etc/resolv.conf", "nameserver 1.1.1.1\nnameserver 8.8.8.8\n", 0o644),
 ]
 
 
@@ -63,6 +73,18 @@ def tar_file(tar, arcname, path):
     with open(path, "rb") as fh:
         tar.addfile(info, fh)
     return st.st_size
+
+
+def tar_data(tar, arcname, content, mode):
+    info = tarfile.TarInfo(arcname)
+    data = content.encode("utf-8")
+    info.size = len(data)
+    info.mode = mode
+    info.mtime = 0
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    tar.addfile(info, io.BytesIO(data))
+    return len(data)
 
 
 def main():
@@ -107,6 +129,12 @@ def main():
                         tar_dir(tar, "/".join(parts[:i]))
                     size = tar_file(tar, guest, exe)
                     packed.append((name, guest, size))
+                for guest, content, mode in SYSTEM_FILES:
+                    parts = guest.split("/")
+                    for i in range(1, len(parts)):
+                        tar_dir(tar, "/".join(parts[:i]))
+                    size = tar_data(tar, guest, content, mode)
+                    packed.append(("(data)", guest, size))
 
     with open(opts.out, "rb") as fh:
         total = len(fh.read())
@@ -121,7 +149,7 @@ def main():
 
     for name, guest, size in packed:
         print("system %-16s /%s  %d byte(s)" % (name, guest, size))
-    print("wrote %s: %d program(s), %d member(s), %d byte(s)"
+    print("wrote %s: %d entry(ies), %d member(s), %d byte(s)"
           % (opts.out, len(packed), len(members), total))
     return 0
 

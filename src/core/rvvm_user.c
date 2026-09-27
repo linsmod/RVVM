@@ -496,6 +496,139 @@ static void uapi_stat_convert(struct uapi_stat* dst, const struct stat* src)
     dst->ctime_nsec = 0;
 }
 
+/* Guest-visible permission bits are a shadow on hosts whose stat cannot
+ * express them (the win32 CRT reports every writable file as 0666 and every
+ * directory as 0777, whatever the guest chmod'ed it to). A chmod that the
+ * guest performed is recorded here by the file's own identity - (st_dev,
+ * st_ino), immune to descriptor recycling - and re-applied whenever the object
+ * is stat'ed again. sshd refuses a host key whose mode carries group/other
+ * bits, so this is load-bearing for it. On a Linux host the recorded mode is
+ * the mode the host already reports: the round-trip changes nothing. */
+#define MODE_OVERRIDE_MAX 8192   /* an installed package is hundreds of files */
+typedef struct {
+    uint64_t dev;
+    uint64_t ino;
+    uint32_t mode;
+    bool     used;
+} mode_override_t;
+static mode_override_t* mode_overrides;
+static int              mode_override_count;   /* slots allocated so far */
+static spinlock_t       mode_override_lock = RVVM_LOCK_INIT;
+
+/* The table grows on demand: dropping a mode because the array filled up is
+ * worse than a flat default - the guest then sees a 0644 host key where it
+ * wrote 0600, and sshd silently refuses to start. */
+static bool mode_override_grow(int want)
+{
+    int   have = mode_override_count;
+    int   next = have ? have * 2 : 256;
+    void* grown;
+
+    if (want <= have) {
+        return true;
+    }
+    while (next < want) {
+        next *= 2;
+    }
+    if (next > MODE_OVERRIDE_MAX) {
+        next = MODE_OVERRIDE_MAX;
+        if (next <= have) {
+            return false;
+        }
+    }
+    grown = safe_realloc(mode_overrides, (size_t)next * sizeof(*mode_overrides));
+    if (!grown) {
+        return false;
+    }
+    mode_overrides = grown;
+    for (int i = have; i < next; i++) {
+        mode_overrides[i] = (mode_override_t){0};
+    }
+    mode_override_count = next;
+    return true;
+}
+
+/* The key is compared through these rather than field-to-field: st_dev is not
+ * the same width everywhere (the win32 compat headers widen it, the CRT does
+ * not), and comparing a signed int to an unsigned long long silently promotes
+ * one to the other's sign - two prints of the same number from a key that
+ * nonetheless compares unequal. */
+static uint64_t mode_key_dev(const struct stat* st)
+{
+    return (uint64_t)st->st_dev & 0xffffffffULL;
+}
+
+static uint64_t mode_key_ino(const struct stat* st)
+{
+    return (uint64_t)st->st_ino;
+}
+
+static void mode_override_record(const struct stat* st, uint32_t mode)
+{
+    uint64_t dev = mode_key_dev(st);
+    uint64_t ino = mode_key_ino(st);
+
+    spin_lock(&mode_override_lock);
+    for (int i = 0; i < mode_override_count; i++) {
+        if (mode_overrides[i].used &&
+            mode_overrides[i].dev == dev && mode_overrides[i].ino == ino) {
+            mode_overrides[i].mode = mode;
+            spin_unlock(&mode_override_lock);
+            return;
+        }
+    }
+    for (int i = 0; i < mode_override_count; i++) {
+        if (!mode_overrides[i].used) {
+            mode_overrides[i].used = true;
+            mode_overrides[i].dev  = dev;
+            mode_overrides[i].ino  = ino;
+            mode_overrides[i].mode = mode;
+            spin_unlock(&mode_override_lock);
+            return;
+        }
+    }
+    if (mode_override_grow(mode_override_count + 1)) {
+        mode_override_t* slot = &mode_overrides[mode_override_count - 1];
+        for (int i = 0; i < mode_override_count; i++) {
+            if (!mode_overrides[i].used) {
+                slot = &mode_overrides[i];
+                break;
+            }
+        }
+        slot->used = true;
+        slot->dev  = dev;
+        slot->ino  = ino;
+        slot->mode = mode;
+    }
+    spin_unlock(&mode_override_lock);
+}
+
+static void stat_apply_mode_override(struct stat* st)
+{
+    uint64_t dev = mode_key_dev(st);
+    uint64_t ino = mode_key_ino(st);
+
+    spin_lock(&mode_override_lock);
+    for (int i = 0; i < mode_override_count; i++) {
+        if (mode_overrides[i].used &&
+            mode_overrides[i].dev == dev && mode_overrides[i].ino == ino) {
+            st->st_mode = (st->st_mode & S_IFMT) | (mode_overrides[i].mode & 07777u);
+            break;
+        }
+    }
+    spin_unlock(&mode_override_lock);
+}
+
+/* A chmod() that records itself: after the host call went through, the object
+ * is stat'ed for its identity so every later stat reports the guest's mode */
+static void mode_override_capture_fstat(int host_fd, uint32_t mode)
+{
+    struct stat st = {0};
+    if (fstat(host_fd, &st) == 0) {
+        mode_override_record(&st, mode);
+    }
+}
+
 static void uapi_statfs64_convert(struct uapi_statfs64* dst, const struct statfs* src)
 {
     dst->type = src->f_type;
@@ -3173,6 +3306,35 @@ static void shadow_fill_stat(struct stat* st, const vp_shadow_entry_t* entry)
     st->st_dev   = (dev_t)RVVM_SHADOW_DEV;
 }
 
+/* The same archive mode, laid over a stat the host answered for a *real* file.
+ *
+ * A packed entry carries its own permission bits (vp_rootfs.c reads them out of
+ * the tar header and keeps them in the shadow entry), but Windows has nowhere
+ * to put them, so the host's own answer for the extracted file is a flat
+ * 0666/0777 plus whatever the content synthesis guessed. This is the
+ * authoritative layer: the archive's mode wins over the guess, and a chmod the
+ * guest made (stat_apply_mode_override()) wins over both. Only the mode word is
+ * taken - size and timestamps stay the host's, which is the truth for a file a
+ * package overwrote since the archive was unpacked. */
+static bool stat_apply_shadow_mode(const char* abs, struct stat* st)
+{
+    const vp_shadow_entry_t* entry;
+
+    if (!uctx()->shadow || !abs) {
+        return false;
+    }
+    entry = vp_shadow_lookup(uctx()->shadow, abs);
+    if (!entry || entry->hidden) {
+        return false;
+    }
+    if (entry->kind != VP_SHADOW_FILE && entry->kind != VP_SHADOW_DIR) {
+        /* A link is described by lstat(), which has its own branch */
+        return false;
+    }
+    st->st_mode = (st->st_mode & S_IFMT) | (mode_t)(entry->mode & 07777);
+    return true;
+}
+
 /* Hide @abs and, when it is an archive directory, everything under it: the host
  * rmdir removed a real (empty) directory, and the index must stop reporting the
  * names it held. */
@@ -3916,6 +4078,11 @@ static void unwrap_guest_sockaddr(void* addr, unsigned int* len)
     *len = (unsigned int)sizeof(*un);
 }
 
+#define UAPI_O_CREAT     0x0040
+#define UAPI_O_EXCL      0x0080
+#define UAPI_O_TRUNC     0x0200
+#define UAPI_O_APPEND    0x0400
+
 /* Guest open(2) flags -> host open() flags.
  *
  * On a Linux host the two sets are identical, so this passes through. The
@@ -3929,10 +4096,10 @@ static int uapi_open_flags(int flags)
 {
 #if defined(_WIN32)
     int host = flags & 3;                   /* O_RDONLY / O_WRONLY / O_RDWR agree */
-    if (flags & 0x40)   host |= _O_CREAT;   /* guest O_CREAT */
-    if (flags & 0x80)   host |= _O_EXCL;    /* guest O_EXCL */
-    if (flags & 0x200)  host |= _O_TRUNC;   /* guest O_TRUNC */
-    if (flags & 0x400)  host |= _O_APPEND;  /* guest O_APPEND */
+    if (flags & UAPI_O_CREAT) host |= _O_CREAT;
+    if (flags & UAPI_O_EXCL)  host |= _O_EXCL;
+    if (flags & UAPI_O_TRUNC) host |= _O_TRUNC;
+    if (flags & UAPI_O_APPEND) host |= _O_APPEND;
     if ((flags & 0x410000) == 0x410000) {
         /* Guest O_TMPFILE (__O_TMPFILE|O_DIRECTORY): the CRT has no
          * equivalent, and dropping the bit left a bare O_RDWR that made the
@@ -10448,15 +10615,26 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_fchdir(%ld)", a0);
                     a0 = rvvm_sys_fchdir(userland_fd_host(uctx(), (int)a0));
                     break;
-                case 52: // fchmod
-                    rvvm_info("sys_fchmodat(%ld, %lx)", a0, a1);
-                    a0 = errno_ret(fchmod(userland_fd_host(uctx(), (int)a0), a1));
+                case 52: { // fchmod
+                    int hfd = userland_fd_host(uctx(), (int)a0);
+                    rvvm_info("sys_fchmod(%ld, %lx)", a0, a1);
+                    a0 = errno_ret(fchmod(hfd, a1));
+                    if ((int64_t)a0 >= 0) {
+                        mode_override_capture_fstat(hfd, (uint32_t)a1);
+                    }
                     break;
-                case 53: // fchmodat
+                }
+                case 53: { // fchmodat
+                    int hdir = userland_fd_host(uctx(), (int)a0);
+                    const char* hpath = wrap_guest_path(path_buf, (int)a0, to_str(a1));
+                    struct stat st = {0};
                     rvvm_info("sys_fchmodat(%ld, %s, %lx)", a0, to_str(a1), a2);
-                    a0 = errno_ret(fchmodat(userland_fd_host(uctx(), (int)a0),
-                                            wrap_guest_path(path_buf, (int)a0, to_str(a1)), a2, 0));
+                    a0 = errno_ret(fchmodat(hdir, hpath, a2, 0));
+                    if ((int64_t)a0 >= 0 && fstatat(hdir, hpath, &st, 0) == 0) {
+                        mode_override_record(&st, (uint32_t)a2);
+                    }
                     break;
+                }
                 case 54: // fchownat
                     if (uctx()->fake_root) {
                         a0 = 0;
@@ -10552,12 +10730,30 @@ static void* rvvm_user_thread_wrap(void* arg)
                         } else {
                             /* NULL path with AT_EMPTY_PATH refers to the dirfd */
                             const char* host_path = wrap_guest_path(path_buf, (int)a0, path);
+                            /* A create carries the permission bits in its mode
+                             * argument, and the host has nowhere to keep them
+                             * (see mode_override_record()): apk never chmods
+                             * what it installs, it opens it with O_CREAT and a
+                             * mode, so this is where an installed program's
+                             * 0755 - or an installed key's 0600 - arrives. */
+                            bool created = (a2 & UAPI_O_CREAT) != 0;
+                            if (created) {
+                                struct stat probe = {0};
+                                if (fstatat(userland_fd_host(uctx(), (int)a0), host_path,
+                                            &probe, 0) == 0) {
+                                    /* Already there: O_CREAT leaves its mode be */
+                                    created = false;
+                                }
+                            }
                             a0 = errno_ret(openat(userland_fd_host(uctx(), (int)a0),
                                                   host_path, uapi_open_flags(a2), a3));
                             if ((int64_t)a0 >= 0) {
                                 int host_fd  = (int)a0;
                                 int guest_fd = userland_fd_add(uctx(), host_fd,
                                                                (a2 & UAPI_O_CLOEXEC) != 0);
+                                if (created) {
+                                    mode_override_capture_fstat(host_fd, (uint32_t)a3);
+                                }
                                 if (guest_fd < 0) {
                                     /* The table is full: userland_fd_add() has
                                      * already closed the host descriptor. */
@@ -11008,6 +11204,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 79: { // newfstatat
                     struct stat st = {0};
+                    const int   dirfd = (int)a0;   /* a0 holds the result below */
                     const char* path = to_str(a1);
                     struct uapi_stat* out = to_ptr_sz(a2, sizeof(*out));
                     char abs[UAPI_PATH_MAX];
@@ -11103,6 +11300,17 @@ static void* rvvm_user_thread_wrap(void* arg)
                                                          (a3 & AT_SYMLINK_NOFOLLOW) == 0), &st, a3);
                     }
                     a0 = errno_ret(ret);
+                    if (a0 == 0) {
+                        /* A follow (the default) resolves the link: the archive
+                         * only describes the link itself, so an un-followed
+                         * answer has nothing to take from it. */
+                        if (path && (path[0] == '/' || dirfd == UAPI_AT_FDCWD) &&
+                            !(a3 & AT_SYMLINK_NOFOLLOW)) {
+                            stat_apply_shadow_mode(abs, &st);
+                        }
+                        /* ...and a chmod the guest performed beats both */
+                        stat_apply_mode_override(&st);
+                    }
                     uapi_stat_convert(out, &st);
                     break;
                 }
@@ -11150,6 +11358,13 @@ static void* rvvm_user_thread_wrap(void* arg)
                             a0 = 0;
                         } else {
                             a0 = errno_ret(fstat(hfd, &st));
+                            if (a0 == 0) {
+                                stat_apply_mode_override(&st);
+                                rvvm_info("fstat fd=%ld mode=%o dev=%llx ino=%llx",
+                                          fd, st.st_mode & 07777u,
+                                          (unsigned long long)st.st_dev,
+                                          (unsigned long long)st.st_ino);
+                            }
                         }
                     }
                     RVVM_TRC(RVVM_TRC_FD, "DBG newfstat fd=%ld ret=%ld host_size=%lld", fd, (long)a0, (long long)st.st_size);
@@ -11788,10 +12003,12 @@ case 179: // sysinfo
                     a0 = errno_ret(listen(userland_fd_host(uctx(), (int)a0), a1));
                     break;
                 case 202: { // accept
+                    int        listen_fd = userland_fd_host(uctx(), (int)a0);
                     void*      sa = to_ptr(a1);
                     socklen_t* lp = to_ptr(a2);
-                    rvvm_info("sys_accept(%ld, %lx, %lx)", a0, a1, a2);
-                    a0 = errno_ret(accept(userland_fd_host(uctx(), (int)a0), sa, lp));
+                    rvvm_info("sys_accept(guest %ld, host %d, %lx, %lx)", a0, listen_fd, a1, a2);
+                    a0 = errno_ret(accept(listen_fd, sa, lp));
+                    rvvm_info("  accept -> %ld (errno %d)", (long)a0, (long)a0 < 0 ? errno : 0);
                     if ((int64_t)a0 >= 0) {
                         /* accept(2) has no flag argument: the new descriptor
                          * never carries FD_CLOEXEC, exactly like Linux - and it
@@ -12946,6 +13163,64 @@ static bool guest_exec(rvvm_userland_t* ctx, rvvm_hart_t* cpu, rvvm_user_thread_
  * value to the guest then. False leaves the guest running with errno set, so
  * execve() fails like any other syscall.
  */
+static bool rvvm_script_peek(const char* host_path, char* interp, size_t isz,
+                             char* iarg, size_t asz)
+{
+    char    buf[280];
+    ssize_t n;
+    char*   nl;
+    char*   at;
+    char*   sp;
+
+    int fd = openat(UAPI_AT_FDCWD, host_path, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n < 2 || buf[0] != '#' || buf[1] != '!') {
+        return false;
+    }
+    nl = memchr(buf, '\n', (size_t)n);
+    if (!nl) {
+        return false;
+    }
+    *nl = 0;
+    at = buf + 2;               /* "#! /bin/sh" and "#!/bin/sh" are both legal */
+    while (*at == ' ' || *at == '\t') {
+        at++;
+    }
+    sp = strchr(at, ' ');
+    if (!sp) {
+        sp = strchr(at, '\t');
+    }
+    if (sp) {
+        *sp = 0;
+        do {
+            sp++;
+        } while (*sp == ' ' || *sp == '\t');
+    }
+    n = (ssize_t)strlen(at);
+    if (n && at[n - 1] == '\r') {
+        at[n - 1] = 0;
+    }
+    if (!*at) {
+        return false;
+    }
+    rvvm_strlcpy(interp, at, isz);
+    rvvm_strlcpy(iarg, sp ? sp : "", asz);
+    return true;
+}
+
+/* A host-side string for the new argv, matching guest_str_dup()'s allocator */
+static char* exec_host_str(const char* str)
+{
+    size_t len  = strlen(str) + 1;
+    char*  copy = safe_malloc(len);
+    memcpy(copy, str, len);
+    return copy;
+}
+
 static bool rvvm_sys_execve(rvvm_hart_t* cpu, rvvm_user_thread_t* thread, char* path_buf,
                             rvvm_addr_t path, rvvm_addr_t uargv, rvvm_addr_t uenvp)
 {
@@ -12985,6 +13260,65 @@ static bool rvvm_sys_execve(rvvm_hart_t* cpu, rvvm_user_thread_t* thread, char* 
             goto done;
         }
         args = 1;
+    }
+
+    /* binfmt_script: a "#!" file is not an image any loader can take - the
+     * kernel re-runs execve() on the interpreter named in the first line with
+     * the script prepended to argv. apk runs its trigger *scripts* this way;
+     * without this every trigger exec failed with ENOEXEC. The interpreter is
+     * itself peeked nothing further: a chained script (#! pointing at #!) is
+     * not a thing guests rely on. */
+    {
+        char        host_path[UAPI_PATH_MAX];
+        const char* hp    = wrap_guest_path(host_path, UAPI_AT_FDCWD, guest_path);
+        char        interp[UAPI_PATH_MAX] = {0};
+        char        iarg[UAPI_PATH_MAX]   = {0};
+
+        if (hp && (args + 2) < (int)GUEST_EXEC_ARGV_MAX &&
+            rvvm_script_peek(hp, interp, sizeof(interp), iarg, sizeof(iarg))) {
+            char* xargv[GUEST_EXEC_ARGV_MAX];
+            int   xargs = 0;
+            int   i;
+            bool  ok    = true;
+
+            memset(xargv, 0, sizeof(xargv));
+            xargv[xargs++] = exec_host_str(interp);    /* argv[0]: interpreter */
+            if (iarg[0]) {
+                xargv[xargs++] = exec_host_str(iarg);  /* the one script argument */
+            }
+            xargv[xargs++] = exec_host_str(guest_path);/* the script itself */
+            for (i = 1; i < args; i++) {
+                xargv[xargs++] = argv[i];              /* ownership moves along */
+            }
+            for (i = 0; i < xargs && ok; i++) {
+                ok = xargv[i] != NULL;
+            }
+            if (!ok) {
+                /* Half a vector is worse than none: release ours, restore the
+                 * borrowed range and let the image path report its own error */
+                for (i = 0; i < xargs; i++) {
+                    safe_free(xargv[i]);
+                }
+                safe_free(argv[0]); /* replaced below by the shift */
+                for (i = 1; i < args; i++) {
+                    argv[i - 1] = argv[i];
+                }
+                argv[args - 1] = NULL;
+                args--;
+                errno = EFAULT;
+                goto done;
+            }
+
+            replaced = guest_exec(uctx(), cpu, thread,
+                                  wrap_guest_path(host_path, UAPI_AT_FDCWD, interp),
+                                  (size_t)xargs, xargv, envv);
+            /* guest_exec() has built the new stack (or failed) - the strings
+             * are ours to drop, borrowed originals included */
+            guest_strvec_free(xargv, xargs);
+            safe_free(argv[0]); /* the replaced original argv[0] */
+            guest_strvec_free(envv, envs);
+            return replaced;
+        }
     }
 
     replaced = guest_exec(uctx(), cpu, thread, wrap_guest_path(path_buf, UAPI_AT_FDCWD, guest_path),

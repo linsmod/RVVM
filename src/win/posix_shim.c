@@ -1782,6 +1782,45 @@ static void stat_refine_path(struct rvvm_stat* out, const char* path)
     }
 }
 
+/* Windows stores no POSIX permission bits, and the CRT only invents an execute
+ * bit for *its* executable extensions (.exe/.com/.bat/.cmd) - none of which a
+ * guest ELF, or a '#!' script, has. Everything therefore stats as 0666, which
+ * is a lie a guest notices the moment it asks for X_OK.
+ *
+ * The real modes are known where they came from: a packed archive carries them
+ * and the userland layers them over this result (see the shadow lookup in
+ * rvvm_sys_newfstatat()). What is left is an object the archive never knew -
+ * a program a package installed at run time, say - and its permission bits are
+ * only recoverable from the content: the ELF magic, or a shebang first line.
+ * This is the last-resort answer, below both a packed entry's own mode and a
+ * chmod the guest performed. */
+static bool file_content_is_executable(const char* path)
+{
+    unsigned char head[4] = {0};
+    int fd = _open(path, _O_RDONLY | _O_BINARY);
+    if (fd < 0) {
+        return false;
+    }
+    if (_read(fd, head, sizeof(head)) < 0) {
+        head[0] = 0;
+    }
+    _close(fd);
+    if (head[0] == 0x7f && head[1] == 'E' && head[2] == 'L' && head[3] == 'F') {
+        return true;
+    }
+    return head[0] == '#' && head[1] == '!';
+}
+
+static void stat_synthesize_mode(struct rvvm_stat* buf, const char* path)
+{
+    unsigned type = buf->st_mode & _S_IFMT;
+    if (type == _S_IFDIR) {
+        buf->st_mode = type | 0755;
+    } else if (type == _S_IFREG) {
+        buf->st_mode = type | (file_content_is_executable(path) ? 0755 : 0644);
+    }
+}
+
 int rvvm_stat(const char* path, struct rvvm_stat* buf)
 {
     struct _stat64 st;
@@ -1790,6 +1829,7 @@ int rvvm_stat(const char* path, struct rvvm_stat* buf)
     }
     stat_fill(buf, &st);
     stat_refine_path(buf, path);
+    stat_synthesize_mode(buf, path);
     return 0;
 }
 
@@ -1838,11 +1878,28 @@ int rvvm_lstat(const char* path, struct rvvm_stat* buf)
 int rvvm_fstat(int fd, struct rvvm_stat* buf)
 {
     struct _stat64 st;
+    char           path[MAX_PATH + 16];
+    DWORD          n;
+
     if (_fstat64(fd, &st)) {
         return -1;
     }
     stat_fill(buf, &st);
     stat_refine(buf, (HANDLE)_get_osfhandle(fd));
+    /* The same synthesis as the path form: an open descriptor is how a guest
+     * asks "may I execute this" and "how open is this key" (sshd fstats every
+     * host key before it trusts it), and it must not get a different answer
+     * from the one stat() gave for the same file. */
+    n = GetFinalPathNameByHandleA((HANDLE)_get_osfhandle(fd), path, MAX_PATH, 0);
+    if (n && n < MAX_PATH) {
+        path[n] = 0;
+        if (strncmp(path, "\\\\?\\UNC\\", 8) == 0) {
+            memmove(path + 2, path + 8, strlen(path) - 7);
+        } else if (strncmp(path, "\\\\?\\", 4) == 0) {
+            memmove(path, path + 4, strlen(path) - 3);
+        }
+        stat_synthesize_mode(buf, path);
+    }
     return 0;
 }
 

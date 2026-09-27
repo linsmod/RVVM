@@ -448,9 +448,13 @@ Debug switches:
 
 | Env var | Effect |
 |---|---|
-| `RVVM_VERBOSE=1` | full syscall trace on stderr |
+| `RVVM_VERBOSE=1` | full syscall trace on stderr (winhost and the ash `--serve` core alike) |
+| `RVVM_TRACE=<cats>` | trace categories: `path fd pty job tty signal mmap sys dev wsock` |
 | `RVVM_DUMP_FRAME=1` | dump the first presented frames as `frame_NNN.bmp` |
 | `RVVM_USER_NO_THREADS` | force the guest single-threaded (clone -> EAGAIN) |
+
+An ash core is detached, so its stderr disappears with it: set the vars, then
+run `rvvm_ash --serve 2> core.log` yourself and connect from another console.
 
 ## Known gaps
 
