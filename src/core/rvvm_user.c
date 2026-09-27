@@ -1490,10 +1490,13 @@ typedef struct rvvm_userland {
     // instead of being handed to the host.
     spinlock_t                proc_lock;
     vector_t(rvvm_process_t*) procs;
-    // Next pid/tid to hand out; reset by every launch (see userland_procs_reset)
-    uint32_t                  next_task_id;
+    // The id space this run hands pids and tids out of, shared with every
+    // address space of the family and refcounted (see rvvm_taskid_space_t).
+    // A per-context counter cannot work: two branches of the fork tree that
+    // advance in parallel hand out the same number to two live processes.
+    struct rvvm_taskid_space* taskids;
     // The launched image is an init, so the run root is pid 1 (see
-    // userland_image_is_init()). Set per launch, like next_task_id.
+    // userland_image_is_init()). Set per launch, like the id space.
     bool                      init_pid1;
 
     // --- Descriptors of the process this address space runs ---
@@ -4576,11 +4579,57 @@ static void user_fault_handler_install(void)
 /* Pids and tids come from one counter, like Linux: the numbers never collide, and
  * a tid stays meaningful to the calls that take one. The launched process starts
  * at 100 rather than 1, so that a guest cannot take itself for init (getpid() ==
- * 1 changes a process's signal handling), and reports a parent of 1. */
+ * 1 changes a process's signal handling), and reports a parent of 1.
+ *
+ * The counter is per *run*, not per address space. It used to be a field of the
+ * context, seeded in a child as `pid + 1`, which only keeps a parent and its own
+ * descendants apart: two sibling branches of the fork tree each ran their own
+ * counter and overlapped. sshd shows it - the daemon and the ssh client it is
+ * being tested against both came out as pid 105, and everything that resolves a
+ * pid to a process (wait4, kill, the process-group search, /proc) then names the
+ * wrong one. Sharing one monotonic counter for the whole run is both the Linux
+ * rule and the cheap way to be right: a number handed out is never handed out
+ * again for the lifetime of the run. */
 #define USERLAND_FIRST_TASK_ID  100
 #define USERLAND_ROOT_PARENT_ID 1
 /* ... unless it *is* an init, which gets the pid it demands. */
 #define USERLAND_INIT_TASK_ID   1
+
+/* The run's id space. Refcounted because a child outlives the parent it was
+ * forked from (sshd daemonizing out of the session shell that started it), and
+ * it still has to hand out ids afterwards. */
+typedef struct rvvm_taskid_space {
+    spinlock_t lock;
+    uint32_t   next_id;
+    uint32_t   refs;
+} rvvm_taskid_space_t;
+
+static struct rvvm_taskid_space* userland_taskids_new(uint32_t first)
+{
+    /* SPINLOCK_INIT is a brace initializer, so the whole struct goes down in
+     * one shot rather than field by field. */
+    struct rvvm_taskid_space* ids = safe_new_obj(rvvm_taskid_space_t);
+    *ids = (struct rvvm_taskid_space){
+        .lock    = SPINLOCK_INIT,
+        .next_id = first,
+        .refs    = 1,
+    };
+    return ids;
+}
+
+static void userland_taskids_ref(struct rvvm_taskid_space* ids)
+{
+    if (ids) {
+        atomic_add_uint32(&ids->refs, 1);
+    }
+}
+
+static void userland_taskids_unref(struct rvvm_taskid_space* ids)
+{
+    if (ids && atomic_sub_uint32(&ids->refs, 1) == 1) {
+        safe_free(ids);
+    }
+}
 
 /* An image named "init" is an init, the way a container's is: it is launched the
  * same way every init expects to be, and every init refuses to run as anything
@@ -4627,9 +4676,19 @@ static void userland_proc_unref(rvvm_process_t* proc)
 
 static uint32_t userland_task_id_alloc(rvvm_userland_t* ctx)
 {
-    spin_lock(&ctx->proc_lock);
-    uint32_t id = ctx->next_task_id++;
-    spin_unlock(&ctx->proc_lock);
+    struct rvvm_taskid_space* ids = ctx->taskids;
+    if (!ids) {
+        return USERLAND_FIRST_TASK_ID;
+    }
+    spin_lock(&ids->lock);
+    uint32_t id = ids->next_id++;
+    /* 0 is "no thread" to the guest, and 1 means init; the counter is seeded
+     * past them, but a run that has wrapped all the way around would step on
+     * one, so it is skipped here rather than handed out. */
+    if (id == 0) {
+        id = ids->next_id++;
+    }
+    spin_unlock(&ids->lock);
     return id;
 }
 
@@ -5313,7 +5372,15 @@ static void userland_procs_reset(rvvm_userland_t* ctx)
         userland_proc_unref(vector_at(ctx->procs, i));
     }
     vector_clear(ctx->procs);
-    ctx->next_task_id = ctx->init_pid1 ? USERLAND_INIT_TASK_ID : USERLAND_FIRST_TASK_ID;
+    /* A new run restarts the numbering - but only where this context is the one
+     * that owns the space. A forked child shares its parent's (see
+     * userland_taskids_ref), and must not rewind the counter the rest of the
+     * family is still drawing from. */
+    if (ctx->taskids && ctx->taskids->refs == 1) {
+        spin_lock(&ctx->taskids->lock);
+        ctx->taskids->next_id = ctx->init_pid1 ? USERLAND_INIT_TASK_ID : USERLAND_FIRST_TASK_ID;
+        spin_unlock(&ctx->taskids->lock);
+    }
     spin_unlock(&ctx->proc_lock);
 }
 
@@ -5964,7 +6031,11 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
     }
     rvvm_userland_t* ctx = safe_new_obj(rvvm_userland_t);
     ctx->machine      = machine;
-    ctx->next_task_id = pid + 1;   // The child wears pid; its own ids come after
+    /* The id space is the run's, not this address space's: the child keeps
+     * drawing from the same counter its parent does, which is what makes a pid
+     * unique across the whole fork tree instead of only down one branch. */
+    ctx->taskids      = parent->taskids;
+    userland_taskids_ref(ctx->taskids);
     vector_init(ctx->children);
 
     /* Filesystem view and credentials: to the guest's files this is the same
@@ -13752,7 +13823,7 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
     ctx->fake_root    = USERLAND_DEFAULT_FAKE_ROOT;
     rvvm_strlcpy(ctx->cwd, "/", sizeof(ctx->cwd));
     // The process id space starts where every run of this instance starts
-    ctx->next_task_id = USERLAND_FIRST_TASK_ID;
+    ctx->taskids = userland_taskids_new(USERLAND_FIRST_TASK_ID);
     // Terminal state before the guest changes it - must match the TCGETS
     // answer in user_tty_ioctl(): canonical, echoing, line editing.
     ctx->tty_lflag    = TTY_LFLAG_DEFAULT;
@@ -13935,6 +14006,12 @@ static void userland_destroy(rvvm_machine_t* machine)
      * coming back. */
     userland_procs_reset(ctx);
     vector_free(ctx->procs);
+    /* The id space goes with the last address space holding it: a forked child
+     * that outlived this one keeps handing out ids from it (sshd's children
+     * after the shell that started the daemon is gone), so this is a refcount
+     * drop, not a free. */
+    userland_taskids_unref(ctx->taskids);
+    ctx->taskids = NULL;
     /* Only an internally created session is ours to free: a host-attached one
      * outlives the machine by design (see rvvm_tty_detach). */
     if (ctx->tty && ctx->tty_owned) {

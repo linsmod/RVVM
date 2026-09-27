@@ -11,6 +11,9 @@
     other still holds one. This driver runs the whole path non-interactively
     through `-c` sessions, with every check on the guest's own output:
 
+      install   openssh is not in the bundle's rootfs (Alpine minirootfs ships
+               busybox only), so it is apk-installed first - a fresh runtime
+               otherwise fails every later step with `ssh-keygen: not found`.
       setup    host keys (ssh-keygen -A), the privsep user/dir, and a client
                key installed into authorized_keys.
       daemon   sshd starts and daemonizes, and the *same* session then gets a
@@ -111,7 +114,22 @@ $sshOpts   = "-p $SshPort -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev
              "-o BatchMode=yes -o IdentitiesOnly=yes -i /root/.ssh/id_e2e -o ConnectTimeout=3"
 
 try {
+# --- install: openssh is NOT in the bundle's rootfs -------------------------
+# rootfs.tar.gz is an Alpine minirootfs: it ships busybox and nothing else, so
+# a fresh runtime has no sshd, no ssh and no ssh-keygen (`ssh-keygen: not
+# found`, and every later step then fails for the wrong reason). Install it
+# first, and make the step idempotent so a warm runtime costs one `apk info`.
+# --no-cache keeps apk from writing an index into the run's rootfs; the
+# repositories come from the image's own /etc/apk/repositories.
+$r = Client ('apk add --no-cache openssh 2>&1 | tail -3; ' +
+             'command -v sshd >/dev/null && command -v ssh >/dev/null && ' +
+             'command -v ssh-keygen >/dev/null && echo e2e-install-ok')
+CheckOut $r ($r -match 'e2e-install-ok') 'install: openssh present in the guest (apk)'
+
 # --- setup: host keys, privsep identity/dir, client key ----------------------
+# The image's own /etc/passwd has `sshd:x:22:22:sshd:/dev/null:/sbin/nologin`,
+# which is not the privsep identity OpenSSH wants, so the grep only adds the
+# 74:74 entry when the image does not already carry one.
 $r = Client ('mkdir -p /run/sshd /root/.ssh /var/empty; ' +
              'grep -q ''^sshd:'' /etc/passwd || echo ''sshd:x:74:74:privsep:/run/sshd:/bin/false'' >> /etc/passwd; ' +
              'ssh-keygen -A < /dev/null >/dev/null 2>&1; ' +

@@ -43,6 +43,8 @@ rvvm_ash_x86_64.exe --port 7897 -c 'echo hello'
 
 - __trace 走 core 的 stderr__（每个进程自己的 stderr，不是 stdout）。`TRACE:` 行带 `[pid:tid]` （本次新增，见 §4.1），`INFO:` 行不带 pid。
 - `RVVM_TRACE` 分类：`pty` / `job` / `fd` / `wsock` / `sys` / `signal` / `tty` / `dev` / `mmap`； `all` 全开，`-name` 关掉某个。
+- __sshd 的日志甩进 guest 文件，而不是靠 pty 转发__（见 §1.3）。这条是 daemonize 路径下唯一
+  能拿到日志的办法，且不依赖会话存活。
 - __抓栈__（最有价值的一步）：
 
 ```powershell
@@ -62,6 +64,55 @@ gdb --batch -x cmds.txt --args rvvm_ash_x86_64.exe --serve --port 7919
 # 方式 B：core 已经卡住时直接附加
 gdb --batch -p <pid> -ex "set pagination off" -ex "thread apply all bt"
 ```
+
+---
+
+### 1.3 把 sshd 日志甩进 guest 文件（daemonize 路径唯一可用的观测手段）
+
+§3 坑 #4 说"debug 一律用 `sshd -d -d` 并让会话活着"，但 **`-d -d` 会让 sshd
+不 fork**（日志里明写 `Server will not fork when running in debugging mode.`），
+于是 privsep 子进程那一段**根本不会发生** —— 也就是复现不了 §6.3 里
+`[104:104] close anchor 5/6/10 → thread_exit` 那个现象。文档 §6 要查的正是那条路径。
+
+解法：__不要靠 pty 转发 stderr，直接重定向到 guest 里的文件__。`runtime/rootfs` 是
+guest `/` 的可写层（不是 scratch copy，见 `win32-host/README.md` 的 Persistence 一节），
+路径一一对应，宿主侧可以直接读：
+
+| guest 路径 | 宿主路径 |
+|---|---|
+| `/tmp/sshd.log` | `release.windows.x86_64\runtime\rootfs\tmp\sshd.log` |
+| `/etc/passwd`  | `release.windows.x86_64\runtime\rootfs\etc\passwd`  |
+| `/root/.ssh/`  | `release.windows.x86_64\runtime\rootfs\root\.ssh\`      |
+
+好处：daemonize 之后 stderr 已挂到关闭的会话上，但文件照样在宿主盘上；
+会话结束、core 被 kill 都不影响日志留存。
+
+具体怎么起 core、怎么发那条 `-c`、怎么读日志，`tools/openssh_e2e.ps1` 里就是活的
+版本（它就是这个手法的自动化），改的时候对着它改，不要在这里维护第二份命令。
+
+注意 `2>&1` 在 guest 里合并的是 sshd **自己的** fd 1/2，和 core 的 trace（走宿主
+stderr）是两套互不干扰的通道，可以同时开。
+
+### 1.4 顺带记录的 setsockopt 缺口（非当前触发点）
+
+`-d -d` 与 daemonize 两条路径的日志都在 `Connection from ...` 之前出现这两行，
+sshd 只是 warning 后继续，但说明宿主语义映射确有缺口，值得单独跟进：
+
+```
+setsockopt IPV6_V6ONLY: Protocol not available      # setsockopt(IPPROTO_IPV6, IPV6_V6ONLY)
+setsockopt socket 6 IP_TOS 184: Invalid argument   # setsockopt(IPPROTO_IP, IP_TOS)
+```
+
+### 1.5 干净 runtime 上 openssh 是不存在的
+
+`bundle/rootfs.tar.gz` 是 Alpine **minirootfs**，只带 busybox。全新 `runtime/`
+里 `sshd` / `ssh` / `ssh-keygen` 全都没有，表现为 `ssh-keygen: not found`，
+后面每一步都因为错的原因失败。e2e 因此自带一步 `apk add --no-cache openssh`。
+想手工复现就先装，否则会误判成模拟器的问题。
+
+另外镜像自带的 `/etc/passwd` 里是 `sshd:x:22:22:sshd:/dev/null:/sbin/nologin`，
+不是 OpenSSH privsep 要的身份；e2e 的 setup 用 `grep -q '^sshd:'` 守卫，
+只在镜像没带该条目时才补 `74:74:privsep`。
 
 ---
 
@@ -93,7 +144,7 @@ __规矩：每轮实验前 `Get-Process rvvm* | Stop-Process -Force`，并且换
 1. __误认 accept__：`vpsessiond` 的监听器是 guest 里的 AF_UNIX socket，它的 `accept(addr=NULL, len=0)` 和 sshd 的 `accept(addr, addrlen)` 在日志里长得一样。真正的 sshd accept 是 `sys_accept(guest N, host M, <非零指针>, <非零指针>)` 那一条。 认错这个，把"会话建立的流量"当成"SSH 连接的流量"，会把结论带偏一整轮。
 2. __grep 被 ANSI 转义打断__：trace 行实际是 `\e[36;1mTRACE\e[0;1m[103:103]: ...`， `TRACE[(\d+):` 匹配不到。要用 `[(\d+):\d+]:` 匹配。
 3. __`nr=` 行是十六进制返回值__：`rvvm_info(" nr=%ld -> %lx", a7, a0)`，所以 `nr=220 -> 68` 是 `clone` 返回 `0x68 = 104`（pid），不是 68。
-4. __guest 日志会经 pty 转发__：sshd 的 stderr 是会话 pty，客户端可见； 但 daemonize 之后 stderr 仍挂在那个已关闭的会话上，日志就丢了 —— 所以排查 一律用 `sshd -d -d`（前台调试）并让会话活着。
+4. __guest 日志会经 pty 转发__：sshd 的 stderr 是会话 pty，客户端可见； 但 daemonize 之后 stderr 仍挂在那个已关闭的会话上，日志就丢了 —— 所以排查 一律用 `sshd -d -d`（前台调试）并让会话活着，__或更好：直接把 stderr 重定向到 guest 文件（§1.3），那是 daemonize 路径唯一可行的观测手段__。
 5. __子命令要能自己结束__：`tail -50` 会等到 EOF 才输出，掩盖真实进度； 把输出重定向到 guest 内文件、再用另一条 `-c` 去 `cat`，两边日志都拿得到。
 
 ---
@@ -168,6 +219,67 @@ socket 锚点是 `_open("NUL")`，宿主 stat 会给出字符设备。已加分�
 
 ---
 
+## 5A. 新发现的缺陷（2026-09-27，尚未修复）
+
+### 5A.1 pid/tid 空间是**每地址空间一份**，导致跨分支 pid 碰撞
+
+- 现象：一次 daemonize 路径的运行里，trace 出现**同一个 pid 同时属于两个活进程**：
+
+  ```
+  TRACE[104:104]: fork: parent=104 child=105      # sshd 主进程 fork 出 105
+  TRACE[105:105]: fork: parent=105 child=106      # 105 再 fork 出 106
+  TRACE[101:101]: fork: parent=101 child=105      # ★ shell 又 fork 出一个 105 —— 撞了
+  TRACE[106:106]: fork: parent=106 child=107
+  TRACE[101:101]: fork: parent=101 child=106      # ★ 又撞 106
+  ```
+
+  同一轮里 `pid 105` 先是 sshd 的子进程（`ctx=0x2a4621dac40` 一族），
+  随后又成了客户端 `/usr/bin/ssh`（`ctx=0x2a4e53a8090` 一族）。
+  退出日志同样错位：`TRACE[105:105]: sys_exit_group(255) ctx=0x2a4621dac40` 与
+  `TRACE[105:105]: sys_exit_group(0) ctx=0x2a4e53a8090` —— 同一个 `[105:105]`
+  标签下是两个不同地址空间。
+
+- 根因：`userland_task_id_alloc()` 用的是 **ctx 自己的** `next_task_id`
+  （`src/core/rvvm_user.c`）：
+
+  ```c
+  static uint32_t userland_task_id_alloc(rvvm_userland_t* ctx)
+  {
+      spin_lock(&ctx->proc_lock);
+      uint32_t id = ctx->next_task_id++;   // ← 每地址空间一份计数器
+      spin_unlock(&ctx->proc_lock);
+      return id;
+  }
+  ```
+
+  而 `userland_child_create()` 给子地址空间播种时是：
+
+  ```c
+  ctx->next_task_id = pid + 1;   // 子进程戴 pid，它自己的 id 从 pid+1 开始
+  ```
+
+  这个 `pid + 1` 只保证**父子链上**不撞，保证不了**兄弟子树之间**不撞：
+  shell(101) 的计数器还在 105 时，它 fork 出的 sshd(104) 已经用自己那份
+  计数器发到了 105/106。于是两条互不相干的分支各自往下发号，号段重叠。
+
+  Linux 上 pid 在**整个 pid namespace** 内唯一；这里的模型是"每个地址空间一份"，
+  语义就不对。
+
+- 影响：任何按 pid 索引的结构都会认错人 —— `wait4(pid)` 可能等到别人的孩子、
+  `kill(pid)` / 信号投递找错记录、进程组/会话搜索（`tty_fg_pgid` 那套）跨子树失配、
+  `/proc` 枚举出现重名。**sshd 的 privsep monitor 正是重度依赖 pid 语义**：
+  它 fork 出的子进程与客户端的子进程在号段上重叠，是当前握手失败的
+  高优先级嫌疑点（客户端这次报的是 `banner exchange: invalid format`，
+  与 §6.1 的 `Connection reset` 不同，疑似同一根因的不同表现）。
+
+- 修复方向：把 id 分配器提到**全 run 共享**（挂在一处所有地址空间都能到达的结构上，
+  例如 run root 的 `procs` 注册表 + 一把独立的锁），并让
+  `userland_task_id_alloc()` 拒绝分配**当前仍被任何存活记录占用**的号
+  （扫一遍 `procs` 即可，进程数是 guest 级的，量很小）。
+  `userland_child_create()` 里那句 `next_task_id = pid + 1` 相应去掉。
+
+---
+
 ## 6. OpenSSH 现状：精确定位到的阻塞点
 
 ### 6.1 客户端侧
@@ -215,6 +327,9 @@ __即：__
 ### 6.4 下一步
 
 以 `RVVM_TRACE=fd,job,wsock,sys` + `RVVM_VERBOSE=1` 跑同一场景， __按子进程 pid 提取它在 monitor 握手之后、退出之前的最后几条 syscall__——失败点就在那几行里。 候选：monitor 协议首包 `mm_request_receive` 的收发语义、紧随其后的某个 stat/检查 （`S_ISSOCK` 已修但不是它），或某个被我们映射成 0 成功/失败的系统调用。
+
+观测手段见 §1.3：__不要用 `-d -d`__（它让 sshd 不 fork，privsep 路径根本不走），
+要 daemonize + `> /tmp/sshdbg.log 2>&1`，再从 `runtime/rootfs/tmp/sshdbg.log` 读。
 
 ---
 
