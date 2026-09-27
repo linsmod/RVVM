@@ -13133,7 +13133,6 @@ case 179: // sysinfo
                     rvvm_info("sys_munmap(%lx, %lx)", a0, a1);
                     a0 = rvvm_sys_munmap(a0, a1);
                     break;
-#ifdef __linux__
                 case 216: { // mremap
                     rvvm_info("sys_mremap(%lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4);
                     /* Growing in place is only valid while nothing is mapped
@@ -13167,7 +13166,6 @@ case 179: // sysinfo
                     a0 = new_addr;
                     break;
                 }
-#endif
                 case 220: // clone
                     rvvm_info("sys_clone(%lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4);
                     if (getenv("RVVM_USER_NO_THREADS")) {
