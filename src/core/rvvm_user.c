@@ -1433,6 +1433,9 @@ typedef struct rvvm_userland {
     // and reported back, not enforced - see rvvm_sys_prlimit().
     uint64_t                 rlim_cur[16];
     uint64_t                 rlim_max[16];
+    // File creation mask, see umask(2) and guest_create_mode(). Per address
+    // space because Linux's is per process, and inherited across fork.
+    uint32_t                 umask;
     // Guest-virtual working directory. Relative paths in guest syscalls are
     // resolved against this, never against the host process's own cwd: the host
     // cwd is wherever the emulator happened to be started from, which has
@@ -6255,6 +6258,7 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
     ctx->fake_euid    = parent->fake_euid;
     ctx->fake_gid     = parent->fake_gid;
     ctx->fake_egid    = parent->fake_egid;
+    ctx->umask        = parent->umask;
     memcpy(ctx->rlim_cur, parent->rlim_cur, sizeof(ctx->rlim_cur));
     memcpy(ctx->rlim_max, parent->rlim_max, sizeof(ctx->rlim_max));
     if (parent->prefix_path) {
@@ -7583,6 +7587,15 @@ static rvvm_addr_t rvvm_sys_getcwd(char* buffer, size_t size)
      * 0 as ENOENT, so the length is reported explicitly. */
     rvvm_strlcpy(buffer, uctx()->cwd, size);
     return len;
+}
+
+/* The mode a file or directory is actually created with: the caller's bits
+ * minus the process umask, which is what the kernel does and what every
+ * program that cares about permissions relies on. ssh-keygen is the canonical
+ * user - it sets umask(0177), opens at 0644, and gets a 0600 private key. */
+static uint32_t guest_create_mode(rvvm_addr_t mode)
+{
+    return ((uint32_t)mode & 0777) & ~uctx()->umask;
 }
 
 /* chdir(2): moves the guest's cwd, not the host's. The target decides success
@@ -11317,13 +11330,22 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * goes to the table before the host sees it. Creating a node
                      * does not follow the path's last component. */
                     a0 = errno_ret(mknodat(userland_fd_host(uctx(), (int)a0),
-                                           wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false), a2, a3));
+                                           wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false),
+                                           guest_create_mode(a2), a3));
                     break;
-                case 34: // mkdirat
+                case 34: { // mkdirat
+                    const char* mpath = wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false);
                     rvvm_info("sys_mkdirat(%ld, %s, %lx)", a0, to_str(a1), a2);
-                    a0 = errno_ret(mkdirat(userland_fd_host(uctx(), (int)a0),
-                                           wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false), a2));
+                    uint32_t mmode = guest_create_mode(a2);
+                    a0 = errno_ret(mkdirat(userland_fd_host(uctx(), (int)a0), mpath, mmode));
+                    if ((int64_t)a0 >= 0) {
+                        /* Same reason as openat: the host keeps no mode, so the
+                         * one the guest asked for is remembered against the
+                         * path. */
+                        mode_override_record_path(mpath, mmode, true);
+                    }
                     break;
+                }
                 case 35: { // unlinkat (guest rmdir is the same call with AT_REMOVEDIR)
                     char unlink_abs[UAPI_PATH_MAX];
                     bool have_unlink_abs = false;
@@ -11582,13 +11604,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                                 }
                             }
                             a0 = errno_ret(openat(userland_fd_host(uctx(), (int)a0),
-                                                  host_path, uapi_open_flags(a2), a3));
+                                                  host_path, uapi_open_flags(a2),
+                                                  guest_create_mode(a3)));
                             if ((int64_t)a0 >= 0) {
                                 int host_fd  = (int)a0;
                                 int guest_fd = userland_fd_add(uctx(), host_fd,
                                                                (a2 & UAPI_O_CLOEXEC) != 0);
                                 if (created) {
-                                    mode_override_record_path(host_path, (uint32_t)a3, true);
+                                    mode_override_record_path(host_path, guest_create_mode(a3), true);
                                 }
                                 if (guest_fd < 0) {
                                     /* The table is full: userland_fd_add() has
@@ -12712,9 +12735,23 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_getrusage(%lx, %lx)", a0, a1);
                     a0 = errno_ret(getrusage(a0, to_ptr(a1)));
                     break;
-                case 166: // umask
+                case 166: { // umask
+                    /* Kept per address space rather than handed to the host.
+                     * Beyond being per-process on Linux, forwarding it would
+                     * reach the CRT's own umask - the one this emulator's file
+                     * operations obey - so a guest could loosen the modes of
+                     * files the *host* side creates. Nothing consumes the host
+                     * value anyway, since the host filesystem carries no POSIX
+                     * mode: guest_create_mode() is what makes the mask matter,
+                     * and it did not, which is how a private key created as
+                     * open(..., 0644) under umask(0177) ended up world-readable
+                     * and ssh refused to load it. */
                     rvvm_info("sys_umask(%lx)", a0);
-                    a0 = errno_ret(umask(a0));
+                    uint32_t old = uctx()->umask;
+                    uctx()->umask = (uint32_t)a0 & 0777;
+                    a0 = old;
+                    break;
+                }
                     break;
                 case 167: // prctl
                     rvvm_info("sys_prctl(%lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4);
@@ -14296,6 +14333,7 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
     ctx->fake_euid    = 0;
     ctx->fake_gid     = 0;
     ctx->fake_egid    = 0;
+    ctx->umask        = 0;
     for (int i = 0; i < 16; i++) {
         ctx->rlim_cur[i] = UINT64_MAX;
         ctx->rlim_max[i] = UINT64_MAX;
