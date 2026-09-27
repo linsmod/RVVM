@@ -99,7 +99,12 @@
 #define FRAME_HEAD_LEN 6
 #define FRAME_END      0x07   // BEL closes a frame
 
-#define CMD_MAX        512
+/* A one-shot command, as a guest path's worth of bytes. 512 was small enough to
+ * be reached by an ordinary e2e step - a setup that creates keys and writes an
+ * authorized_keys file runs past it - and the limit used to be invisible. 4KB is
+ * still bounded, still one allocation per session that asked for a command, and
+ * comfortably past anything a driver writes. */
+#define CMD_MAX       4096
 
 struct session {
     bool    used;
@@ -255,11 +260,28 @@ static ssize_t frame_apply(struct session* s, const uint8_t* buf, size_t len)
     } else if (blen >= 1 && body[0] == 'C' && !s->started) {
         /* A command to run instead of an interactive shell. Only before the
          * spawn: afterwards there is a session already, and substituting what it
-         * runs would throw away whatever it is doing. */
-        size_t n = blen - 1 < CMD_MAX - 1 ? blen - 1 : CMD_MAX - 1;
-        memcpy(s->cmd, body + 1, n);
-        s->cmd[n]  = 0;
-        s->has_cmd = n != 0;
+         * runs would throw away whatever it is doing.
+         *
+         * Too long a command is refused, not shortened. It used to be copied with
+         * a cap, and a capped command is the worst of both: nothing says so, and
+         * what the guest gets is a prefix that still parses, so it runs whatever
+         * the cut left behind. A 611-byte setup step became
+         *     cat /root/.ssh/id_e2e.pub > /root/.ssh/autho
+         * and the driver read the result - "cat: read error: Invalid argument" -
+         * as a fault in the read path. A refusal is visible from the guest's side
+         * and cannot be mistaken for anything else. */
+        size_t want = blen - 1;
+        if (want >= CMD_MAX - 1) {
+            dlog("command too long: %zu bytes, limit %d - refused", want, CMD_MAX - 1);
+            snprintf(s->cmd, sizeof(s->cmd),
+                     "echo 'vpsessiond: command too long (%zu bytes, limit %d)' >&2",
+                     want, CMD_MAX - 1);
+            s->has_cmd = true;
+        } else {
+            memcpy(s->cmd, body + 1, want);
+            s->cmd[want] = 0;
+            s->has_cmd = want != 0;
+        }
     }
     return (ssize_t)(end + 1);
 }
