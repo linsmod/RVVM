@@ -40,6 +40,7 @@ The wire protocol is the session server's, not a new one:
 #include "win/win_socket.h"
 #include "win32_cmdpost_bridge.h"
 #include "utils.h" /* rvvm_set_loglevel: RVVM_VERBOSE in the core */
+#include "core/rvvm_user.h" /* rvvm_user_set_mode_store: persisted guest modes */
 #include "virtpass/vp_rootfs.h" /* VP_GUEST_SESSIOND: the core's guest path */
 
 #define ASH_PORT_DEFAULT 7900
@@ -289,6 +290,22 @@ static bool ash_lock_path(char* out, size_t size)
     return true;
 }
 
+/* Where a run keeps the permission bits the host filesystem cannot hold:
+ * beside the persisted rootfs, so the two live and are cleared together. */
+static bool ash_mode_store_path(char* out, size_t size)
+{
+    char exe_dir[MAX_PATH];
+    char runtime[MAX_PATH];
+
+    if (!ash_exe_directory(exe_dir, sizeof(exe_dir))) {
+        return false;
+    }
+    snprintf(runtime, sizeof(runtime), "%s\\runtime", exe_dir);
+    CreateDirectoryA(runtime, NULL);
+    snprintf(out, size, "%s\\rootfs.modes", runtime);
+    return true;
+}
+
 static DWORD ash_lock_pid(const char* path)
 {
     FILE* f = fopen(path, "r");
@@ -380,6 +397,15 @@ int ash_serve(int port, int idle_s)
     /* Same switch as rvvm_winhost (win32_main.c): RVVM_VERBOSE=1 lifts the log
      * to LOG_INFO so the per-syscall lines (sys_openat etc.) reach stderr. */
     rvvm_set_loglevel(getenv("RVVM_VERBOSE") ? LOG_INFO : LOG_WARN);
+
+    /* The guest's permission bits outlive this process: the host filesystem
+     * has nowhere to put them, so they go to a file beside the rootfs. */
+    {
+        char modes[MAX_PATH];
+        if (ash_mode_store_path(modes, sizeof(modes))) {
+            rvvm_user_set_mode_store(modes);
+        }
+    }
 
     if (!win32_host_init_console(0, 0, 0)) {
         fprintf(stderr, "ash --serve: could not initialize the host\n");

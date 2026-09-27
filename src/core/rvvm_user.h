@@ -34,6 +34,12 @@ typedef ssize_t (*rvvm_user_io_callback)(int fd, const void* buf, size_t count);
 // If callback returns -1, the syscall will fail with errno
 void rvvm_user_set_io_callback(rvvm_machine_t* machine, rvvm_user_io_callback callback);
 
+// Where the guest's permission bits are kept between runs. The host filesystem
+// cannot store them, so a guest chmod (and the mode an open(O_CREAT) arrives
+// with) is recorded here as well; pass NULL to keep the run in memory only.
+// Call before the guest starts - the file is read on the first stat.
+void rvvm_user_set_mode_store(const char* path);
+
 // Opaque host context bound to a machine's userland instance. The host stores
 // whatever it needs to reach from a guest's syscall path (VirtPass stores its
 // vp_cmdpost_t there); the core only passes it back, and never dereferences it.

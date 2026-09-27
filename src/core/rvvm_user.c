@@ -629,6 +629,270 @@ static void mode_override_capture_fstat(int host_fd, uint32_t mode)
     }
 }
 
+/* The identity table is the authority on a file's mode: a chmod that arrived
+ * on an open descriptor never named a path, so the path entry still carries
+ * the mode the file was *created* with. Whoever persists a path asks here
+ * first, and only falls back to the path entry when the identity is unknown. */
+static bool mode_override_lookup(const struct stat* st, uint32_t* mode)
+{
+    uint64_t dev   = mode_key_dev(st);
+    uint64_t ino   = mode_key_ino(st);
+    bool     found = false;
+
+    spin_lock(&mode_override_lock);
+    for (int i = 0; i < mode_override_count; i++) {
+        if (mode_overrides[i].used &&
+            mode_overrides[i].dev == dev && mode_overrides[i].ino == ino) {
+            *mode = mode_overrides[i].mode;
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&mode_override_lock);
+    return found;
+}
+
+/* ------------------------------------------------------------------ *
+ * The same modes, persisted                                           *
+ *                                                                    *
+ * The (dev, ino) table above lives in this process only, so a run     *
+ * that ends forgets every guest chmod - and the host filesystem has   *
+ * nowhere to keep them, which is the whole reason the table exists.    *
+ * The bits therefore also go to a small text file beside the run's     *
+ * writable layer (a host hands rvvm_user_set_mode_store() its path);   *
+ * it is keyed by host path, re-applied to the identity table on load,  *
+ * and a rename carries the entry to the new name. A path that no      *
+ * longer exists is simply dropped: the synthesis below it takes over. *
+ * ------------------------------------------------------------------ */
+typedef struct {
+    char*    path;
+    uint32_t mode;
+} mode_path_t;
+static mode_path_t* mode_paths;
+static int          mode_path_count;
+static int          mode_path_cap;
+static char         mode_store_path[UAPI_PATH_MAX];
+static bool         mode_store_loaded;
+static bool         mode_store_dirty;
+static time_t       mode_store_flush_time;
+static spinlock_t   mode_store_lock      = RVVM_LOCK_INIT;
+static spinlock_t   mode_store_load_lock = RVVM_LOCK_INIT;
+static rvvm_event_t mode_store_wake      = RVVM_EVENT_INIT;
+static bool         mode_store_flusher_started;
+
+static void mode_store_ensure_loaded(void);
+static void mode_store_flush(void);
+
+static char* mode_path_strdup(const char* path)
+{
+    size_t len  = strlen(path) + 1;
+    char*  copy = safe_malloc(len);
+    memcpy(copy, path, len);
+    return copy;
+}
+
+/* Rewrite the store from the in-memory table. The whole read-modify-write is
+ * serialized: a guest syscall and the flusher thread can arrive at once, and
+ * two fopen("w") on one file interleave into garbage.
+ *
+ * The identity table is asked for each path's mode before the path entry is
+ * used - a chmod that came in on an open descriptor (install(1) creates at
+ * 0644 and then fchmods to 0600) never names a path, so the entry alone would
+ * persist the create mode and lose the chmod. */
+static void mode_store_flush(void)
+{
+    FILE* f;
+
+    /* Never write before the old file was read back: an O_CREAT record can be
+     * the very first thing a guest does, and flushing first would truncate the
+     * store down to that single entry. */
+    mode_store_ensure_loaded();
+    if (!mode_store_path[0]) {
+        return;
+    }
+    spin_lock(&mode_store_lock);
+    if (!mode_store_dirty) {
+        spin_unlock(&mode_store_lock);
+        return;
+    }
+    f = fopen(mode_store_path, "w");
+    if (f) {
+        for (int i = 0; i < mode_path_count; i++) {
+            uint32_t    mode = mode_paths[i].mode;
+            struct stat st   = {0};
+            if (!mode_paths[i].path) {
+                continue;
+            }
+            if (stat(mode_paths[i].path, &st) == 0) {
+                mode_override_lookup(&st, &mode);
+            }
+            fprintf(f, "%o\t%s\n", mode & 07777u, mode_paths[i].path);
+        }
+        fclose(f);
+        mode_store_dirty      = false;
+        mode_store_flush_time = time(NULL);
+    }
+    spin_unlock(&mode_store_lock);
+}
+
+/* Insert or update @path's entry. The caller holds mode_store_lock. */
+static void mode_path_set_locked(const char* path, uint32_t mode)
+{
+    for (int i = 0; i < mode_path_count; i++) {
+        if (mode_paths[i].path && !strcmp(mode_paths[i].path, path)) {
+            mode_paths[i].mode = mode;
+            return;
+        }
+    }
+    if (mode_path_count == mode_path_cap) {
+        int   cap   = mode_path_cap ? mode_path_cap * 2 : 64;
+        void* grown = safe_realloc(mode_paths, (size_t)cap * sizeof(*mode_paths));
+        if (!grown) {
+            return;
+        }
+        mode_paths = grown;
+        for (int k = mode_path_count; k < cap; k++) {
+            mode_paths[k] = (mode_path_t){0};
+        }
+        mode_path_cap = cap;
+    }
+    mode_paths[mode_path_count].path = mode_path_strdup(path);
+    mode_paths[mode_path_count].mode = mode;
+    mode_path_count++;
+}
+
+static void mode_override_record_path(const char* host_path, uint32_t mode, bool persist)
+{
+    struct stat st = {0};
+
+    if (!host_path || !*host_path) {
+        return;
+    }
+    spin_lock(&mode_store_lock);
+    mode_path_set_locked(host_path, mode);
+    if (persist) {
+        mode_store_dirty = true;
+    }
+    spin_unlock(&mode_store_lock);
+
+    /* The identity table is what stat consults; the path is only its handle */
+    if (stat(host_path, &st) == 0) {
+        mode_override_record(&st, mode);
+    }
+    /* Coalesced: a package install records hundreds of these, and the file is
+     * rewritten at most once a second. The flusher thread comes back for the
+     * tail of the burst, which no later record would carry. */
+    if (persist && time(NULL) != mode_store_flush_time) {
+        mode_store_flush();
+    }
+}
+
+/* The caller holds mode_store_load_lock. */
+static void mode_store_load(void)
+{
+    char  line[UAPI_PATH_MAX + 32];
+    FILE* f;
+
+    if (!mode_store_path[0]) {
+        mode_store_loaded = true;
+        return;
+    }
+    f = fopen(mode_store_path, "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            unsigned mode = 0;
+            char*    path = strchr(line, '\t');
+            if (!path) {
+                continue;
+            }
+            *path = 0;
+            path++;
+            path[strcspn(path, "\r\n")] = 0;
+            if (sscanf(line, "%o", &mode) != 1 || !*path) {
+                continue;
+            }
+            mode_override_record_path(path, (uint32_t)mode, false);
+        }
+        fclose(f);
+    }
+    mode_store_loaded = true;
+}
+
+static void mode_store_ensure_loaded(void)
+{
+    if (mode_store_loaded) {
+        return;
+    }
+    spin_lock(&mode_store_load_lock);
+    if (!mode_store_loaded) {
+        mode_store_load();
+    }
+    spin_unlock(&mode_store_load_lock);
+}
+
+/* A rename takes the entry with it: apk writes name.tmp and renames it into
+ * place, and without this the mode stays filed under a name that is gone. */
+static void mode_path_rename(const char* from, const char* to)
+{
+    if (!from || !to || !*from || !*to) {
+        return;
+    }
+    spin_lock(&mode_store_lock);
+    for (int i = 0; i < mode_path_count; i++) {
+        if (mode_paths[i].path && !strcmp(mode_paths[i].path, from)) {
+            char* moved = mode_path_strdup(to);
+            safe_free(mode_paths[i].path);
+            mode_paths[i].path = moved;
+            mode_store_dirty   = true;
+            break;
+        }
+    }
+    spin_unlock(&mode_store_lock);
+}
+
+/* Records are coalesced to at most one rewrite a second, so the tail of a
+ * burst stays dirty until the next mode change - which for a daemon that
+ * chmods once and then runs forever never comes. This thread closes that
+ * window and is a no-op while nothing is dirty. */
+static void* mode_store_flusher_main(void* arg)
+{
+    UNUSED(arg);
+    for (;;) {
+        rvvm_event_wait(&mode_store_wake, 200000000ULL);
+        mode_store_flush();
+    }
+    return NULL;
+}
+
+PUBLIC void rvvm_user_set_mode_store(const char* path)
+{
+    if (path && *path) {
+        rvvm_strlcpy(mode_store_path, path, sizeof(mode_store_path));
+    } else {
+        mode_store_path[0] = 0;
+    }
+    /* A store is named once per run: the previous one's entries must not leak
+     * into it. Loaded lazily, because the run's tree may not be unpacked yet
+     * when the host names the file and every stat below would then miss. */
+    spin_lock(&mode_store_lock);
+    for (int i = 0; i < mode_path_count; i++) {
+        safe_free(mode_paths[i].path);
+    }
+    mode_path_count  = 0;
+    mode_store_dirty = false;
+    spin_unlock(&mode_store_lock);
+    mode_store_loaded = false;
+
+    if (mode_store_path[0] && !mode_store_flusher_started) {
+        rvvm_thread_t* thread;
+        mode_store_flusher_started = true;
+        thread = rvvm_thread_create(mode_store_flusher_main, NULL);
+        if (thread) {
+            rvvm_thread_detach(thread);
+        }
+    }
+}
+
 static void uapi_statfs64_convert(struct uapi_statfs64* dst, const struct statfs* src)
 {
     dst->type = src->f_type;
@@ -10620,6 +10884,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_fchmod(%ld, %lx)", a0, a1);
                     a0 = errno_ret(fchmod(hfd, a1));
                     if ((int64_t)a0 >= 0) {
+                        /* No path here, but the identity is what the store
+                         * flushes by (mode_override_lookup), so a path entry
+                         * recorded when the file was created still carries
+                         * this mode across runs. */
                         mode_override_capture_fstat(hfd, (uint32_t)a1);
                     }
                     break;
@@ -10627,11 +10895,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 53: { // fchmodat
                     int hdir = userland_fd_host(uctx(), (int)a0);
                     const char* hpath = wrap_guest_path(path_buf, (int)a0, to_str(a1));
-                    struct stat st = {0};
                     rvvm_info("sys_fchmodat(%ld, %s, %lx)", a0, to_str(a1), a2);
                     a0 = errno_ret(fchmodat(hdir, hpath, a2, 0));
-                    if ((int64_t)a0 >= 0 && fstatat(hdir, hpath, &st, 0) == 0) {
-                        mode_override_record(&st, (uint32_t)a2);
+                    if ((int64_t)a0 >= 0) {
+                        mode_override_record_path(hpath, (uint32_t)a2, true);
                     }
                     break;
                 }
@@ -10752,7 +11019,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                                 int guest_fd = userland_fd_add(uctx(), host_fd,
                                                                (a2 & UAPI_O_CLOEXEC) != 0);
                                 if (created) {
-                                    mode_override_capture_fstat(host_fd, (uint32_t)a3);
+                                    mode_override_record_path(host_path, (uint32_t)a3, true);
                                 }
                                 if (guest_fd < 0) {
                                     /* The table is full: userland_fd_add() has
@@ -11301,6 +11568,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     a0 = errno_ret(ret);
                     if (a0 == 0) {
+                        mode_store_ensure_loaded();
                         /* A follow (the default) resolves the link: the archive
                          * only describes the link itself, so an un-followed
                          * answer has nothing to take from it. */
@@ -11359,6 +11627,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         } else {
                             a0 = errno_ret(fstat(hfd, &st));
                             if (a0 == 0) {
+                                mode_store_ensure_loaded();
                                 stat_apply_mode_override(&st);
                                 rvvm_info("fstat fd=%ld mode=%o dev=%llx ino=%llx",
                                           fd, st.st_mode & 07777u,
@@ -12283,14 +12552,19 @@ case 179: // sysinfo
                     a0 = errno_ret(sendmmsg(userland_fd_host(uctx(), (int)a0), to_ptr(a1), a2, a3));
                     break;
 #endif
-                case 276: // renameat2
+                case 276: { // renameat2
+                    const char* from = wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false);
+                    const char* to   = wrap_guest_path_ex(path_buf1, (int)a2, to_str(a3), false);
                     rvvm_info("sys_renameat2(%ld, %s, %ld, %s, %lx)", a0, to_str(a1), a2, to_str(a3), a4);
                     /* rename() moves the link, it never dereferences it. */
-                    a0 = errno_ret(renameat(userland_fd_host(uctx(), (int)a0),
-                                            wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false),
-                                            userland_fd_host(uctx(), (int)a2),
-                                            wrap_guest_path_ex(path_buf1, (int)a2, to_str(a3), false)));
+                    a0 = errno_ret(renameat(userland_fd_host(uctx(), (int)a0), from,
+                                            userland_fd_host(uctx(), (int)a2), to));
+                    if (a0 == 0) {
+                        /* ...and the mode the old name carried goes with it */
+                        mode_path_rename(from, to);
+                    }
                     break;
+                }
                 case 277: // seccomp - stub
                     // Hitler SHOT HIMSELF after seeing this...
                     a0 = 0;
