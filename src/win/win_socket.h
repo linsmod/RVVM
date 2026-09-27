@@ -38,6 +38,16 @@ void win_socket_init(void);
 /* Non-zero when this CRT fd is a WinSock socket owned by this layer */
 int  win_socket_is_fd(int fd);
 
+/* The anchor's generation, or 0 when the number is not a live anchor.
+ *
+ * An anchor number is reused the instant it is freed, and every guest process of
+ * a run shares this one table - so a guest slot that remembers "host fd 9" says
+ * nothing about *which* socket 9 is by the time it is used again. A caller that
+ * filed a descriptor under an anchor number remembers the generation it saw and
+ * compares it against this one, which is what tells it apart from an anchor that
+ * has since been handed to somebody else. */
+uint64_t win_socket_anchor_gen(int fd);
+
 /* CRT fd anchor: a slot taken from the CRT fd table so that socket descriptors
  * get a numbering that cannot collide with ordinary files (and that read()/
  * close()/dup() can be dispatched on). Used for sockets and epoll instances. */

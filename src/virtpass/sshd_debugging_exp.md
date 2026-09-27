@@ -389,3 +389,192 @@ __即：__
 - `src/util/vma_ops.c`：`seh_handler` 不再取 `seh_lock`
 - `src/util/utils.{h,c}`：trace 行身份前缀
 - `src/win/win_socket.c`：收发 trace
+
+
+
+update: 9-27 13:13
+
+# 找到根因了
+
+## 决定性证据
+
+`fd 6` 在 sshd-session(子进程)里**从头到尾是空的**:
+
+```
+TRACE[103:103]: fd_wr[init]    pid=106 fd=6 used=0 host=0
+TRACE[103:103]: fd_wr[inherit] pid=106 fd=6 used=0 host=0     ← 继承下来就是空的,之后再没被填过
+```
+
+而 sshd-session 自己的日志说它用的是 fd 6:
+
+```
+debug1: sshd-session version OpenSSH_10.3
+debug1: network sockets: 6, 6                                  ← 客户端连接在 6
+debug2: fd 6 setting TCP_NODELAY
+Connection from 127.0.0.1 port 60701 with IP opts:  80 00 00 00
+<—— 再无输出:banner 互换的两行 debug 都没有>
+```
+
+**子进程认定客户端连接在 fd 6,而它的 fd 6 是个空槽。** 真正的连接在别处(peer 60701 的持有情况):
+
+```
+fd_drop pid=103 fd=8  host=10  socket peer 60701   ← sshd master
+fd_drop pid=106 fd=8  host=11  socket peer 60701   ← 子进程,只有 fd 8
+fd_drop pid=103 fd=0  host=12  socket peer 60701
+fd_drop pid=103 fd=1  host=16  socket peer 60701
+fd_drop pid=103 fd=6  host=6   socket peer 60701
+```
+
+父进程在 6/8/0/1 上都有,**唯独继承到子进程的那个是空的**。所以 `sshd_exchange_identification()` 往 fd 6 写 banner 时,写的是一个不存在的描述符 —— banner 永远出不去,客户端只等到 RST。
+
+顺带:sshd 明明打印了 `Connection from 127.0.0.1 port 60701`,说明它 accept 成功、拿到了对端地址。它知道连接在,却仍然写不出去 —— 完全符合"fd 号对不上内容"。
+
+## 顺带挖出一个更严重的独立问题
+
+`userland_fd_host()`(`src/core/rvvm_user.c`):
+
+```c
+static int userland_fd_host(rvvm_userland_t* ctx, int fd)
+{
+    if (userland_fd_tracked(ctx, fd)) {
+        return ctx->fds[fd].fd;
+    }
+    return fd;        // ← 未跟踪的 guest fd,直接当成宿主同号 fd 用
+}
+```
+
+一个**已经被 close 掉的 guest fd**,在宿主侧会落到**宿主进程同号的 fd** 上。guest 往一个已关闭的 fd 写,实际可能写进宿主的任意描述符 —— 这既是正确性问题,也是隔离问题。
+
+我**没有动它**。这个"未跟踪就按同号透传"看起来是为 `dup` 到表外编号兜底而故意留的(见 `userland_fd_slot_alloc` 的注释),全局改成 EBADF 很可能连带打断 dup2 兜底和 console 处理。在没有回归验证手段的前提下改它不负责任,需要单独评估。
+
+## 我没有修复 SSH
+
+诚实说:**没有**。我这轮做到的是把根因从"客户端连接 I/O 为 0"收敛到一个具体的、可验证的事实 —— **privsep 子进程里 sshd 声称的连接 fd(6)是空的,而连接实际在 fd 8**。
+
+剩下的未知是**为什么**空的。fork 继承路径 `userland_fd_table_inherit` 是嫌疑最大的地方(它按 fd 逐个复制,某些分支会静默跳过),但我没有验证到那一行,不想再给一个未经验证的结论 —— 这轮我已经有两次因为过度解读 trace 而下错结论。
+
+## 下一步(具体)
+
+1. 在 `userland_fd_table_inherit` 里,子进程 fd 6 为什么没被填?重点看 `shared` / pty / procfs 三个提前 `continue` 的分支,以及 `dup()` 失败时的 `inherit_shared` 兜底。
+2. 父进程在 fd 6 上装连接的时刻,相对 fork 的先后 —— 如果父进程的 dup2 发生在 fork **之后**,那就是竞态/顺序问题,子进程自然看不到。
+3. 验证手段已经就绪:`fd_wr[... ] pid=N` 现在能直接看出每一步是哪个进程,`fd_drop` 带 peer。
+
+## 状态
+
+| commit | 内容 |
+|---|---|
+| `851622d` | pid/tid 全 run 共享(修碰撞)+ e2e 装 openssh |
+| `c14043f` | 收发 trace 带 peer |
+| `248aa00` | 文档更正 privsep 结论 |
+| `08c53ce` | fd trace 带 owner pid + `fd_drop` |
+
+`procfs_e2e` / `ash_e2e` PASS,openssh_e2e 3/7(与基线一致)。工作区干净,没有提交任何未经验证的改动。
+
+关于 gdb:我考虑了,但 gdb 断的是模拟器的宿主符号,看不到 guest 的 fd 表语义 —— 这里真正缺的是**子进程 fd 6 的来源**那一行的 trace,比在宿主上断点更直接。所以这轮没用上 gdb。如果你要我继续,我会先补一条针对 `userland_fd_table_inherit` 每个分支的 trace,再决定要不要上 gdb。
+
+---
+
+# 第二轮:定位到 anchor 复用(已修)
+
+上面"找到根因了"那一节的结论**是错的**,本节更正。它把"子进程 fd 6 是空的"当成根因,
+但那其实是 trace 采样窗口的错觉:加上 `sys` 分类后重跑,`inherit` 全部是 `used=1` 的
+`inherit_dup`,子进程的 fd 表从来没空过。
+
+## 真正的根因:anchor 号码被同 run 的其他进程借走
+
+`win_socket_alloc_anchor()` 用 `_open("NUL")` 从 **CRT fd 表**取一个号来锚定 socket。
+但 guest fd 表把 host fd(就是这个号)长期存下来。两个事实叠加:
+
+1. CRT fd 表是**宿主进程全局**的,一个 run 里所有 guest 进程共用;
+2. guest 进程的普通 `open()` 也从同一张表取号。
+
+所以只要 run 里另一个进程(哪怕是毫不相干的 ssh 客户端)开一次文件,拿到 sshd 正占着的
+那个号;anchor 一旦归还,这个号就归文件所有 —— 而 sshd 的槽位里还写着这个号。
+
+## 决定性证据
+
+master 的 fd 9 从装上到出问题,中间**没有任何一行 `fd_wr` 写过它**:
+
+```
+564212684  fd_wr[install] pid=113 fd=9  used=1 host=9  gen=24    ← socketpair 端 A
+564212684  fd_wr[install] pid=113 fd=10 used=1 host=10 gen=25    ← 端 B
+564212687  fd_wr[setfl]   pid=113 fd=9  host=9  gen=24           ← 仍是 24,槽位完全正确
+564212707  fd_stale pid=113 fd=9 host=9 gen=24 now=32            ← 20ms 后 anchor 9 已是别人的
+```
+
+同一时刻在干这件事的是 **pid 114(并发的 ssh 客户端)**:
+
+```
+564212686  fd_wr[install] pid=114 fd=4 host=11
+564212687  fd_wr[close]   pid=114 fd=4 host=11
+564212688  fd_wr[install] pid=114 fd=4 host=11
+```
+
+它在不停 open/close `/root/.ssh/id_e2e*`,host 号被反复分配释放。
+
+后果就是最初那个 3605 字节脏数据:master 往自己 socketpair 上写 privsep 数据,
+字节实际落进了客户端连接,客户端收到 `0x00` 开头的东西,报 `invalid format`。
+
+## 修法
+
+anchor 加**引用计数 + generation 校验**(`wsock_fds_refs` / `wsock_fds_gen`):
+
+- socket 仍然立刻关,但 **CRT 号只在最后一个 guest 槽位放手时才归还**;
+- `userland_fd_host()` 每次解析都核对 generation,不符即返回 EBADF(`fd_stale` trace);
+- `userland_fds_write()` 在装/覆盖槽位时配平引用。
+
+**没有选"独立编号域"**:派发路径(`posix_shim` 的 read/close、`win_socket_is_fd` 判定)
+依赖 anchor 是**真 CRT fd**,换编号域会波及所有派发。引用计数保住了这个前提。
+
+## 效果与遗留
+
+`fd_stale` 12 次 → **0 次**;`invalid format` 消失,privsep monitor 通道 2252 字节干净送达。
+sshd 的失败点因此**后移**到 `kex_exchange_identification: Connection reset by peer`。
+
+回归:`procfs_e2e` 22/22、`ash_e2e` 7/7、`session_e2e` PASS、
+`jobctl killpg` / `wait-bg` PASS。`openssh_e2e` 仍 3/7(与基线一致)。
+
+**仍未修好 SSH。** 剩下的 kex 失败是 banner 之后的独立问题,需要载荷级 trace
+(把 sshd 实际写出的字节 dump 出来)才能继续,不是 socket 收发统计能回答的。
+
+## 踩到的坑:引用计数不能在 userland_fds_write 里配平
+
+第一版把 ref/unref 写在 `userland_fds_write()` 内部,结果 **procfs_e2e 挂死在
+`/proc/self/stat`**(stash 后基线 3/3 通过,确认是真回归)。
+
+原因:`userland_fds_write()` 不是"一次调用 = 一次归属变更"。`userland_fd_table_inherit()`
+对同一个槽位会**连续调两次** —— 先 `inherit` 复制父的槽位,再 `inherit_pty` /
+`inherit_dup` 换成自己的。按调用配平会把第一次的引用立刻 unref 掉,anchor 计数
+提前归零,号被提前归还 CRT,fd 悬空 → guest 卡死。
+
+**结论:引用只在槽位归属真正改变的地方配平** —— `userland_fd_install()` 取,
+`userland_fd_close()` 还,inherit 路径显式取。`userland_fds_write()` 只管记账,
+不再碰引用。这也符合它自己的注释("唯一改写 ctx->fds[fd] 的函数")。
+
+## 另一个既有问题(与本次改动无关):core 日志泄漏进客户端 stdout
+
+`procfs_e2e` 偶发 FAIL `/proc/self/cwd readlinks to /`。已定位:**不是** fd 问题,
+`readlink /proc/self/cwd` 本身 6/6 都正确返回 `/`,但每 2 次有 1 次 core 的
+`vpsessiond:` 日志混进了客户端捕获的 stdout:
+
+```
+match=True  raw=[/]
+match=False raw=[[...] vpsessiond:   [slot 0] open sock=4|[...] client connected, 1 of 16 in use|
+                 [...] session 4 started (pid 107, command), 1 of 16 in use|
+                 /|[...] close why=shell exited sock=4 pid=0 child_done=1]
+```
+
+驱动的 `Client()` 把两路输出合并,检查用 `^\s*/\s*$` 整行匹配,混入日志行就失配。
+**未修** —— 与 anchor 修复无关,属于独立问题,不应混进同一个提交。
+
+
+## 状态
+
+| commit | 内容 |
+|---|---|
+| `851622d` | pid/tid 全 run 共享(修碰撞)+ e2e 装 openssh |
+| `c14043f` | wsock: name the peer in the send/recv traces |
+| `248aa00` | 文档更正 privsep 结论 |
+| `08c53ce` | fd trace 带 owner pid + `fd_drop` |
+| (本轮) | anchor 引用计数 + generation 校验,消除跨进程串写 |
+

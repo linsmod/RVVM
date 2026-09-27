@@ -125,6 +125,47 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 static SRWLOCK wsock_lock = SRWLOCK_INIT;
 static SOCKET  wsock_fds[WSOCK_MAX_FD];
 
+/* What each anchor was last bound to, so a stale guest slot can tell "my socket"
+ * from "whatever now sits on my number" (see win_socket_anchor_gen). Bumped on
+ * every bind; a guest slot remembers the value it saw when it was filed. */
+static uint64_t wsock_fds_gen[WSOCK_MAX_FD];
+static volatile LONG64 wsock_fds_gen_next;
+
+/* How many guest fd-table slots still name each anchor.
+ *
+ * The anchor's number comes from the CRT fd table (_open("NUL")), which is
+ * process-global: while a socket anchor holds a number, *any* guest process in
+ * the run that opens a file can be handed that same number, and once the anchor
+ * gives it back the file owns it. A guest slot, on the other hand, keeps the
+ * anchor number for as long as it lives - and every guest process of a run
+ * shares one fd table and one CRT table, so a slot's number can be recycled out
+ * from under it by an unrelated process. That is not theoretical: it is how the
+ * sshd master ended up writing its privsep data into a client's connection.
+ *
+ * So an anchor is only given back to the CRT when the last slot naming it goes
+ * away, and a recycled number can no longer be one somebody still holds. The
+ * socket object is still closed on the first win_socket_close() - only the number
+ * is kept reserved. */
+static LONG wsock_fds_refs[WSOCK_MAX_FD];
+
+/* Release the CRT number of an anchor, once nothing names it any more. */
+static void wsock_anchor_release(int fd)
+{
+    bool last;
+    AcquireSRWLockExclusive(&wsock_lock);
+    last = (--wsock_fds_refs[fd] <= 0);
+    if (last) {
+        wsock_fds_refs[fd] = 0;
+    }
+    ReleaseSRWLockExclusive(&wsock_lock);
+    if (last) {
+        RVVM_TRC(RVVM_TRC_WSOCK, "free anchor %d (last reference)", fd);
+        _close(fd);
+    } else {
+        RVVM_TRC(RVVM_TRC_WSOCK, "anchor %d kept (still referenced)", fd);
+    }
+}
+
 /* Defined with the anchors below; needed by the public peer query above. */
 static const char* wsock_peer_str(SOCKET s);
 
@@ -152,8 +193,26 @@ static SOCKET wsock_fd_take(int fd)
     AcquireSRWLockExclusive(&wsock_lock);
     s = wsock_fds[fd];
     wsock_fds[fd] = INVALID_SOCKET;
+    /* Burn the generation as the anchor goes away, so whoever still names this
+     * number finds 0 and can tell the binding is gone (win_socket_anchor_gen). */
+    wsock_fds_gen[fd] = 0;
     ReleaseSRWLockExclusive(&wsock_lock);
     return s;
+}
+
+uint64_t win_socket_anchor_gen(int fd)
+{
+    uint64_t gen = 0;
+    if (fd < 0 || fd >= WSOCK_MAX_FD) {
+        return 0;
+    }
+    if (wsock_init_state != 2) {
+        win_socket_init();
+    }
+    AcquireSRWLockShared(&wsock_lock);
+    gen = (wsock_fds[fd] != INVALID_SOCKET) ? wsock_fds_gen[fd] : 0;
+    ReleaseSRWLockShared(&wsock_lock);
+    return gen;
 }
 
 int win_socket_is_fd(int fd)
@@ -266,14 +325,43 @@ int win_socket_alloc_anchor(void)
         errno = EMFILE;
         return -1;
     }
+    AcquireSRWLockExclusive(&wsock_lock);
+    /* Zero: the reference belongs to whichever guest slot gets filed onto this
+     * anchor, and takes it in userland_fd_install() / the inherit paths. */
+    wsock_fds_refs[fd] = 0;
+    ReleaseSRWLockExclusive(&wsock_lock);
     RVVM_TRC(RVVM_TRC_WSOCK, "alloc anchor %d", fd);
     return fd;
 }
 
+/* One more guest slot now names @fd. The CRT number stays reserved until the
+ * matching unrefs bring the count back to zero (see wsock_fds_refs). */
+void win_socket_anchor_ref(int fd)
+{
+    if (fd < 0 || fd >= WSOCK_MAX_FD) {
+        return;
+    }
+    AcquireSRWLockExclusive(&wsock_lock);
+    InterlockedIncrement(&wsock_fds_refs[fd]);
+    ReleaseSRWLockExclusive(&wsock_lock);
+}
+
 void win_socket_free_anchor(int fd)
 {
+    /* Not a guest-held slot (a failed alloc, a dup that could not be bound):
+     * give the number straight back. */
     RVVM_TRC(RVVM_TRC_WSOCK,  "free anchor %d", fd);
     _close(fd);
+}
+
+/* A guest slot that named @fd is going away without closing a socket (an epoll
+ * instance, say): drop its reference so the number can be reused. */
+void win_socket_anchor_unref(int fd)
+{
+    if (fd < 0 || fd >= WSOCK_MAX_FD) {
+        return;
+    }
+    wsock_anchor_release(fd);
 }
 
 /* The far end of @s as "host:port", or "?" when it has none. Every address space
@@ -325,8 +413,13 @@ static int wsock_fd_alloc(SOCKET s)
     }
     AcquireSRWLockExclusive(&wsock_lock);
     wsock_fds[fd] = s;
+    /* A fresh generation, never 0 (0 reads as "not a live anchor"): this is what
+     * a guest slot files alongside the anchor number, so that a slot outliving
+     * its anchor can recognise the number has been handed to someone else. */
+    wsock_fds_gen[fd] = (uint64_t)InterlockedIncrement64(&wsock_fds_gen_next);
     ReleaseSRWLockExclusive(&wsock_lock);
-    RVVM_TRC(RVVM_TRC_WSOCK,  "fd %d <- socket %p", fd, (void*)s);
+    RVVM_TRC(RVVM_TRC_WSOCK,  "fd %d <- socket %p (gen %llu)", fd, (void*)s,
+             (unsigned long long)wsock_fds_gen[fd]);
     return fd;
 }
 
@@ -705,12 +798,16 @@ int win_socket_close(int fd)
     if (closesocket(s) == SOCKET_ERROR) {
         int err = WSAGetLastError();
         RVVM_TRC(RVVM_TRC_WSOCK,  "closesocket FAILED on fd %d (socket %p) err=%d", fd, (void*)s, err);
-        _close(fd);
+        wsock_anchor_release(fd);
         errno = wsock_errno_of(err);
         return -1;
     }
     RVVM_TRC(RVVM_TRC_WSOCK,  "closesocket OK on fd %d (socket %p)", fd, (void*)s);
-    _close(fd);
+    /* The socket is gone with this call, but the CRT *number* only goes back to
+     * the fd table when the last guest slot naming it is gone too - otherwise a
+     * still-live slot would find its number handed to an unrelated file (see
+     * wsock_fds_refs). This call drops the closing slot's own reference. */
+    wsock_anchor_release(fd);
     return 0;
 }
 

@@ -135,6 +135,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
  * device for it (see the newfstat case). */
 int win_socket_is_fd(int fd);
 const char* win_socket_peer_str(int fd);
+uint64_t win_socket_anchor_gen(int fd);
+void win_socket_anchor_ref(int fd);
+void win_socket_anchor_unref(int fd);
+int  win_socket_close(int fd);
 #endif
 #include "elf_load.h"
 #include "mem_ops.h"
@@ -1197,6 +1201,14 @@ typedef struct {
     // live where they are acted on - the host, which keeps the guest's own word
     // per fd - so this stays 0 for them and F_GETFL asks the host instead.
     uint32_t flags;
+    // The anchor generation this slot was filed under, or 0 for a descriptor that
+    // rides on no anchor (a console, a plain host fd, an emulator-owned object).
+    // The anchor *number* alone is not an identity: it is freed and handed to the
+    // next socket as soon as the descriptor behind it goes, so a slot that
+    // outlives its anchor would otherwise resolve to a stranger's socket - the
+    // sshd master writing its log into a client's connection that way. Comparing
+    // the generation is what makes the number mean "mine" again.
+    uint64_t anchor_gen;
 } rvvm_fd_entry_t;
 typedef struct rvvm_process {
     uint32_t     pid;         // Guest-visible process id
@@ -4946,15 +4958,27 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
                                bool shared, bool console, uint32_t flags,
                                const char* op)
 {
+    /* The slot is rewritten wholesale; the anchor reference it holds is *not*
+     * adjusted here. This function is also called to re-file a slot that keeps
+     * naming the same anchor (fork() copies a slot through it and then again for
+     * the dup it makes of it), and adjusting per call would drop references the
+     * slot still holds. Whoever hands a slot an anchor takes the reference
+     * (userland_fd_install / userland_fd_dup / the inherit paths), and whoever
+     * takes it away gives it back (userland_fd_close). */
     ctx->fds[fd].used    = used;
     ctx->fds[fd].fd      = host_fd;
     ctx->fds[fd].cloexec = cloexec;
     ctx->fds[fd].shared  = shared;
     ctx->fds[fd].console = console;
     ctx->fds[fd].flags   = flags;
+    /* An anchor-backed slot remembers *which* socket its number meant when it was
+     * filed; a slot riding on no anchor records 0, which never matches a live one
+     * (so a console and a plain host fd are never treated as recycled). */
+    ctx->fds[fd].anchor_gen = used ? win_socket_anchor_gen(host_fd) : 0;
     if (fd >= FD_TRACE_LO && fd <= FD_TRACE_HI) {
-        RVVM_TRC(RVVM_TRC_FD, "fd_wr[%s] pid=%u fd=%d used=%d host=%d clo=%d sh=%d con=%d fl=%x",
+        RVVM_TRC(RVVM_TRC_FD, "fd_wr[%s] pid=%u fd=%d used=%d host=%d gen=%llu clo=%d sh=%d con=%d fl=%x",
                   op, (unsigned)ctx->pid, fd, (int)used, host_fd,
+                  (unsigned long long)ctx->fds[fd].anchor_gen,
                   (int)cloexec, (int)shared, (int)console, flags);
     }
 }
@@ -4990,6 +5014,9 @@ static void userland_fd_install(rvvm_userland_t* ctx, int guest_fd, int host_fd,
     /* ...and the flag word is the new descriptor's, never the one the number
      * happened to carry before. A caller that knows the guest's flags sets them
      * right after (see userland_fd_set_flags). */
+    /* This slot now holds the anchor, so it holds a reference on it: the number
+     * must not go back to the CRT fd table while this slot names it. */
+    win_socket_anchor_ref(host_fd);
     userland_fds_write(ctx, guest_fd, true, host_fd, cloexec, false, false, 0, "install");
 }
 
@@ -5028,6 +5055,24 @@ static bool userland_console_ready(rvvm_userland_t* ctx)
 static int userland_fd_host(rvvm_userland_t* ctx, int fd)
 {
     if (userland_fd_tracked(ctx, fd)) {
+        /* An anchor-backed slot whose anchor has since been recycled no longer
+         * refers to its own socket - the number now names somebody else's (the
+         * anchor table is run-wide, and a fork()ed sibling or a later socket in
+         * this process can take it the moment the descriptor behind it closes).
+         * Acting on that number would read or write a stranger's descriptor, so
+         * it is reported as the bad descriptor it now is. Returning -1 lets every
+         * caller reach the host with a number that can only fail, which is EBADF
+         * rather than someone else's data. A console and a plain host fd file no
+         * generation (0) and are always left alone. */
+        uint64_t gen = ctx->fds[fd].anchor_gen;
+        if (gen != 0 && gen != win_socket_anchor_gen(ctx->fds[fd].fd)) {
+            RVVM_TRC(RVVM_TRC_FD, "fd_stale pid=%u fd=%d host=%d gen=%llu now=%llu "
+                      "(anchor recycled under us)",
+                      (unsigned)ctx->pid, fd, ctx->fds[fd].fd,
+                      (unsigned long long)gen,
+                      (unsigned long long)win_socket_anchor_gen(ctx->fds[fd].fd));
+            return -1;
+        }
         return ctx->fds[fd].fd;
     }
     return fd;
@@ -5118,7 +5163,20 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
         userland_proc_fd_release(ctx->fds[fd].fd);
     } else if (!ctx->fds[fd].shared && !userland_dev_by_fd(ctx->fds[fd].fd, NULL)) {
         /* A device descriptor is just a number: nothing was opened for it. */
-        close(ctx->fds[fd].fd);
+        if (win_socket_is_fd(ctx->fds[fd].fd)) {
+            /* A socket anchor: the socket goes now, the CRT number only once
+             * nothing names it (this call drops this slot's reference). */
+            win_socket_close(ctx->fds[fd].fd);
+        } else {
+            close(ctx->fds[fd].fd);
+            /* An anchor that is not a socket (an epoll instance) still holds the
+             * reference this slot took when it was filed. */
+            win_socket_anchor_unref(ctx->fds[fd].fd);
+        }
+    } else if (ctx->fds[fd].shared) {
+        /* Rides on another address space's anchor: give back the reference this
+         * slot took, so the parent's own copy keeps the number alive. */
+        win_socket_anchor_unref(ctx->fds[fd].fd);
     }
     userland_fds_write(ctx, fd, false, ctx->fds[fd].fd, ctx->fds[fd].cloexec,
                        ctx->fds[fd].shared, ctx->fds[fd].console, ctx->fds[fd].flags,
@@ -5337,7 +5395,12 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
             userland_fds_write(child, fd, false, 0, false, false, false, 0, "inherit");
             continue;
         }
-        /* Copy the slot wholesale through the unified write. */
+        /* Copy the slot wholesale through the unified write. A socket anchor is
+         * named by both tables, so the child takes a reference of its own - that
+         * is what keeps the number out of the CRT table for as long as it lives. */
+        if (win_socket_is_fd(parent->fds[fd].fd)) {
+            win_socket_anchor_ref(parent->fds[fd].fd);
+        }
         userland_fds_write(child, fd, parent->fds[fd].used, parent->fds[fd].fd,
                            parent->fds[fd].cloexec, parent->fds[fd].shared,
                            parent->fds[fd].console, parent->fds[fd].flags, "inherit");
@@ -5367,12 +5430,23 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
         }
         int host_fd = dup(parent->fds[fd].fd);
         if (host_fd >= 0) {
+            /* A socket anchor is dup'd by the socket layer, which files the copy
+             * under a fresh anchor; take the child's reference on it (this slot
+             * will close it on its own). */
+            if (win_socket_is_fd(host_fd)) {
+                win_socket_anchor_ref(host_fd);
+            }
             userland_fds_write(child, fd, true, host_fd, parent->fds[fd].cloexec,
                                false, parent->fds[fd].console, parent->fds[fd].flags,
                                "inherit_dup");
         } else {
             /* No copy: the parent's host fd has to do, and the child may not
-             * close it (see userland_fd_close). */
+             * close it (see userland_fd_close). The child still names the anchor,
+             * so it holds a reference of its own - that is what keeps the number
+             * out of the CRT table while this process lives. */
+            if (win_socket_is_fd(parent->fds[fd].fd)) {
+                win_socket_anchor_ref(parent->fds[fd].fd);
+            }
             userland_fds_write(child, fd, true, parent->fds[fd].fd,
                                parent->fds[fd].cloexec, true,
                                parent->fds[fd].console, parent->fds[fd].flags,
