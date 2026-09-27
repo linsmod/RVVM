@@ -182,6 +182,7 @@ __规矩：每轮实验前 `Get-Process rvvm* | Stop-Process -Force`，并且换
 7. __musl 的失败可能报陈旧 errno__：`initgroups: root: Network is down` 里的 errno 来自**上一次**失败的 `connect()`（§6A.5）。 语义上不该出现的 errno（查 group 怎么会是网络错）先别顺着 errno 名猜，回头找最近一次失败的 syscall。
 8. __`RVVM_VERBOSE=1` + `RVVM_TRACE=sys` 会打出 syscall 实参__：`INFO: sys_getsockopt(6, 0, 4, ...)`。 §6A.1 的 `IP_OPTIONS` 常量取错（Linux 4 / WinSock 1）就是这样被发现的 —— 只打指针的 trace 看不出这种错。
 9. __`INFO:` 行不带 `[pid:tid]`__：要按进程归因就用 `RVVM_TRC`（`TRACE:` 行才有前缀）。 §6A.5 第一版把 connect 的目标 trace 打在 INFO 通道上，结果分不清那两次 UDP 探测是谁发的。 和坑 #2 一样是**格式**骗人。
+   → **已修**：现在 `log_prefix()`（`src/util/utils.c`）给**所有**级别都加身份，`INFO[104:104]:` / `WARN[host]:` / `ERROR[104:104]:` 都带。 无 userland 挂载时仍是 `INFO: `，注册 formatter 之前那两行（`Loaded ELF ...`）同理。
 10. __宿主没有的语义要照 Linux 的规则补，不要照宿主__：`connect(0.0.0.0)` 在 Linux 是成功的（内核把 `INADDR_ANY` 改写成 loopback），在 WinSock 上是 `WSAEADDRNOTAVAIL`（§6A.6）。 这一类差异不会报错，只会让 guest 的探测静默失败并留下一个误导性的 errno。
 
 ---
@@ -191,6 +192,11 @@ __规矩：每轮实验前 `Get-Process rvvm* | Stop-Process -Force`，并且换
 ### 4.1 trace 带 `[pid:tid]`
 
 `src/util/utils.{h,c}`：新增 `rvvm_trace_set_id_fn()` 钩子；`rvvm_user_thread_wrap` 里注册一次， 回调输出 `[pid:tid]`（guest 进程/线程），非 guest 线程输出 `[host]`。没有它， 多进程 fork/exec 的日志完全无法归因（本次多个误判都源于此）。
+
+**后来扩到所有级别**（第三轮）：原先只有 `TRACE:` 带身份，`INFO:`/`WARN:`/`ERROR:` 不带 ——
+而 `sys_connect()` 这类最需要归因的行恰恰是 `INFO:`。见坑 #9。现在 `log_prefix()`
+统一给 `DEBUG`/`INFO`/`WARN`/`ERROR`/`FATAL`/`TRACE` 加身份，形如
+`INFO[104:104]: `；guest 之外是 `[host]`，没有 userland 挂载时保持原样。
 
 ### 4.2 `win_socket` 收发可见性
 
@@ -426,7 +432,7 @@ __即：__
 - `src/core/rvvm_user.c`：trace id 钩子注册、ctx children 注册表与 detach 走查、writev 零长度段、 写 helper 的空写语义、SIGCHLD 通知语义、socket 的 fstat、**`chroot(2)`**（§6A.2）、**guest 凭证的 real/effective id 与 `setres*`/`getres*`**（§6A.3）、**`prlimit64(2)`**（§6A.4）、**`sys_connect` 的目标地址 trace**（§6A.6）
 - `src/util/threading.c`：win32 带超时等待的上限 + timer 装配校验
 - `src/util/vma_ops.c`：`seh_handler` 不再取 `seh_lock`
-- `src/util/utils.{h,c}`：trace 行身份前缀
+- `src/util/utils.{h,c}`：trace 行身份前缀（后扩到所有日志级别，见 §4.1）
 - `src/win/win_socket.c`：收发 trace、anchor 引用计数与 generation 校验、**`getsockopt(IP_OPTIONS)` 的 Linux 语义**（§6A.1）
 
 
@@ -623,6 +629,7 @@ match=False raw=[[...] vpsessiond:   [slot 0] open sock=4|[...] client connected
 | `0dfc951` | wsock: `getsockopt(IP_OPTIONS)` 按 Linux 语义返回"无选项"(§6A.1) |
 | `75b9c76` | userland: chroot / real-vs-effective id / prlimit64(§6A.2-4) |
 | `626173d` | wsock: 数据报 `connect(0.0.0.0)` 视为本机 + connect 目标 trace(§6A.6) |
+| (本轮) | util: 所有日志级别都带 `[pid:tid]`,`INFO:` 不再无法归因(§4.1、坑 #9) |
 | (本轮) | 文档订正:§0/§6/§6.4 的结论作废,新增 §6A |
 
 
