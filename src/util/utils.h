@@ -388,12 +388,18 @@ enum rvvm_trace_cat {
 };
 
 /*
- * Optional identity appended to every trace line: the userland layer registers
- * a formatter that writes the calling guest thread's "[pid:tid]" (or "[host]"
- * outside any guest), so interleaved lines from two in-process fork()ed
- * processes - a socketpair close on one side, a recv on the other - can be
- * told apart even when they share a millisecond timestamp. No formatter, or
- * an empty buffer, keeps the plain "TRACE: " form.
+ * Optional identity appended to every log line, whatever its level: the
+ * userland layer registers a formatter that writes the calling guest thread's
+ * "[pid:tid]" (or "[host]" outside any guest), so interleaved lines from two
+ * in-process fork()ed processes - a socketpair close on one side, a recv on the
+ * other - can be told apart even when they share a millisecond timestamp.
+ *
+ * This covers INFO/WARN/ERROR/FATAL as well as traces. It has to: a run's guest
+ * processes all share one stderr stream, so an unattributed "INFO:
+ * sys_connect(6, ...)" is a line nobody can act on - the question a log like
+ * this gets opened to answer is precisely *whose* call that was. No formatter,
+ * or an empty buffer, keeps the plain "INFO: " form, so a build with no
+ * userland attached is unchanged.
  */
 typedef void (*rvvm_trace_id_fn)(char* buf, size_t size);
 PUBLIC void rvvm_trace_set_id_fn(rvvm_trace_id_fn fn);

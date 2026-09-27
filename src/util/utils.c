@@ -832,14 +832,44 @@ static void log_print(const char* prefix, const char* fmt, const void* argv)
 #endif
 }
 
+/* The identity a trace line can carry, see rvvm_trace_set_id_fn(). Declared
+ * here rather than next to the trace machinery because every level wants it. */
+static rvvm_trace_id_fn rvvm_trace_id;
+
+/*
+ * One prefix builder for every level, so "INFO" and "TRACE" are attributed the
+ * same way. The identity is not decoration: with a run's guest processes
+ * interleaved into one stderr stream, "INFO: sys_connect(6, ...)" cannot be
+ * told apart from a different process's line, and that is exactly the question
+ * a log like this gets opened to answer. A run with no userland attached, or
+ * one calling from outside any guest thread, still reads "INFO: " / "[host]".
+ */
+#define LOG_PREFIX_SIZE 64
+static const char* log_prefix(char* buf, size_t size, const char* level, const char* color)
+{
+    char ids[40] = {0};
+
+    if (rvvm_trace_id) {
+        rvvm_trace_id(ids, sizeof ids);
+    }
+    if (log_has_colors()) {
+        rvvm_snprintf(buf, size, ids[0] ? "\033[%s1m%s\033[0;1m%s: " : "\033[%s1m%s\033[0;1m: ",
+                     color, level, ids);
+    } else {
+        rvvm_snprintf(buf, size, ids[0] ? "%s%s: " : "%s: ", level, ids);
+    }
+    return buf;
+}
+
 #if defined(USE_DEBUG)
 
 PRINT_FORMAT void rvvm_debug(const char* format_str, ...)
 {
     if (rvvm_loglevel >= LOG_INFO) {
+        char   prefix[LOG_PREFIX_SIZE];
         va_list args;
         va_start(args, format_str);
-        log_print(log_has_colors() ? "\033[33;1mDEBUG\033[0;1m: " : "DEBUG: ", format_str, &args);
+        log_print(log_prefix(prefix, sizeof prefix, "DEBUG", "33"), format_str, &args);
         va_end(args);
     }
 }
@@ -849,9 +879,10 @@ PRINT_FORMAT void rvvm_debug(const char* format_str, ...)
 PRINT_FORMAT void rvvm_info(const char* format_str, ...)
 {
     if (rvvm_loglevel >= LOG_INFO) {
+        char   prefix[LOG_PREFIX_SIZE];
         va_list args;
         va_start(args, format_str);
-        log_print(log_has_colors() ? "\033[33;1mINFO\033[0;1m: " : "INFO: ", format_str, &args);
+        log_print(log_prefix(prefix, sizeof prefix, "INFO", "33"), format_str, &args);
         va_end(args);
     }
 }
@@ -859,9 +890,10 @@ PRINT_FORMAT void rvvm_info(const char* format_str, ...)
 PRINT_FORMAT void rvvm_warn(const char* format_str, ...)
 {
     if (rvvm_loglevel >= LOG_WARN) {
+        char   prefix[LOG_PREFIX_SIZE];
         va_list args;
         va_start(args, format_str);
-        log_print(log_has_colors() ? "\033[31;1mWARN\033[0;1m: " : "WARN: ", format_str, &args);
+        log_print(log_prefix(prefix, sizeof prefix, "WARN", "31"), format_str, &args);
         va_end(args);
     }
 }
@@ -872,7 +904,6 @@ PRINT_FORMAT void rvvm_warn(const char* format_str, ...)
 
 static uint32_t rvvm_trace_mask  = 0;
 static bool     rvvm_trace_ready = false;
-static rvvm_trace_id_fn rvvm_trace_id;   // per-line [pid:tid] formatter, see utils.h
 
 static const struct {
     uint32_t    bit;
@@ -985,19 +1016,9 @@ PUBLIC PRINT_FORMAT_ARG2 void rvvm_trace(uint32_t cat, const char* format_str, .
         return;
     }
     {
-        char prefix_buf[64];
-        const char* prefix = log_has_colors() ? "\033[36;1mTRACE\033[0;1m: " : "TRACE: ";
-        if (rvvm_trace_id) {
-            char ids[40] = {0};
-            rvvm_trace_id(ids, sizeof ids);
-            if (ids[0]) {
-                rvvm_snprintf(prefix_buf, sizeof prefix_buf,
-                              log_has_colors() ? "\033[36;1mTRACE\033[0;1m%s: " : "TRACE%s: ", ids);
-                prefix = prefix_buf;
-            }
-        }
+        char prefix_buf[LOG_PREFIX_SIZE];
         va_start(args, format_str);
-        log_print(prefix, format_str, &args);
+        log_print(log_prefix(prefix_buf, sizeof prefix_buf, "TRACE", "36"), format_str, &args);
         va_end(args);
     }
 }
@@ -1005,18 +1026,20 @@ PUBLIC PRINT_FORMAT_ARG2 void rvvm_trace(uint32_t cat, const char* format_str, .
 PRINT_FORMAT void rvvm_error(const char* format_str, ...)
 {
     if (rvvm_loglevel >= LOG_ERROR) {
+        char   prefix[LOG_PREFIX_SIZE];
         va_list args;
         va_start(args, format_str);
-        log_print(log_has_colors() ? "\033[31;1mERROR\033[0;1m: " : "ERROR: ", format_str, &args);
+        log_print(log_prefix(prefix, sizeof prefix, "ERROR", "31"), format_str, &args);
         va_end(args);
     }
 }
 
 PRINT_FORMAT void rvvm_fatal(const char* format_str, ...)
 {
+    char   prefix[LOG_PREFIX_SIZE];
     va_list args;
     va_start(args, format_str);
-    log_print(log_has_colors() ? "\033[31;1mFATAL\033[0;1m: " : "FATAL: ", format_str, &args);
+    log_print(log_prefix(prefix, sizeof prefix, "FATAL", "31"), format_str, &args);
     va_end(args);
     stacktrace_print();
     abort();
