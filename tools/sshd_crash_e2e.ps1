@@ -62,7 +62,7 @@
     default catches it with room to spare (default 6).
 
 .PARAMETER IdleSecs
-    `--idle` for the core, the backstop for a driver that dies here (default 600).
+    `--idle` for the core, the backstop for a driver that dies here (default 10, dont let user wait a long time).
 
 .PARAMETER Trace
     RVVM_TRACE for the core, because the fault block is much easier to read with
@@ -82,7 +82,7 @@ param(
     [int]$Port = 7921,
     [int]$SshPort = 2242,
     [int]$Rounds = 6,
-    [int]$IdleSecs = 600,
+    [int]$IdleSecs = 10,
     [string]$Trace = 'fd,sys',
     [string]$Exe = (Join-Path $PSScriptRoot '..\release.windows.x86_64\rvvm_ash_x86_64.exe')
 )
@@ -189,15 +189,29 @@ $o = Guest 'apk add --no-cache openssh >/dev/null 2>&1; command -v sshd >/dev/nu
 Check ($o -match 'e2e-ready') 'openssh is installed in the guest'
 
 if (-not $core.HasExited) {
+    # Kept under vpsessiond's CMD_MAX (512) on purpose. It stores a command in a
+    # fixed char[CMD_MAX] and truncates what does not fit *silently* - no error,
+    # no warning to the guest - so a longer command simply stops mid-line. A 611
+    # byte version of this step ended as
+    #     cat /root/.ssh/id_e2e.pub > /root/.ssh/autho
+    # and reported it as "cat: read error: Invalid argument", which reads like a
+    # fault in the read path and is not one. Two steps instead of one.
     $o = Guest ('mkdir -p /run/sshd /var/empty && chmod 0755 /run/sshd /var/empty; ' +
-                '[ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -q -t ed25519 -N "" -f /etc/ssh/ssh_host_ed25519_key; ' +
-                '[ -f /etc/ssh/ssh_host_rsa_key ] || ssh-keygen -q -t rsa -b 2048 -N "" -f /etc/ssh/ssh_host_rsa_key; ' +
-                'grep -q "^sshd:" /etc/passwd || echo "sshd:x:22:22:sshd:/var/empty:/sbin/nologin" >> /etc/passwd; ' +
                 'mkdir -p /root/.ssh && chmod 700 /root/.ssh; ' +
-                '[ -f /root/.ssh/id_e2e ] || ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_e2e; ' +
-                'cat /root/.ssh/id_e2e.pub > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys; ' +
-                'echo e2e-keys-ready')
-    Check ($o -match 'e2e-keys-ready') 'host keys, privsep user and an authorized key are in place' $o
+                'grep -q "^sshd:" /etc/passwd || ' +
+                'echo "sshd:x:22:22:sshd:/var/empty:/sbin/nologin" >> /etc/passwd; ' +
+                'echo e2e-dirs-ready') 60
+    Check ($o -match 'e2e-dirs-ready') 'privsep dir, the sshd user and /root/.ssh are in place' $o
+}
+if (-not $core.HasExited) {
+    $o = Guest ('[ -f /etc/ssh/ssh_host_ed25519_key ] || ' +
+                'ssh-keygen -q -t ed25519 -N "" -f /etc/ssh/ssh_host_ed25519_key; ' +
+                '[ -f /root/.ssh/id_e2e ] || ' +
+                'ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_e2e; ' +
+                'cp /root/.ssh/id_e2e.pub /root/.ssh/authorized_keys; ' +
+                'chmod 600 /root/.ssh/authorized_keys; ' +
+                'echo e2e-keys-ready') 120
+    Check ($o -match 'e2e-keys-ready') 'host keys and an authorized key are in place' $o
 }
 
 # --- the rounds -------------------------------------------------------------
