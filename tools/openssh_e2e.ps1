@@ -36,6 +36,12 @@
     Port sshd listens on inside the guest (bound on the host loopback, since
     guest bind/connect are forwarded) - default 2222.
 
+.PARAMETER SshPortDebug
+    Port for the `sshd -d -d` step, which serves one connection and exits but can
+    still be holding the port when the next step starts its daemon. Defaults to
+    2223 so the two cannot collide; the failure that made this worth a parameter
+    was the two steps failing alternately, one per run.
+
 .PARAMETER Trace
     RVVM_TRACE categories for the core run; '' disables tracing.
 
@@ -48,6 +54,9 @@
 param(
     [int]$Port = 7913,
     [int]$SshPort = 2222,
+    # The debug-mode daemon gets a port of its own so it cannot collide with the
+    # long-lived one the next step starts - see the note on that step.
+    [int]$SshPortDebug = 2223,
     [string]$Trace = 'wsock,fd,sys',
     [string]$Exe = (Join-Path $PSScriptRoot '..\release.windows.x86_64\rvvm_ash_x86_64.exe')
 )
@@ -79,14 +88,30 @@ function Client([string]$cmd) {
     ($r -join "`n") -replace "`e\[[0-9;?]*[A-Za-z]", ''
 }
 
+# Stop the core on $Port and wait until it is really gone, so each run starts from
+# its own empty run instead of answering for a predecessor. --shutdown is the
+# graceful path: the core tears down its endpoint, its rootfs lock and the host
+# sockets it forwarded for the guest, rather than being killed still holding them.
+# A force-kill is only the fallback for a core that will not answer - and a run
+# that is killed rather than shut down can leave a guest sshd's forwarded
+# listener behind, which is the kind of thing the next run then blames on itself.
+function Stop-Core([int]$Port) {
+    & $exe --port $Port --shutdown 2>$null | Out-Null
+    for ($i = 0; $i -lt 100; $i++) {
+        if (-not (Test-AshUp -Exe $exe -Port $Port)) { return }
+        Start-Sleep -Milliseconds 100
+    }
+    Get-Process -Name 'rvvm_ash_x86_64' -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 300
+}
+
 $out = Join-Path $env:TEMP 'openssh_e2e_core_out.txt'
 $err = Join-Path $env:TEMP 'openssh_e2e_core_err.txt'
 Remove-Item $out, $err -ErrorAction SilentlyContinue
 
 # A stale core from an earlier run would answer for us: make sure ours is the one.
-Get-Process -Name 'rvvm_ash_x86_64' -ErrorAction SilentlyContinue |
-    Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 300
+Stop-Core $Port
 
 if ($Trace) { $env:RVVM_TRACE = $Trace }
            else { Remove-Item Env:RVVM_TRACE -ErrorAction SilentlyContinue }
@@ -110,8 +135,14 @@ if (-not $up) {
 
 # No -o UsePAM here: this OpenSSH is built without PAM and rejects the option outright.
 $sshdOpts  = "-e -p $SshPort -o PermitRootLogin=yes -o PasswordAuthentication=no -o StrictModes=no"
+# ConnectTimeout bounds the whole initial handshake in OpenSSH, not just the TCP
+# connect - and this guest is an interpreter doing post-quantum key exchange, so a
+# healthy handshake lands around 1.6s but a slow one can pass 3. At 3 the client
+# gave up mid-handshake and reported "Connection timed out during banner exchange",
+# which reads like a server fault and is not one. 30s still bounds the case that
+# matters (a handshake that never finishes) without racing a slow one.
 $sshOpts   = "-p $SshPort -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null " +
-             "-o BatchMode=yes -o IdentitiesOnly=yes -i /root/.ssh/id_e2e -o ConnectTimeout=3"
+             "-o BatchMode=yes -o IdentitiesOnly=yes -i /root/.ssh/id_e2e -o ConnectTimeout=30"
 
 try {
 # --- install: openssh is NOT in the bundle's rootfs -------------------------
@@ -143,10 +174,27 @@ CheckOut $r ($r -match 'e2e-setup-ok') 'setup: host keys, privsep dir/user, clie
 # --- one session: sshd in single-connection debug mode + ssh attempts ---------
 # `sshd -d -d` stays in this session and logs exactly why a connection dies;
 # the transcript is the primary diagnostic when a kex reset shows up.
-$r = Client ("/usr/sbin/sshd -e -d -d -p $SshPort -o PermitRootLogin=yes -o PasswordAuthentication=no -o StrictModes=no & " +
+#
+# Its own port, deliberately. The debug daemon does not fork: it serves exactly
+# one connection and then exits, so it can still hold $SshPort when the next step
+# starts its long-lived daemon - which then cannot bind, while the client reaches
+# the departing debug daemon instead. That made the two steps fail alternately,
+# one per run, and it looked like an emulator fault when it was only two daemons
+# sharing a number. Separate ports remove the coupling instead of waiting for one
+# of them to go away.
+$debugSshdOpts = "-e -d -d -p $SshPortDebug -o PermitRootLogin=yes -o PasswordAuthentication=no -o StrictModes=no"
+$debugSshOpts  = $sshOpts -replace "-p $SshPort ", "-p $SshPortDebug "
+# The retry loop is bounded (ConnectTimeout on each attempt) but the wait for the
+# debug daemon was not: `sshd -d -d` serves exactly one connection and then exits,
+# so if no attempt ever reaches it, it is still listening and a bare `wait` would
+# never return - and nothing bounds Client() on this side either. Wait for the
+# daemon to leave, with a ceiling, and move on. A daemon still up at the ceiling
+# is the check's own failure to report, not a reason to hang the run.
+$r = Client ("/usr/sbin/sshd $debugSshdOpts & sshdpid=`$!; " +
              'for i in 1 2 3 4 5 6; do ' +
-             "/usr/bin/ssh $sshOpts root@127.0.0.1 'echo openssh-e2e-ok' < /dev/null && break; sleep 1; done; " +
-             'wait')
+             "/usr/bin/ssh $debugSshOpts root@127.0.0.1 'echo openssh-e2e-ok' < /dev/null && break; sleep 1; done; " +
+             'i=0; while [ $i -lt 20 ] && kill -0 $sshdpid 2>/dev/null; do sleep 1; i=$((i+1)); done; ' +
+             'echo e2e-debug-daemon-gone')
 CheckOut $r ($r -match 'openssh-e2e-ok') 'sshd (single-connection debug) serves a pubkey session'
 
 # --- one session: start the daemon, get a pubkey session from it -------------
@@ -161,10 +209,9 @@ $r = Client ("/usr/bin/ssh $sshOpts root@127.0.0.1 'echo openssh-e2e-ok2' < /dev
 CheckOut $r ($r -match 'openssh-e2e-ok2') 'a second session reaches the same running daemon'
 
 } finally {
-    # Cleanup: kill whatever core is listening now, even when a check threw -
-    # a lingering core would hold the rootfs lock.
-    Get-Process -Name 'rvvm_ash_x86_64' -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+    # Cleanup: stop whatever core is listening now, even when a check threw - a
+    # lingering core would hold the rootfs lock and answer the next run.
+    Stop-Core $Port
 }
 
 if ($fails) {
