@@ -134,6 +134,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
  * anchor is a "NUL" device underneath and fstat() would report a character
  * device for it (see the newfstat case). */
 int win_socket_is_fd(int fd);
+const char* win_socket_peer_str(int fd);
 #endif
 #include "elf_load.h"
 #include "mem_ops.h"
@@ -1495,6 +1496,13 @@ typedef struct rvvm_userland {
     // A per-context counter cannot work: two branches of the fork tree that
     // advance in parallel hand out the same number to two live processes.
     struct rvvm_taskid_space* taskids;
+    // The guest process this address space belongs to. An address space is one
+    // process, so this is the pid its fd table and its /proc entry answer to.
+    // The trace prefix carries the pid of the *thread* doing the work, which
+    // during a fork is the parent's - so a line that mutates a child's table
+    // reads as if the parent had done it to itself. Naming the owner here is
+    // what tells the two apart.
+    uint32_t                  pid;
     // The launched image is an init, so the run root is pid 1 (see
     // userland_image_is_init()). Set per launch, like the id space.
     bool                      init_pid1;
@@ -4945,8 +4953,8 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
     ctx->fds[fd].console = console;
     ctx->fds[fd].flags   = flags;
     if (fd >= FD_TRACE_LO && fd <= FD_TRACE_HI) {
-        RVVM_TRC(RVVM_TRC_FD, "fd_wr[%s] ctx=%p fd=%d used=%d host=%d clo=%d sh=%d con=%d fl=%x",
-                  op, (void*)ctx, fd, (int)used, host_fd,
+        RVVM_TRC(RVVM_TRC_FD, "fd_wr[%s] pid=%u fd=%d used=%d host=%d clo=%d sh=%d con=%d fl=%x",
+                  op, (unsigned)ctx->pid, fd, (int)used, host_fd,
                   (int)cloexec, (int)shared, (int)console, flags);
     }
 }
@@ -5087,6 +5095,18 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
 {
     if (!userland_fd_tracked(ctx, fd)) {
         return false;
+    }
+    /* Say what is going away, and whose it was, before it goes. A socket's
+     * peer is the one thing that survives a fork and an address-recycling
+     * allocator, so it is what tells you *which connection* just died - and
+     * "the parent dropped the connection it had just accepted" is a bug
+     * visible in a single line, where the bare fd_wr[close] below is not. */
+    RVVM_TRC(RVVM_TRC_FD, "fd_drop pid=%u fd=%d host=%d%s", (unsigned)ctx->pid,
+             fd, ctx->fds[fd].fd, ctx->fds[fd].shared ? " shared(kept)" : "");
+    if (win_socket_is_fd(ctx->fds[fd].fd)) {
+        RVVM_TRC(RVVM_TRC_FD, "fd_drop pid=%u fd=%d host=%d socket peer %s",
+                 (unsigned)ctx->pid, fd, ctx->fds[fd].fd,
+                 win_socket_peer_str(ctx->fds[fd].fd));
     }
     struct userland_pty* pty = NULL;
     bool master = false;
@@ -6031,6 +6051,7 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
     }
     rvvm_userland_t* ctx = safe_new_obj(rvvm_userland_t);
     ctx->machine      = machine;
+    ctx->pid          = pid;   // the owner its traces and /proc entry name
     /* The id space is the run's, not this address space's: the child keeps
      * drawing from the same counter its parent does, which is what makes a pid
      * unique across the whole fork tree instead of only down one branch. */
@@ -13022,6 +13043,9 @@ static void jump_start(size_t entry, size_t stack_top, const char* image_path,
     /* What /proc/<pid>/{stat,status,cmdline} will report about it. */
     userland_proc_set_image(thread->proc, image_path, argc, argv);
     thread->tid  = thread->proc->pid;
+    /* The address space belongs to this process, so its fd table traces name
+     * it - not just whichever thread happens to be running when they fire. */
+    ctx->pid     = root_pid;
     /* ...and it is the console's foreground group until somebody says otherwise. */
     ctx->tty_fg_pgid = root_pid;
 
@@ -13815,6 +13839,8 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
 
     rvvm_userland_t* ctx = safe_new_obj(rvvm_userland_t);
     ctx->machine      = machine;
+    /* Set per launch below; the fork path overwrites it for a child. */
+    ctx->pid          = 0;
     vector_init(ctx->children);
     /* The console is already open on 0/1/2 before the guest runs a single
      * instruction, so the table starts out knowing those numbers are taken. */

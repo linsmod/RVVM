@@ -125,6 +125,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 static SRWLOCK wsock_lock = SRWLOCK_INIT;
 static SOCKET  wsock_fds[WSOCK_MAX_FD];
 
+/* Defined with the anchors below; needed by the public peer query above. */
+static const char* wsock_peer_str(SOCKET s);
+
 /* 0: not started, 1: WSAStartup in flight, 2: ready (see win_socket_init) */
 static LONG wsock_init_state;
 
@@ -161,6 +164,14 @@ int win_socket_is_fd(int fd)
         win_socket_init();
     }
     return wsock_fd_get(fd) != INVALID_SOCKET;
+}
+
+const char* win_socket_peer_str(int fd)
+{
+    if (wsock_init_state != 2) {
+        win_socket_init();
+    }
+    return wsock_peer_str(wsock_fd_get(fd));
 }
 
 /* ------------------------------------------------------------------------ */

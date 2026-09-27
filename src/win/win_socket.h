@@ -43,6 +43,10 @@ int  win_socket_is_fd(int fd);
  * close()/dup() can be dispatched on). Used for sockets and epoll instances. */
 int  win_socket_alloc_anchor(void);
 void win_socket_free_anchor(int fd);
+/* The far end of this anchor's socket as "host:port", "?" if it has none.
+ * Traces call this: a socket pointer is not an identity (the address is reused
+ * the moment the socket is freed), but the peer is, and it survives a fork. */
+const char* win_socket_peer_str(int fd);
 
 /* Creation */
 int  win_socket_create(int domain, int type, int protocol);
