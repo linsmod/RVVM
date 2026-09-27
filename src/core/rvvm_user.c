@@ -9957,42 +9957,59 @@ static void userland_proc_snapshot_walk(rvvm_userland_t* ctx, uint32_t* pids, ui
 /* Find one process by pid anywhere in the family. Returns a reference, and the
  * context whose descriptors are its own.
  *
- * KNOWN BUG - this is where the core faults under an sshd session, and the
- * reason is not settled. A symbolized stack (make bin USE_DEBUG=1 USE_LTO=0,
- * which is what makes libbacktrace able to name frames - see project.mk's
- * debug-deps) puts it here:
+ * This is where the core died under an sshd session, and it was worth being
+ * wrong twice about, because the first wrong answer was in this comment.
  *
- *     atomic_cas_uint32_ex   src/util/atomics.h:360
- *     atomic_cas_uint32_try  src/util/atomics.h:391
- *     rvvm_lock_raw          src/util/locking.h:71
- *     this function, at the spin_lock below, reached from the recursion
- *     si_addr 0, sig=SEGV
+ * A symbolized stack (make bin USE_DEBUG=1 USE_LTO=0, then run the core under
+ * gdb so the fault stops with its stack - see project.mk's debug-deps) puts it
+ * at the spin_lock below, reached from the recursion:
  *
- * si_addr 0 says the lock it faulted on was at address zero, so @ctx arrives
- * NULL - past the guard at the top of this function, which is not possible from
- * the code as written.
+ *     strlen                 <- rvvm_warn("...held at %s", lock->location)
+ *     rvvm_vsnprintf
+ *     lock_debug_report      src/util/locking.c:33
+ *     rvvm_lock_wait_raw     src/util/locking.c:170
+ *     this function, at the spin_lock below
+ *     userland_proc_opendir_fd <- userland_proc_open_path("/proc/<pid>/fd")
  *
- * Two explanations were tried and both are wrong, which is worth recording so
- * they are not tried again:
+ * The deadlock report firing at all says the CAS below could not succeed, and it
+ * says what @ctx is: its fields are the freed-block poison (0xfeeefeee...), and
+ * lock->location with them. @ctx is not NULL and is not a context - it is
+ * memory that has been released, so the wait can never end and the report that
+ * says so faults in strlen. Both symptoms - the "10 second lock hold" and the
+ * segfault - are one thing, and the crash lands in a different frame each run
+ * (the lock word, the report's %s, procs.data) purely by what the recycled
+ * block happens to hold.
  *
- *   - "the child contexts are freed under the walk". They are not. A forked
- *     child's context is only released by userland_destroy() at whole-machine
- *     teardown; there is no per-process free of it anywhere, so a reference here
- *     would be inert.
- *   - "ctx->procs is mutated without the lock". Every push_back, erase and free
- *     of it takes this same proc_lock (userland_proc_register, _forget,
- *     _reap_orphan_zombies).
+ * The freed block is a child address space, and the record that named it is the
+ * one for an exited process (refs=1, exited=1) filed in its parent's registry.
+ * userland_destroy() frees the space as soon as the child's last thread ends
+ * (rvvm_user_child_main), and used to do the detach in the wrong order: it
+ * cleared ctx->parent_ctx before calling userland_detach_family(), whose upward
+ * walk *is* that pointer, so for a leaf child nothing was detached and every
+ * ancestor registry kept a child_ctx naming the block about to go. Fixed there.
  *
- * Holding proc_lock across the recursion instead does close the window that the
- * first explanation assumed, and deadlocks the run: rvvm_user.c:6625 takes a
- * lock that proc_lock is held above ("Possible deadlock at 6625, last held at
- * this spin_lock"). Reverted.
+ * Two explanations tried on the way, both wrong, recorded so they are not:
  *
- * So the next thing to look at is this function's own collection step: kids[] is
- * read out of p->child_ctx, and record->child_ctx is written *without* the lock
- * on the fork path (userland_child_create's caller). On x86-64 that write cannot
- * tear, so it should not be this - but it is the one write to the field that is
- * not serialised against this read, and it is the last unexamined edge. */
+ *   - "a record in ctx->procs is freed under the walk". It is not: a record is
+ *     filed in two registries and each holds a reference, and every erase takes
+ *     proc_lock.
+ *   - "the child contexts are freed under the walk, so the reference would be
+ *     inert". This was the load-bearing wrong one. It claimed a forked child's
+ *     context is only released at whole-machine teardown and that there is no
+ *     per-process free of it anywhere - which is false, rvvm_user_child_main
+ *     does exactly that, and had done so all along. Believing it is what kept
+ *     the detach ordering from being looked at.
+ *
+ * Holding proc_lock across the recursion instead does close a window, and
+ * deadlocks the run: rvvm_user.c:6625 takes a lock that proc_lock is held above
+ * ("Possible deadlock at 6625, last held at this spin_lock"). Reverted.
+ *
+ * What is left unexamined is the collection step's own race: kids[] is read out
+ * of p->child_ctx, and record->child_ctx is written *without* the lock on the
+ * fork path (userland_child_create's caller, after the record is already filed in
+ * two registries). On x86-64 that write cannot tear, so a reader sees NULL or a
+ * real context - but it is still the one write to the field that is not
+ * serialised against this read. */
 static rvvm_process_t* userland_proc_find_family_walk(rvvm_userland_t* ctx, uint32_t pid,
                                                       rvvm_userland_t** home, int depth,
                                                       rvvm_userland_t** path, int path_len)
@@ -14645,13 +14662,26 @@ static void userland_destroy(rvvm_machine_t* machine)
      * the same object through its own registry, and that record still names
      * this instance as its parent. Detach it before the memory below goes.
      *
-     * The parent's side of the family link is dropped first, while it is
-     * still known good: a parent that is already gone cleared this pointer
-     * when it detached its children, so the branch is simply skipped. */
+     * The detach goes first, and it has to: it finds the ancestors by walking
+     * `ctx->parent_ctx`, so clearing that pointer above it left the upward walk
+     * with nowhere to go and the whole detach a no-op. A forked child's address
+     * space is freed per process, not at machine teardown (rvvm_user_child_main
+     * does it as soon as the last thread ends), and for a leaf - a privsep
+     * grandchild, the shape sshd churns through - the downward half has no
+     * children to unlink either, so *nothing* was detached. Every ancestor
+     * registry kept a record naming this address space, and the next /proc
+     * lookup in the family followed it into the block freed below: a lock word
+     * of poison, so the wait never ended, and the 10s deadlock report then
+     * printed a garbage location string and took the core down.
+     *
+     * Only the parent's side of the family link is dropped here, and it is
+     * dropped while it is still known good: a parent that is already gone
+     * cleared this pointer when it detached its children, so the branch is
+     * simply skipped. */
     rvvm_userland_t* parent = ctx->parent_ctx;
+    userland_detach_family(ctx);
     ctx->parent_ctx = NULL;
     userland_children_remove(parent, ctx);
-    userland_detach_family(ctx);
 
     /* Every process record goes: nothing can reference them any more - the
      * threads are gone (see the wait above), so the references they held are not
