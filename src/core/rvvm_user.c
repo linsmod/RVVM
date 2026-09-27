@@ -9955,7 +9955,44 @@ static void userland_proc_snapshot_walk(rvvm_userland_t* ctx, uint32_t* pids, ui
 }
 
 /* Find one process by pid anywhere in the family. Returns a reference, and the
- * context whose descriptors are its own. */
+ * context whose descriptors are its own.
+ *
+ * KNOWN BUG - this is where the core faults under an sshd session, and the
+ * reason is not settled. A symbolized stack (make bin USE_DEBUG=1 USE_LTO=0,
+ * which is what makes libbacktrace able to name frames - see project.mk's
+ * debug-deps) puts it here:
+ *
+ *     atomic_cas_uint32_ex   src/util/atomics.h:360
+ *     atomic_cas_uint32_try  src/util/atomics.h:391
+ *     rvvm_lock_raw          src/util/locking.h:71
+ *     this function, at the spin_lock below, reached from the recursion
+ *     si_addr 0, sig=SEGV
+ *
+ * si_addr 0 says the lock it faulted on was at address zero, so @ctx arrives
+ * NULL - past the guard at the top of this function, which is not possible from
+ * the code as written.
+ *
+ * Two explanations were tried and both are wrong, which is worth recording so
+ * they are not tried again:
+ *
+ *   - "the child contexts are freed under the walk". They are not. A forked
+ *     child's context is only released by userland_destroy() at whole-machine
+ *     teardown; there is no per-process free of it anywhere, so a reference here
+ *     would be inert.
+ *   - "ctx->procs is mutated without the lock". Every push_back, erase and free
+ *     of it takes this same proc_lock (userland_proc_register, _forget,
+ *     _reap_orphan_zombies).
+ *
+ * Holding proc_lock across the recursion instead does close the window that the
+ * first explanation assumed, and deadlocks the run: rvvm_user.c:6625 takes a
+ * lock that proc_lock is held above ("Possible deadlock at 6625, last held at
+ * this spin_lock"). Reverted.
+ *
+ * So the next thing to look at is this function's own collection step: kids[] is
+ * read out of p->child_ctx, and record->child_ctx is written *without* the lock
+ * on the fork path (userland_child_create's caller). On x86-64 that write cannot
+ * tear, so it should not be this - but it is the one write to the field that is
+ * not serialised against this read, and it is the last unexamined edge. */
 static rvvm_process_t* userland_proc_find_family_walk(rvvm_userland_t* ctx, uint32_t pid,
                                                       rvvm_userland_t** home, int depth)
 {

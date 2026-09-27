@@ -531,6 +531,26 @@ guest-assets: $(guest_assets)
 .PHONY: android-assets # Old name of guest-assets, kept for existing scripts
 android-assets: guest-assets
 
+# Stacktraces: libbacktrace is loaded by name at runtime (src/util/stacktrace.c)
+# rather than linked, so a build without it still runs - it just cannot say where
+# it went when it faults. That only holds if the DLL is somewhere LoadLibrary
+# looks, and the exe's own directory is the one place that needs nothing set up
+# on the caller's side. A mingw-w64 toolchain installs it as libbacktrace-0.dll,
+# which dlib.c's probe now also looks for.
+#
+# Skipped with a note when it is not there. An optional debug aid is never a
+# reason for a build to fail.
+#
+# Override TOOLCHAIN_BIN if your toolchain lives elsewhere:
+#   make bin TOOLCHAIN_BIN=/path/to/mingw64/bin
+override TOOLCHAIN_BIN ?= $(firstword $(wildcard C:/msys64/mingw64/bin) $(wildcard /mingw64/bin) /usr/bin)
+
+.PHONY: debug-deps       # Stage the optional libraries the host loads by name
+debug-deps:
+	$(if $(wildcard $(TOOLCHAIN_BIN)/libbacktrace-0.dll),\
+	  $(call install_file,$(TOOLCHAIN_BIN)/libbacktrace-0.dll,$(BUILDDIR)/libbacktrace-0.dll,0644),\
+	  $(call log_info,libbacktrace-0.dll not under $(TOOLCHAIN_BIN) - stacktraces stay unavailable))
+
 # The APK ships the same two archives a release bundle carries. The host unpacks
 # them into the app's own storage on first use and materializes the guest's
 # rootfs from there, exactly as the WinHost does it - the code is the same

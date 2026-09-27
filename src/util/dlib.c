@@ -140,6 +140,17 @@ dlib_ctx_t* dlib_open(const char* lib_name, uint32_t flags)
             DLIB_PROBE_NAMED("", lib_name, ".so", flags);
             DLIB_PROBE_NAMED("", lib_name, ".dll", flags);
             DLIB_PROBE_NAMED("", lib_name, ".dylib", flags);
+            /* And the ABI-versioned spellings, which are not different libraries
+             * but the same soname under a name the probes above cannot guess. A
+             * mingw-w64 toolchain installs libbacktrace as libbacktrace-0.dll -
+             * the tag in the *middle* of the name - so every unversioned probe
+             * misses it and stacktraces are never available on the one platform
+             * that most wants them. Linux carries the same tag at the end, as
+             * libfoo.so.0. */
+            DLIB_PROBE_NAMED("lib", lib_name, "-0.dll", flags);
+            DLIB_PROBE_NAMED("lib", lib_name, ".so.0", flags);
+            DLIB_PROBE_NAMED("", lib_name, "-0.dll", flags);
+            DLIB_PROBE_NAMED("", lib_name, ".so.0", flags);
         }
     }
 #else

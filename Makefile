@@ -1109,7 +1109,7 @@ $(call path_shell,$(LIB_STATIC_TARGETS): $(LIB_OBJ))
 all: lib bin
 
 .PHONY: bin         # Build executables
-bin: $(call path_shell,$(BIN_TARGETS))
+bin: $(call path_shell,$(BIN_TARGETS)) debug-deps
 
 .PHONY: lib         # Build shared / static libraries
 lib: $(if $(call var_use,USE_LIB),$(LIB_TARGETS)) $(if $(call var_use,USE_LIB_STATIC),$(LIB_STATIC_TARGETS))
