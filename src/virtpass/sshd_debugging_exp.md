@@ -17,16 +17,18 @@
 | SSH banner 互换 | ✅ 通过（此前"banner 从未互换"是 sshd 自己 `fatal()` 了，见 §6A.1） |
 | privsep monitor 通道 | ✅ socketpair 上双向一字节不差走通 |
 | KEX + 公钥校验 | ✅ 通过 |
-| **公钥会话 + 执行远端命令** | ✅ **通过**（`openssh-e2e-ok`，守护进程路径） |
-| **第二个会话复用同一守护进程** | ✅ **通过**（`openssh-e2e-ok2`） |
-| `sshd -d -d` 单连接调试模式 | ❌ 仍失败：privsep 子进程 `dup(0)` 拿到 pty 而非客户端 socket（§6B） |
+| **公钥会话 + 执行远端命令** | ⚠️ **能通,但不稳定**（§6B.5）|
+| **第二个会话复用同一守护进程** | ⚠️ 同上 |
+| `sshd -d -d` 单连接调试模式 | ❌ 同一处 anchor 记账失衡（§6B.4/§6B.5） |
 
-`openssh_e2e` **6/7**。剩下的一条是 `-d -d` 调试模式，见 §6B。
+`openssh_e2e` **5–6 / 7**,会飘。**功能层面 client + sshd 已经打通**:真的公钥会话、
+真的执行远端命令、真的第二个会话复用同一个守护进程。**但它现在还不能算"可靠"** ——
+privsep 子进程偶尔拿不到 socket,而且这不是两个问题,是同一个（§6B.5）。
 
 已修复 14 个模拟器缺陷（见 §5、§5A、§6A、§6B），其中 9 个是"任意程序都可能踩到"的通用 bug：
-writev 零长度 iovec、地址空间 UAF、win32 带超时 futex 等待可能永久阻塞、
+writev 零长度 iovec、地址空间 UAF、win32 带超时等待可能永久阻塞、
 `socket` anchor 号码被回收、`chroot(2)` 缺失、guest 凭证不分 real/effective id、
-数据报 `connect(0.0.0.0)` 语义、AF_UNIX `connect` 缺路径的 errno、**创建文件不应用 umask**。
+数据报 `connect(0.0.0.0)` 语义、AF_UNIX `connect` 缺路径的 errno、创建文件不应用 umask。
 
 ---
 
@@ -1015,6 +1017,41 @@ dup 没能绑定)"这种路径,那时计数就是 0,需要一次真正的 `_clos
 判据已经有了:`free anchor N (last reference)` 在没有 `alloc anchor N` 的情况下
 出现第二次。`dup` 的那条 trace 建议保留 —— 它把"槽位说的"和"实际解析出来的"
 分开打出来,正是它把这一条从"猜"变成"看"。
+
+### 6B.4.4 读 trace 时的陷阱:`alloc anchor N` 不等于"新建了一个 anchor"
+
+`win_socket_alloc_anchor()` 是 `_open("NUL", ...)`,**它拿到的号很可能是回收来的** ——
+`_open` 只认 CRT 的空闲表。所以那一行表示"取到了一个号",不表示"产生了一个 anchor";
+真正让 anchor 存在的是 `wsock_fd_alloc()` 里的 `fd N <- socket ... (gen G)`。
+
+我第一遍就是把这两行当成一回事,才得出"anchor 被分配了两次中间没有释放"这个
+(表面上很吓人的)结论。**实际上中间确实少了一次释放,但那 45 条"没有 alloc 就 free"
+里绝大多数只是我的统计窗口太短 —— 长命的 socket 分配发生在几百行之前。**
+判据要按 `fd N <- socket (gen G)` 来算,不是按 `alloc anchor N`。
+
+trace 已改名为 `take crt number N (reused if it comes round)`,以免下一个人再踩。
+
+## 6B.5 同一个 bug 也会打到守护进程路径(所以它会飘)
+
+连跑几次 `openssh_e2e`,`sshd serves a pubkey session` 这一条时而通过时而失败。
+抓到的失败 transcript 与 §6B.4 **完全同一个签名**:
+
+```
+debug1: network sockets: 6, 6
+debug1: network sockets: -1, -1 [preauth]
+main: fcntl(-1, F_SETFD, FD_CLOEXEC): Bad file descriptor [preauth]
+```
+
+也就是说:**不是"调试模式特有"的问题,而是同一个 anchor 记账失衡,只不过在守护进程
+路径上取决于分配时序,有时撞上有时撞不上。** 这也和"同一个号被发给两个活槽位"
+的性质一致 —— 是时序相关的,不是必现的。
+
+所以现在该做的事没变,而且更重要了:**这个 fd 记账问题不修,`openssh_e2e` 就不能算绿**,
+因为它已经会让一个曾经通过的检查随机失败。
+
+**建议的下一步**(比继续读代码可靠):在 `wsock_anchor_ref()` / `wsock_anchor_release()`
+上加一个"每个号的有引用槽位数"计数,和实际记账对账。失衡的那一刻会自己报出来是哪
+个号、计数是多少,而不是等它变成一个远端的 EBADF。这比现在这样从症状倒推便宜得多。
 
 
 
