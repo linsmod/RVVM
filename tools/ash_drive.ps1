@@ -64,6 +64,10 @@ function New-AshSession {
         [switch]$NoCurrent
     )
     $sess = Connect-AshSession -Exe $Exe -Port $Port
+    # Bounds the read when Poll claims readability and the bytes are not there
+    # yet (see Read-AshChunk). Long enough for a real read on loopback, short
+    # enough that the "readable but empty" case is a millisecond, not a hang.
+    try { $sess.Socket.ReceiveTimeout = 250 } catch { }
     $d = [pscustomobject]@{
         Path      = $sess.Path
         Sock      = $sess.Socket
@@ -72,6 +76,8 @@ function New-AshSession {
         Decoder   = [Text.Encoding]::UTF8.GetDecoder()
         Actions   = @()
         ReadEnded = $false
+        EmptySince = $null
+        ReadEndWhy = ''
         Closed    = $false
         Rate      = @{}
         SampleSw  = [Diagnostics.Stopwatch]::StartNew()
@@ -106,25 +112,46 @@ function Write-AshBytes($d, [byte[]]$b) {
     }
 }
 
-# One bounded non-blocking read. Poll tells us whether data is waiting (or the
-# peer closed) without throwing on timeout; a ready socket with 0 available is
-# EOF. Returns $true if bytes arrived, $false on timeout or EOF.
+# One bounded non-blocking read. Poll says "something is waiting" without
+# throwing on timeout; the read itself is what tells us what.
+#
+# Socket.Available is not consulted, and that is the point. On this AF_UNIX
+# socket it reports 0 on a stream that has bytes queued and the peer still
+# attached, so an earlier version that read "Poll says readable && Available==0"
+# as the end of the stream declared EOF in the middle of a live session. That is
+# self-sealing and silent: ReadEnded is sticky and Write-AshBytes refuses to
+# write once it is set, so the session stopped being driven at that instant -
+# every later step typed nothing, read nothing and ran out its wait, with a
+# transcript that looked like a guest which had gone quiet.
+#
+# So: ask Poll, then Receive, and let the byte count decide. 0 is a real close.
+# A receive that times out means the socket claimed readability and then had
+# nothing, which is not a close - ReceiveTimeout is set short so that case costs
+# a millisecond rather than a hang.
 function Read-AshChunk($d, [int]$timeoutMs) {
     if ($d.ReadEnded) { return $false }
     if (-not $d.Sock.Poll($timeoutMs * 1000, [System.Net.Sockets.SelectMode]::SelectRead)) {
         return $false
     }
-    $avail = $d.Sock.Available
-    if ($avail -le 0) { $d.ReadEnded = $true; return $false }
-    $tmp = New-Object byte[] ([Math]::Min($avail, 4096))
+    $tmp = New-Object byte[] 4096
     $n = 0
     try {
         $n = $d.Sock.Receive($tmp, 0, $tmp.Length, [System.Net.Sockets.SocketFlags]::None)
     } catch {
-        $d.ReadEnded = $true
+        $code = $_.Exception.SocketErrorCode
+        if ($code -eq [System.Net.Sockets.SocketError]::TimedOut -or
+            $code -eq [System.Net.Sockets.SocketError]::WouldBlock) {
+            return $false        # readable a moment ago, nothing yet: not EOF
+        }
+        $d.ReadEnded = $true     # the socket itself is finished
+        $d.ReadEndWhy = "recv $code : $($_.Exception.Message)"
         return $false
     }
-    if ($n -le 0) { $d.ReadEnded = $true; return $false }
+    if ($n -le 0) {
+        $d.ReadEnded = $true     # 0 bytes == peer closed
+        $d.ReadEndWhy = "recv 0 bytes (peer closed)"
+        return $false
+    }
     $chars = New-Object char[] 8192
     # Incremental decoder: a multi-byte char split across two chunks is not
     # two replacement chars.
@@ -264,6 +291,8 @@ function Invoke-Session {
     $d.Buf       = New-Object System.Text.StringBuilder
     $d.Decoder   = [Text.Encoding]::UTF8.GetDecoder()
     $d.ReadEnded = $false
+    $d.EmptySince = $null
+    $d.ReadEndWhy = ''
     $d.Closed    = $false
     $d.Rate      = @{}
     $d.SampleSw  = [Diagnostics.Stopwatch]::StartNew()
