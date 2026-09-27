@@ -12,18 +12,20 @@
 | 阶段 | 状态 |
 |---|---|
 | 模拟器稳定性（HOST FAULT / 挂死） | ✅ 已修复，HOST FAULT 归零，e2e 不再挂死 |
-| 回归（`procfs_e2e` / `ash_e2e`） | ✅ 22/22、7/7 通过 |
+| 回归（`procfs_e2e` / `ash_e2e` / `session_e2e` / `jobctl`） | ✅ 22/22、7/7、PASS、PASS |
 | sshd 启动 / 守护化 | ✅ 通过 |
-| sshd 启动前的客户端连接 I/O | ❌ 对客户端连接的 `sent`/`recv` 统计为 **0**，banner 从未互换（§6.3.1） |
+| SSH banner 互换 | ✅ 通过（此前"banner 从未互换"是 sshd 自己 `fatal()` 了，见 §6A.1） |
 | privsep monitor 通道 | ✅ socketpair 上双向一字节不差走通 |
-| SSH 握手（pubkey 会话） | ❌ 仍失败：`kex_exchange_identification: Connection reset by peer` |
+| KEX + 公钥校验 | ✅ 通过，`SSH2_MSG_EXT_INFO` 已发出，公钥 test 通过 |
+| 建立会话（`exec` 远端命令） | ❌ 仍失败，卡在 `initgroups`（§6A.5） |
 
-已修复 7 个模拟器缺陷（见 §5、§5A），其中 3 个是"任意程序都可能踩到"的通用 bug：
-writev 零长度 iovec、地址空间 UAF、win32 带超时 futex 等待可能永久阻塞。
+已修复 11 个模拟器缺陷（见 §5、§5A、§6A），其中 6 个是"任意程序都可能踩到"的通用 bug：
+writev 零长度 iovec、地址空间 UAF、win32 带超时 futex 等待可能永久阻塞、
+`socket` anchor 号码被回收、`chroot(2)` 缺失、guest 凭证不分 real/effective id。
 
-**当前阻塞点**：sshd 在 fork 之前、在父进程里，对刚 accept 的客户端连接不做任何
-I/O —— 既不写自己的 banner，也不读客户端的（§6.3.1）。monitor 那条 socketpair
-反倒完全正常，所以问题不在 privsep，而在 banner 互换之前那一步。
+**当前阻塞点**：`temporarily_use_uid()` 里的 `initgroups()` 返回 -1，sshd 以
+`initgroups: root: Network is down` 退出 255。注意这个 errno 是**前面一次无关的
+UDP `connect()` 失败留下的陈旧值**，不是 initgroups 自己的失败原因（§6A.5）。
 
 ---
 
@@ -96,21 +98,39 @@ guest `/` 的可写层（不是 scratch copy，见 `win32-host/README.md` 的 Pe
 好处：daemonize 之后 stderr 已挂到关闭的会话上，但文件照样在宿主盘上；
 会话结束、core 被 kill 都不影响日志留存。
 
+__而且这不只是 daemonize 路径的专利__（第三轮补充）：走 pty 时，sshd `fatal()` 之后
+紧接着 `exit_group`，会话随即被拆掉，__最后几行日志会随 pty 一起消失__ —— 而"最后
+一行"恰恰是要看的东西。第三轮里 `Function not implemented`、`was able to restore
+old [e]gid`、`Invalid argument` 这三条根因，全都是只在重定向到文件时才看得到的。
+所以只要是"日志到某一行就断"的排查，一律先把 stderr 落到 guest 文件，**再另开一条
+`-c` 去 `cat`**：
+
+```sh
+rm -f /tmp/sshdbg.log
+/usr/sbin/sshd -d -d -p 2222 ... >/dev/null 2>/tmp/sshdbg.log &
+sleep 2; /usr/bin/ssh -p 2222 ... root@127.0.0.1 'echo ok'; sleep 2
+cat /tmp/sshdbg.log
+```
+
 具体怎么起 core、怎么发那条 `-c`、怎么读日志，`tools/openssh_e2e.ps1` 里就是活的
 版本（它就是这个手法的自动化），改的时候对着它改，不要在这里维护第二份命令。
 
 注意 `2>&1` 在 guest 里合并的是 sshd **自己的** fd 1/2，和 core 的 trace（走宿主
 stderr）是两套互不干扰的通道，可以同时开。
 
-### 1.4 顺带记录的 setsockopt 缺口（非当前触发点）
+### 1.4 顺带记录的 socketopt 缺口
 
 `-d -d` 与 daemonize 两条路径的日志都在 `Connection from ...` 之前出现这两行，
-sshd 只是 warning 后继续，但说明宿主语义映射确有缺口，值得单独跟进：
+sshd 只是 warning 后继续，但说明宿主语义映射确有缺口，**仍然待跟进**：
 
 ```
 setsockopt IPV6_V6ONLY: Protocol not available      # setsockopt(IPPROTO_IPV6, IPV6_V6ONLY)
 setsockopt socket 6 IP_TOS 184: Invalid argument   # setsockopt(IPPROTO_IP, IP_TOS)
 ```
+
+这一族的 `getsockopt` 侧曾经不是 warning 而是**直接致命**：`IP_OPTIONS` 的 get 在
+§6A.1 里吃掉了整条连接。教训是同一个族要两侧一起看 —— `setsockopt` 失败只说明
+映射有洞，`getsockopt` 失败可能直接结束进程。
 
 ### 1.5 干净 runtime 上 openssh 是不存在的
 
@@ -155,6 +175,9 @@ __规矩：每轮实验前 `Get-Process rvvm* | Stop-Process -Force`，并且换
 3. __`nr=` 行是十六进制返回值__：`rvvm_info(" nr=%ld -> %lx", a7, a0)`，所以 `nr=220 -> 68` 是 `clone` 返回 `0x68 = 104`（pid），不是 68。
 4. __guest 日志会经 pty 转发__：sshd 的 stderr 是会话 pty，客户端可见； 但 daemonize 之后 stderr 仍挂在那个已关闭的会话上，日志就丢了 —— 所以排查 一律用 `sshd -d -d`（前台调试）并让会话活着，__或更好：直接把 stderr 重定向到 guest 文件（§1.3），那是 daemonize 路径唯一可行的观测手段__。
 5. __子命令要能自己结束__：`tail -50` 会等到 EOF 才输出，掩盖真实进度； 把输出重定向到 guest 内文件、再用另一条 `-c` 去 `cat`，两边日志都拿得到。
+6. __先确认那行日志是 `fatal()` 还是 `debug()`__：`debug1:` 前缀极具误导性。 `check_ip_options()` 里 `Connection from ... with IP opts:` 是 **`fatal()`**（见 §6A.1），而 §6.3.1 却按"普通日志"读它，于是把"进程已经死了"当成"连接是死的"，白追两轮。 有疑问就去抠 format string / 读源码，别在 trace 里猜语义。
+7. __musl 的失败可能报陈旧 errno__：`initgroups: root: Network is down` 里的 errno 来自**上一次**失败的 `connect()`（§6A.5）。 语义上不该出现的 errno（查 group 怎么会是网络错）先别顺着 errno 名猜，回头找最近一次失败的 syscall。
+8. __`RVVM_VERBOSE=1` + `RVVM_TRACE=sys` 会打出 syscall 实参__：`INFO: sys_getsockopt(6, 0, 4, ...)`。 §6A.1 的 `IP_OPTIONS` 常量取错（Linux 4 / WinSock 1）就是这样被发现的 —— 只打指针的 trace 看不出这种错。
 
 ---
 
@@ -284,7 +307,14 @@ socket 锚点是 `_open("NUL")`，宿主 stat 会给出字符设备。已加分�
 
 ---
 
-## 6. OpenSSH 现状：精确定位到的阻塞点
+## 6. OpenSSH：当时的阻塞点（已被 §6A 推翻）
+
+> ⚠️ **本节的结论已被 §6A 推翻，保留只为对照。** 本节（连同 §6.3.1 的更正）花了
+> 两轮，把"客户端连接上 sent/recv 为 0"一路追到 `userland_fd_table_inherit`，方向是错的。
+> 真实原因根本不需要追：sshd 在那之前就已经 **`fatal()` 退出 255** 了，客户端看到 RST
+> 是结果而不是起点。§6.3.1 的"父进程手里那条客户端连接是死的"其实是
+> **父进程已经死了**。
+> 当前状态见 §0，修复过程见 §6A。
 
 ### 6.1 客户端侧
 
@@ -379,22 +409,29 @@ __即：__
 观测手段见 §1.3：__不要用 `-d -d`__（它让 sshd 不 fork，privsep 路径根本不走），
 要 daemonize + `> /tmp/sshdbg.log 2>&1`，再从 `runtime/rootfs/tmp/sshdbg.log` 读。
 
+> ❌ **这份清单本身是错的，别照着查。** 三个候选里没有一个是真凶，而且"那个 fd 上
+> 第一次 read/write"根本不存在 —— 父进程在写之前就 `fatal()` 退出了（§6A.1）。
+> 保留它是因为它记录了当时的推理路径；正确的方法见 §6A.0。
+
 ---
 
 ## 7. 涉及文件
 
 - `tools/openssh_e2e.ps1`（新增）：OpenSSH 端到端用例
-- `src/core/rvvm_user.c`：trace id 钩子注册、ctx children 注册表与 detach 走查、writev 零长度段、 写 helper 的空写语义、SIGCHLD 通知语义、socket 的 fstat
+- `src/core/rvvm_user.c`：trace id 钩子注册、ctx children 注册表与 detach 走查、writev 零长度段、 写 helper 的空写语义、SIGCHLD 通知语义、socket 的 fstat、**`chroot(2)`**（§6A.2）、**guest 凭证的 real/effective id 与 `setres*`/`getres*`**（§6A.3）、**`prlimit64(2)`**（§6A.4）、**`sys_connect` 的目标地址 trace**（§6A.6）
 - `src/util/threading.c`：win32 带超时等待的上限 + timer 装配校验
 - `src/util/vma_ops.c`：`seh_handler` 不再取 `seh_lock`
 - `src/util/utils.{h,c}`：trace 行身份前缀
-- `src/win/win_socket.c`：收发 trace
+- `src/win/win_socket.c`：收发 trace、anchor 引用计数与 generation 校验、**`getsockopt(IP_OPTIONS)` 的 Linux 语义**（§6A.1）
 
 
 
 update: 9-27 13:13
 
 # 找到根因了
+
+> ⚠️ 这一节的结论**是错的**，见下面"第二轮"和 §6A。它把 trace 采样窗口里看到的
+> "子进程 fd 6 是空的"当成了根因；实际上 sshd 早就 `fatal()` 退出了。
 
 ## 决定性证据
 
@@ -576,5 +613,197 @@ match=False raw=[[...] vpsessiond:   [slot 0] open sock=4|[...] client connected
 | `c14043f` | wsock: name the peer in the send/recv traces |
 | `248aa00` | 文档更正 privsep 结论 |
 | `08c53ce` | fd trace 带 owner pid + `fd_drop` |
-| (本轮) | anchor 引用计数 + generation 校验,消除跨进程串写 |
+| `ac9041b` | wsock: anchor 引用计数 + generation 校验,消除跨进程串写 |
+| `5bd87f1` | core: adjust fd slots allocation |
+| (本轮) | §6A 的四个缺陷:IP_OPTIONS / chroot / real-vs-effective id / prlimit64 |
+
+
+---
+
+# 第三轮:四个 `fatal()` 各吃掉一条连接(已修)
+
+## 6A.0 先说方法:这一轮为什么快
+
+前两轮都在**读 trace 猜语义**,反复误判(§3 的坑 #1、§6.3.1 都栽在"拿 trace 里的
+现象反推原因")。这一轮换了做法,一步就定位:
+
+> **去读 sshd 的源码,并把 guest 二进制里的 format string 抠出来。**
+
+`sshd_debugging_exp.md` 记的是"怎么查",但这一轮真正的教训是"**先去查清楚那个
+日志行是 `fatal()` 还是 `debug()`**"。`debug1:` 前缀让人以为那只是日志;实际上
+`check_ip_options()` 里那句是 `fatal()`,进程当场 `cleanup_exit(255)`。这一个事实
+解释了此前所有观测:没有 banner、没有 I/O、客户端只等到 RST、`wait` 得到 255。
+
+具体做法(可复用):
+
+```powershell
+# 1) 从 guest 二进制里抠 format string,确认日志行的确切形状
+$b = 'release.windows.x86_64\runtime\rootfs\usr\sbin\sshd'
+$txt = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($b))
+[regex]::Matches($txt, '[\x20-\x7e]{0,60}rexec start in[\x20-\x7e]{0,80}') | % { $_.Value }
+#   -> rexec start in %d out %d newsock %d config_s %d/%d
+
+# 2) 拿同版本源码对答案(注意 tag要对上 V_10_3_P1)
+Invoke-WebRequest https://raw.githubusercontent.com/openssh/openssh-portable/V_10_3_P1/sshd-session.c
+#   -> check_ip_options(): 那行是 fatal(),不是 logit()
+```
+
+第二条命令还顺带纠正了一个一直没人核对的数字:`config_s 9/10` 的 `9/10` 是
+**config socketpair 的两端**,不是别的意思。
+
+## 6A.1 `getsockopt(IPPROTO_IP, IP_OPTIONS)` 返回 4 字节垃圾 → `fatal()`
+
+- 现象(guest 日志最后一行,之后再无输出):
+
+  ```
+  Connection from 127.0.0.1 port 63222 with IP opts:  80 00 00 00
+  ```
+
+  进程 `exit 255`,客户端 `kex_exchange_identification: Connection reset by peer`。
+
+- 根因:`sshd-session.c` 的 `check_ip_options()` 读
+  `getsockopt(sock_in, IPPROTO_IP, IP_OPTIONS, opts, &option_size)`,**只要
+  `option_size != 0` 就 `fatal()`**(Linux 上把 IP options 视为源路由攻击)。
+  WinSock 的这个 get **成功返回 4,但不填调用者的缓冲区**,于是 guest 读回自己栈上
+  的残留 —— `80 00 00 00` 就是未初始化栈,不是对端发来的东西。Linux 对普通 TCP
+  对端返回 0,所以真机上永远不会走到 fatal。
+
+- 定位过程中最关键的一步,是让 trace 打出**实参**而不是指针:
+
+  ```
+  INFO: sys_getsockopt(6, 0, 4, 3ffff9a0, 3ffff870)
+  ```
+
+  `optname = 4`,而 **WinSock 的 `IP_OPTIONS` 是 1**。也就是说这条调用根本没被
+  拦在映射层,是原样打到宿主上的。第一次修的时候按 WinSock 的值写了常量 1,
+  结果 `-d -d` 依旧 fatal,daemonize 路径反而从 2/8 变成 8/8 —— 正是这个
+  "一半好了" 的信号指出常量取错了。Linux `netinet/in.h` 是
+  `IP_TOS 1 / IP_TTL 2 / IP_HDRINCL 3 / IP_OPTIONS 4`。
+
+- 修复:`src/win/win_socket.c` 的 `win_socket_getsockopt()` 对
+  `(IPPROTO_IP, IP_OPTIONS)` 合成 Linux 的答案(`*len = 0`,返回 0)。
+  guest socket 是直通的 loopback 转发,不可能带上 IP options,所以"没有"是唯一
+  正确的答案。
+
+- 效果:日志变成正常形态 `Connection from ... on 127.0.0.1 port 2222`,进程继续往下走。
+
+## 6A.2 `chroot(2)`(syscall 51)未实现 → ENOSYS → fatal
+
+- 现象:`chroot("/var/empty"): Function not implemented`,紧接
+  `monitor_read_log: child log fd closed` / `mm_reap: child exited with status 255`。
+- 定位:ENOSYS = 38,trace 里对应 `Syscall 51 failed: -38`;riscv64 musl
+  `bits/syscall.h` 里 `__NR_chroot 51`(注意 **51 在 asm-generic 里也是
+  `__NR_fchmod`**,极易看错)。
+- 修复:`rvvm_sys_chroot()`(`src/core/rvvm_user.c`)。宿主没有 chroot,而且 guest
+  进程本来就有整个宿主文件系统,没有东西可以再收走,所以**只保证返回值的含义**:
+  路径按 chdir 同样的方式解析和校验(不存在 → ENOENT,不是目录 → ENOTDIR,是目录 →
+  成功),root 本身不动。
+- ⚠️ 这意味着**依赖 chroot 做文件隔离的 guest 在这里拿不到隔离**。OpenSSH 只是
+  chroot 之后就不再碰文件系统,所以对它无影响;这一点已在代码注释里写明。
+
+## 6A.3 guest 凭证不分 real / effective id → `permanently_set_uid()` 自查失败
+
+- 现象:
+
+  ```
+  debug1: permanently_set_uid: 22/22
+  permanently_set_uid: was able to restore old [e]gid
+  ```
+
+  OpenSSH 在丢掉特权后会**故意验一次"特权真的回不来了吗"**,回得来就 `fatal()`。
+  这是安全设计,不是它挑刺。
+
+- 根因:`USERLAND_DEFAULT_FAKE_ROOT` 默认 true,于是
+  `rvvm_sys_setuid()` 无条件 `ctx->fake_uid = uid; return 0;` —— `setuid(0)`
+  在丢掉特权之后照样成功。另外 `geteuid`/`getegid` 直接返回 `getuid`/`getgid`,
+  `setresuid`/`setresgid` 忽略另外两个参数(注释里自称 "semi stub")。
+
+- 修复:`rvvm_userland_t` 增加 `fake_euid`/`fake_egid`,和 real id 分开。规则照 Linux:
+  euid 为 0 才能设全部三个 id;非特权的只能设自己已经持有的 id,其余 EPERM
+  —— `setuid(0)` 因此自然失败,不需要为 sshd 特判。顺带把
+  `geteuid`/`getegid`/`setresuid`/`setresgid`/`getresuid`/`getresgid` 补成真的。
+  子空间在 `userland_child_create()` 里继承这四个字段。
+
+## 6A.4 `prlimit64(2)`(261)写死 EINVAL → sandbox fatal
+
+- 现象:`ssh_sandbox_child: setrlimit(RLIMIT_FSIZE, { 0, 0 }): Invalid argument`。
+- 根因:`case 261` 原本是 `a0 = -UAPI_EINVAL;`(上一行 `prlimit()` 还被注释掉了)。
+  musl 的 `getrlimit`/`setrlimit` **都走 prlimit64**,所以这条一失败,sandbox
+  子进程当场 fatal。
+- 修复:`rvvm_sys_prlimit()`,按地址空间记 soft/hard,执行 Linux 的规则
+  (硬上限不可抬高 → EPERM;硬上限压到软上限以下时软上限跟着降),`-1` 表示不改。
+  同样**只记录不强制** —— 和 chroot 一个理由:模拟器已经把整个宿主文件系统交出去了,
+  卡文件大小并不额外收走任何访问权。
+- 只支持 `pid == 0`(自身)。别的 pid 直接 `ESRCH`:限额挂在地址空间上,这里没有
+  按 pid 查找,与其拿本进程的数去回答另一个进程的查询,不如明确拒绝。
+
+## 6A.5 当前阻塞点:`initgroups()` 失败,errno 是陈旧值
+
+修完上面四条,guest 日志能一路走到公钥校验:
+
+```
+debug1: kex_server_update_ext_info: Sending SSH2_MSG_EXT_INFO
+debug1: userauth_pubkey: publickey test pkalg ssh-ed25519 ... SHA256:ffRn6CUCLsSBqyX80o0Y4Urlp+cORGTFmrOb0/j8DQI
+debug1: temporarily_use_uid: 0/0 (e=0/0)
+initgroups: root: Network is down
+```
+
+`Network is down` = ENETDOWN = 100。而**这轮里唯一返回 100 的 syscall 是一次
+无关的 UDP `connect()`**:
+
+```
+sys_socket(2, 80002, 11)        # AF_INET, SOCK_DGRAM|NONBLOCK|CLOEXEC, IPPROTO_UDP
+sys_connect(6, 3fffec38, 10)    # len 10 (!), 目标 0.0.0.0:65535
+TRACE: Syscall 203 failed: -100
+sys_socket(a, 80002, 11)        # AF_INET6
+sys_connect(6, 3fffecb0, 1c)    # len 28
+TRACE: Syscall 203 failed: -100
+sys_connect(... ) -> unix "/var/run/nscd/socket"
+```
+
+两个反常点都还没解释:
+
+1. **len 10 的 AF_INET `sockaddr_in`** —— `sockaddr_in` 是 12(musl)或 16(Linux)字节。
+2. **`connect()` 调的是 fd 6,而刚 `socket()` 出来的在 fd 7。**
+
+排除掉的方向(都已实测):
+
+- group/passwd 数据没问题:`/etc/group`、`/etc/passwd` 完整,`sshd:x:22:22` 在。
+- 不是 group 查询本身的问题:`getent group root`、`groups`、`id -G` 在 guest 里
+  **全部正确,且一次 `connect()` 都不发**。
+- 不是 DNS:`/etc/resolv.conf` 是正常的 `1.1.1.1` / `8.8.8.8`,而且 apk 装包时
+  DNS 是通的。
+
+所以 `initgroups()` 走的是 busybox 那几条命令不走的分支。**新加的坑 #7**:
+
+> **musl 的失败可能报一个陈旧 errno。** `initgroups: root: Network is down` 里的
+> errno 是**上一次失败的 `connect()` 留下的**,不是 initgroups 自己的原因。看到一个
+> 语义上不该出现的 errno(查 group 怎么会是网络错),先回头找最近一次失败的 syscall,
+> 别顺着 errno 名去猜。
+
+下一步:在 guest 地址空间里断 `initgroups`,看它到底为什么返回 -1
+(§1.2 的 gdb 手法;`ld-musl-riscv64.so.1` 里同时含 `initgroups`/`getgrouplist`/
+`nscd` 字符串,而 `/etc/nsswitch.conf` 也在,值得先确认走的是 nscd 分支还是
+文件分支)。
+
+## 6A.6 顺带加的 trace
+
+`sys_connect` 现在会打出**要连哪里**,而不只是缓冲区地址:
+
+```
+INFO: sys_connect(6, 3fffec38, a)
+INFO:   connect -> inet 0.0.0.0:65535
+INFO:   connect -> unix "/var/run/nscd/socket"
+INFO:   connect -> family 10 len 28
+```
+
+一个 guest 根本没打算发起的 `connect()`,和一次被宿主拒绝的 `connect()`,以前在
+trace 里长得一模一样。
+
+## 6A.7 回归
+
+`procfs_e2e` 22/22、`session_e2e` PASS(含 `^C`/`^Z`/`jobs`/kill)、
+`ash_e2e` 7/7 —— A.3 改了 `stat()` 报出来的 owner id(用的是 `fake_uid`,即 real
+id,没动),`/proc/self/status` 的 Uid 与 `ps` 输出均未受影响。
+`openssh_e2e` 仍是 3/7,但失败点已从"banner 都没互换"推进到 §6A.5。
 
