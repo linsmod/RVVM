@@ -919,6 +919,30 @@ int win_socket_connect(int fd, const void* addr, int len)
     if (have < 0) {
         return -1;
     }
+    /* Connecting a datagram socket to the unspecified address means the local
+     * host, and Linux says so in the kernel: __ip4_datagram_connect() rewrites
+     * INADDR_ANY to INADDR_LOOPBACK and __ip6_datagram_connect() does the same
+     * for in6addr_any, so the call *succeeds*. WinSock has no such rule and
+     * answers WSAEADDRNOTAVAIL.
+     *
+     * Making the substitution here rather than failing is what a guest expects:
+     * musl probes with exactly this connect (a UDP socket, then the same over
+     * IPv6, before falling back to an nscd socket), and the refusal left errno
+     * set to a network error that the caller then reported as the reason its
+     * own, entirely unrelated, call had failed. */
+    if (st.ss_family == AF_INET) {
+        const struct sockaddr_in* in4 = (const struct sockaddr_in*)&st;
+        if (in4->sin_addr.s_addr == htonl(INADDR_ANY)) {
+            struct sockaddr_in* m4 = (struct sockaddr_in*)&st;
+            m4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        }
+    } else if (st.ss_family == AF_INET6) {
+        const struct sockaddr_in6* in6 = (const struct sockaddr_in6*)&st;
+        if (IN6_IS_ADDR_UNSPECIFIED(&in6->sin6_addr)) {
+            struct sockaddr_in6* m6 = (struct sockaddr_in6*)&st;
+            m6->sin6_addr = in6addr_loopback;
+        }
+    }
     if (connect(s, (struct sockaddr*)&st, wlen) == SOCKET_ERROR) {
         int err = WSAGetLastError();
         /* A non-blocking connect that is *in progress* is not a failure: Winsock

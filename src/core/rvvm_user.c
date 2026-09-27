@@ -12902,25 +12902,49 @@ case 179: // sysinfo
                     rvvm_info("sys_connect(%ld, %lx, %lx)",
                               a0, a1, a2);
                     {
+                        /* Built as one string and emitted on the traced (not the
+                         * INFO) channel on purpose: INFO lines carry no [pid:tid],
+                         * and a run interleaves every process's syscalls into the
+                         * same stream - a connect belonging to someone else reads
+                         * exactly like one belonging to the process you are
+                         * chasing. */
                         struct uapi_sockaddr_in probe;
+                        unsigned char raw[24];
+                        char desc[160];
                         unsigned short fam = 0;
+                        unsigned i, n = (len < sizeof(raw)) ? len : sizeof(raw);
+                        desc[0] = '\0';
                         memset(&probe, 0, sizeof(probe));
-                        if (to_ptr_sz(a1, sizeof(probe)))
-                            memcpy(&probe, to_ptr(a1), sizeof(probe));
+                        memset(raw, 0, sizeof(raw));
+                        if (to_ptr_sz(a1, (rvvm_addr_t)n))
+                            memcpy(raw, to_ptr(a1), n);
+                        memcpy(&probe, raw, sizeof(probe) < n ? sizeof(probe) : n);
                         fam = probe.sin_family;
+                        for (i = 0; i < n && i < 16; i += 8) {
+                            rvvm_snprintf(desc + strlen(desc), sizeof(desc) - strlen(desc),
+                                          "%s%02x %02x %02x %02x %02x %02x %02x %02x",
+                                          i ? " " : "", raw[i], raw[i + 1], raw[i + 2],
+                                          raw[i + 3], raw[i + 4], raw[i + 5], raw[i + 6],
+                                          raw[i + 7]);
+                        }
                         if (fam == AF_INET) {
                             unsigned p = ((probe.sin_port & 0xff) << 8) |
                                          ((probe.sin_port >> 8) & 0xff);
-                            rvvm_info("  connect -> inet %u.%u.%u.%u:%u",
-                                      probe.sin_addr & 255, (probe.sin_addr >> 8) & 255,
-                                      (probe.sin_addr >> 16) & 255,
-                                      (probe.sin_addr >> 24) & 255, p);
+                            rvvm_snprintf(desc + strlen(desc), sizeof(desc) - strlen(desc),
+                                          " -> inet %u.%u.%u.%u:%u",
+                                          probe.sin_addr & 255, (probe.sin_addr >> 8) & 255,
+                                          (probe.sin_addr >> 16) & 255,
+                                          (probe.sin_addr >> 24) & 255, p);
                         } else if (fam == AF_UNIX) {
                             const struct uapi_sockaddr_un* un = to_ptr(a1);
-                            rvvm_info("  connect -> unix \"%.100s\"", un->sun_path);
+                            rvvm_snprintf(desc + strlen(desc), sizeof(desc) - strlen(desc),
+                                          " -> unix \"%.100s\"", un->sun_path);
                         } else {
-                            rvvm_info("  connect -> family %u len %u", fam, len);
+                            rvvm_snprintf(desc + strlen(desc), sizeof(desc) - strlen(desc),
+                                          " -> family %u", fam);
                         }
+                        RVVM_TRC(RVVM_TRC_SYS, "connect fd %ld, %u byte(s): %s",
+                                  (long)a0, len, desc);
                     }
                     a0 = errno_ret(connect(userland_fd_host(uctx(), (int)a0), sa, (socklen_t)len));
                     break;
