@@ -69,6 +69,25 @@ function TS() {
     "[" + ([Environment]::TickCount64).ToString().PadLeft(9) + " ms] "
 }
 
+# Whatever a previous run left behind goes first, before this driver touches
+# anything shared: a core still holds the daemon's log open, so the first thing
+# below would fail on it, and the endpoint is a filesystem socket, so a core
+# still answers the readiness probe and this run would drive *that* core's
+# session server instead of its own - a different run, with its own rootfs and
+# nothing bounding how long it stays up.
+#
+# That is not hypothetical. This driver's -Multi checks failed four of them
+# against a core that looked fresh, while the identical steps replayed by hand
+# against a new one passed every time; and they misdescribed themselves on the
+# way, since the file the second session looked for had never been created at
+# all rather than created empty, which is what the note in AGENTS.md says and
+# what sent the first attempt at this looking at the path layer.
+#
+# Printed, not silent: a test that kills a process should say so.
+foreach ($stale in (Stop-AshCores -Exe $exe)) {
+    "$(TS)     cleared a stale core: $stale"
+}
+
 function Check($ok, $what, $detail) {
     if ($ok) {
         "$(TS)ok   $what"
@@ -135,6 +154,27 @@ if (-not $up) {
     $outTask.Result
     "--- daemon log ---"
     if (Test-Path -LiteralPath $dlog) { Get-Content -LiteralPath $dlog } else { "(no log at $dlog)" }
+    exit 1
+}
+
+# The endpoint answering is not enough - it has to be *this* process's core
+# answering. The endpoint is a filesystem socket at a path derived from the port,
+# so a core left over from an earlier run answers the probe above just as well,
+# and `--serve` refuses a port another live core already owns: the process this
+# driver started exits, the probe passes against the stranger, and every check
+# below then reports on a run this driver never set up. Nothing downstream can
+# notice - the shell, the ptys and the filesystem all look right.
+#
+# So ask the process directly. (Stop-AshCores above normally makes this
+# unreachable; it is here because a core can also arrive between that sweep and
+# this launch, and a silently wrong run is the one outcome a driver must not
+# have.)
+Check (-not $p.HasExited) "the core serving port $Port is the one this driver started"
+if ($p.HasExited) {
+    "--- why the core would not start ---"
+    $errTask.Result
+    "--- core output ---"
+    $outTask.Result
     exit 1
 }
 
