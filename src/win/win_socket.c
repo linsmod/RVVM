@@ -342,7 +342,14 @@ int win_socket_alloc_anchor(void)
      * anchor, and takes it in userland_fd_install() / the inherit paths. */
     wsock_fds_refs[fd] = 0;
     ReleaseSRWLockExclusive(&wsock_lock);
-    RVVM_TRC(RVVM_TRC_WSOCK, "alloc anchor %d", fd);
+    /* A number here is a *reused* one as often as a fresh one: _open() only
+     * knows the CRT's free list, and a number whose anchor was given back comes
+     * straight round again. So this line says a number was taken, not that an
+     * anchor came into existence - wsock_fd_alloc() below is what makes one, and
+     * "fd N <- socket ... (gen G)" is the line to read for that. Confusing the
+     * two is how one number looks like it is allocated twice in a row while a
+     * live slot still holds it. */
+    RVVM_TRC(RVVM_TRC_WSOCK, "take crt number %d (reused if it comes round)", fd);
     return fd;
 }
 
