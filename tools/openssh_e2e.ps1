@@ -136,7 +136,7 @@ function Guest {
         Write-Host ("{0}WARN session socket ended during this step (reset #{1}): {2}" -f (TS), $script:resets, $script:S.ReadEndWhy)
         Write-Host ("{0}WARN   step was: {1}" -f (TS), $flat.Substring(0, [Math]::Min(70, $flat.Length)))
         try { Close-AshSession $script:S } catch { }
-        $script:S = New-AshSession -Exe $exe -Port $Port -Frame 'R40;120'
+        $script:S = New-AshSession -Exe $exe -Port $Port -Frame 'R40;5'
         Reset-Steps -On $script:S
         Expect-Pattern -On $script:S '/ #' 20000
         Step -On $script:S 0 ("stty -echo; echo " + $script:marker + "`n")
@@ -195,7 +195,7 @@ if (-not $up) {
 # One session for the whole run: the guest's state (the installed openssh, the
 # host keys, the daemon) has to be the same state every step reads.
 $script:marker = 'e2e-step-end'
-$script:S = New-AshSession -Exe $exe -Port $Port -Frame 'R40;120'
+$script:S = New-AshSession -Exe $exe -Port $Port -Frame 'R40;5'
 $script:lastOut = ''
 $script:resets = 0
 
@@ -264,7 +264,7 @@ $out = Guest -Cmd ("/usr/sbin/sshd $dbgSshd & sshdpid=`$!; " +
              'for i in 1 2 3 4 5 6; do ' +
              "/usr/bin/ssh $dbgSsh root@127.0.0.1 'echo openssh-e2e-ok' < /dev/null 2>&1 && break; sleep 1; done; " +
              'i=0; while [ $i -lt 20 ] && kill -0 $sshdpid 2>/dev/null; do sleep 1; i=$((i+1)); done; ' +
-             'echo e2e-debug-daemon-gone') -TimeoutMs 120000
+             'echo e2e-debug-daemon-gone') -TimeoutMs 5000
 Check ($out -match 'openssh-e2e-ok') 'sshd (single-connection debug) serves a pubkey session'
 Check ($out -match 'e2e-debug-daemon-gone') 'the debug daemon left on its own'
 
@@ -276,7 +276,7 @@ Check ($out -match 'e2e-sshd-started')  'sshd starts and daemonizes (fork/setsid
 Check ($out -match 'openssh-e2e-ok')    'sshd serves a pubkey session and runs a remote command'
 
 # --- the daemon outlives the session that started it ------------------------
-$out = Guest -Cmd ("/usr/bin/ssh $sshOpts root@127.0.0.1 'echo openssh-e2e-ok2' < /dev/null 2>&1") -TimeoutMs 120000
+$out = Guest -Cmd ("/usr/bin/ssh $sshOpts root@127.0.0.1 'echo openssh-e2e-ok2' < /dev/null 2>&1") -TimeoutMs 5000
 Check ($out -match 'openssh-e2e-ok2') 'a second session reaches the same running daemon'
 
 # --- the servers' own logs, read back only when something failed ------------
@@ -285,7 +285,7 @@ Check ($out -match 'openssh-e2e-ok2') 'a second session reaches the same running
 # between "sshd did not answer" and a line number in sshd-session.c.
 $diag = ''
 if ($fails) {
-    $diag = Guest -Cmd 'cat /tmp/openssh-e2e-debug-sshd.log /tmp/openssh-e2e-daemon-sshd.log 2>&1 | tail -120' -TimeoutMs 30000
+    $diag = Guest -Cmd 'cat /tmp/openssh-e2e-debug-sshd.log /tmp/openssh-e2e-daemon-sshd.log 2>&1 | tail -5' -TimeoutMs 30000
 }
 
 # The session carried every step. Counted separately from the ssh checks above,
@@ -320,7 +320,7 @@ if ($fails) {
     "--- session server log ($dlog) ---"; $log
     "--- core console ---"; $outTask.Result
     "--- core stderr (tail) ---"
-    ($errTask.Result -split "`n" | Where-Object { $_ } | Select-Object -Last 120) -join "`n"
+    ($errTask.Result -split "`n" | Where-Object { $_ } | Select-Object -Last 5) -join "`n"
     exit 1
 }
 "=== PASS: openssh ==="

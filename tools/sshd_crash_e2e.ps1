@@ -210,7 +210,7 @@ if (-not $core.HasExited) {
                 'ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_e2e; ' +
                 'cp /root/.ssh/id_e2e.pub /root/.ssh/authorized_keys; ' +
                 'chmod 600 /root/.ssh/authorized_keys; ' +
-                'echo e2e-keys-ready') 120
+                'echo e2e-keys-ready') 5
     Check ($o -match 'e2e-keys-ready') 'host keys and an authorized key are in place' $o
 }
 
@@ -228,7 +228,7 @@ for ($r = 1; $r -le $Rounds; $r++) {
                 "sleep 1; /usr/bin/ssh $sshOpts root@127.0.0.1 'echo CRASH-ROUND-OK' < /dev/null 2>&1; " +
                 'echo ssh-rc=$?; ' +
                 'i=0; while [ $i -lt 20 ] && kill -0 $sshdpid 2>/dev/null; do sleep 1; i=$((i+1)); done; ' +
-                'echo round-end') 120
+                'echo round-end') 5
     $ms = [Environment]::TickCount64 - $t0
     if ($core.HasExited) {
         $crashed = $true
