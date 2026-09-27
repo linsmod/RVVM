@@ -24,6 +24,7 @@ app package (rvvm_winhost --app <id>). Debugging is RVVM_TRACE / RVVM_VERBOSE.
 #include <string.h>
 
 #include "win32_cmdpost_bridge.h"
+#include "utils.h" /* rvvm_set_loglevel: RVVM_VERBOSE, as the client path uses */
 
 /* Implemented in ash_client.c */
 int ash_serve(int port, int idle_s);
@@ -117,6 +118,11 @@ int main(int argc, char** argv)
         return ash_sock_path(port);
     }
     if (serve) {
+        /* The same switch the client path honours (see ash_client.c): without
+         * it a core stays at LOG_WARN, so the per-syscall lines a session's
+         * trouble has to be read from never reach this console - and the core is
+         * exactly where they are needed. */
+        rvvm_set_loglevel(getenv("RVVM_VERBOSE") ? LOG_INFO : LOG_WARN);
         return ash_serve(port, idle);
     }
 

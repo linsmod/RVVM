@@ -69,6 +69,11 @@
 #define SOCK_DIR      "/cores"
 #define SOCK_FMT      SOCK_DIR "/vpsessiond-%d.sock"
 
+/* The daemon's own log, as a guest path. /tmp is the one directory every run
+ * gets (the host makes it under <release>/runtime/rootfs/tmp), so a path that
+ * works there works in every run directory without the host being told. */
+#define DLOG_PATH     "/tmp/vpsessiond.log"
+
 /* How long a fresh connection may hold its shell back while a first frame is in
  * flight. Long enough for a client's preamble on loopback, short enough that an
  * interactive client sees its prompt immediately. */
@@ -130,7 +135,51 @@ static long loop_ms(void)
 /* Every line this daemon prints carries the clock, and the same epoch the core's
  * trace and the harness's transcript use: the three land in one file, and a
  * session's trouble is usually a race between them (a write the relay had not
- * drained, a signal that arrived a millisecond late). */
+ * drained, a signal that arrived a millisecond late).
+ *
+ * They land there by going to a *file*, not to the console. The win32 host
+ * registers no io callback, so a guest write to fd 1/2 is the host process's own
+ * stdout - the very stream `ash --port N -c ...` hands back to whoever asked for
+ * a command, and the e2e drivers read. Every daemon line interleaved into that
+ * transcript, non-deterministically (it depends on which process reaches its
+ * write first), and a check like `readlink /proc/self/cwd` - whose whole output is
+ * one line - stopped matching. A log has no business in a program's output, and
+ * the file is where a log belongs. The host side reads it out of the run's
+ * runtime directory: guest /tmp maps to <release>/runtime/rootfs/tmp.
+ *
+ * The redirect is one dup2() of fd 1 in main(), and dlog() is untouched by it.
+ * If the log does not land in the file, that is a finding about the file layer
+ * below (fd 1 does not follow the redirect, or a line is lost across fork()), not
+ * something this program should paper over: a guest that writes its log around a
+ * host defect hides the defect, and the harness then reads a log that is missing
+ * exactly the lines the defect costs. */
+static void dlog_redirect(void)
+{
+    /* Best effort: the host creates /tmp for the run, but a rootfs without it
+     * must not stop the core from booting. */
+    mkdir("/tmp", 0777);
+
+    FILE* f = fopen(DLOG_PATH, "a");
+    if (!f) {
+        fprintf(stderr, "vpsessiond: cannot open %s, log stays on the console\n",
+                DLOG_PATH);
+        return;
+    }
+    /* Only stdout moves. stderr stays on the console, so a startup failure
+     * (mkdir/bind, both above the first session) still reaches the terminal
+     * that launched the core. */
+    /* Only stdout moves. stderr stays on the console, so a startup failure
+     * (mkdir/bind, both above the first session) still reaches the terminal
+     * that launched the core. A dup2() that fails says so here, and nowhere
+     * else: a daemon that cannot see where its log went is a second, quieter
+     * bug than the one it would be hiding. */
+    if (dup2(fileno(f), STDOUT_FILENO) < 0) {
+        fprintf(stderr, "vpsessiond: dup2(%d -> 1): %s\n", fileno(f),
+                strerror(errno));
+    }
+    fclose(f);
+}
+
 static void dlog(const char* fmt, ...)
 {
     va_list ap;
@@ -519,6 +568,10 @@ static void session_check_child(struct session* s)
 
 int main(int argc, char** argv)
 {
+    /* First, before anything can print: this daemon's log is a file, not the
+     * host process's stdout, which belongs to whoever asked for a command. */
+    dlog_redirect();
+
     int port = DEFAULT_PORT;
     if (argc > 1) {
         port = atoi(argv[1]);

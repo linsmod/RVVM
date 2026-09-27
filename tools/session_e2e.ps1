@@ -98,6 +98,16 @@ function New-Client([string]$frame) {
 }
 
 # --- the core: vpsessiond as the run root -------------------------------
+# The daemon's log is a *file* in the run's rootfs (guest /tmp -> this path),
+# not the host process's stdout: the win32 host has no io callback, so a guest
+# write to fd 1/2 is the core's own stdout, and every daemon line there would
+# interleave - non-deterministically - into the transcript `ash -c` hands back,
+# which is what the session checks match against. Removing the old log first
+# makes "what this run logged" exactly what the file holds; the guest appends,
+# so a stale file would otherwise read as this run's.
+$dlog = Join-Path ([IO.Path]::GetDirectoryName($exe)) 'runtime\rootfs\tmp\vpsessiond.log'
+if (Test-Path -LiteralPath $dlog) { Remove-Item -LiteralPath $dlog -Force }
+
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $exe
 $psi.Arguments = "--serve --port $Port"
@@ -123,6 +133,8 @@ if (-not $up) {
     try { $p.Kill() } catch { }
     "--- core output ---"
     $outTask.Result
+    "--- daemon log ---"
+    if (Test-Path -LiteralPath $dlog) { Get-Content -LiteralPath $dlog } else { "(no log at $dlog)" }
     exit 1
 }
 
@@ -302,15 +314,28 @@ $out = $outTask.Result
 $err = $errTask.Result
 
 # The console is the *core's* terminal, not any session's: nothing a session
-# wrote to its own /dev/tty may show up here.
+# wrote to its own /dev/tty may show up here. The daemon's own lines must not be
+# here either - they go to the log file, so this console carries only what the
+# host itself printed.
 Check ($out -notmatch 'via-dev-tty') 'the run console never sees a session''s /dev/tty'
+Check ($out -notmatch 'vpsessiond:') 'the daemon log does not leak into the run console'
 
-$sessions = ([regex]::Matches($out, 'session \d+ started')).Count
+# The core's own account of the run, read from the file instead of the console.
+# Its presence is also a check: a core that ran sessions but logged nothing has a
+# log nobody can read, which is worse than no log.
+# An empty log reads as $null, and the run must *report* that rather than die on
+# it: a log that stayed empty is the finding, not a reason to lose the checks
+# that were already run.
+$log = if (Test-Path -LiteralPath $dlog) { [string](Get-Content -LiteralPath $dlog -Raw) } else { '' }
+$sessions = ([regex]::Matches($log, 'session \d+ started')).Count
 $want = if ($Multi) { 2 } else { 1 }
 Check ($sessions -ge $want) "the core started $sessions session(s) without exiting"
+Check ($log -match 'listening on') 'the daemon logged its endpoint'
 
 "--- core console ---"
-($out -split "`n" | Where-Object { $_ -match 'vpsessiond|dbg:' }) -join "`n"
+$out
+"--- daemon log ($dlog) ---"
+$log
 "--- core stderr (filtered) ---"
 ($err -split "`n" | Where-Object { $_ -and $_ -notmatch 'Syscall \d+ failed' }) -join "`n"
 

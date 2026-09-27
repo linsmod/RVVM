@@ -1186,16 +1186,35 @@ static int userland_proc_readlink(const char* abs, uint32_t self_pid, char* buff
  * A slot inherited without its own copy (see userland_fd_table_inherit) is
  * marked shared: it rides on the parent's host fd, so closing it here would
  * take the descriptor away from the parent too. */
+/* What a slot's number is a name of. The console used to be a slot like the
+ * others, holding the host's own 0/1/2 - which is how two number spaces came
+ * to share one set of numbers: a plain file the host handed out number 0 (a core
+ * launched with its standard handles detached has no stdin to skip) landed on
+ * the console's own handle, and dup(2) of it then copied the console instead of
+ * the file. Saying what a slot *is* keeps the guest's numbers and the host's
+ * apart, and lets the console be an attach rather than a borrowed handle. */
+typedef enum {
+    FD_BACKEND_HOST    = 0,   // a host descriptor; the slot's fd is that number
+    FD_BACKEND_SIM     = 1,   // an object this userland serves: a pty end, a
+                               // /dev entry, a generated /proc file, a socket
+                               // anchor. The fd field is this layer's own number
+    FD_BACKEND_CONSOLE = 2,   // the run's console (see userland_console)
+} rvvm_fd_backend_t;
+
 typedef struct {
-    int  fd;       // The host fd; ignored while used is clear
+    int  fd;       // The host fd (HOST) or this layer's own number (SIM); unused
+                   // by CONSOLE, which is an attach rather than a handle
     bool cloexec;  // FD_CLOEXEC: execve() closes this slot
-    bool shared;   // Rides on another address space's host fd: never closed here
+    bool shared;   // HOST only: rides on another address space's host fd, never
+                   // closed here (see userland_fd_table_inherit)
     bool used;     // The slot holds a descriptor
-    bool console;  // Still the run's console (0/1/2 as they started): reads come
-                   // from the keyboard (rvvm_user_tty_input), never from the
-                   // host process's own stdin. Cleared the moment a real
-                   // descriptor is put on the number - `cmd < file` then reads
-                   // the file, which is the whole point of the distinction.
+    // What the number is a name of. A console is the run's screen, not a
+    // descriptor: reads come from the keyboard (rvvm_user_tty_input) and writes
+    // are parsed by the VTerm, never from the host process's own std handles. It
+    // is cleared the moment a real descriptor is put on the number - `cmd < file`
+    // then reads the file, which is the whole point of the distinction - and
+    // dup(2) of a console slot is a console, on whatever number it lands.
+    rvvm_fd_backend_t backend;
     // The guest's open-file flag word, for the descriptors this userland serves
     // itself (a pty end, a /dev entry, the console). A host descriptor's flags
     // live where they are acted on - the host, which keeps the guest's own word
@@ -4955,8 +4974,8 @@ static bool userland_parent_alive(rvvm_process_t* proc)
 
 static void userland_fds_write(rvvm_userland_t* ctx, int fd,
                                bool used, int host_fd, bool cloexec,
-                               bool shared, bool console, uint32_t flags,
-                               const char* op)
+                               bool shared, rvvm_fd_backend_t backend,
+                               uint32_t flags, const char* op)
 {
     /* The slot is rewritten wholesale; the anchor reference it holds is *not*
      * adjusted here. This function is also called to re-file a slot that keeps
@@ -4969,17 +4988,17 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
     ctx->fds[fd].fd      = host_fd;
     ctx->fds[fd].cloexec = cloexec;
     ctx->fds[fd].shared  = shared;
-    ctx->fds[fd].console = console;
+    ctx->fds[fd].backend = backend;
     ctx->fds[fd].flags   = flags;
     /* An anchor-backed slot remembers *which* socket its number meant when it was
      * filed; a slot riding on no anchor records 0, which never matches a live one
      * (so a console and a plain host fd are never treated as recycled). */
     ctx->fds[fd].anchor_gen = used ? win_socket_anchor_gen(host_fd) : 0;
     if (fd >= FD_TRACE_LO && fd <= FD_TRACE_HI) {
-        RVVM_TRC(RVVM_TRC_FD, "fd_wr[%s] pid=%u fd=%d used=%d host=%d gen=%llu clo=%d sh=%d con=%d fl=%x",
+        RVVM_TRC(RVVM_TRC_FD, "fd_wr[%s] pid=%u fd=%d used=%d host=%d gen=%llu clo=%d sh=%d be=%d fl=%x",
                   op, (unsigned)ctx->pid, fd, (int)used, host_fd,
                   (unsigned long long)ctx->fds[fd].anchor_gen,
-                  (int)cloexec, (int)shared, (int)console, flags);
+                  (int)cloexec, (int)shared, (int)backend, flags);
     }
 }
 
@@ -4996,6 +5015,33 @@ static void userland_fd_dump(rvvm_userland_t* ctx, const char* tag)
     }
 }
 
+/* 0/1/2 belong to the console: those are the host numbers the run's own stdin,
+ * stdout and stderr ride on, and every console slot in the table names one of
+ * them (see userland_fd_table_init).
+ *
+ * A plain file must not be filed on one of them, and the collision is not
+ * cosmetic. The host hands out the lowest free number, so a core started
+ * without a usable stdin (a service, a driver, anything launched with its
+ * standard handles detached) has the CRT offer 0 for the first file it opens -
+ * and dup(2) of that file then copies the console's own handle: `dup2(f, 1)`
+ * reports success and the write(2) that follows answers EBADF, because what
+ * fd 1 now names is the host's stdin, not the file. The guest's two number
+ * spaces are separate on Linux and cannot tangle like this; here they share the
+ * host's, so a file is moved off the console numbers before it is filed. */
+static int userland_fd_host_off_console(int host_fd)
+{
+    int moved = host_fd;
+
+    while (moved >= 0 && moved <= 2) {
+        int next = dup(moved);
+        if (next < 0) {
+            break;      /* nothing better to offer; the caller decides */
+        }
+        moved = next;
+    }
+    return moved;
+}
+
 static void userland_fd_install(rvvm_userland_t* ctx, int guest_fd, int host_fd, bool cloexec)
 {
     if (!ctx || guest_fd < 0 || guest_fd >= USERLAND_FD_TABLE_MAX) {
@@ -5008,6 +5054,17 @@ static void userland_fd_install(rvvm_userland_t* ctx, int guest_fd, int host_fd,
          * accounting rather than dropping it on the floor. */
         rvvm_warn("fd %d reused while still tracked", guest_fd);
     }
+    {
+        int filed = userland_fd_host_off_console(host_fd);
+        if (filed != host_fd) {
+            /* The copy is what the slot names from here on, so the number the
+             * host handed out is this table's to give back. */
+            if (host_fd >= 0) {
+                close(host_fd);
+            }
+            host_fd = filed;
+        }
+    }
     /* A real descriptor landed on this number, so it is no longer the console:
      * `cmd < file` reads the file, not the keyboard. Every way of putting an fd
      * in the table (open, dup, pipe, socket, accept) comes through here. */
@@ -5017,7 +5074,9 @@ static void userland_fd_install(rvvm_userland_t* ctx, int guest_fd, int host_fd,
     /* This slot now holds the anchor, so it holds a reference on it: the number
      * must not go back to the CRT fd table while this slot names it. */
     win_socket_anchor_ref(host_fd);
-    userland_fds_write(ctx, guest_fd, true, host_fd, cloexec, false, false, 0, "install");
+    userland_fds_write(ctx, guest_fd, true, host_fd, cloexec, false,
+                       userland_own_fd(host_fd) ? FD_BACKEND_SIM : FD_BACKEND_HOST,
+                       0, "install");
 }
 
 static bool userland_fd_tracked(rvvm_userland_t* ctx, int fd)
@@ -5025,13 +5084,17 @@ static bool userland_fd_tracked(rvvm_userland_t* ctx, int fd)
     return ctx && fd >= 0 && fd < USERLAND_FD_TABLE_MAX && ctx->fds[fd].used;
 }
 
-/* Whether @fd is still the run's console: one of 0/1/2, untouched by any
- * redirect since. Those read from the keyboard and write to the console, not
- * from/to the host process's own descriptors - which are the host's to use
- * (its stdin is what the pump reads). */
+/* Whether @fd is still the run's console: a slot that names the screen rather
+ * than a descriptor, untouched by any redirect since. Those read from the
+ * keyboard and write to the console, not from/to the host process's own
+ * descriptors - which are the host's to use (its stdin is what the pump reads).
+ *
+ * The number does not matter: a console dup()ed onto 7 is a console, and only
+ * the redirect that replaces the slot takes it away. That is the whole reason
+ * this asks what the slot is rather than whether it is 0/1/2. */
 static bool userland_fd_is_console(rvvm_userland_t* ctx, int fd)
 {
-    return userland_fd_tracked(ctx, fd) && ctx->fds[fd].console;
+    return userland_fd_tracked(ctx, fd) && ctx->fds[fd].backend == FD_BACKEND_CONSOLE;
 }
 
 /* Read-readiness of the virtual console. Its input lives in the cooked ring -
@@ -5093,7 +5156,8 @@ static bool userland_fd_serves_own(rvvm_userland_t* ctx, int fd)
         userland_proc_is_fd(hfd)) {
         return true;
     }
-    return fd >= 0 && fd <= 2 && userland_fd_is_console(ctx, fd);
+    /* A console is served here whatever number it is on. */
+    return userland_fd_is_console(ctx, fd);
 }
 
 /* The guest's open-file flag word for a descriptor (see rvvm_fd_entry_t::flags):
@@ -5108,7 +5172,7 @@ static void userland_fd_set_flags(rvvm_userland_t* ctx, int fd, uint32_t flags)
 {
     if (userland_fd_tracked(ctx, fd)) {
         userland_fds_write(ctx, fd, true, ctx->fds[fd].fd, ctx->fds[fd].cloexec,
-                           ctx->fds[fd].shared, ctx->fds[fd].console, flags, "setfl");
+                           ctx->fds[fd].shared, ctx->fds[fd].backend, flags, "setfl");
     }
 }
 
@@ -5155,7 +5219,12 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
     }
     struct userland_pty* pty = NULL;
     bool master = false;
-    if (userland_pty_by_fd(ctx->fds[fd].fd, &pty, &master)) {
+    if (userland_fd_is_console(ctx, fd)) {
+        /* A console is an attach, not a handle: there is nothing of ours behind
+         * the number to release, and the host's own stdout is the host's to
+         * close. The slot goes; the screen it named keeps being the screen for
+         * every other descriptor that is still attached to it. */
+    } else if (userland_pty_by_fd(ctx->fds[fd].fd, &pty, &master)) {
         userland_pty_release(pty, master);
     } else if (userland_proc_is_fd(ctx->fds[fd].fd)) {
         /* A procfs descriptor rides on a generated object, not a host fd: the
@@ -5179,7 +5248,7 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
         win_socket_anchor_unref(ctx->fds[fd].fd);
     }
     userland_fds_write(ctx, fd, false, ctx->fds[fd].fd, ctx->fds[fd].cloexec,
-                       ctx->fds[fd].shared, ctx->fds[fd].console, ctx->fds[fd].flags,
+                       ctx->fds[fd].shared, ctx->fds[fd].backend, ctx->fds[fd].flags,
                        "close");
     return true;
 }
@@ -5248,18 +5317,29 @@ static int userland_fd_dup(rvvm_userland_t* ctx, int source_fd, int host_fd, int
     return guest_fd;
 }
 
-/* A copy of a descriptor this userland owns (a pty end, a /dev entry): the same
- * object with one more reference, at a guest slot of this table's choosing.
- * There is no host fd to dup, which is why dup(2)/dup3(2)/F_DUPFD cannot simply
- * call the host for it. Returns the guest fd, -1 when the table is full, or -2
- * when @host_fd is an ordinary host descriptor and the caller should dup it
- * itself. */
+/* A copy of a descriptor this userland owns (a console, a pty end, a /dev
+ * entry): the same object with one more reference, at a guest slot of this
+ * table's choosing. There is no host fd to dup, which is why dup(2)/dup3(2)/
+ * F_DUPFD cannot simply call the host for it - and a console is the sharp case:
+ * the number behind it is the host's own stdout, and a dup of that would be a
+ * second name for it, closing one and taking the other's console away. Returns
+ * the guest fd, -1 when the table is full, or -2 when @host_fd is an ordinary
+ * host descriptor and the caller should dup it itself. */
 static int userland_own_fd_dup(rvvm_userland_t* ctx, int source_fd, int host_fd, int min_fd, bool cloexec)
 {
     struct userland_pty* pty = NULL;
     bool master = false;
     int  dev = -1;
 
+    if (userland_fd_is_console(ctx, source_fd)) {
+        int guest_fd = userland_fd_slot_alloc(ctx, min_fd);
+        if (guest_fd < 0) {
+            return -1;
+        }
+        userland_fds_write(ctx, guest_fd, true, host_fd, cloexec, false,
+                           FD_BACKEND_CONSOLE, ctx->fds[source_fd].flags, "own_dup_console");
+        return guest_fd;
+    }
     if (userland_pty_by_fd(host_fd, &pty, &master)) {
         int guest_fd = userland_fd_slot_alloc(ctx, min_fd);
         if (guest_fd < 0) {
@@ -5304,7 +5384,7 @@ static void userland_fd_set_cloexec(rvvm_userland_t* ctx, int fd, bool cloexec)
 {
     if (userland_fd_tracked(ctx, fd)) {
         userland_fds_write(ctx, fd, true, ctx->fds[fd].fd, cloexec,
-                           ctx->fds[fd].shared, ctx->fds[fd].console, ctx->fds[fd].flags,
+                           ctx->fds[fd].shared, ctx->fds[fd].backend, ctx->fds[fd].flags,
                            "setclo");
     }
 }
@@ -5356,18 +5436,23 @@ static void userland_fd_table_free(rvvm_userland_t* ctx)
 static void userland_fd_table_init(rvvm_userland_t* ctx)
 {
     for (int fd = 0; fd < USERLAND_FD_TABLE_MAX; ++fd) {
-        userland_fds_write(ctx, fd, false, 0, false, false, false, 0, "init");
+        userland_fds_write(ctx, fd, false, 0, false, false, FD_BACKEND_HOST, 0, "init");
     }
     for (int fd = 0; fd <= 2; ++fd) {
-        /* 0/1/2 start out as the run's console. fd 0 is the one that matters:
-         * it is served by the virtual TTY (user_tty_read), so the host's own
-         * stdin is the host's to read - the stdin pump feeds those bytes in
-         * through rvvm_user_tty_input() instead of racing the guest for the
-         * same handle, which is what made an interactive shell see EOF at once.
-         */
-        /* ...and their access mode, which F_GETFL has to answer: stdin is read
-         * and stdout/stderr are written. */
-        userland_fds_write(ctx, fd, true, fd, false, true, true,
+        /* 0/1/2 start out as the run's console - the one place in the table where
+         * the number names the screen rather than a descriptor. fd 0 is the one
+         * that matters: it is served by the virtual TTY (user_tty_read), so the
+         * host's own stdin is the host's to read - the stdin pump feeds those
+         * bytes in through rvvm_user_tty_input() instead of racing the guest for
+         * the same handle, which is what made an interactive shell see EOF at
+         * once.
+         *
+         * ...and their access mode, which F_GETFL has to answer: stdin is read
+         * and stdout/stderr are written. The fd field is the host handle the
+         * attach falls back to for the bytes a host with no sink still wants to
+         * see (see userland_fd_console_host); it is not a descriptor the guest
+         * can dup, which is what FD_BACKEND_CONSOLE says. */
+        userland_fds_write(ctx, fd, true, fd, false, false, FD_BACKEND_CONSOLE,
                            fd ? UAPI_O_WRONLY : UAPI_O_RDONLY, "console");
     }
 }
@@ -5392,7 +5477,16 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
 
     for (int fd = 0; fd < USERLAND_FD_TABLE_MAX; ++fd) {
         if (!parent->fds[fd].used) {
-            userland_fds_write(child, fd, false, 0, false, false, false, 0, "inherit");
+            userland_fds_write(child, fd, false, 0, false, false, FD_BACKEND_HOST, 0, "inherit");
+            continue;
+        }
+        /* A console is an attach, not a descriptor: the child is handed the same
+         * one outright. There is no host handle to copy - and none to close,
+         * which is why this never had to be the "shared" case it used to be. */
+        if (parent->fds[fd].backend == FD_BACKEND_CONSOLE) {
+            userland_fds_write(child, fd, true, parent->fds[fd].fd,
+                               parent->fds[fd].cloexec, false, FD_BACKEND_CONSOLE,
+                               parent->fds[fd].flags, "inherit_console");
             continue;
         }
         /* Copy the slot wholesale through the unified write. A socket anchor is
@@ -5403,7 +5497,7 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
         }
         userland_fds_write(child, fd, parent->fds[fd].used, parent->fds[fd].fd,
                            parent->fds[fd].cloexec, parent->fds[fd].shared,
-                           parent->fds[fd].console, parent->fds[fd].flags, "inherit");
+                           parent->fds[fd].backend, parent->fds[fd].flags, "inherit");
         if (userland_pty_by_fd(parent->fds[fd].fd, &child_pty, &child_master)) {
             /* An emulator object, not a host descriptor: there is nothing to
              * dup, and the child shares the pair (its reference is counted, so
@@ -5411,21 +5505,20 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
             userland_pty_ref(child_pty, child_master);
             userland_fds_write(child, fd, true, parent->fds[fd].fd,
                                parent->fds[fd].cloexec, false,
-                               parent->fds[fd].console, parent->fds[fd].flags,
+                               FD_BACKEND_SIM, parent->fds[fd].flags,
                                "inherit_pty");
             continue;
         }
         if (userland_proc_is_fd(parent->fds[fd].fd)) {
-            /* A generated /proc object: no host fd to dup, so the child gets its
+            /* A generated /proc object: no host fd to dup, so the child gets an
              * own reference to the same slot (its close releases that reference,
              * not the parent's). */
             userland_proc_fd_ref(parent->fds[fd].fd);
             continue;
         }
         if (parent->fds[fd].shared) {
-            /* The console, or a descriptor the parent itself did not own:
-             * there is nothing here to copy, and a dup of it would only give
-             * the child a second handle on the emulator's own stdio. */
+            /* A descriptor the parent itself did not own (descriptors exhausted
+             * when it was inherited): nothing here to copy. */
             continue;
         }
         int host_fd = dup(parent->fds[fd].fd);
@@ -5437,7 +5530,7 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
                 win_socket_anchor_ref(host_fd);
             }
             userland_fds_write(child, fd, true, host_fd, parent->fds[fd].cloexec,
-                               false, parent->fds[fd].console, parent->fds[fd].flags,
+                               false, FD_BACKEND_HOST, parent->fds[fd].flags,
                                "inherit_dup");
         } else {
             /* No copy: the parent's host fd has to do, and the child may not
@@ -5449,7 +5542,7 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
             }
             userland_fds_write(child, fd, true, parent->fds[fd].fd,
                                parent->fds[fd].cloexec, true,
-                               parent->fds[fd].console, parent->fds[fd].flags,
+                               FD_BACKEND_HOST, parent->fds[fd].flags,
                                "inherit_shared");
         }
     }
@@ -8930,7 +9023,7 @@ static int64_t userland_read_fd(struct rvvm_userland* ctx, int fd, void* buf,
     if (userland_dev_by_fd(host_fd, &dev)) {
         return userland_dev_read(dev, buf, count, block);
     }
-    if (fd == 0 && userland_fd_is_console(ctx, fd)) {
+    if (userland_fd_is_console(ctx, fd)) {
         if (!block && !user_tty_readable(ctx)) {
             return -UAPI_EAGAIN;
         }
@@ -8957,7 +9050,7 @@ static int64_t userland_write_fd(struct rvvm_userland* ctx, int fd, const void* 
     if (userland_dev_by_fd(host_fd, &dev)) {
         return userland_dev_write(dev, buf, count);
     }
-    if ((fd == 1 || fd == 2) && userland_fd_is_console(ctx, fd)) {
+    if (userland_fd_is_console(ctx, fd)) {
         user_tty_write(ctx, fd, buf, count);
     }
     if (ctx->io_callback) {
@@ -10806,8 +10899,11 @@ static void* rvvm_user_thread_wrap(void* arg)
 #endif
                 case 23: { // dup
                     rvvm_info("sys_dup(%ld)", a0);
-                    /* A descriptor of ours (a pty end) has no host fd to copy:
-                     * the copy is another reference to the same object. */
+                    /* A descriptor of ours (a console, a pty end) has no host fd to
+                     * copy: the copy is another reference to the same object. A
+                     * console is the case that matters - its host number is the
+                     * host's own stdout, and a dup() of that would hand the guest
+                     * a second name for it instead of a second console. */
                     int own = userland_own_fd_dup(uctx(), (int)a0,
                                                   userland_fd_host(uctx(), (int)a0), 0, false);
                     if (own != -2) {
@@ -10850,12 +10946,20 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     int host_old = userland_fd_host(uctx(), oldfd);
 
-                    /* A descriptor this userland owns (a pty end, a /dev entry)
-                     * has no host fd to duplicate: the copy is another
-                     * reference to the same object. The reference is taken
-                     * before whatever sat on @newfd is released, so the object
-                     * cannot go away in between. */
-                    if (userland_own_fd(host_old)) {
+                    /* A descriptor this userland owns - a console attach above all,
+                     * whose number behind it is the host's own stdout - has no host
+                     * fd to duplicate: the copy is another reference to the same
+                     * object. The reference is taken before whatever sat on @newfd is
+                     * released, so the object cannot go away in between.
+                     *
+                     * The console answers to what the slot is, not to the number
+                     * behind it: dup2(1, 7) hands back a console, and dup2(file, 1)
+                     * replaces the console with the file. That is the whole
+                     * distinction, and reading it off the host number - which is
+                     * what dup()ing it would do - is what used to copy the host's
+                     * own stdout instead of the guest's descriptor. */
+                    if (userland_fd_is_console(uctx(), oldfd) ||
+                        userland_own_fd(host_old)) {
                         struct userland_pty* pty = NULL;
                         bool master = false;
                         int  dev = -1;
@@ -10863,9 +10967,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                             userland_pty_ref(pty, master);
                         }
                         (void)dev;   // a /dev entry is the number itself
+                        int keep_flags = uctx()->fds[oldfd].flags;
+                        rvvm_fd_backend_t keep_be = uctx()->fds[oldfd].backend;
                         userland_fd_close(uctx(), newfd);
-                        userland_fd_install(uctx(), newfd, host_old, (a2 & UAPI_O_CLOEXEC) != 0);
-                        userland_fd_set_flags(uctx(), newfd, userland_fd_flags(uctx(), oldfd));
+                        userland_fds_write(uctx(), newfd, true, host_old,
+                                           (a2 & UAPI_O_CLOEXEC) != 0, false,
+                                           keep_be, keep_flags, "dup3_own");
                         a0 = newfd;
                         break;
                     }
@@ -10958,11 +11065,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 29: // ioctl
                     // TODO: I sure hope not many ioctl() interfaces need struct conversion...
                     rvvm_info("sys_ioctl(%ld, %lx, %lx)", a0, a1, a2);
-                    /* Only 0/1/2 *as they started* are the console: a dup2()
-                     * onto that number put a real descriptor there, and the
-                     * termios probes are not for it. */
-                    if ((a0 == 0 || a0 == 1 || a0 == 2) && uctx()->tty &&
-                        userland_fd_is_console(uctx(), (int)a0)) {
+                    /* The console is answered from the VTerm, on whatever number it
+                     * is: a dup2() onto that number put a real descriptor there
+                     * and the termios probes are not for it. */
+                    if (uctx()->tty && userland_fd_is_console(uctx(), (int)a0)) {
                         // Virtual TTY rendered by the host: answer the termios
                         // probes guest libc makes for isatty() itself instead
                         // of forwarding them to the host fd. fd 0 is included
@@ -11398,10 +11504,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -UAPI_EFAULT;
                         break;
                     }
-                    /* Only fd 0 *as it started* is the console: `cmd < file` puts
-                     * a real descriptor on that number (dup2), and reading it has
-                     * to reach the file, not the keyboard. */
-                    if (a0 == 0 && uctx()->tty && userland_fd_is_console(uctx(), (int)a0)) {
+                    /* A console read is the keyboard: `cmd < file` puts a real
+                     * descriptor on that number (dup2), and reading it has to
+                     * reach the file, not the keys. */
+                    if (uctx()->tty && userland_fd_is_console(uctx(), (int)a0)) {
                         // fd 0 is the virtual TTY: the guest's stdin comes from
                         // the host keyboard (rvvm_user_tty_input), not from the
                         // host process's own stdin. Blocks until a line has been
@@ -11457,10 +11563,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -UAPI_EFAULT;
                         break;
                     }
-                    /* The console is only an untracked 1/2: a `cmd > file` put a
-                     * real descriptor on that number, and the bytes belong to it,
+                    /* A console write is the screen: a `cmd > file` put a real
+                     * descriptor on that number, and the bytes belong to it,
                      * not to the host's console sink. */
-                    bool console_out = (a0 == 1 || a0 == 2) && userland_fd_is_console(uctx(), (int)a0);
+                    bool console_out = userland_fd_is_console(uctx(), (int)a0);
                     int  host_fd     = userland_fd_host(uctx(), (int)a0);
                     int  wfd         = (int)a0;   // a0 is the result from here on
                     if (userland_proc_is_fd(host_fd)) {
@@ -11527,8 +11633,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * console, anything else - including a redirected one - is
                      * a descriptor the host reads or writes by its own number. */
                     int  iov_fd      = userland_fd_host(uctx(), (int)a0);
-                    bool iov_console = (a0 == 0 || a0 == 1 || a0 == 2) &&
-                                       userland_fd_is_console(uctx(), (int)a0);
+                    bool iov_console = userland_fd_is_console(uctx(), (int)a0);
                     /* A pty end or a /dev device is served here too: the host
                      * has no descriptor behind either. */
                     struct userland_pty* iov_pty = NULL;
