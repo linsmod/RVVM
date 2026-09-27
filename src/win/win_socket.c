@@ -160,14 +160,49 @@ static volatile LONG64 wsock_fds_gen_next;
  * is kept reserved. */
 static LONG wsock_fds_refs[WSOCK_MAX_FD];
 
-/* Release the CRT number of an anchor, once nothing names it any more. */
-static void wsock_anchor_release(int fd)
+/* Whether any guest slot has *ever* named this number since it was taken. The
+ * count alone cannot tell a legitimate release from a bug: an anchor that was
+ * bound but never filed into a slot is closed with the count still at zero, and
+ * that has to keep working. Once a slot has claimed the number, though, a
+ * release at zero means one slot let go more than once - and acting on it closes
+ * a CRT descriptor that something else may hold by then, which is how a number
+ * gets handed back to the pool under a live slot (see wsock_anchor_release). */
+static bool wsock_fds_claimed[WSOCK_MAX_FD];
+
+/* Release the CRT number of an anchor, once nothing names it any more. @why says
+ * which path is letting go, so an over-release names itself. */
+static void wsock_anchor_release(int fd, const char* why)
 {
     bool last;
+    if (fd < 0 || fd >= WSOCK_MAX_FD) {
+        return;
+    }
     AcquireSRWLockExclusive(&wsock_lock);
-    last = (--wsock_fds_refs[fd] <= 0);
-    if (last) {
-        wsock_fds_refs[fd] = 0;
+    if (!wsock_fds_claimed[fd]) {
+        /* No slot ever named this number, so there is no reference to drop and
+         * the count was never anything but the zero it was born with. This is
+         * the ordinary teardown of an anchor that was bound and then dropped
+         * before it was filed (a failed dup, an accept that gave up), and it is
+         * why this cannot simply refuse to close at zero. */
+        last = true;
+    } else if (wsock_fds_refs[fd] <= 0) {
+        /* A slot named this number and has now let go more times than it took
+         * it. The bookkeeping above has lost track somewhere, and the number is
+         * no longer evidence of anything: _close()ing it here is what hands it
+         * to the CRT while another slot still points at it, and the next
+         * _open() gives it straight back - which is how a privsep child ends up
+         * dup()ing a descriptor that has silently become somebody else's.
+         *
+         * So say so, loudly and with the count, and leave the number alone. A
+         * leaked CRT handle is recoverable; a closed stranger's is not. */
+        long held = wsock_fds_refs[fd];
+        ReleaseSRWLockExclusive(&wsock_lock);
+        rvvm_warn("anchor %d released with no reference (%s, count %ld): a slot "
+                  "is letting go more often than it takes - not closing it",
+                  fd, why, held);
+        return;
+    } else {
+        last = (--wsock_fds_refs[fd] == 0);
     }
     ReleaseSRWLockExclusive(&wsock_lock);
     if (last) {
@@ -341,6 +376,7 @@ int win_socket_alloc_anchor(void)
     /* Zero: the reference belongs to whichever guest slot gets filed onto this
      * anchor, and takes it in userland_fd_install() / the inherit paths. */
     wsock_fds_refs[fd] = 0;
+    wsock_fds_claimed[fd] = false;
     ReleaseSRWLockExclusive(&wsock_lock);
     /* A number here is a *reused* one as often as a fresh one: _open() only
      * knows the CRT's free list, and a number whose anchor was given back comes
@@ -362,13 +398,28 @@ void win_socket_anchor_ref(int fd)
     }
     AcquireSRWLockExclusive(&wsock_lock);
     InterlockedIncrement(&wsock_fds_refs[fd]);
+    wsock_fds_claimed[fd] = true;
     ReleaseSRWLockExclusive(&wsock_lock);
 }
 
 void win_socket_free_anchor(int fd)
 {
+    if (fd < 0 || fd >= WSOCK_MAX_FD) {
+        return;
+    }
+    AcquireSRWLockExclusive(&wsock_lock);
     /* Not a guest-held slot (a failed alloc, a dup that could not be bound):
-     * give the number straight back. */
+     * give the number straight back. One that *was* held means the caller is
+     * discarding a live reference, which is the same bookkeeping fault
+     * wsock_anchor_release() reports - say which number it was. */
+    bool was_claimed = wsock_fds_claimed[fd];
+    long held        = wsock_fds_refs[fd];
+    wsock_fds_claimed[fd] = false;
+    wsock_fds_refs[fd] = 0;
+    ReleaseSRWLockExclusive(&wsock_lock);
+    if (was_claimed) {
+        rvvm_warn("anchor %d given back while %ld slot(s) still named it", fd, held);
+    }
     RVVM_TRC(RVVM_TRC_WSOCK,  "free anchor %d", fd);
     _close(fd);
 }
@@ -380,7 +431,7 @@ void win_socket_anchor_unref(int fd)
     if (fd < 0 || fd >= WSOCK_MAX_FD) {
         return;
     }
-    wsock_anchor_release(fd);
+    wsock_anchor_release(fd, "slot dropped without closing");
 }
 
 /* The far end of @s as "host:port", or "?" when it has none. Every address space
@@ -816,8 +867,8 @@ int win_socket_close(int fd)
     }
     if (closesocket(s) == SOCKET_ERROR) {
         int err = WSAGetLastError();
-        RVVM_TRC(RVVM_TRC_WSOCK,  "closesocket FAILED on fd %d (socket %p) err=%d", fd, (void*)s, err);
-        wsock_anchor_release(fd);
+        RVVM_TRC(RVVM_TRC_WSOCK, "closesocket FAILED on fd %d (socket %p) err=%d", fd, (void*)s, err);
+        wsock_anchor_release(fd, "closesocket failed");
         errno = wsock_errno_of(err);
         return -1;
     }
@@ -826,7 +877,7 @@ int win_socket_close(int fd)
      * the fd table when the last guest slot naming it is gone too - otherwise a
      * still-live slot would find its number handed to an unrelated file (see
      * wsock_fds_refs). This call drops the closing slot's own reference. */
-    wsock_anchor_release(fd);
+    wsock_anchor_release(fd, "socket closed");
     return 0;
 }
 
