@@ -17,15 +17,18 @@
 | SSH banner 互换 | ✅ 通过（此前"banner 从未互换"是 sshd 自己 `fatal()` 了，见 §6A.1） |
 | privsep monitor 通道 | ✅ socketpair 上双向一字节不差走通 |
 | KEX + 公钥校验 | ✅ 通过，`SSH2_MSG_EXT_INFO` 已发出，公钥 test 通过 |
-| 建立会话（`exec` 远端命令） | ❌ 仍失败，卡在 `initgroups`（§6A.5） |
+| 建立会话（`exec` 远端命令） | ❌ 仍失败，卡在 `initgroups`（§6A.5，已排除 `initgroups`/`getgrouplist` 本身） |
 
-已修复 11 个模拟器缺陷（见 §5、§5A、§6A），其中 6 个是"任意程序都可能踩到"的通用 bug：
+已修复 12 个模拟器缺陷（见 §5、§5A、§6A），其中 7 个是"任意程序都可能踩到"的通用 bug：
 writev 零长度 iovec、地址空间 UAF、win32 带超时 futex 等待可能永久阻塞、
-`socket` anchor 号码被回收、`chroot(2)` 缺失、guest 凭证不分 real/effective id。
+`socket` anchor 号码被回收、`chroot(2)` 缺失、guest 凭证不分 real/effective id、
+数据报 `connect(0.0.0.0)` 语义。
 
 **当前阻塞点**：`temporarily_use_uid()` 里的 `initgroups()` 返回 -1，sshd 以
-`initgroups: root: Network is down` 退出 255。注意这个 errno 是**前面一次无关的
-UDP `connect()` 失败留下的陈旧值**，不是 initgroups 自己的失败原因（§6A.5）。
+`initgroups: root: Network is down` 退出 255。已反汇编排除 `initgroups` 与
+`getgrouplist` 本身（前者只调 malloc/getgrouplist/setgroups/free），失败那轮里
+`/etc/group` 甚至没被打开；剩下未归因的是 `initgroups` 之前那两次 UDP 探测
+（§6A.5.1）。
 
 ---
 
@@ -178,6 +181,8 @@ __规矩：每轮实验前 `Get-Process rvvm* | Stop-Process -Force`，并且换
 6. __先确认那行日志是 `fatal()` 还是 `debug()`__：`debug1:` 前缀极具误导性。 `check_ip_options()` 里 `Connection from ... with IP opts:` 是 **`fatal()`**（见 §6A.1），而 §6.3.1 却按"普通日志"读它，于是把"进程已经死了"当成"连接是死的"，白追两轮。 有疑问就去抠 format string / 读源码，别在 trace 里猜语义。
 7. __musl 的失败可能报陈旧 errno__：`initgroups: root: Network is down` 里的 errno 来自**上一次**失败的 `connect()`（§6A.5）。 语义上不该出现的 errno（查 group 怎么会是网络错）先别顺着 errno 名猜，回头找最近一次失败的 syscall。
 8. __`RVVM_VERBOSE=1` + `RVVM_TRACE=sys` 会打出 syscall 实参__：`INFO: sys_getsockopt(6, 0, 4, ...)`。 §6A.1 的 `IP_OPTIONS` 常量取错（Linux 4 / WinSock 1）就是这样被发现的 —— 只打指针的 trace 看不出这种错。
+9. __`INFO:` 行不带 `[pid:tid]`__：要按进程归因就用 `RVVM_TRC`（`TRACE:` 行才有前缀）。 §6A.5 第一版把 connect 的目标 trace 打在 INFO 通道上，结果分不清那两次 UDP 探测是谁发的。 和坑 #2 一样是**格式**骗人。
+10. __宿主没有的语义要照 Linux 的规则补，不要照宿主__：`connect(0.0.0.0)` 在 Linux 是成功的（内核把 `INADDR_ANY` 改写成 loopback），在 WinSock 上是 `WSAEADDRNOTAVAIL`（§6A.6）。 这一类差异不会报错，只会让 guest 的探测静默失败并留下一个误导性的 errno。
 
 ---
 
@@ -615,7 +620,10 @@ match=False raw=[[...] vpsessiond:   [slot 0] open sock=4|[...] client connected
 | `08c53ce` | fd trace 带 owner pid + `fd_drop` |
 | `ac9041b` | wsock: anchor 引用计数 + generation 校验,消除跨进程串写 |
 | `5bd87f1` | core: adjust fd slots allocation |
-| (本轮) | §6A 的四个缺陷:IP_OPTIONS / chroot / real-vs-effective id / prlimit64 |
+| `0dfc951` | wsock: `getsockopt(IP_OPTIONS)` 按 Linux 语义返回"无选项"(§6A.1) |
+| `75b9c76` | userland: chroot / real-vs-effective id / prlimit64(§6A.2-4) |
+| `626173d` | wsock: 数据报 `connect(0.0.0.0)` 视为本机 + connect 目标 trace(§6A.6) |
+| (本轮) | 文档订正:§0/§6/§6.4 的结论作废,新增 §6A |
 
 
 ---
@@ -748,53 +756,87 @@ debug1: temporarily_use_uid: 0/0 (e=0/0)
 initgroups: root: Network is down
 ```
 
-`Network is down` = ENETDOWN = 100。而**这轮里唯一返回 100 的 syscall 是一次
+`Network is down` = ENETDOWN = 100。而**这轮里唯一返回 100 的 syscall 是两次
 无关的 UDP `connect()`**:
 
 ```
-sys_socket(2, 80002, 11)        # AF_INET, SOCK_DGRAM|NONBLOCK|CLOEXEC, IPPROTO_UDP
-sys_connect(6, 3fffec38, 10)    # len 10 (!), 目标 0.0.0.0:65535
-TRACE: Syscall 203 failed: -100
-sys_socket(a, 80002, 11)        # AF_INET6
-sys_connect(6, 3fffecb0, 1c)    # len 28
-TRACE: Syscall 203 failed: -100
-sys_connect(... ) -> unix "/var/run/nscd/socket"
+TRACE[104:104]: connect fd 6, 16 byte(s): 02 00 ff ff 00 00 00 00 00 ... -> inet 0.0.0.0:65535
+TRACE[104:104]: Syscall 203 failed: -99 / -100
+TRACE[104:104]: connect fd 6, 28 byte(s): 0a 00 ff ff 00 00 00 00 00 ... -> family 10 (::)
+TRACE[104:104]: Syscall 203 failed: -99 / -100
+TRACE[104:104]: connect fd 7, 110 byte(s): 01 00 "/var/run/nscd/socket"
 ```
 
-两个反常点都还没解释:
+三次都是**连上就关、一个字节都不发**的探测:UDP v4 → UDP v6 → nscd。errno 在两次
+`connect()` 之间被改掉,而 OpenSSH 报的是 `initgroups` 的 errno。
 
-1. **len 10 的 AF_INET `sockaddr_in`** —— `sockaddr_in` 是 12(musl)或 16(Linux)字节。
-2. **`connect()` 调的是 fd 6,而刚 `socket()` 出来的在 fd 7。**
+**坑 #9（本轮自己踩的）**:`INFO:` 行不带 `[pid:tid]`。第一版 trace 打在 INFO 通道上,
+于是"这是哪个进程的 connect"根本看不出来,差点把不同进程的调用混成一条线索。**要归因
+就用 `RVVM_TRC`**。
 
 排除掉的方向(都已实测):
 
 - group/passwd 数据没问题:`/etc/group`、`/etc/passwd` 完整,`sshd:x:22:22` 在。
-- 不是 group 查询本身的问题:`getent group root`、`groups`、`id -G` 在 guest 里
-  **全部正确,且一次 `connect()` 都不发**。
-- 不是 DNS:`/etc/resolv.conf` 是正常的 `1.1.1.1` / `8.8.8.8`,而且 apk 装包时
-  DNS 是通的。
+- 不是 DNS:`getent hosts example.com` 在 guest 里正常解析,而且解析器用的正是
+  `socket(AF_INET6, SOCK_DGRAM|…)` + `connect` 这个形状 —— 只是地址是真的
+  (`2606:4700::`)。所以那两个 `0.0.0.0:65535` 不是解析器。
+- busybox 的 `groups root` / `id -G root` 正确,只发一次 nscd 的 AF_UNIX connect。
 
-所以 `initgroups()` 走的是 busybox 那几条命令不走的分支。**新加的坑 #7**:
+### 6A.5.1 反汇编把 initgroups 本身排除了
+
+`objdump` 在 msys64 里不认识 riscv64,但 guest 的 `lib/ld-musl-riscv64.so.1` 就在
+`runtime/rootfs` 里,`nm -D` 能读符号表(`initgroups` @ `0x34278`),python 的 capstone
+配 `CS_MODE_RISCV64|CS_MODE_RISCVC` 能反汇编(ELF 头/`.dynsym`/重定位手写解析即可)。
+于是直接把两个函数拆开看:
+
+```
+initgroups:  malloc → getgrouplist → setgroups → free        # 没有任何 socket
+getgrouplist: 入口有一个 AF_NETLINK 探测,之后 fopen/fread/strcmp 解析 /etc/group
+```
+
+**结论:`initgroups` 和 `getgrouplist` 都不发 UDP 包。** 更关键的是,失败那轮里
+**`/etc/group` 根本没被 open**(`sys_openat` 里没有它,紧接着就去读
+`/etc/ssh/ssh_host_rsa_key` 了)—— 说明 `getgrouplist` 在走到自己的 `fopen` 之前
+就返回了负值,而它没有为此设置 errno。
+
+所以剩下的未知收窄成一件事:**那两次 UDP 探测是谁发的**。它既不属于 `initgroups`,
+也不属于 `getgrouplist`,也不是解析器。
+
+下一步的取法(本机都不通,需要换环境):
+
+- musl 源码:`git.musl-libc.git` TLS 握手失败,`sources.debian.org` 有 PoW 墙,
+  GitHub 上的 musl 镜像路径全部 404。
+- 或者:起一个 Ghidra 实例,把 `ld-musl-riscv64.so.1` 按 `RISC-V:LE:64` 导进去,
+  从那两个探测点往回追调用者。
+
+**新加的坑 #7**:
 
 > **musl 的失败可能报一个陈旧 errno。** `initgroups: root: Network is down` 里的
-> errno 是**上一次失败的 `connect()` 留下的**,不是 initgroups 自己的原因。看到一个
+> errno 是**前面某次失败的 `connect()` 留下的**,不是 initgroups 自己的原因。看到一个
 > 语义上不该出现的 errno(查 group 怎么会是网络错),先回头找最近一次失败的 syscall,
 > 别顺着 errno 名去猜。
 
-下一步:在 guest 地址空间里断 `initgroups`,看它到底为什么返回 -1
-(§1.2 的 gdb 手法;`ld-musl-riscv64.so.1` 里同时含 `initgroups`/`getgrouplist`/
-`nscd` 字符串,而 `/etc/nsswitch.conf` 也在,值得先确认走的是 nscd 分支还是
-文件分支)。
+## 6A.6 顺带修掉的第二个模拟器缺陷:`connect(0.0.0.0)`
 
-## 6A.6 顺带加的 trace
+探测用的 `sockaddr` 全是零,只有 `sin_family` 和 `sin_port = htons(-1) = 0xffff`
+非零。这不是 guest 的毛病,是宿主语义:
 
-`sys_connect` 现在会打出**要连哪里**,而不只是缓冲区地址:
+- Linux `__ip4_datagram_connect()` 会把 `INADDR_ANY` 改写成 `INADDR_LOOPBACK`,
+  `__ip6_datagram_connect()` 对 `in6addr_any` 同理 —— 所以**数据报 socket 连
+  0.0.0.0 是成功的**,含义是"本机"。
+- WinSock 没有这条规则,回 `WSAEADDRNOTAVAIL`。
+
+`win_socket_connect()` 现在照 Linux 的做法替换成 loopback。**这不是 `initgroups`
+的原因**(修完两次探测都成功了,`initgroups` 照旧失败),但它本身是个真的语义缺口,
+而且那个 errno 正是会被误报出去的东西。
+
+顺带把 `sys_connect` 的目标 trace 从 INFO 通道挪到 `RVVM_TRC`(见坑 #9),现在会打出
+地址/端口/路径和原始字节:
 
 ```
-INFO: sys_connect(6, 3fffec38, a)
-INFO:   connect -> inet 0.0.0.0:65535
-INFO:   connect -> unix "/var/run/nscd/socket"
-INFO:   connect -> family 10 len 28
+TRACE[104:104]: connect fd 6, 16 byte(s): 02 00 ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 -> inet 0.0.0.0:65535
+TRACE[106:106]: connect fd 3, 16 byte(s): 02 00 08 ae 7f 00 00 01 00 00 00 00 00 00 00 00 -> inet 127.0.0.1:2222
+TRACE[104:104]: connect fd 7, 110 byte(s): 01 00 2f 76 61 72 2f 72 75 6e 2f 6e 73 63 64 2f -> unix "/var/run/nscd/socket"
 ```
 
 一个 guest 根本没打算发起的 `connect()`,和一次被宿主拒绝的 `connect()`,以前在
@@ -802,8 +844,10 @@ trace 里长得一模一样。
 
 ## 6A.7 回归
 
-`procfs_e2e` 22/22、`session_e2e` PASS(含 `^C`/`^Z`/`jobs`/kill)、
-`ash_e2e` 7/7 —— A.3 改了 `stat()` 报出来的 owner id(用的是 `fake_uid`,即 real
-id,没动),`/proc/self/status` 的 Uid 与 `ps` 输出均未受影响。
+`procfs_e2e` 22/22、`session_e2e` PASS(含 `^C`/`^Z`/`jobs`/kill)、`ash_e2e` 7/7
+—— A.3 改了 `stat()` 报出来的 owner id(用的是 `fake_uid`,即 real id,没动),
+`/proc/self/status` 的 Uid 与 `ps` 输出均未受影响;A.6 动的是 `connect()` 的
+目标地址替换,guest 侧所有 connect 路径都过一遍,`session_e2e` 的 AF_UNIX 监听
+和 `apk` 的 HTTPS 都照常。
 `openssh_e2e` 仍是 3/7,但失败点已从"banner 都没互换"推进到 §6A.5。
 
