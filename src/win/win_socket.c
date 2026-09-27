@@ -65,6 +65,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #define AF_UNIX 1       /* WinSock spells it the same, some SDKs omit it */
 #endif
 
+/* Winsock has no <sys/un.h> here, and <winsock2.h> does not declare
+ * struct sockaddr_un under WIN32_LEAN_AND_MEAN. Spelled out for reading a
+ * guest-supplied AF_UNIX address; the first two fields are what every
+ * implementation agrees on. */
+struct wsock_sockaddr_un {
+    unsigned short sun_family;
+    char           sun_path[108];
+};
+
 /* ------------------------------------------------------------------------ */
 /* Guest (Linux UAPI) numbering                                              */
 /*                                                                           */
@@ -941,6 +950,29 @@ int win_socket_connect(int fd, const void* addr, int len)
         if (IN6_IS_ADDR_UNSPECIFIED(&in6->sin6_addr)) {
             struct sockaddr_in6* m6 = (struct sockaddr_in6*)&st;
             m6->sin6_addr = in6addr_loopback;
+        }
+    } else if (st.ss_family == AF_UNIX) {
+        /* A unix socket whose path is not there is ENOENT on Linux, and musl
+         * leans on that hard: __nscd_query() reads only EACCES, ECONNREFUSED
+         * and ENOENT as "no nscd is running" and falls back to the passwd
+         * files, while *any* other errno makes it give up. WinSock answers
+         * WSAENETDOWN, so getgrouplist() bailed out before it ever opened
+         * /etc/group and returned nothing but the caller's primary gid.
+         *
+         * That was silent for every guest process - busybox `id -G root`
+         * printed just "0" - until OpenSSH's initgroups() made it fatal, which
+         * is where it was finally noticed. So the lookup Linux does is done
+         * here instead of trusting whichever code the host happens to pick.
+         * The path is already host-mapped by the time it gets here. */
+        const struct wsock_sockaddr_un* un = (const struct wsock_sockaddr_un*)&st;
+        if (un->sun_path[0] != '\0') {
+            uint16_t* wpath = utf8_to_utf16(un->sun_path);
+            DWORD attrs = wpath ? GetFileAttributesW(wpath) : INVALID_FILE_ATTRIBUTES;
+            free(wpath);
+            if (attrs == INVALID_FILE_ATTRIBUTES) {
+                errno = ENOENT;
+                return -1;
+            }
         }
     }
     if (connect(s, (struct sockaddr*)&st, wlen) == SOCKET_ERROR) {
