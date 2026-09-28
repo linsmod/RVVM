@@ -11,13 +11,33 @@ set(RVVM_INC  "${RVVM_ROOT}/include")
 # ============================================================
 # Global compile definitions
 # ============================================================
+#
+# USE_JIT is decided per ABI rather than globally. The JIT emits *host* code, and
+# its 32-bit ARM backend (src/rvjit/rvjit_arm.h) defines neither
+# RVJIT_NATIVE_LINKER nor RVJIT_NATIVE_64BIT: no direct block-to-block linking,
+# and 64-bit guest registers moved through helpers instead of natively. That is a
+# configuration the JIT recognises, but it is not the one this app is built
+# against - project.mk gates USE_JIT on the same host list (x86_64, arm64,
+# riscv64, loongarch64) and leaves every other host on the interpreter. So a
+# 32-bit ABI gets an interpreter-only build, which is the whole of what
+# "supports compiling" needs to mean here.
+option(RVVM_JIT_32BIT "Build the 32-bit JIT backend instead of the interpreter" OFF)
+set(RVVM_JIT_ABIS arm64-v8a x86_64 riscv64)
+set(RVVM_JIT_SRCS)
+if(RVVM_JIT_32BIT OR CMAKE_ANDROID_ARCH_ABI IN_LIST RVVM_JIT_ABIS)
+    add_definitions(-DUSE_JIT)
+    set(RVVM_JIT_SRCS
+        ${RVVM_SRC}/rvjit/rvjit.c
+        ${RVVM_SRC}/rvjit/rvjit_emit.c
+    )
+endif()
+
 add_definitions(
     -DRVVM_USER_TEST
     -DRVVM_USE_RV64
     -DUSE_RV64
     -DANDROID
     -D__linux__
-    -DUSE_JIT
     -D_GNU_SOURCE
     -DUSE_FPU
 )
@@ -70,9 +90,8 @@ add_library(rvvm_core STATIC
     ${RVVM_SRC}/cpu/riscv_fpu.c
     ${RVVM_SRC}/cpu/riscv64_interpreter.c
 
-    # JIT (ARM64 backend, RVJIT_NATIVE_LINKER)
-    ${RVVM_SRC}/rvjit/rvjit.c
-    ${RVVM_SRC}/rvjit/rvjit_emit.c
+    # JIT (RVVM_JIT_SRCS: the host backend, or nothing on a 32-bit ABI)
+    ${RVVM_JIT_SRCS}
 
     # Utils
     ${RVVM_SRC}/util/elf_load.c

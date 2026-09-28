@@ -14,7 +14,9 @@ android {
         versionName = "1.0"
 
         ndk {
-            abiFilters 'arm64-v8a', 'x86_64'
+            // armeabi-v7a builds the interpreter: the JIT's arm32 backend is a
+            // reduced one (see the USE_JIT gate in src/main/cpp/CMakeLists.txt).
+            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64'
         }
 
         externalNativeBuild {
