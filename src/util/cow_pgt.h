@@ -46,11 +46,29 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
  *   - On POSIX, MAP_NORESERVE does avoid the commit, but commit was never the
  *     POSIX constraint; address space is.
  *
- * So the contiguous window has to be given up. This module keeps one shared,
- * physically-backed, *read-only* base covering the whole guest range, plus a
- * per-machine page table, and translates a guest offset to a host pointer one
- * page at a time:
+ * So the contiguous window has to be given up. One shared, physically-backed,
+ * *read-only* base covers the whole guest range, plus a per-machine page table.
+ * The base is mapped once per region and never grows: there is no grow, expand or
+ * resize path anywhere in this module, and that is deliberate. The base is
+ * exactly the thing being paid for once instead of N times - a page table's whole
+ * purpose is that the untouched pages cost one shared mapping rather than one per
+ * machine - so a mechanism that grew it would reintroduce the linear cost. Only
+ * the per-machine private arena grows, on demand, in chunk-sized mappings.
  *
+ * The shape for one ash run, which is what this exists for:
+ *
+ *     1 run                     ->  1 region: one read-only base, guest_size, once
+ *       guest process N         ->  N machines: one bitmap + one private arena
+ *
+ * ash's core runs a single session server, so one run is one region; each session
+ * it forks is a guest process with its own machine and therefore its own page
+ * table. The session table is 16 entries, so the worst case is 16 machines sharing
+ * one region, where today it is 16 separate guest_size allocations. Each Android
+ * guest app is its own run and therefore its own region, which is right: different
+ * guests have different rootfses and share nothing.
+ *
+ * The mapping, one page at a time
+ * -------------------------------
  *     still shared    base + offset        costs nothing per machine
  *     private         the machine's arena  costs one host page, once
  *
@@ -85,13 +103,27 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
  *
  * Threading
  * ---------
- * A machine is not internally synchronised. It is owned by one thread at a time,
- * in the same way a TLB entry is. Concurrent access to *different* machines is
- * fully parallel and needs no lock, because they share only the immutable base;
- * concurrent access to the *same* machine needs the caller's own exclusion,
- * which is the machine lock RVVM already has. cow_pgt_machine_fork() and
- * cow_pgt_machine_free() are not safe against concurrent cow_pgt_ptr() on the
- * same machine.
+ * A machine is not internally synchronised, and on the userland path it does not
+ * need to be: the binding is per thread, not per lock.
+ *
+ * rvvm_user.c's translation helpers reach the machine through tls_userland
+ * (THREAD_LOCAL, set on a vCPU thread and on the startup path). So a given thread
+ * has exactly one machine, every call on that thread is serialised by being on
+ * that thread, and a host thread - which has tls_userland == NULL and therefore
+ * cannot reach any machine's page table - never touches one. The MMU's
+ * riscv_phys_read()/riscv_phys_write() go through the hart's own by-value copy of
+ * the region, so a hart is likewise bound to its machine.
+ *
+ * What this rules out is a host thread reaching into a running machine's guest
+ * memory through these helpers at all. What it does not rule out is two *harts of
+ * the same machine* on two host threads, which is a real configuration: they share
+ * one page table, and unshare is then concurrent with another hart's translation.
+ * That is the case the TLB invalidation has to handle, and the reason a cached
+ * translation for a still-shared page going stale is the hazard this design
+ * carries.
+ *
+ * cow_pgt_machine_fork() and cow_pgt_machine_free() must not run concurrently
+ * with any translation on the machine they touch.
  */
 
 /* One shared region: the base plus its own bookkeeping. One per host process in

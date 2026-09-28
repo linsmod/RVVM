@@ -7429,7 +7429,7 @@ static bool uapi_fdset_to_host(rvvm_userland_t* ctx, int nfds, rvvm_addr_t guest
     if (!guest_set) {
         return true;
     }
-    const uapi_fd_set* gset = to_ptr_sz(guest_set, sizeof(*gset));
+    const uapi_fd_set* gset = to_ptr_sz_wr(guest_set, sizeof(*gset));
     if (!gset) {
         return false;
     }
@@ -7463,7 +7463,7 @@ static bool uapi_fdset_from_host(rvvm_userland_t* ctx, int nfds, rvvm_addr_t gue
     if (!guest_set) {
         return true;
     }
-    uapi_fd_set* gset = to_ptr_sz(guest_set, sizeof(*gset));
+    uapi_fd_set* gset = to_ptr_sz_wr(guest_set, sizeof(*gset));
     if (!gset) {
         return false;
     }
@@ -7490,7 +7490,7 @@ static int uapi_own_set_ready(rvvm_userland_t* ctx, int nfds, rvvm_addr_t guest_
     if (!guest_set) {
         return 0;
     }
-    uapi_fd_set* gset = to_ptr_sz(guest_set, sizeof(*gset));
+    uapi_fd_set* gset = to_ptr_sz_wr(guest_set, sizeof(*gset));
     if (!gset) {
         return 0;
     }
@@ -11424,7 +11424,7 @@ static void userland_siginject(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
 
     uint64_t sp = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 2);
     uint64_t frame_addr = (sp - sizeof(frame)) & ~(uint64_t)0xF;
-    struct vp_sigframe* host_frame = to_ptr_sz(frame_addr, sizeof(frame));
+    struct vp_sigframe* host_frame = to_ptr_sz_wr(frame_addr, sizeof(frame));
     if (!host_frame) {
         // The stack is not in guest RAM (should not happen): drop the signal
         // rather than corrupting anything.
@@ -12838,7 +12838,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 90: // capget - stub
                     if (a1) {
-                        struct uapi_cap_data_struct* cap = to_ptr(a1);
+                        struct uapi_cap_data_struct* cap = to_ptr_wr(a1);
                         memset(cap, 0, sizeof(*cap));
                     }
                     a0 = 0;
@@ -13011,7 +13011,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 121: { // sched_getparam - stub
                     if (a1) {
-                        struct uapi_sched_param* param = to_ptr_sz(a1, sizeof(*param));
+                        struct uapi_sched_param* param = to_ptr_sz_wr(a1, sizeof(*param));
                         if (!param) {
                             a0 = -UAPI_EFAULT;
                             break;
@@ -13252,7 +13252,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 153: // times
                     // TODO: Struct conversion!
                     rvvm_info("sys_times(%lx)", a0);
-                    a0 = errno_ret(times(to_ptr(a0)));
+                    a0 = errno_ret(times(to_ptr_wr(a0)));
                     break;
                 case 154: // setpgid
                     rvvm_info("sys_setpgid(%lx, %lx)", a0, a1);
@@ -13292,7 +13292,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                             .version = "RVVM " RVVM_VERSION,
                             .machine = "riscv64",
                         };
-                        struct uapi_new_utsname* out = to_ptr_sz(a0, sizeof(*out));
+                        struct uapi_new_utsname* out = to_ptr_sz_wr(a0, sizeof(*out));
                         if (!out) {
                             a0 = -UAPI_EFAULT;
                             break;
@@ -13367,12 +13367,12 @@ case 179: // sysinfo
                     rvvm_info("sys_sysinfo(%lx)", a0);
 #ifdef __linux__
                     // TODO: struct conversion(?)
-                    a0 = errno_ret(sysinfo(to_ptr(a0)));
+                    a0 = errno_ret(sysinfo(to_ptr_wr(a0)));
 #else
                     /* No host sysinfo(): answer from the registry, so `ps`
                      * (which calls it before walking /proc) gets a workable
                      * structure instead of ENOSYS. */
-                    userland_fill_sysinfo(to_ptr_sz(a0, sizeof(struct uapi_sysinfo)));
+                    userland_fill_sysinfo(to_ptr_sz_wr(a0, sizeof(struct uapi_sysinfo)));
                     a0 = 0;
 #endif
                     break;
@@ -13475,7 +13475,7 @@ case 179: // sysinfo
                 case 202: { // accept
                     int        listen_fd = userland_fd_host(uctx(), (int)a0);
                     void*      sa = to_ptr_wr(a1);
-                    socklen_t* lp = to_ptr(a2);
+                    socklen_t* lp = to_ptr_wr(a2);
                     rvvm_info("sys_accept(guest %ld, host %d, %lx, %lx)", a0, listen_fd, a1, a2);
                     a0 = errno_ret(accept(listen_fd, sa, lp));
                     rvvm_info("  accept -> %ld (errno %d)", (long)a0, (long)a0 < 0 ? errno : 0);
@@ -13559,7 +13559,7 @@ case 179: // sysinfo
                 }
                 case 204: { // getsockname
                     void*      sa  = to_ptr_wr(a1);
-                    socklen_t* lp  = to_ptr(a2);
+                    socklen_t* lp  = to_ptr_wr(a2);
                     rvvm_info("sys_getsockname(%ld, %lx, %lx)", a0, a1, a2);
                     a0 = errno_ret(getsockname(userland_fd_host(uctx(), (int)a0), sa, lp));
                     if ((int64_t)a0 == 0 && sa && lp) {
@@ -13571,7 +13571,7 @@ case 179: // sysinfo
                 }
                 case 205: { // getpeername
                     void*      sa  = to_ptr_wr(a1);
-                    socklen_t* lp  = to_ptr(a2);
+                    socklen_t* lp  = to_ptr_wr(a2);
                     rvvm_info("sys_getpeername(%ld, %lx, %lx)", a0, a1, a2);
                     a0 = errno_ret(getpeername(userland_fd_host(uctx(), (int)a0), sa, lp));
                     if ((int64_t)a0 == 0 && sa && lp) {
