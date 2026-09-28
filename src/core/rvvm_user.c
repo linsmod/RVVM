@@ -999,9 +999,9 @@ static void* to_ptr(rvvm_addr_t addr)
 }
 
 // Writable counterpart of to_ptr(). Unshares the page on demand. Every writer
-// in the tree has to use this one; the set of them is reviewed line by line
-// because a missed writer is an access violation at run time rather than a
-// silently wrong result.
+// in the tree has to use this one; the set of them is classified by the syscall
+// ABI rather than by the call site, because for thirteen sites the call site says
+// nothing - see the classification tables in the commit message.
 static void* to_ptr_wr(rvvm_addr_t addr)
 {
     rvvm_machine_t* machine = cur_machine();
@@ -2416,6 +2416,34 @@ static THREAD_LOCAL rvvm_addr_t tls_cur_syscall;   // definition lives with it
 #define UAPI_TIOCSPGRP   0x5410
 #define UAPI_TIOCSCTTY   0x540E
 #define UAPI_TIOCNOTTY   0x5422
+
+/*
+ * ioctl's third argument is an out-parameter for the request codes that fill a
+ * buffer and a source for the ones that take a value, and the request code is the
+ * only thing that decides - nothing at the call site can tell, which is why the
+ * three ioctl call sites are textually identical and why reading them cannot
+ * settle it. This is the concrete case where the classification has to come from
+ * the ABI rather than from the code.
+ *
+ * The set-request list is short, and the default is writable because the two
+ * mistakes are not symmetric: treating a set-request as a get-request unshares a
+ * page unnecessarily - one 4 KiB copy on a path that is already a syscall - while
+ * treating a get-request as a set-request hands the emulator a pointer into the
+ * shared read-only base and faults inside the ioctl. An unrecognised request
+ * therefore gets the writable accessor.
+ */
+static void* to_ptr_ioctl(rvvm_addr_t addr, uint64_t cmd)
+{
+    switch (cmd) {
+    case UAPI_TIOCSPGRP:     // session leader group: a source
+    case UAPI_TIOCSCTTY:     // controlling terminal: a source
+    case UAPI_TIOCSPTLCK:    // unlockpt(): a source
+        return to_ptr(addr);
+    default:
+        // TCGETS, TIOCGWINSZ and TIOCGPTN fill; so may anything not listed.
+        return to_ptr_wr(addr);
+    }
+}
 #define UAPI_FIONREAD    0x541B
 /* Signals whose disposition the emulator has to act on itself, because it
  * cannot run a host-installed handler for the guest. asm-generic numbering, the
@@ -7804,11 +7832,11 @@ static void rvvm_msghdr_from_guest(struct msghdr* host, const struct uapi_msghdr
                                    struct iovec* iov_buf, size_t iov_count)
 {
     memset(host, 0, sizeof(*host));
-    host->msg_name       = guest->name ? to_ptr_sz(guest->name, guest->namelen) : NULL;
+    host->msg_name       = guest->name ? to_ptr_sz_wr(guest->name, guest->namelen) : NULL;
     host->msg_namelen    = guest->namelen;
     host->msg_iov        = iov_buf;
     host->msg_iovlen     = EVAL_MIN(guest->iovlen, iov_count);
-    host->msg_control    = guest->control ? to_ptr_sz(guest->control, guest->controllen) : NULL;
+    host->msg_control    = guest->control ? to_ptr_sz_wr(guest->control, guest->controllen) : NULL;
     host->msg_controllen = guest->controllen;
     host->msg_flags      = guest->flags;
 }
@@ -11643,7 +11671,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(epoll_wait(userland_fd_host(uctx(), (int)a0), host_evs, maxev, a3));
                     if ((ssize_t)a0 > 0 && a1) {
                         struct uapi_epoll_event* guest_evs =
-                            to_ptr_sz(a1, (size_t)a0 * sizeof(struct uapi_epoll_event));
+                            to_ptr_sz_wr(a1, (size_t)a0 * sizeof(struct uapi_epoll_event));
                         if (guest_evs) {
                             for (size_t i = 0; i < (size_t)a0; i++) {
                                 guest_evs[i].event = host_evs[i].events;
@@ -11852,7 +11880,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         // probes guest libc makes for isatty() itself instead
                         // of forwarding them to the host fd. fd 0 is included
                         // because it is the same console, only the input half.
-                        a0 = user_tty_ioctl(a1, a2 ? to_ptr(a2) : NULL,
+                        a0 = user_tty_ioctl(a1, a2 ? to_ptr_ioctl(a2, a1) : NULL,
                                             (int32_t)(thread->proc ? thread->proc->pid : 0));
                         break;
                     }
@@ -11862,14 +11890,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                         bool master = false;
                         int idev = -1;
                         if (userland_pty_by_fd(hfd, &pty, &master)) {
-                            a0 = (rvvm_addr_t)userland_pty_ioctl(pty, master, a1, a2 ? to_ptr(a2) : NULL,
+                            a0 = (rvvm_addr_t)userland_pty_ioctl(pty, master, a1, a2 ? to_ptr_ioctl(a2, a1) : NULL,
                                                                  thread);
                         } else if (userland_dev_by_fd(hfd, &idev) && idev == DEV_CONSOLE) {
                             /* /dev/console or /dev/ttyN: the termios and window
                              * size of the run's session, exactly as for an
                              * untracked fd 0/1/2 above. getty asks for both
                              * before it reads a login name. */
-                            a0 = user_tty_ioctl(a1, a2 ? to_ptr(a2) : NULL,
+                            a0 = user_tty_ioctl(a1, a2 ? to_ptr_ioctl(a2, a1) : NULL,
                                                 (int32_t)(thread->proc ? thread->proc->pid : 0));
                         } else {
                             a0 = errno_ret(ioctl(hfd, a1, a2));
@@ -12270,7 +12298,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 }
                 case 61: { // getdents64
-                    void* dirp = a2 ? to_ptr_sz(a1, a2) : NULL;
+                    void* dirp = a2 ? to_ptr_sz_wr(a1, a2) : NULL;
                     a0 = (a2 && !dirp) ? (rvvm_addr_t)-UAPI_EFAULT
                          : (rvvm_addr_t)rvvm_sys_getdents64(userland_fd_host(uctx(), (int)a0), dirp, a2);
                     break;
@@ -12292,7 +12320,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 }
                 case 63: { // read
-                    void* buf = a2 ? to_ptr_sz(a1, a2) : NULL;
+                    void* buf = a2 ? to_ptr_sz_wr(a1, a2) : NULL;
                     if (a2 && !buf) {
                         a0 = -UAPI_EFAULT;
                         break;
@@ -12583,7 +12611,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 }
                 case 67: { // pread64
-                    void* buf = a2 ? to_ptr_sz(a1, a2) : NULL;
+                    void* buf = a2 ? to_ptr_sz_wr(a1, a2) : NULL;
                     int   pfd = userland_fd_host(uctx(), (int)a0);
                     if (a2 && !buf) {
                         a0 = -UAPI_EFAULT;
@@ -12622,7 +12650,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_sendfile(%ld, %ld, %lx, %lx)", a0, a1, a2, a3);
                     /* The offset is an in/out parameter: NULL means "take the
                      * input's own position" - and advance it. */
-                    int64_t* off = a2 ? to_ptr_sz(a2, sizeof(*off)) : NULL;
+                    int64_t* off = a2 ? to_ptr_sz_wr(a2, sizeof(*off)) : NULL;
                     if (a2 && !off) {
                         a0 = -UAPI_EFAULT;
                         break;
@@ -12638,7 +12666,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 78: // readlinkat
                     rvvm_info("sys_readlinkat(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
-                    a0 = rvvm_sys_readlinkat(userland_fd_host(uctx(), (int)a0), to_str(a1), to_ptr(a2), a3);
+                    a0 = rvvm_sys_readlinkat(userland_fd_host(uctx(), (int)a0), to_str(a1), to_ptr_wr(a2), a3);
                     break;
                 case 79: { // newfstatat
                     struct stat st = {0};
@@ -12938,7 +12966,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     if (ret == 0) {
                         // A NULL target has nothing to write back to; that is
                         // not worth faulting on, POSIX allows it for getres/clock_gettime alike
-                        struct uapi_timespec* out = to_ptr(a1);
+                        struct uapi_timespec* out = to_ptr_wr(a1);
                         if (out) {
                             uapi_ts_from_host(out, &ts);
                         }
@@ -12953,7 +12981,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_clock_getres(%lx, %lx)", a0, a1);
                     ret = clock_getres(a0, &ts);
                     if (ret == 0) {
-                        struct uapi_timespec* out = to_ptr(a1);
+                        struct uapi_timespec* out = to_ptr_wr(a1);
                         if (out) {
                             uapi_ts_from_host(out, &ts);
                         }
@@ -13121,7 +13149,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         // a3 is the guest sigsetsize; the whole struct sigaction
                         // must never spill past one siga[] slot
                         size_t copy_len = a3 < sizeof(ctx->siga[0]) ? a3 : sizeof(ctx->siga[0]);
-                        void* old = a2 ? to_ptr_sz(a2, copy_len) : NULL;
+                        void* old = a2 ? to_ptr_sz_wr(a2, copy_len) : NULL;
                         const void* act = a1 ? to_ptr_sz(a1, copy_len) : NULL;
                         if ((a2 && !old) || (a1 && !act)) {
                             a0 = -UAPI_EFAULT;
@@ -13150,7 +13178,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 135: // rt_sigprocmask
                     rvvm_info("sys_rt_sigprocmask(%ld, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    a0 = errno_ret(sigprocmask(a0, to_ptr(a1), to_ptr(a2)));
+                    a0 = errno_ret(sigprocmask(a0, to_ptr(a1), to_ptr_wr(a2)));
                     break;
                 case 137: { // rt_sigtimedwait_time32
                     /* The one process-wide pending slot is the whole signal
@@ -13272,7 +13300,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 158: // getgroups
                     RVVM_TRC(RVVM_TRC_SYS, "sys_getgroups(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(getgroups(a0, to_ptr(a1)));
+                    a0 = errno_ret(getgroups(a0, to_ptr_wr(a1)));
                     break;
                 case 159: // setgroups
                     if (uctx()->fake_root) {
@@ -13304,7 +13332,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 165: // getrusage
                     rvvm_info("sys_getrusage(%lx, %lx)", a0, a1);
-                    a0 = errno_ret(getrusage(a0, to_ptr(a1)));
+                    a0 = errno_ret(getrusage(a0, to_ptr_wr(a1)));
                     break;
                 case 166: { // umask
                     /* Kept per address space rather than handed to the host.
@@ -13332,7 +13360,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 169: { // gettimeofday
                     // a1 is struct timezone* - obsolete: the kernel ignores it
                     // and every libc passes NULL, so accept it and drop it.
-                    struct uapi_timeval* tv = a0 ? to_ptr_sz(a0, sizeof(*tv)) : NULL;
+                    struct uapi_timeval* tv = a0 ? to_ptr_sz_wr(a0, sizeof(*tv)) : NULL;
                     if (a0 && !tv) {
                         a0 = -UAPI_EFAULT;
                     } else {
@@ -13591,7 +13619,7 @@ case 179: // sysinfo
                     // TODO: struct conversion(?)
                     rvvm_info("sys_recvfrom(%ld, %lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4, a5);
                     a0 = errno_ret(recvfrom(userland_fd_host(uctx(), (int)a0),
-                                            to_ptr(a1), a2, a3, to_ptr(a4), to_ptr(a5)));
+                                            to_ptr_wr(a1), a2, a3, to_ptr_wr(a4), to_ptr_wr(a5)));
                     break;
                 case 208: // setsockopt
                     rvvm_info("sys_setsockopt(%ld, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4);
@@ -13599,7 +13627,7 @@ case 179: // sysinfo
                     break;
                 case 209: // getsockopt
                     rvvm_info("sys_getsockopt(%ld, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4);
-                    a0 = errno_ret(getsockopt(userland_fd_host(uctx(), (int)a0), a1, a2, to_ptr(a3), to_ptr(a4)));
+                    a0 = errno_ret(getsockopt(userland_fd_host(uctx(), (int)a0), a1, a2, to_ptr_wr(a3), to_ptr_wr(a4)));
                     break;
                 case 210: // shutdown
                     rvvm_info("sys_shutdown(%ld, %lx)", a0, a1);
@@ -13728,7 +13756,7 @@ case 179: // sysinfo
                     int flags = (int)a3;
                     /* Same as socket(): the ABI's flags are taken off the host
                      * call and applied here. */
-                    a0 = errno_ret(accept4(userland_fd_host(uctx(), (int)a0), to_ptr(a1), to_ptr(a2),
+                    a0 = errno_ret(accept4(userland_fd_host(uctx(), (int)a0), to_ptr_wr(a1), to_ptr_wr(a2),
                                            a3 & ~UAPI_SOCK_TYPE_MASK));
                     if ((int64_t)a0 >= 0) {
                         int host_fd  = (int)a0;
@@ -13778,19 +13806,19 @@ case 179: // sysinfo
                     // TODO: Struct conversion (the rusage argument follows the
                     // guest's 64-bit timeval layout, not the host's)
                     rvvm_info("sys_wait4(%lx, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    int* status = a1 ? to_ptr_sz(a1, sizeof(int)) : NULL;
+                    int* status = a1 ? to_ptr_sz_wr(a1, sizeof(int)) : NULL;
                     if (a1 && !status) {
                         a0 = -UAPI_EFAULT;
                         break;
                     }
                     /* The guest's pids are the emulator's own, so the filter is
                      * resolved in rvvm_sys_wait4() - it is never a host pid. */
-                    a0 = rvvm_sys_wait4(uctx(), thread, (int32_t)a0, status, (int)a2, to_ptr(a3));
+                    a0 = rvvm_sys_wait4(uctx(), thread, (int32_t)a0, status, (int)a2, to_ptr_wr(a3));
                     break;
                 }
                 case 261: { // prlimit64
                     rvvm_info("sys_prlimit64(%lx, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    a0 = rvvm_sys_prlimit(a0, (int)a1, to_ptr(a2), to_ptr(a3));
+                    a0 = rvvm_sys_prlimit(a0, (int)a1, to_ptr(a2), to_ptr_wr(a3));
                     break;
                 }
 #ifdef __linux__
@@ -13818,7 +13846,7 @@ case 179: // sysinfo
                     a0 = 0;
                     break;
                 case 278: { // getrandom
-                    void* buf = a1 ? to_ptr_sz(a0, a1) : NULL;
+                    void* buf = a1 ? to_ptr_sz_wr(a0, a1) : NULL;
                     if (a1 && !buf) {
                         a0 = -UAPI_EFAULT;
                         break;
@@ -13852,7 +13880,7 @@ case 179: // sysinfo
                     // kernel UAPI type, guest and host layouts are identical
                     // (asserted above), unlike struct stat.
                     rvvm_info("sys_statx(%ld, %s, %lx, %lx, %lx)", a0, to_str(a1), a2, a3, a4);
-                    struct statx* stx = to_ptr_sz(a4, sizeof(*stx));
+                    struct statx* stx = to_ptr_sz_wr(a4, sizeof(*stx));
                     if (!stx) {
                         a0 = -UAPI_EFAULT;
                     } else {
