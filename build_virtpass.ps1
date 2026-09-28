@@ -13,7 +13,7 @@
     invocation (so -jN is shared by all goals of the run):
 
       all     -> bin android vp-sdk   (default when -Target is omitted)
-      win32   -> guest-assets + bin + pack-apps  (guest ELFs, the Windows binaries, and the bundle they boot from)
+      win32   -> guest-assets + bin + pack-apps + fetch-rootfs  (guest ELFs, the Windows binaries, and the whole bundle they boot from)
       apk     -> android              (guest assets + librvvm_jni.so + APK)
       android -> same as apk
       assets  -> guest-assets         (zig/musl riscv64 guest ELFs into the build tree)
@@ -112,7 +112,11 @@ if (($env:PATH -split ';') -notcontains $mingwBin) {
 # --- -Target -> make goals (the single source of truth for what gets built) ---
 $targetMap = @{
     'all'     = @('bin', 'android', 'vp-sdk')
-    'win32'   = @('guest-assets', 'bin', 'pack-apps')
+    # win32 needs fetch-rootfs as well as the two packers: a host resolves
+    # bundle/rootfs.tar.gz next to its own binary, and without it the rootfs
+    # mount fails outright ("running without a guest rootfs") - the build then
+    # produces binaries that cannot boot. pack-apps already pulls in pack-system.
+    'win32'   = @('guest-assets', 'bin', 'pack-apps', 'fetch-rootfs')
     'apk'     = @('android')
     'android' = @('android')
     'assets'  = @('guest-assets')
