@@ -139,6 +139,30 @@ uint64_t win_socket_anchor_gen(int fd);
 void win_socket_anchor_ref(int fd);
 void win_socket_anchor_unref(int fd);
 int  win_socket_close(int fd);
+#else
+/* Not a WinSock build, so the anchors do not exist - and a guest socket here is
+ * a real host socket, with no anchor table, no generation and no reference to
+ * take. "This number is not an anchor" is therefore the true answer, not a
+ * placeholder.
+ *
+ * Stubs rather than an #if at each call site, because that is the whole point:
+ * ten call sites each carrying their own `#if defined(_WIN32)` is ten chances
+ * for the next one to be added without it, and that is how the Android build
+ * came to stop compiling - ac9041b introduced the anchor generation and put its
+ * call sites in unguarded, so clang failed on every one of them with "call to
+ * undeclared function".
+ *
+ * Each stub answers what win_socket.c answers for a number that is not a live
+ * anchor, and every caller is already written against that: each one either
+ * tests the answer, or sits in a branch only an anchor can reach. The fd slot's
+ * anchor_gen field stays in the struct and stays 0 here, which is precisely the
+ * "no generation" the stale-anchor check above it looks for. */
+static inline int         win_socket_is_fd(int fd)       { (void)fd; return 0; }
+static inline const char* win_socket_peer_str(int fd)    { (void)fd; return "?"; }
+static inline uint64_t    win_socket_anchor_gen(int fd)  { (void)fd; return 0; }
+static inline void        win_socket_anchor_ref(int fd)  { (void)fd; }
+static inline void        win_socket_anchor_unref(int fd) { (void)fd; }
+static inline int         win_socket_close(int fd)       { (void)fd; return -1; }
 #endif
 #include "elf_load.h"
 #include "mem_ops.h"
