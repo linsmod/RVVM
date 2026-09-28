@@ -1,6 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- The guest's sockets are this app's sockets: rvvm_user.c serves the
+         guest's socket()/connect()/sendto() with the host's own syscalls, in
+         this process, under this UID. Android blocks network syscalls for a UID
+         that does not hold INTERNET, so without it the guest is a closed box -
+         the symptom being apk reporting "DNS: non-recoverable failure" even
+         though /etc/resolv.conf (tools/pack_system.py) is present and correct.
+         The win32 host has no equivalent gate, which is why this only ever
+         showed up on Android. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
 
     <application
