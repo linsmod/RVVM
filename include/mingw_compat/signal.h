@@ -134,4 +134,16 @@ static inline int sigismember(const sigset_t* set, int sig)
 int sigaction(int sig, const struct sigaction* act, struct sigaction* old);
 int sigprocmask(int how, const sigset_t* set, sigset_t* old);
 
+/* The host instruction that faulted, and - when it lies inside the main image -
+ * its RVA. Takes the `void* ucontext` a SA_SIGINFO handler is given, which this
+ * shim fills with the EXCEPTION_POINTERS its Vectored Exception Handler was
+ * called with. *rva comes back 0 when the address is not in the main image (a
+ * fault inside a DLL), because a PE's load base is randomised and a raw address
+ * on its own is not something a symbolizer can be handed.
+ *
+ * This exists because a fault block that reports only the *guest* PC and the
+ * guest registers says what the guest was doing and nothing about the emulator
+ * line that was servicing it - which is where the fault was, every time. */
+void* shim_fault_host_pc(void* ucontext, unsigned long long* rva);
+
 #endif /* RVVM_MINGW_SIGNAL_H */

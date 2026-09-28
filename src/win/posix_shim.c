@@ -3011,6 +3011,46 @@ static LONG CALLBACK shim_veh(EXCEPTION_POINTERS* ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* The host instruction behind a fault, for the fault block in rvvm_user.c.
+ *
+ * A SA_SIGINFO handler is handed the EXCEPTION_POINTERS this shim was called
+ * with as its `void* ucontext` (see shim_veh above), and that record is the only
+ * place the faulting *host* instruction is available: the siginfo carries the
+ * address that was accessed, not the code that touched it.
+ *
+ * The RVA is reported next to the raw address because a PE image loads at a
+ * randomised base, so `0x7ff7....` cannot be handed to addr2line as it stands.
+ * Subtracting the main image's base is what makes it a link-time address again,
+ * and this is the only place that knows the base - so the caller is spared the
+ * arithmetic it cannot do without a windows.h. */
+void* shim_fault_host_pc(void* ucontext, unsigned long long* rva)
+{
+    if (rva) {
+        *rva = 0;
+    }
+    if (!ucontext) {
+        return NULL;
+    }
+    EXCEPTION_RECORD* rec = ((EXCEPTION_POINTERS*)ucontext)->ExceptionRecord;
+    if (!rec) {
+        return NULL;
+    }
+    uintptr_t pc = (uintptr_t)rec->ExceptionAddress;
+    if (rva) {
+        HMODULE self = GetModuleHandleA(NULL);
+        if (self) {
+            IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)self;
+            IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((uint8_t*)self + dos->e_lfanew);
+            uintptr_t base = (uintptr_t)self;
+            uintptr_t end  = base + nt->OptionalHeader.SizeOfImage;
+            if (pc >= base && pc < end) {
+                *rva = (unsigned long long)(pc - base);
+            }
+        }
+    }
+    return (void*)pc;
+}
+
 int sigaction(int sig, const struct sigaction* act, struct sigaction* old)
 {
     if (sig < 1 || sig >= _NSIG) {
