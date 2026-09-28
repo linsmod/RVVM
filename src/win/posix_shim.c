@@ -1419,7 +1419,14 @@ int openat(int dirfd, const char* path, int flags, ...)
         va_end(ap);
     }
     if ((flags & SHIM_O_TMPFILE_MARK) == SHIM_O_TMPFILE_MARK) {
-        return shim_tmpfile_open(dirfd, mode);
+        /* O_TMPFILE does not carry O_CREAT, so the mode argument is not read
+         * above - and neither does musl read it on the guest side, which is why
+         * the kernel substitutes its own 0600 default for this case. Handing the
+         * 0 we defaulted to on through instead would _chmod() the placeholder to
+         * 0, and on Windows a mode without a write bit is FILE_ATTRIBUTE_READONLY:
+         * the file comes out unwritable, `ls` reports mode 0, and Windows then
+         * refuses to delete it (see unlinkat). */
+        return shim_tmpfile_open(dirfd, (flags & O_CREAT) ? mode : 0600);
     }
     if (at_path(dirfd, path, full, sizeof(full))) {
         return -1;
@@ -1482,10 +1489,30 @@ int unlinkat(int dirfd, const char* path, int flags)
     if (_unlink(full) == 0) {
         return 0;
     }
-    /* A symlink to a directory (or a junction) is a directory object: POSIX
-     * unlink(2) removes the link in either case, so retry accordingly. */
-    if (shim_path_is_reparse(full) && _rmdir(full) == 0) {
-        return 0;
+    /* Windows refuses to delete a file that carries FILE_ATTRIBUTE_READONLY, and
+     * _chmod() puts that attribute on whenever the guest's mode has no write
+     * bit - which is what shim_tmpfile_open() does for every O_TMPFILE
+     * placeholder, so an abandoned one (apk's atomic database updates make
+     * hundreds) could never be removed again, by the guest or by a sweep.
+     *
+     * POSIX has no such rule: unlink() needs write permission on the *directory*,
+     * never on the file, so a guest must be able to remove its own read-only
+     * file. Clear the attribute and retry. The first errno is what we report if
+     * neither retry works out, so the reason for the failure survives. */
+    {
+        int   first_errno = errno;
+        DWORD attrs      = GetFileAttributesA(full);
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY) &&
+            SetFileAttributesA(full, attrs & ~(DWORD)FILE_ATTRIBUTE_READONLY) &&
+            _unlink(full) == 0) {
+            return 0;
+        }
+        /* A symlink to a directory (or a junction) is a directory object: POSIX
+         * unlink(2) removes the link in either case, so retry accordingly. */
+        if (shim_path_is_reparse(full) && _rmdir(full) == 0) {
+            return 0;
+        }
+        errno = first_errno;
     }
     return -1;
 }
