@@ -3981,8 +3981,9 @@ static rvvm_addr_t rvvm_sys_asset_open(const char* name, int flags)
     rvvm_userland_t* ctx = uctx();
     int fd;
 
-    /* O_ACCMODE != O_RDONLY, or a flag that would create / truncate / append -
-     * the same bit numbers uapi_open_flags() translates above. */
+    /* O_ACCMODE != O_RDONLY, or a flag that would create / truncate / append.
+     * Guest-space numbers, and checked as such: `flags` is still the guest's
+     * word here, the host numbering only comes into play in uapi_open_flags(). */
     if ((flags & 3) != 0 || (flags & (0x40 | 0x80 | 0x200 | 0x400))) {
         return -UAPI_EROFS;
     }
@@ -4476,13 +4477,38 @@ static void unwrap_guest_sockaddr(void* addr, unsigned int* len)
 #define UAPI_O_EXCL      0x0080
 #define UAPI_O_TRUNC     0x0200
 #define UAPI_O_APPEND    0x0400
+/* The three flags a Linux host does NOT number the way the guest does, so
+ * uapi_open_flags() has to move them by hand. Measured, not remembered:
+ * `zig cc -target riscv64-linux-musl` against the NDK's <fcntl.h> for arm32 and
+ * arm64 (both identical, so this is not a 32-bit problem):
+ *
+ *   flag         guest    host    the guest's bit is the host's...
+ *   O_DIRECTORY  0x10000  0x4000  O_DIRECT
+ *   O_NOFOLLOW   0x20000  0x8000  O_LARGEFILE
+ *   O_DIRECT     0x04000  0x10000 O_DIRECTORY
+ *
+ * Everything else the guest can set - the accmode, O_CREAT/EXCL/TRUNC/APPEND,
+ * O_NONBLOCK, O_DSYNC, O_ASYNC, O_CLOEXEC, O_NOATIME, O_PATH - is numbered
+ * identically on both sides and passes through untouched. */
+#define UAPI_O_DIRECTORY 0x10000
+#define UAPI_O_NOFOLLOW  0x20000
+#define UAPI_O_DIRECT    0x04000
+#define UAPI_O_MOVED     (UAPI_O_DIRECTORY | UAPI_O_NOFOLLOW | UAPI_O_DIRECT)
 
 /* Guest open(2) flags -> host open() flags.
  *
- * On a Linux host the two sets are identical, so this passes through. The
- * win32 CRT numbers them differently (O_CREAT 0x40 vs 0x100, O_APPEND 0x400 vs
- * 0x8, O_EXCL 0x80 vs 0x400) and has no equivalent for O_DIRECTORY / O_CLOEXEC
- * / O_NONBLOCK / O_NOFOLLOW / O_PATH, while some guest bits would even alias a
+ * A Linux host agrees with the guest on every flag except the three above, so
+ * those are translated and the rest passes through. That used to be a bare
+ * `return flags`, which quietly assumed the whole namespace matched - and a
+ * guest opendir() then arrived on the host as O_RDONLY|O_DIRECT and failed with
+ * EINVAL. That is what made `ls <dir>` report "can't open '/bin': Invalid
+ * argument" and apk report "Unable to open root: Invalid argument" on Android,
+ * while every file operation (no O_DIRECTORY) worked: the only thing broken was
+ * the flags a directory open is the sole user of.
+ *
+ * The win32 CRT is a different story and gets the full table: it renumbers
+ * O_CREAT/O_EXCL/O_APPEND, has no equivalent for O_DIRECTORY / O_CLOEXEC /
+ * O_NONBLOCK / O_NOFOLLOW / O_PATH, and some guest bits would even alias a
  * *different* CRT flag (the guest's O_NOCTTY 0x100 would be read as _O_CREAT,
  * silently creating files). Everything without an equivalent is dropped; the
  * CRT layer adds _O_BINARY itself. */
@@ -4504,7 +4530,13 @@ static int uapi_open_flags(int flags)
     }
     return host;
 #else
-    return flags;
+    int host = flags & ~UAPI_O_MOVED;
+    /* The host's own <fcntl.h> decides what these become, so this is right on
+     * Linux, Android and the BSDs without a table to keep in step. */
+    if (flags & UAPI_O_DIRECTORY) host |= O_DIRECTORY;
+    if (flags & UAPI_O_NOFOLLOW)  host |= O_NOFOLLOW;
+    if (flags & UAPI_O_DIRECT)    host |= O_DIRECT;
+    return host;
 #endif
 }
 
@@ -11856,7 +11888,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                             /* O_DIRECTORY, or the mount root itself, is a
                              * listing: it gets a synthetic fd the getdents64
                              * path knows. Everything else is a file. */
-                            if ((a2 & 0x10000) || !*asset) {
+                            if ((a2 & UAPI_O_DIRECTORY) || !*asset) {
                                 a0 = rvvm_sys_asset_opendir(asset, a2);
                             } else {
                                 a0 = rvvm_sys_asset_open(asset, a2);
