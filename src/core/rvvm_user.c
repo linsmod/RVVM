@@ -6026,8 +6026,75 @@ static void userland_finish_threads(rvvm_userland_t* ctx, rvvm_process_t* proc, 
  * comes through here too, and any process of the address space may still have
  * threads - a host stop takes them all down.
  */
+/*
+ * Every address space this run forked, taken down with it.
+ *
+ * A fork() gets a machine of its own, so nothing the run root does reaches it:
+ * userland_finish_threads() below walks this ctx's registry, and a child keeps
+ * its threads registered in its own. When the run ended, those machines were
+ * simply left running and went when the host process did - no signal, no chance
+ * to clean up, and userland_destroy() never called for any of them.
+ *
+ * SIGKILL and no waiting, which is the shape this stands in for: a cgroup being
+ * torn down, not init exiting. It also keeps this non-blocking, which matters
+ * because it runs on the very address space that is on its way out.
+ *
+ * Finishing the threads is what lets each child machine finish with itself:
+ * rvvm_user_child_main() waits for its own registry to empty and calls
+ * userland_destroy() when it does, so from here on the teardown is theirs and
+ * this does not have to wait for it.
+ *
+ * The records are marked under the registry lock but the threads are finished
+ * after that lock is dropped: userland_finish_threads() takes the child address
+ * space's own thread lock, and telling the parent from under the registry lock
+ * would come back around into it. No SIGCHLD either - the parent is the one
+ * leaving, and there is nobody left to tell.
+ */
+#define USERLAND_FAMILY_KILL_BATCH 16
+static void userland_kill_family(rvvm_userland_t* ctx)
+{
+    RVVM_TRC(RVVM_TRC_JOB, "family: run root %u taking down %u record(s)", ctx->pid,
+             (unsigned)vector_size(ctx->procs));
+    for (;;) {
+        rvvm_userland_t* kids[USERLAND_FAMILY_KILL_BATCH];
+        size_t           n    = 0;
+        bool             more;
+
+        spin_lock(&ctx->proc_lock);
+        vector_foreach(ctx->procs, i) {
+            rvvm_process_t* proc = vector_at(ctx->procs, i);
+            if (n >= USERLAND_FAMILY_KILL_BATCH) {
+                break;
+            }
+            /* child_ctx is what makes this a machine of its own; a process
+             * without one is a thread of ours, and the caller already handles
+             * those. An already-exited record is left for the next pass - the
+             * mark is what the pass counts, so this terminates. */
+            if (!proc->child_ctx || atomic_load_uint32(&proc->exited)) {
+                continue;
+            }
+            userland_proc_exit(proc, userland_exit_status(128 + UAPI_SIGKILL));
+            RVVM_TRC(RVVM_TRC_JOB, "family: pid=%u machine torn down with the run", proc->pid);
+            kids[n++] = proc->child_ctx;
+        }
+        more = n == USERLAND_FAMILY_KILL_BATCH;
+        spin_unlock(&ctx->proc_lock);
+
+        for (size_t i = 0; i < n; i++) {
+            userland_finish_threads(kids[i], NULL, NULL);
+        }
+        if (!more) {
+            break;
+        }
+    }
+}
+
 static void userland_process_exit(rvvm_userland_t* ctx, int code, rvvm_user_thread_t* self)
 {
+    /* First, so nothing is still running by the time the host is told the run
+     * ended. */
+    userland_kill_family(ctx);
+
     if (atomic_swap_uint32(&ctx->userland_exit_reported, 1) == 0 && ctx->exit_callback) {
         // The machine goes with the code: rvvm_user_stop() may fire this on
         // the calling host thread, where no TLS hart exists to identify the
