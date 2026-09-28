@@ -362,6 +362,98 @@ static void ash_rootfs_unlock(const char* path)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Being stopped from outside                                          */
+/*                                                                     */
+/* Windows hands a console process these when something outside stops */
+/* it: the console going away - the window being closed, which is    */
+/* what the task manager's "End task" does to a console program, plus */
+/* logoff and shutdown - and Ctrl+C / Ctrl+Break, the same request   */
+/* made at the keyboard.                                              */
+/*                                                                     */
+/* Left unhandled, the process is torn down where it stands and the  */
+/* caller sees whatever code the killer chose:                       */
+/* STATUS_CONTROL_C_EXIT, 0xC000013A. That is an NTSTATUS where a    */
+/* caller expects an exit code, it is not in the set ash_core.h      */
+/* declares closed, and it reads as neither "stopped cleanly" nor a  */
+/* number anyone can act on. So every catchable stop is answered     */
+/* with ASH_EXIT_TERMINATED, which says the one thing that is true   */
+/* of all of them: the run was cut short, and the guest never        */
+/* decided anything.                                                  */
+/*                                                                     */
+/* A console handler runs on a thread of its own and on a deadline,  */
+/* so it does only what is safe there: the two registrations this   */
+/* core owns are file deletes, each guarded by the pid already       */
+/* recorded in it (a lock a later run has since reclaimed is left    */
+/* alone, as on the orderly path), and then it leaves at once.       */
+/* Anything heavier - asking the guest to shut down - would be a     */
+/* wait on threads that are not going to answer, and the deadline    */
+/* would run out while it waited.                                    */
+/*                                                                     */
+/* A hard TerminateProcess (Stop-Process -Force, taskkill /F) is    */
+/* not a control event and cannot be caught by anyone, so that one   */
+/* still exits with the killer's code.                               */
+/* ------------------------------------------------------------------ */
+
+/* The port this process registered a core under, or -1 when it is not a core. */
+static int ash_serve_port = -1;
+
+static BOOL WINAPI ash_console_ctrl(DWORD type)
+{
+    char    line[128];
+    HANDLE  err = GetStdHandle(STD_ERROR_HANDLE);
+    int     n;
+
+    switch (type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    /* The console going away: the window being closed, which is what the task
+     * manager's "End task" does to a console program, plus logoff and shutdown. */
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        break;
+    default:
+        return FALSE;
+    }
+
+    if (ash_serve_port >= 0 && ash_core_pid(ash_serve_port) == GetCurrentProcessId()) {
+        char core[MAX_PATH];
+        if (ash_core_file(ash_serve_port, core, sizeof(core))) {
+            DeleteFileA(core);
+        }
+    }
+    {
+        char lock[MAX_PATH];
+        if (ash_lock_path(lock, sizeof(lock)) && ash_lock_pid(lock) == GetCurrentProcessId()) {
+            DeleteFileA(lock);
+        }
+    }
+
+    /* WriteFile, not fprintf: stdio can be held by another thread at this
+     * point, and a console handler that blocks is one Windows simply kills -
+     * which would put us back to reporting the killer's code. */
+    n = snprintf(line, sizeof(line),
+                 "ash: terminated from outside (console control event %lu), "
+                 "leaving with ASH_EXIT_TERMINATED\n", (unsigned long)type);
+    if (n > 0 && err != NULL && err != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(err, line, (DWORD)n, &written, NULL);
+    }
+    ExitProcess(ASH_EXIT_TERMINATED);
+    return TRUE;
+}
+
+void ash_install_termination_handler(void)
+{
+    static bool installed = false;
+
+    if (!installed) {
+        installed = true;
+        SetConsoleCtrlHandler(ash_console_ctrl, TRUE);
+    }
+}
+
 int ash_serve(int port, int idle_s, const char* dlog)
 {
     const char* shell = ash_default_core_shell();
@@ -437,6 +529,9 @@ int ash_serve(int port, int idle_s, const char* dlog)
     }
 
     ash_core_register(port, shell);
+    /* From here the run owns a port, so a control event has a registration to
+     * drop (see ash_console_ctrl). Cleared again on the way out, below. */
+    ash_serve_port = port;
     fprintf(stderr, "ash: core up (shell %s, port %d%s%s) - connect with `ash`\n",
             shell, port, idle_s > 0 ? ", idle " : "", idle_s > 0 ? idle_buf : "");
     rc = win32_host_wait_guest();
@@ -446,6 +541,7 @@ int ash_serve(int port, int idle_s, const char* dlog)
      * log that explains the run, so nothing is lost by not returning it. */
     fprintf(stderr, "ash: core stopped (the guest program left with %d)\n", rc);
     ash_core_unregister(port);
+    ash_serve_port = -1;
     ash_rootfs_unlock(lock);
     win32_host_shutdown();
     return rc == 0 ? ASH_EXIT_OK : ASH_EXIT_GUEST_NONZERO;

@@ -120,6 +120,12 @@ int main(int argc, char** argv)
         }
     }
 
+    /* Before any mode runs, so every one of them reports a stop from outside the
+     * same way (see ASH_EXIT_TERMINATED). A client inside a session is unaffected:
+     * that console is in raw mode, so a ^C is a byte to the guest rather than a
+     * control event to this process. */
+    ash_install_termination_handler();
+
     if (list) {
         return ash_list();
     }

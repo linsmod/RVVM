@@ -43,6 +43,24 @@
  * that nothing had happened. The status itself is on the core's stderr. */
 #define ASH_EXIT_GUEST_NONZERO 69
 
+/* The run was cut short from outside, and the guest never decided anything: the
+ * console went away - the window being closed, which is what the task manager's
+ * "End task" does to a console program, plus logoff and shutdown - or Ctrl+C /
+ * Ctrl+Break, the same stop requested at the keyboard.
+ *
+ * Without this, every one of those leaves the process with STATUS_CONTROL_C_EXIT
+ * (0xC000013A): an NTSTATUS where a caller expects an exit code, and not a member
+ * of the set this header declares closed.
+ *
+ * Reachable only for the terminations Windows delivers as a control event. A hard
+ * TerminateProcess - Stop-Process -Force, taskkill /F - ends the process before any
+ * code of ours can run, so that one still exits with whatever value the killer
+ * chose; there is no process left to choose with. */
+#define ASH_EXIT_TERMINATED 70
+
+/* Installed once from main(), before any mode runs. */
+void ash_install_termination_handler(void);
+
 /* Implemented in ash_client.c */
 int ash_serve(int port, int idle_s, const char* dlog);
 int ash_client(int port, const char* one_cmd, bool autostart);
