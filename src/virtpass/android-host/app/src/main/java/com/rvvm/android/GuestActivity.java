@@ -119,6 +119,12 @@ public class GuestActivity extends Activity {
     private SurfaceHolder.Callback2 surfaceCallback;
     private TextureView consoleView;  // optional TTY overlay
     private FitFrameLayout videoArea; // letterbox container
+    /** Whether this guest has ever produced a frame, i.e. whether it has
+     *  graphics at all. A console-only guest (test_busybox, an ash session)
+     *  never draws, so its video layer must stay hidden - the SurfaceView is
+     *  opaque black and sits ON TOP of the TTY console, so revealing it for a
+     *  guest with nothing to draw is a black screen. */
+    private boolean videoRevealed = false;
     private FrameLayout consoleContainer; // holds consoleView + ttyInput
     private TtyEditText ttyInput;     // keyboard/IME focus target
     private TextView statusBar;       // floating overlay for status messages
@@ -230,6 +236,7 @@ public class GuestActivity extends Activity {
         // visibility as GlWindowCard: the surface stays alive at 1x1 but
         // nothing is shown until the guest has something to draw.
         videoArea.setVisibility(View.INVISIBLE);
+        videoRevealed = false;
 
         // Status text lives in the layout at the key bar's slot; it replaces
         // the key bar when the guest exits in stay-open mode.
@@ -301,6 +308,7 @@ public class GuestActivity extends Activity {
             if (videoArea != null && videoArea.getVisibility() != View.VISIBLE) {
                 videoArea.setVisibility(View.VISIBLE);
             }
+            videoRevealed = true;
         });
         RvvmNative.nativeSetFrameCallback(frameCallback);
 
@@ -704,7 +712,14 @@ public class GuestActivity extends Activity {
         // waiting for it on re-entry would leave an INVISIBLE SurfaceView -
         // which gets no surface at all, and the guest would run windowless
         // (every frame's lock failing).
-        if (isGuestStarted && RvvmNative.nativeIsGuestRunning(guestId)) {
+        //
+        // ...but only for a guest that HAS drawn. The reveal is content-driven,
+        // and a console-only guest has no content coming: revealing its empty
+        // black SurfaceView on top of the TTY console is the black screen this
+        // used to turn every re-entry into. videoRevealed is what "has graphics"
+        // means here, and it is a property of the run, so it survives the
+        // pause (surfaceDestroyed hides the layer without clearing this).
+        if (videoRevealed && isGuestStarted && RvvmNative.nativeIsGuestRunning(guestId)) {
             videoArea.setVisibility(View.VISIBLE);
         }
 
