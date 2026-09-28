@@ -4548,6 +4548,32 @@ static void user_fault_hex(char** p, uint64_t val)
     *(*p)++ = '\n';
 }
 
+/* The host instruction that faulted.
+ *
+ * The block below otherwise reports the *guest* PC and the guest registers,
+ * which say what the guest was doing and nothing about the emulator line that
+ * was servicing it - and the emulator line is where the fault was, every time
+ * this block has been read. A host PC alone is not quite enough on Win32: the
+ * PE's load base is randomised, so the address is reported next to its RVA,
+ * which is what a symbolizer can be handed.
+ *
+ * Linux carries the instruction pointer in the signal context; MinGW has no such
+ * context, so the project's signal shim passes its Vectored Exception Handler's
+ * EXCEPTION_POINTERS in the same argument (see shim_fault_host_pc). */
+static void* fault_host_pc(void* ucontext, unsigned long long* rva)
+{
+    *rva = 0;
+#if defined(RVVM_MINGW_SIGNAL_H)
+    return shim_fault_host_pc(ucontext, rva);
+#elif defined(REG_RIP)
+    ucontext_t* uc = (ucontext_t*)ucontext;
+    return uc ? (void*)(uintptr_t)uc->uc_mcontext.gregs[REG_RIP] : NULL;
+#else
+    UNUSED(ucontext);
+    return NULL;
+#endif
+}
+
 static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
 {
     /* A fault raised while this handler is already running: whatever it was
@@ -4568,13 +4594,33 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
      * process anyway, so sharing one buffer costs nothing. */
     static char buf[8192];
     char* p = buf;
-    UNUSED(ucontext);
     const char* hdr = "=== HOST FAULT inside guest === sig=";
     while (*hdr) *p++ = *hdr++;
     user_fault_hex(&p, (uint64_t)(size_t)sig);
     const char* addr = "fault addr(si_addr): ";
     while (*addr) *p++ = *addr++;
     user_fault_hex(&p, (uint64_t)(size_t)info->si_addr);
+    /* Which host instruction touched that address - the emulator's own line,
+     * which nothing else in this block can name. Printed before the guest state
+     * on purpose: it is what the reader needs first, and the guest PC below only
+     * says what the guest was doing when it got there. */
+    {
+        const char* hpc = "host pc: ";
+        while (*hpc) *p++ = *hpc++;
+        unsigned long long rva = 0;
+        void* h = fault_host_pc(ucontext, &rva);
+        if (h) {
+            user_fault_hex(&p, (uint64_t)(size_t)h);
+            if (rva) {
+                const char* rr = "host pc rva: ";
+                while (*rr) *p++ = *rr++;
+                user_fault_hex(&p, rva);
+            }
+        } else {
+            const char* none = "(unavailable)\n";
+            while (*none) *p++ = *none++;
+        }
+    }
     /* Which marshalled GL/EGL call (if any) was being serviced. Without this
      * the register dump alone cannot say whether the fault came from the
      * guest's own code or from a host GL call on its behalf. */
@@ -4585,10 +4631,12 @@ static void user_fault_handler(int sig, siginfo_t* info, void* ucontext)
         if (name) {
             while (*name) *p++ = *name++;
         } else {
-            const char* none = "(none - guest code)";
+            /* Says what this field is: it tracks GL/EGL dispatch only, so its
+             * absence never meant the fault was the guest's own doing. It did
+             * read that way, and sent the last hunt after the guest. */
+            const char* none = "(none - no GL/EGL call in flight)\n";
             while (*none) *p++ = *none++;
         }
-        *p++ = '\n';
     }
     rvvm_hart_t* cpu = current_user_hart;
     if (cpu) {
@@ -12159,9 +12207,24 @@ static void* rvvm_user_thread_wrap(void* arg)
                     } else if (a7 == 66 && iov_own) {
                         ssize_t total = 0;
                         bool block = userland_fd_write_blocks(uctx(), (int)a0);
+                        /* The byte the first *non-empty* segment starts with, for
+                         * the trace - and the guard is the loop's, not decoration:
+                         * a zero-length segment may carry a NULL base (see below),
+                         * so reading hiov[0].iov_base[0] unconditionally is a NULL
+                         * dereference in the emulator. It only fires when RVVM_TRACE
+                         * includes "sys", which every e2e driver sets, so it read as
+                         * "the core dies under an sshd session" and not as a fault
+                         * in the trace: exit 139, si_addr 0, the faulting host PC
+                         * inside the argument evaluation above this line. */
+                        unsigned first = 0;
+                        for (int i = 0; i < (int)a2; i++) {
+                            if (hiov[i].iov_len) {
+                                first = ((const uint8_t*)hiov[i].iov_base)[0];
+                                break;
+                            }
+                        }
                             RVVM_TRC(RVVM_TRC_SYS, "sys_writev(guest fd=%ld host=%d) iovs=%lu first from %02x",
-                                      a0, iov_fd, (unsigned long)a2,
-                                      (unsigned)((const uint8_t*)hiov[0].iov_base)[0]);
+                                      a0, iov_fd, (unsigned long)a2, first);
                         for (int i = 0; i < (int)a2; i++) {
                             /* A zero-length segment is the no-op POSIX says it is,
                              * and its base may legitimately be NULL: handing it to
