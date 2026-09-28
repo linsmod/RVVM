@@ -202,28 +202,54 @@ static bool ash_pid_alive(DWORD pid)
     return alive;
 }
 
-/* The pid a core's registry file names, or 0 when there is none. */
-static DWORD ash_core_pid(int port)
+/* One "key=value" out of a core's registry file. False when the file is gone or
+ * carries no such key, which for the pid is the answer every reader of it
+ * already had. */
+static bool ash_core_field(int port, const char* key, char* out, size_t out_size)
 {
     char  path[MAX_PATH];
     char  line[256];
-    DWORD pid = 0;
+    char  want[64];
     FILE* f;
+    size_t klen;
 
+    if (out_size) {
+        out[0] = '\0';
+    }
     if (!ash_core_file(port, path, sizeof(path))) {
-        return 0;
+        return false;
     }
     f = fopen(path, "r");
     if (!f) {
-        return 0;
+        return false;
     }
+    klen = strlen(key);
+    snprintf(want, sizeof(want), "%s=", key);
     while (fgets(line, sizeof(line), f)) {
-        if (sscanf(line, "pid=%lu", &pid) == 1) {
-            break;
+        if (!strncmp(line, want, klen) && line[klen] == '=') {
+            char* v = line + klen + 1;
+            char* e = strpbrk(v, "\r\n");
+            if (e) {
+                *e = '\0';
+            }
+            snprintf(out, out_size, "%s", v);
+            fclose(f);
+            return true;
         }
     }
     fclose(f);
-    return pid;
+    return false;
+}
+
+/* The pid a core's registry file names, or 0 when there is none. */
+static DWORD ash_core_pid(int port)
+{
+    char buf[64];
+
+    if (!ash_core_field(port, "pid", buf, sizeof(buf))) {
+        return 0;
+    }
+    return (DWORD)strtoul(buf, NULL, 10);
 }
 
 static void ash_core_register(int port, const char* shell)
@@ -253,7 +279,14 @@ static void ash_core_unregister(int port)
     }
 }
 
-/* Is a live core already on this port? A stale registration is reclaimed. */
+/* Is a live core already on this port? A stale registration is reclaimed.
+ *
+ * Deliberately the pid and not the endpoint: this decides whether a *second*
+ * core may start, and a wedged core - one whose guest died before it bound -
+ * still holds both this port and the tree's rootfs lock. Refusing to start
+ * beside it is the whole point; asking it whether it is well would wave the
+ * next core straight into the same lock. `ash --list` is where the endpoint
+ * gets asked, because reporting is a different question from gating. */
 static bool ash_core_up(int port)
 {
     DWORD pid = ash_core_pid(port);
@@ -266,6 +299,45 @@ static bool ash_core_up(int port)
     }
     ash_core_unregister(port);
     return false;
+}
+
+/* Does a core's endpoint answer right now? The socket is the contract, and it
+ * lives in the *guest*: a core whose guest trapped before it bound has a live
+ * pid, a registration, and nothing listening. So this is the only question that
+ * separates a core a client can use from one it cannot. */
+static bool ash_core_serving(int port)
+{
+    int fd = ash_connect(port);
+
+    if (fd < 0) {
+        return false;
+    }
+    win_socket_close(fd);
+    return true;
+}
+
+/* How long a registration may go without answering before it is called wedged.
+ *
+ * The registration is written *after* the guest is started and before it binds
+ * (see ash_serve), so a core that is merely still coming up looks exactly like
+ * one that will never come up. Reporting the second as the first sends the
+ * reader to kill a healthy core; reporting the first as the second sends them
+ * away from a dead one. Ten seconds is long past the gap on a warm cache and
+ * short enough that a wedged core is named while it is still being looked at. */
+#define ASH_STARTING_GRACE_MS 10000
+
+static bool ash_core_starting(int port)
+{
+    char                buf[64];
+    unsigned long long  started;
+
+    if (!ash_core_field(port, "started", buf, sizeof(buf))) {
+        return false;
+    }
+    started = strtoull(buf, NULL, 10);
+    /* GetTickCount64 wraps every ~49.7 days and the subtraction is unsigned, so
+     * it comes out right across the wrap - which a plain "<" would not. */
+    return (unsigned long long)GetTickCount64() - started < ASH_STARTING_GRACE_MS;
 }
 
 /* ------------------------------------------------------------------ */
@@ -570,28 +642,32 @@ int ash_list(void)
         int   port = atoi(fd.cFileName);   /* "<port>.core" */
         DWORD pid  = ash_core_pid(port);
         char  shell[128] = "";
-        char  path[MAX_PATH];
 
         if (!pid) {
             continue;
         }
-        if (ash_core_file(port, path, sizeof(path))) {
-            FILE* f = fopen(path, "r");
-            if (f) {
-                char line[256];
-                while (fgets(line, sizeof(line), f)) {
-                    if (!strncmp(line, "shell=", 6)) {
-                        sscanf(line, "shell=%127s", shell);
-                    }
-                }
-                fclose(f);
-            }
-        }
-        if (ash_pid_alive(pid)) {
-            printf("up     port=%-5d pid=%-6lu shell=%s\n", port, (unsigned long)pid, shell);
-        } else {
+        ash_core_field(port, "shell", shell, sizeof(shell));
+        /* Four answers, and the middle two are the ones this used to collapse.
+         * A registration is a claim, not a proof: the pid can be alive with a
+         * guest that never bound (it trapped), and a core that is merely still
+         * starting up looks the same for a moment. Calling the first "up" sent
+         * a client at a socket nobody was listening on, and calling the second
+         * "dead" would have had an agent killing healthy cores. */
+        if (!ash_pid_alive(pid)) {
             printf("stale  port=%-5d (reclaimed)\n", port);
             ash_core_unregister(port);
+        } else if (ash_core_serving(port)) {
+            printf("up     port=%-5d pid=%-6lu shell=%s\n", port, (unsigned long)pid, shell);
+        } else if (ash_core_starting(port)) {
+            printf("start  port=%-5d pid=%-6lu shell=%s (endpoint not up yet)\n",
+                   port, (unsigned long)pid, shell);
+        } else {
+            /* Not reclaimed, and that is the point: the process is still there
+             * and still holds this tree's rootfs lock, so dropping its
+             * registration would hide the one thing the reader has to act on. */
+            printf("wedged port=%-5d pid=%-6lu shell=%s (registered, endpoint dead; "
+                   "still holds the rootfs - end pid %lu)\n",
+                   port, (unsigned long)pid, shell, (unsigned long)pid);
         }
         found++;
     } while (FindNextFileA(h, &fd));
@@ -611,7 +687,22 @@ int ash_shutdown(int port)
     char  buf[256];
 
     if (fd < 0) {
-        fprintf(stderr, "ash: no core on port %d\n", port);
+        DWORD pid = ash_core_pid(port);
+
+        if (pid && ash_pid_alive(pid)) {
+            /* It is there and cannot be asked. The endpoint lives in the guest,
+             * so a guest that died leaves a core that answers nothing, still
+             * holds this tree's rootfs, and refuses the next --serve with
+             * "another core holds this release rootfs" - a lock nobody can open
+             * because the only key is the thing that is broken. "no core on port
+             * N" points at a core that does not exist; name the one that does. */
+            fprintf(stderr, "ash: the core on port %d is registered (pid %lu) but its endpoint "
+                            "does not answer - it is wedged and still holds this tree's rootfs; "
+                            "end pid %lu to release it\n",
+                    port, (unsigned long)pid, (unsigned long)pid);
+        } else {
+            fprintf(stderr, "ash: no core on port %d\n", port);
+        }
         return 1;
     }
     ash_send_frame(fd, "Q");
