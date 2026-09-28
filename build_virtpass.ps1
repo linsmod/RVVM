@@ -187,21 +187,100 @@ function Write-ArtifactLine {
     }
 }
 
+# The first path component under the repo root: the build tree a file is in.
+function Get-BuildTreeName {
+    param([Parameter(Mandatory)][string]$Path)
+    $rel = $Path.Substring($RVVM_ROOT.Length).TrimStart('\', '/')
+    return ($rel -split '[\\/]')[0]
+}
+
+function Format-Age {
+    param([Parameter(Mandatory)][timespan]$Age)
+    $hours = [int]$Age.TotalHours
+    if ($hours -ge 48) { return '{0} days old' -f [int]($hours / 24) }
+    if ($hours -ge 1) { return '{0} hours old' -f $hours }
+    return '{0} min old' -f [int]$Age.TotalMinutes
+}
+
+# The build type this run targets.
+#
+# Makefile:527 decides it - BUILD_TYPE is release unless USE_DEBUG_FULL is set -
+# and the only handle this script has is $MakeArgs, which it forwards to make
+# verbatim. So this reads the one flag that moves a build between
+# debug.<os>.<arch> and release.<os>.<arch>. The test mirrors the Makefile's own
+# var_use: a useflag counts as set unless its value is exactly 0, and an empty
+# value counts as set there, so it counts as set here too.
+function Get-TargetBuildType {
+    foreach ($arg in @($MakeArgs)) {
+        if ($arg -like 'USE_DEBUG_FULL=*') {
+            $value = ($arg -split '=', 2)[1]
+            if ($value -eq '0') { return 'release' }
+            return 'debug'
+        }
+    }
+    return 'release'
+}
+
+# Artifacts listed per build tree, with the trees this run does not target marked
+# as the other configuration they are.
+#
+# The original list was every tree in the root, sorted newest first, under one
+# label - so a debug tree from before a fix read exactly like the release tree
+# beside it, and a stale binary went on being run and then got blamed for
+# whatever it did. Splitting by tree is what makes the difference visible: the
+# tree this run builds is output, and any other tree is a different
+# configuration that happens to sit in the same directory. Both are named - they
+# are binaries somebody can run - but only one of them is what was just made.
+function Write-TreeArtifactLines {
+    param([Parameter(Mandatory)][string]$Label, [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items)
+    if (-not $Items -or $Items.Count -eq 0) {
+        Write-ArtifactLine $Label @()
+        return
+    }
+    $targetType = Get-TargetBuildType
+    $rows = @()
+    foreach ($group in ($Items | Group-Object { Get-BuildTreeName $_.FullName })) {
+        $newest = $group.Group | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        $rows += [pscustomobject]@{
+            Tree = $group.Name
+            Age  = (Get-Date) - $newest.LastWriteTime
+            Mine = $group.Name -like "$targetType.*"
+            Paths = @($group.Group | Sort-Object FullName | ForEach-Object { $_.FullName })
+        }
+    }
+    $ordered = @($rows | Where-Object { $_.Mine } | Sort-Object Age) +
+               @($rows | Where-Object { -not $_.Mine } | Sort-Object Age)
+    foreach ($row in $ordered) {
+        # Not the parameter name: PowerShell variable names are case-insensitive,
+        # so $label would overwrite $Label and the second tree would inherit the
+        # first one's qualifier.
+        $text = if ($row.Mine) { $Label } else {
+            '{0} (other build tree, not what this run builds, {1})' -f $Label, (Format-Age $row.Age)
+        }
+        Write-ArtifactLine $text $row.Paths
+    }
+}
+
 function Show-Artifacts {
     Write-Host "`nArtifacts:" -ForegroundColor Cyan
 
     if (Test-Goal @('bin')) {
-        # A build tree may hold both debug.<os>.<arch>\ and release.<os>.<arch>\
-        # - newest first, so the one just built is the one on top.
-        $hostBin = @(Get-ChildItem -Path "$RVVM_ROOT\*\rvvm_winhost_*.exe" -File -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | ForEach-Object { $_.FullName })
-        Write-ArtifactLine 'Win32 host' $hostBin
+        # Both debug.<os>.<arch>\ and release.<os>.<arch>\ can sit in the root,
+        # and only one of them is this run's - so they are grouped, not merged
+        # into one list sorted by date.
+        $hostBin = @(Get-ChildItem -Path "$RVVM_ROOT\*\rvvm_winhost_*.exe" -File -ErrorAction SilentlyContinue)
+        Write-TreeArtifactLines 'Win32 host' $hostBin
     }
 
     if (Test-Goal @('guest-assets', 'android', 'dist')) {
         # guest-assets links every sample into the build tree's guest-assets/.
         # The APK carries no loose ELF at all: it boots apps out of
-        # bundle/apps.tar.gz, which is packed from that directory.
+        # bundle/apps.tar.gz, which is packed from this directory.
+        #
+        # No freshness test here, and deliberately: these are the trees' content,
+        # not a per-run output. `make guest-assets` finding them up to date leaves
+        # their timestamps alone, which says the tree is current - the opposite of
+        # what a "written by this run" test would conclude.
         $guest = @(Get-ChildItem -Path "$RVVM_ROOT\*\guest-assets\*.exe" -File -ErrorAction SilentlyContinue |
             ForEach-Object { $_.FullName })
         Write-ArtifactLine 'guest ELFs' $guest
@@ -244,6 +323,9 @@ function Show-Artifacts {
 
 Push-Location -LiteralPath $RVVM_ROOT
 $exitCode = 0
+# Stamped before anything is built, so Show-Artifacts can tell this run's output
+# from a tree that was already in the root when it started.
+$script:buildStarted = Get-Date
 try {
     if ($RegenGlAbi) {
         Write-Host "`n==> python tools/gen_gl_abi.py" -ForegroundColor Cyan
