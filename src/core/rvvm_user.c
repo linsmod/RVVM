@@ -7237,8 +7237,25 @@ static bool userland_own_ready(int host_fd, bool write)
     return userland_dev_by_fd(host_fd, &dev);
 }
 
-static bool uapi_fdset_to_host(rvvm_userland_t* ctx, int nfds, rvvm_addr_t guest_set, fd_set* host_set)
+/* Build the host set from the guest's mask: bit @i of the guest's set is the
+ * descriptor the host knows as userland_fd_host(i). A descriptor past the host's
+ * own FD_SETSIZE cannot be watched at all - the bit is dropped rather than
+ * reported ready for something that was never polled.
+ *
+ * @max_host_fd is set to the highest host number put in the set (0 if none), which
+ * is what the caller has to hand select() as its nfds: a guest fd number and a
+ * host fd number are unrelated, and select() ignores everything at or above the
+ * nfds it is given. Passing the guest's own nfds - the obvious thing, and what
+ * this used to do - silently drops any host descriptor numbered higher, which on
+ * a host whose numbers are sparse and high (an Android app process, where a
+ * socket is routinely fd 20+ while the guest's nfds is single digits) means the
+ * guest waits forever for a socket that is already readable. */
+static bool uapi_fdset_to_host(rvvm_userland_t* ctx, int nfds, rvvm_addr_t guest_set,
+                               fd_set* host_set, int* max_host_fd)
 {
+    if (max_host_fd) {
+        *max_host_fd = 0;
+    }
     if (!guest_set) {
         return true;
     }
@@ -7262,6 +7279,9 @@ static bool uapi_fdset_to_host(rvvm_userland_t* ctx, int nfds, rvvm_addr_t guest
          * set the host watches, and is answered from its own state instead. */
         if (host_fd >= 0 && host_fd < FD_SETSIZE && !userland_own_fd(host_fd)) {
             FD_SET(host_fd, host_set);
+            if (max_host_fd && host_fd > *max_host_fd) {
+                *max_host_fd = host_fd;
+            }
         }
     }
     return true;
@@ -7343,11 +7363,22 @@ static int rvvm_sys_select_time32(int nfds, rvvm_addr_t rfds, rvvm_addr_t wfds, 
         free(hrfds); free(hwfds); free(hefds);
         return -UAPI_EINVAL;
     }
-    if (!uapi_fdset_to_host(ctx, nfds, rfds, hrfds) ||
-        !uapi_fdset_to_host(ctx, nfds, wfds, hwfds) ||
-        !uapi_fdset_to_host(ctx, nfds, efds, hefds)) {
+    /* select()'s first argument counts *host* descriptors: everything at or above
+     * it is ignored, so it has to reach past the highest host fd actually put in
+     * the sets. The guest's nfds is a different number space and is only the
+     * right floor. */
+    int hnfds = 0;
+    int mr = 0, mw = 0, me = 0;
+    if (!uapi_fdset_to_host(ctx, nfds, rfds, hrfds, &mr) ||
+        !uapi_fdset_to_host(ctx, nfds, wfds, hwfds, &mw) ||
+        !uapi_fdset_to_host(ctx, nfds, efds, hefds, &me)) {
         free(hrfds); free(hwfds); free(hefds);
         return -UAPI_EFAULT;
+    }
+    hnfds = (mr > mw ? mr : mw);
+    hnfds = (hnfds > me ? hnfds : me) + 1;
+    if (hnfds < nfds) {
+        hnfds = nfds;
     }
 
     int timeout_ms = -1;
@@ -7367,7 +7398,7 @@ static int rvvm_sys_select_time32(int nfds, rvvm_addr_t rfds, rvvm_addr_t wfds, 
         wait.tv_sec  = slice / 1000;
         wait.tv_usec = (slice % 1000) * 1000;
 
-        ret = errno_ret(select(nfds, hrfds, hwfds, hefds, &wait));
+        ret = errno_ret(select(hnfds, hrfds, hwfds, hefds, &wait));
         if (ret < 0) {
             break;
         }
