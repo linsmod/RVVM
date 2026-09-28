@@ -1066,23 +1066,33 @@ PUBLIC uint64_t rvvm_user_host_ptr(const void* ptr)
  * can only serve guest memory from that one contiguous buffer.
  * ============================================================ */
 
-// Past the guest image and its brk heap, where mmap()ed ranges start
-#define GUEST_MMAP_BASE  0x11000000UL
-#define GUEST_STACK_SIZE 0x4000000UL // 64 MiB
+/* The image, the brk heap, the mmap arena and the stack, all derived from the
+ * one per-host number in <core/rvvm.h> (USERLAND_MEM_SIZE). These are the names
+ * the rest of this file uses; the addresses themselves live with the size they
+ * come from, because the bounds below are only checkable where all of them are. */
+#define GUEST_MMAP_BASE  USERLAND_MMAP_BASE
+#define GUEST_STACK_SIZE USERLAND_STACK_SIZE
+#define GUEST_DYN_BASE   USERLAND_DYN_BASE
 /* How much of the stack reservation is zeroed before the initial frame is built.
  * The stack grows down by writing, so nothing below the frame is ever read
  * before it is written; only the top of the reservation has to be clean (it is
  * where the frame, its alignment gap and any slack live). Zeroing the whole
- * 64 MiB made it all resident at boot for nothing. */
+ * reservation made it all resident at boot for nothing. */
 #define GUEST_STACK_ZERO 0x100000UL // 1 MiB
 #define GUEST_PAGE_SIZE  0x1000UL
 
-// Guest address a relocatable (ET_DYN) main image is placed at: above the NULL
-// page and far below the mmap area, so the brk heap still fits in between (see
-// rvvm_user_linux_ex()). A PIE executable or a bare .so launched as the guest
-// program lands here; ET_EXEC images carry their own link-time address and
-// ignore this.
-#define GUEST_DYN_BASE   0x400000UL
+/* Every one of those is a guest address the allocator hands out, so shrinking
+ * the address space - which is what lets a 32-bit host hold a few guest
+ * processes instead of one - is only safe while these hold. The failure mode if
+ * one stops holding is a guest that brks or mmaps its way into the stack
+ * reservation: a corruption, not a clean -EFAULT. Checked here because this is
+ * the only place the stack and the mmap base are both visible. */
+BUILD_ASSERT(USERLAND_MMAP_BASE < USERLAND_MEM_BASE + USERLAND_MEM_SIZE - USERLAND_STACK_SIZE);
+BUILD_ASSERT(USERLAND_STACK_SIZE > GUEST_STACK_ZERO);
+/* An mmap arena worth the name: a guest that mmaps one buffer must not find the
+ * whole arena smaller than that buffer. */
+BUILD_ASSERT(USERLAND_MEM_BASE + USERLAND_MEM_SIZE - USERLAND_STACK_SIZE - USERLAND_MMAP_BASE
+             >= 16UL * 1024 * 1024);
 
 typedef struct {
     rvvm_addr_t addr;

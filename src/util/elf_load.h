@@ -12,6 +12,21 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define ELF_LOAD_H
 
 #include "blk_io.h"
+#include <core/rvvm.h>
+
+/* Padding past a fixed-address image, usable as guest brk heap.
+ *
+ * Same number as the userland layout's brk headroom (USERLAND_BRK_MARGIN), and
+ * it has to be: the image is placed at USERLAND_DYN_BASE and the brk heap grows
+ * into this margin, while mmap()ed ranges start at USERLAND_MMAP_BASE - which is
+ * defined as the top of exactly this span. A host that shrinks the address space
+ * therefore shrinks this with it, instead of the two disagreeing and a guest
+ * brk()ing into the mmap arena.
+ *
+ * Only the fixed-host-address path below actually reserves it; in guest_window
+ * mode (what rvvm-user uses) map_size stays 0 because the window owns the memory
+ * and the margin is only headroom, never allocated. */
+#define ELF_USERLAND_HEAP_MARGIN USERLAND_BRK_MARGIN
 
 typedef struct {
     // Pass a buffer for objcopy, NULL for userland loading

@@ -128,7 +128,28 @@ $r = Client 'cat /proc/meminfo'
 Check ($r -match 'MemTotal:') "/proc/meminfo has MemTotal"
 $mt = if ($r -match 'MemTotal:\s+(\d+) kB') { [int64]$Matches[1] } else { 0 }
 $mf = if ($r -match 'MemFree:\s+(\d+) kB') { [int64]$Matches[1] } else { 0 }
-Check ($mt -gt 900000) "MemTotal reflects the ~1 GiB guest address space ($mt kB)"
+# Read the expectation out of the header rather than writing the number here:
+# the address space is a per-host number (1 GiB -> 512 MiB, and 128 MiB on a
+# 32-bit host, which the Android build passes as -DUSERLAND_MEM_SIZE), so a
+# literal in this script would have failed for a reason that had nothing to do
+# with procfs. This picks up the default in the header, which is what the Win32
+# build this script drives uses.
+$ramHdr = Join-Path $PSScriptRoot '..\src\core\rvvm.h'
+function Get-RvvmConst {
+    param([string]$Name)
+    # A trailing "// 512 MiB" is allowed: the value is the hex literal, and the
+    # line may also sit inside the #ifndef that makes it overridable.
+    $hit = Select-String -Path $ramHdr -Pattern ("^\s*#define\s+" + $Name + "\s+(0x[0-9a-fA-F]+)UL?\b") |
+        Select-Object -First 1
+    if (-not $hit) { return [int64]0 }
+    return [Convert]::ToInt64($hit.Matches[0].Groups[1].Value.Substring(2), 16)
+}
+# USERLAND_MEM_BASE sits below the RAM, and /proc reports the RAM proper in kB.
+$ramSize = Get-RvvmConst 'USERLAND_MEM_SIZE'
+$ramBase = Get-RvvmConst 'USERLAND_MEM_BASE'
+$expectKb = if ($ramSize -gt 0) { [int64](($ramSize - $ramBase) / 1024) } else { 0 }
+Check ($expectKb -gt 0) "USERLAND_MEM_SIZE/USERLAND_MEM_BASE are readable from rvvm.h ($ramSize/$ramBase)"
+Check ($mt -eq $expectKb) "MemTotal is the guest RAM from rvvm.h ($mt kB, want $expectKb kB)"
 Check ($mf -gt 0 -and $mf -lt $mt) "MemFree is the unallocated address space ($mf kB)"
 
 # `free` reads sysinfo() (total/free) while `top` reads meminfo: both must agree.

@@ -174,6 +174,50 @@ typedef struct randomize_layout {
 } rvvm_ram_t;
 
 /*
+ * Userland address space: one contiguous buffer per rvvm-user process, and the
+ * layout carved out of it.
+ *
+ * "Contiguous" is the load-bearing word. Every host-side view of guest memory -
+ * to_ptr(), the ELF loader's guest_window arithmetic, the TLB's cached host
+ * pointers - derives an address by adding a guest offset to this one pointer, so
+ * the address space cannot be a sparse page table without rewriting all of them.
+ * That is also why the size is a per-process cost of *host address space* and
+ * not of memory the guest touches: a busybox guest lives in a few MiB and the
+ * rest is never faulted in.
+ *
+ * So the size is what decides how many guest processes a host can hold at once,
+ * and it is a per-host number rather than a property of the guest. The whole
+ * layout below is derived from it, which is what keeps a small size coherent:
+ * the alternative - a 1 GiB space whose parts were sized by hand - is what let
+ * the brk heap claim 256 MiB while the mmap arena next to it had 48 MiB, and
+ * what made the 32-bit Android host fail fork() outright (1 GiB per process
+ * against a ~2 GiB user address space; measured, one run was already 1.22 GiB of
+ * VSZ with a few MiB resident, and one concurrent child was the most that fit).
+ *
+ * Defaults suit a 64-bit host. A 32-bit host overrides USERLAND_MEM_SIZE from its
+ * build (see src/virtpass/android-host/app/src/main/cpp/CMakeLists.txt, which
+ * picks per ABI the same way it picks USE_JIT).
+ */
+#ifndef USERLAND_MEM_SIZE
+#define USERLAND_MEM_SIZE 0x20000000UL // 512 MiB
+#endif
+
+#define USERLAND_MEM_BASE 0x1000UL
+
+// Main stack, carved off the top of the space.
+#define USERLAND_STACK_SIZE (USERLAND_MEM_SIZE / 8) // 64 MiB of 512, 16 MiB of 128
+// brk heap headroom above the image, which is where mmap()ed ranges start after
+// it. The image is under a MiB for every guest here, so this is all malloc arena.
+#define USERLAND_BRK_MARGIN (USERLAND_MEM_SIZE / 4) // 128 MiB of 512, 32 MiB of 128
+// Where the guest image itself goes: above the NULL page (callers test a bare
+// offset for NULL, so address 0 must not be valid) and far below the mmap area.
+// A PIE executable or a bare .so launched as the guest program lands here;
+// ET_EXEC images carry their own link-time address and ignore it.
+#define USERLAND_DYN_BASE  0x400000UL
+// First mmap()ed address. Everything between this and the stack is the arena.
+#define USERLAND_MMAP_BASE  (USERLAND_DYN_BASE + USERLAND_BRK_MARGIN)
+
+/*
  * AIA register file
  */
 

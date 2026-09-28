@@ -32,6 +32,22 @@ if(RVVM_JIT_32BIT OR CMAKE_ANDROID_ARCH_ABI IN_LIST RVVM_JIT_ABIS)
     )
 endif()
 
+# Guest address space per rvvm-user process, decided per ABI for the same reason
+# USE_JIT is: the host's address space is the budget. It is one contiguous
+# reservation per guest process (see <core/rvvm.h>), and fork() needs a second
+# one, so this is what decides how many guest processes can be alive at once.
+#
+# A 32-bit process has roughly 2 GiB of user address space to spend, and this app
+# is not spending all of it on the guest: measured on a 32-bit device, one run
+# plus one concurrent child was already 1.28 GiB of VmSize and a second child
+# failed with ENOMEM ("sh: can't fork"). At 512 MiB per process that is the whole
+# story; at 128 MiB a dozen concurrent children fit, which is what a shell doing
+# pipelines and background jobs actually needs. The layout (image, brk heap, mmap
+# arena, stack) is derived from this number, so shrinking it stays coherent.
+if(NOT CMAKE_ANDROID_ARCH_ABI IN_LIST RVVM_JIT_ABIS)
+    add_definitions(-DUSERLAND_MEM_SIZE=0x08000000UL)
+endif()
+
 add_definitions(
     -DRVVM_USER_TEST
     -DRVVM_USE_RV64

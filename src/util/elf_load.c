@@ -42,9 +42,6 @@ PUSH_OPTIMIZATION_SIZE
 #define ELF_PF_W       0x02
 #define ELF_PF_R       0x04
 
-// Padding past the fixed ELF image, usable as guest brk heap
-#define ELF_USERLAND_HEAP_MARGIN 0x10000000
-
 // TODO: Handling >64k PHENTs
 #define ELF_PN_XNUM    0xFFFF
 

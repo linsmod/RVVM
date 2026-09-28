@@ -1091,16 +1091,12 @@ PUBLIC bool rvvm_attach_msi_target(rvvm_machine_t* machine, const rvvm_mmio_dev_
  * Userland emulation API (WIP)
  */
 
-// Guest address space handed to a rvvm-user process: 1 GiB covers the guest
-// ELF image, its brk heap, mmap()s and the main stack.
-//
 // NOTE: this used to be the whole host address space with mem.data == mem.addr,
 // i.e. guest addresses were identity-mapped onto host addresses. That forced a
 // non-relocatable guest ELF to be mapped at the very same *host* address, which
 // breaks as soon as the host (or a debugger disabling ASLR, or the loader of
 // any DLL) has already put something there.
-#define USERLAND_MEM_BASE 0x1000
-#define USERLAND_MEM_SIZE 0x40000000
+
 
 PUBLIC rvvm_machine_t* rvvm_create_userland(const char* isa)
 {
