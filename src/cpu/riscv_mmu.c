@@ -52,6 +52,11 @@ bool riscv_init_ram(rvvm_ram_t* mem, rvvm_addr_t base_addr, size_t size)
 
     mem->addr = base_addr;
     mem->size = size;
+    // No page table: one contiguous allocation is the whole region, and every
+    // translation is data + offset. A machine that shares its guest address
+    // space with other machines sets this before creating any hart, because a
+    // hart copies the region by value.
+    mem->pgt = NULL;
     return true;
 }
 
@@ -62,6 +67,7 @@ void riscv_free_ram(rvvm_ram_t* mem)
     mem->size = 0;
     mem->addr = 0;
     mem->data = NULL;
+    mem->pgt = NULL;
 }
 
 #ifdef USE_JIT
@@ -108,7 +114,10 @@ void riscv_tlb_flush_page(rvvm_hart_t* vm, rvvm_addr_t addr)
     }
 }
 
-static void riscv_tlb_put(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* ptr, uint8_t access)
+// Takes the host address as a size_t because that is all it uses: the TLB
+// stores ptr - vaddr, so a caller that resolved a read-only page does not have
+// to launder a const pointer through this signature.
+static void riscv_tlb_put(rvvm_hart_t* vm, rvvm_addr_t vaddr, size_t ptr, uint8_t access)
 {
     const rvvm_addr_t vpn = vaddr >> RISCV_PAGE_SHIFT;
     rvvm_tlb_entry_t* entry = &vm->tlb[vpn & RVVM_TLB_MASK];
@@ -142,13 +151,42 @@ static void riscv_tlb_put(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* ptr, uint8_t
             break;
     }
 
-    entry->ptr = ((size_t)ptr) - vaddr;
+    entry->ptr = ptr - vaddr;
 }
 
-static forceinline void* riscv_phys_access(rvvm_hart_t* vm, rvvm_addr_t paddr)
+/*
+ * Physical address -> host pointer, for an access that only reads.
+ *
+ * Split from the writable form because the two must not be interchangeable: a
+ * read that went through the writable one would unshare the page, so a guest
+ * that merely looked at a page would make it private and every later write on
+ * that page would pay for a copy. That is the whole cost model, so reads stay
+ * reads all the way down.
+ */
+static forceinline const void* riscv_phys_read(rvvm_hart_t* vm, rvvm_addr_t paddr)
 {
     if (likely(paddr >= vm->mem.addr && (paddr - vm->mem.addr) < vm->mem.size)) {
-        return ((uint8_t*)vm->mem.data) + (paddr - vm->mem.addr);
+        return rvvm_ram_const_ptr(&vm->mem, paddr - vm->mem.addr);
+    }
+    return NULL;
+}
+
+/*
+ * Physical address -> host pointer, for an access that will write. Unshares the
+ * page if it is still shared.
+ *
+ * The page table walk needs this too, and not only for the leaf data access: it
+ * compare-and-swaps the A/D bits into the PTE (riscv_mmu_translate_*), which is a
+ * genuine write to guest RAM. Those bits have to be per-machine, or one machine's
+ * walk would dirty another machine's page tables - and with a read-only shared
+ * base it would fault rather than corrupt. The walk only asks for the writable
+ * pointer when the CAS is actually about to happen, so a guest whose A/D bits are
+ * already set never pays for unsharing those pages.
+ */
+static forceinline void* riscv_phys_write(rvvm_hart_t* vm, rvvm_addr_t paddr)
+{
+    if (likely(paddr >= vm->mem.addr && (paddr - vm->mem.addr) < vm->mem.size)) {
+        return rvvm_ram_ptr(&vm->mem, paddr - vm->mem.addr, true);
     }
     return NULL;
 }
@@ -182,7 +220,11 @@ static inline bool riscv_mmu_translate_sv32(rvvm_hart_t* vm, rvvm_addr_t vaddr, 
 
     for (size_t i = 0; i < SV32_LEVELS; ++i) {
         size_t pgt_off = ((vaddr >> bit_off) & SV32_VPN_MASK) << 2;
-        void* pte_ptr = riscv_phys_access(vm, pagetable + pgt_off);
+        // Read accessor: the walk reads the PTE, and a read must not unshare the
+        // page it is reading. Re-fetched at the top of every iteration, so the
+        // retry below never reuses a pointer that another hart may have unshared
+        // underneath it.
+        const void* pte_ptr = riscv_phys_read(vm, pagetable + pgt_off);
         if (unlikely(!pte_ptr)) {
             // Physical fault on pagetable walk
             return false;
@@ -209,8 +251,17 @@ static inline bool riscv_mmu_translate_sv32(rvvm_hart_t* vm, rvvm_addr_t vaddr, 
                             return false;
                         }
                         if (unlikely(pte != pte_ad)) {
-                            // Atomically update A/D flags
-                            if (unlikely(!atomic_cas_uint32_le(pte_ptr, pte, pte_ad))) {
+                            // Atomically update A/D flags. This is a real write to
+                            // guest RAM and has to be per-machine, so it needs the
+                            // writable translation - but only now, only when the
+                            // CAS is actually about to happen. A guest whose A/D
+                            // bits are already set never pays to unshare these
+                            // pages.
+                            void* pte_wr = riscv_phys_write(vm, pagetable + pgt_off);
+                            if (unlikely(!pte_wr)) {
+                                return false; // Physical fault on pagetable walk
+                            }
+                            if (unlikely(!atomic_cas_uint32_le(pte_wr, pte, pte_ad))) {
                                 // CAS failed, reload the PTE and start over
                                 continue;
                             }
@@ -250,7 +301,8 @@ static inline bool riscv_mmu_translate_rv64(rvvm_hart_t* vm, rvvm_addr_t vaddr, 
 
     for (size_t i = 0; i < sv_levels; ++i) {
         size_t pgt_off = ((vaddr >> bit_off) & SV64_VPN_MASK) << 3;
-        void* pte_ptr = riscv_phys_access(vm, pagetable + pgt_off);
+        // Read accessor, re-fetched every iteration - see the SV32 walk.
+        const void* pte_ptr = riscv_phys_read(vm, pagetable + pgt_off);
         if (unlikely(!pte_ptr)) {
             // Physical fault on pagetable walk
             return false;
@@ -277,8 +329,14 @@ static inline bool riscv_mmu_translate_rv64(rvvm_hart_t* vm, rvvm_addr_t vaddr, 
                             return false;
                         }
                         if (unlikely(pte != pte_ad)) {
-                            // Atomically update A/D flags
-                            if (unlikely(!atomic_cas_uint64_le(pte_ptr, pte, pte_ad))) {
+                            // Atomically update A/D flags. A real per-machine
+                            // write to guest RAM, so take the writable translation
+                            // only now, only because the CAS is about to happen.
+                            void* pte_wr = riscv_phys_write(vm, pagetable + pgt_off);
+                            if (unlikely(!pte_wr)) {
+                                return false; // Physical fault on pagetable walk
+                            }
+                            if (unlikely(!atomic_cas_uint64_le(pte_wr, pte, pte_ad))) {
                                 // CAS failed, reload the PTE and start over
                                 continue;
                             }
@@ -436,7 +494,7 @@ static bool riscv_mmio_scan(rvvm_hart_t* vm, rvvm_addr_t vaddr, rvvm_addr_t padd
                 // This is a direct memory region, cache translation in TLB if possible
                 rvvm_addr_t paddr_align = (paddr & RISCV_PAGE_PNMASK);
                 if (likely(mmio->addr <= paddr_align && (paddr_align + RISCV_PAGE_SIZE) <= (mmio->addr + mmio->size))) {
-                    riscv_tlb_put(vm, vaddr, ((uint8_t*)mmio->mapping) + offset, access);
+                    riscv_tlb_put(vm, vaddr, (size_t)(((uint8_t*)mmio->mapping) + offset), access);
                 }
 
                 // Copy the data over
@@ -525,23 +583,46 @@ cold_path void* riscv_mmu_op_internal(rvvm_hart_t* vm, rvvm_addr_t vaddr, void* 
             return data;
         }
 
-        void* ptr = riscv_phys_access(vm, paddr);
-        if (likely(ptr)) {
-            // Physical address in main memory, cache address translation
-            riscv_tlb_put(vm, vaddr, ptr, access);
-            if (likely(!(attr & RISCV_MMU_ATTR_PTR))) {
-                // Perform actual load/store on translated pointer
-                if (access == RISCV_MMU_WRITE) {
-                    atomic_memcpy_relaxed(ptr, data, size);
-                } else {
-                    atomic_memcpy_relaxed(data, ptr, size);
+        /*
+         * A store and an atomic both arrive here as RISCV_MMU_WRITE (see
+         * riscv_rmw_translate(), which requires the write TLB slot), and both
+         * write through the pointer. A load and an instruction fetch only read,
+         * so they must not unshare the page - doing so would make every page the
+         * guest merely looked at cost a private copy.
+         *
+         * The two are handled in separate branches rather than merged into one
+         * `ptr`, because their constness genuinely differs and the function's
+         * return type is void* for the atomics' bounce-buffer protocol. What
+         * guarantees the read path never reaches the unsharing primitive is
+         * structural - riscv_phys_read() calls the const primitive - not the type
+         * of a merged local.
+         */
+        if (access == RISCV_MMU_WRITE) {
+            void* wptr = riscv_phys_write(vm, paddr);
+            if (likely(wptr)) {
+                // Physical address in main memory, cache address translation
+                riscv_tlb_put(vm, vaddr, (size_t)wptr, access);
+                if (likely(!(attr & RISCV_MMU_ATTR_PTR))) {
+                    atomic_memcpy_relaxed(wptr, data, size);
                 }
-            }
-            if (access == RISCV_MMU_WRITE) {
                 // Clear JITted blocks & flush trace cache if necessary
                 riscv_jit_mark_dirty_mem(vm->machine, paddr, 8);
+                return wptr;
             }
-            return ptr;
+        } else {
+            const void* cptr = riscv_phys_read(vm, paddr);
+            if (likely(cptr)) {
+                // Physical address in main memory, cache address translation.
+                // Carried as a size_t because that is all the TLB keeps, and
+                // returning it that way keeps the const honest right up to the
+                // point the void* return demands otherwise.
+                size_t host = (size_t)cptr;
+                riscv_tlb_put(vm, vaddr, host, access);
+                if (likely(!(attr & RISCV_MMU_ATTR_PTR))) {
+                    atomic_memcpy_relaxed(data, (const void*)host, size);
+                }
+                return (void*)host;
+            }
         }
 
         if (likely(data)) {

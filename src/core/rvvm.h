@@ -167,11 +167,124 @@ BUILD_ASSERT(sizeof(rvvm_jit_tlb_entry_t) == 16);
  * Physical RAM region
  */
 
+typedef struct cow_pgt_machine cow_pgt_machine_t;
+
 typedef struct randomize_layout {
     rvvm_addr_t addr; // Physical memory base address (Should be page-aligned)
     size_t      size; // Physical memory amount (Should be page-aligned)
     void*       data; // Pointer to memory data (Preferably page-aligned)
+
+    /*
+     * Per-machine copy-on-write page table, or NULL.
+     *
+     * NULL means "data is the whole thing": every translation is
+     * data + offset, which is what a machine wants unless it shares its guest
+     * address space with other machines in this process. That is the case the
+     * field exists for - rvvm-user runs many guest processes per host process,
+     * and one contiguous allocation each is what makes guest size a per-process
+     * cost of host address space rather than of memory the guest touches. See
+     * src/util/cow_pgt.h.
+     *
+     * It is NULL on every other machine: kernel-mode, device models, snapshots.
+     * So the NULL case is the general one, not a special case, and the fast path
+     * below stays a plain add.
+     *
+     * Set before any hart is created: a hart copies the region by value
+     * (riscv_hart_init), so a machine that gains a page table after its harts
+     * exist would leave those harts translating through data.
+     */
+    cow_pgt_machine_t* pgt;
 } rvvm_ram_t;
+
+// Out-of-line half of rvvm_ram_ptr()/rvvm_ram_const_ptr(), reached only when the
+// machine has a page table. Declared here so the inline fast path above needs
+// only a forward declaration of the page table type.
+void*       rvvm_ram_ptr_paged(rvvm_ram_t* mem, size_t offset, bool write);
+void*       rvvm_ram_ptr_paged_read(rvvm_ram_t* mem, size_t offset);
+const void* cow_pgt_const_ptr(const cow_pgt_machine_t* machine, size_t offset);
+/*
+ * Drop the const from a read-only translation, deliberately and in one place.
+ *
+ * The read primitives below are typed void* so that rvvm_user.c's ~160 to_ptr()
+ * call sites do not all have to become const-correct in the same patch. Every
+ * place the const is dropped goes through here, so the set of places it is
+ * dropped is greppable and reviewable rather than scattered as raw casts. A
+ * union rather than a cast, because this tree compiles clean under -Wcast-qual
+ * and a cast here would be the one warning the change introduces.
+ *
+ * Sound only for a pointer that came from a read-only translation and is not
+ * written through - which is exactly rvvm_ram_read_ptr()'s contract. Do not use
+ * it to launder anything else.
+ */
+static forceinline void* rvvm_ram_read_ptr_from_const(const void* p)
+{
+    union { const void* c; void* v; } u;
+    u.c = p;
+    return u.v;
+}
+
+/*
+ * Translating a RAM offset into a host pointer.
+ *
+ * Every host-side view of guest memory goes through these: the MMU's
+ * riscv_phys_access(), rvvm_user.c's to_ptr()/to_ptr_sz(), the ELF loader's
+ * window arithmetic, the TLB's cached host pointers. Keeping one set of
+ * primitives is what makes the page table a change to one file rather than to
+ * every caller - and the reason a missed writer shows up as an access violation
+ * at the offending instruction instead of as a wrong answer later.
+ *
+ * write=false must never mutate the page table, so a read path cannot unshare a
+ * page and thereby make every subsequent write on that machine pay for it.
+ * write=true may. Both are idempotent.
+ *
+ * The range form returns a pointer only when the range is genuinely contiguous
+ * in host memory - see cow_pgt_ptr_range() for why that is two specific cases
+ * and not a page cap. Callers that get NULL copy a page at a time; they must not
+ * treat it as an error, because a large range crossing the shared/private
+ * boundary is a normal outcome, not a fault.
+ */
+static forceinline void* rvvm_ram_ptr(rvvm_ram_t* mem, size_t offset, bool write)
+{
+    // The NULL case is today's behaviour and stays a single add: nothing in the
+    // tree but a paged userland machine should ever see this branch taken.
+    if (likely(!mem->pgt)) {
+        return ((uint8_t*)mem->data) + offset;
+    }
+    return rvvm_ram_ptr_paged(mem, offset, write);
+}
+
+static forceinline const void* rvvm_ram_const_ptr(const rvvm_ram_t* mem, size_t offset)
+{
+    if (likely(!mem->pgt)) {
+        return ((const uint8_t*)mem->data) + offset;
+    }
+    return cow_pgt_const_ptr(mem->pgt, offset);
+}
+
+/*
+ * The same read-only translation, typed void*.
+ *
+ * rvvm_user.c's to_ptr() hands its result to ~160 call sites, most of which only
+ * read, and propagating const through all of them would be a diff far larger than
+ * the change it protects. So the guarantee is carried by the primitive rather
+ * than by the type: this calls the non-unsharing one, and a caller that writes
+ * through the result is handed a pointer into the read-only shared base and
+ * faults on the store. That is the intended failure - loud, at the instruction
+ * that got the classification wrong - and it is why the writer classification is
+ * reviewed line by line.
+ */
+static forceinline void* rvvm_ram_read_ptr(rvvm_ram_t* mem, size_t offset)
+{
+    if (likely(!mem->pgt)) {
+        return ((uint8_t*)mem->data) + offset;
+    }
+    return rvvm_ram_ptr_paged_read(mem, offset);
+}
+
+// Ranges are not on the hot path, so these are plain calls.
+void*       rvvm_ram_ptr_range(rvvm_ram_t* mem, size_t offset, size_t size, bool write);
+void*       rvvm_ram_read_ptr_range(rvvm_ram_t* mem, size_t offset, size_t size);
+const void* rvvm_ram_const_ptr_range(const rvvm_ram_t* mem, size_t offset, size_t size);
 
 /*
  * Userland address space: one contiguous buffer per rvvm-user process, and the

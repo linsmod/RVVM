@@ -233,6 +233,11 @@ const void* cow_pgt_const_ptr(const cow_pgt_machine_t* machine, size_t offset);
  */
 void* cow_pgt_ptr_range(cow_pgt_machine_t* machine, size_t offset, size_t size, bool write);
 
+/* Read-only form of the above. Separate rather than a const_cast of the writable
+ * one, for the same reason cow_pgt_const_ptr() is separate: an entry point that
+ * cannot unshare should not share code with a path that can. */
+const void* cow_pgt_const_ptr_range(const cow_pgt_machine_t* machine, size_t offset, size_t size);
+
 /*
  * Collect the guest page range that this machine has unshared since the last
  * call, as [first_page, last_page] inclusive. Returns false if nothing has been

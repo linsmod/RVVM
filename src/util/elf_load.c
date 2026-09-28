@@ -141,7 +141,7 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
     WRAP_ERR(tmp[5] == 1, "Not a little-endian ELF");
 
     // Parse ELF header
-    bool     objcopy   = !!elf->base;
+    bool     objcopy   = elf->objcopy;
     bool     class64   = (tmp[4] == 2);
     uint16_t elf_type  = read_uint16_le_m(tmp + 16);
     uint64_t elf_entry = class64 ? read_uint64_le_m(tmp + 24) : read_uint32_le_m(tmp + 24);
@@ -203,17 +203,24 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
         // can only MEM_RELEASE the exact allocation extent, so ask for the
         // rounded size upfront and remember it for elf_unload_file().
         elf->buf_size = align_size_up(elf->buf_size, vma_alloc_granularity());
-        // elf->base is the host pointer, entry/phdr below are guest addresses
+        // elf->base is the host pointer, entry/phdr below are guest addresses.
+        // guest_base is set only on the two window paths, and it is the field the
+        // userland side reads: it answers "is the image in the guest window, and
+        // where", which is not the same question as "where did base end up". The
+        // relocatable-without-window path below maps a standalone buffer that is
+        // not in the window at all, so guest_base stays 0 there.
         if (elf->guest_window && elf_type == ELF_ET_DYN) {
             // Dynamic (PIC) ELF inside a guest memory window: place it at the
             // address the caller picked, no host mapping involved
             WRAP_ERR(elf->load_addr, "Dynamic ELF needs an explicit load address in guest window mode");
             guest_base  = elf->load_addr;
             elf->base   = elf->guest_window + elf->load_addr;
+            elf->guest_base = elf->load_addr;
             memset(elf->base, 0, elf->buf_size);
             elf->map_size = 0;
         } else if (elf_type == ELF_ET_DYN) {
-            // Dynamic (PIC) ELF, relocate it
+            // Dynamic (PIC) ELF, relocate it into a standalone buffer. guest_base
+            // stays 0: this image is not in the guest window.
             elf->base = vma_alloc(NULL, elf->buf_size, VMA_RDWR);
             WRAP_ERR(elf->base, "Failed to allocate dynamic ELF VMA");
             elf->map_size = elf->buf_size;
@@ -223,6 +230,7 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
              * map_size stays 0 - the window owns this memory), so a debugger
              * disabling host ASLR can no longer collide with it. */
             elf->base = elf->guest_window + elf_loaddr;
+            elf->guest_base = elf_loaddr;
             /* Zero only the image extent, like the dynamic path above: the
              * bridge to the mmap area (ELF_USERLAND_HEAP_MARGIN) is brk heap
              * headroom, and it is demand-zero already - the window is a fresh
@@ -239,6 +247,9 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf)
             WRAP_ERR(elf->base, "Failed to map fixed ELF VMA, address collision?");
             elf->map_size = elf->buf_size + ELF_USERLAND_HEAP_MARGIN;
             guest_base = (size_t)elf->base; // Identity-mapped mode
+            // Not the guest window, so guest_base stays 0 for the userland side
+            // even though this mode does use a guest address - it is a host
+            // address the guest happens to agree with, not window memory.
         }
         if (elf->entry) {
             elf->entry += guest_base - elf_loaddr;

@@ -29,11 +29,33 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #define ELF_USERLAND_HEAP_MARGIN USERLAND_BRK_MARGIN
 
 typedef struct {
-    // Pass a buffer for objcopy, NULL for userland loading
-    // Receive base ELF address for userland
+    // Host pointer to the image: the objcopy caller's buffer, or the address the
+    // image was mapped/written at. Filled on every path, and it means three
+    // different things depending on the branch elf_load_file() took - which is
+    // why the two fields below exist rather than this one carrying the answer.
     void*  base;
     // Objcopy buffer size
     size_t buf_size;
+
+    // Address the image occupies in *guest* address space, and nonzero only when
+    // the image actually lives in the userland window (guest_window set). This is
+    // the field the userland side wants, and it is the one that has to stay
+    // meaningful once guest RAM is no longer one contiguous host allocation:
+    // deriving a guest address by subtracting mem.data from base stops working the
+    // moment a page moves into a per-machine page table.
+    //
+    // Zero on the two paths where the image is not in the window: a standalone
+    // vma_alloc() buffer for a relocatable image, and the legacy fixed-host-address
+    // mode. Note that a stale base used to make userland_fork_memory() compute a
+    // meaningless address and copy the wrong range; testing this field instead is
+    // what removes that.
+    size_t guest_base;
+
+    // True when base is a caller-supplied objcopy buffer, so the image is
+    // relocated into that buffer rather than mapped or copied into a window.
+    // Was previously inferred from base being non-NULL, which conflated "loaded"
+    // with "objcopy" - see the note on elf_unload_file().
+    bool   objcopy;
 
     // Various loaded ELF info
     size_t entry;
@@ -76,9 +98,13 @@ bool elf_load_file(rvfile_t* file, elf_desc_t* elf);
 size_t elf_image_extent(rvfile_t* file);
 
 // Release the mapping made by a previous elf_load_file() userland load and
-// reset the descriptor. Required before re-loading into the same descriptor:
-// a stale elf->base makes elf_load_file() take the objcopy path and produces
-// a wrongly relocated entry.
+// reset the descriptor. Required before re-loading into the same descriptor.
+//
+// The contract used to be "a stale elf->base makes elf_load_file() take the
+// objcopy path", which made "have I loaded into this descriptor?" a question
+// about a pointer's nullness and forced every caller to remember to unload.
+// The mode is now an explicit field, so zeroing the descriptor is the whole
+// contract: this memsets it, which clears base, guest_base and objcopy together.
 void elf_unload_file(elf_desc_t* elf);
 
 bool bin_objcopy(rvfile_t* file, void* buffer, size_t size, bool try_elf);

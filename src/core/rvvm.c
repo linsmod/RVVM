@@ -19,6 +19,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include <util/utils.h>
 #include <util/vector.h>
 #include <util/vma_ops.h>
+#include <util/cow_pgt.h>
 
 #include <core/rvvm.h>
 #include <core/rvvm_isolation.h>
@@ -829,10 +830,47 @@ PUBLIC bool rvvm_mmio_none(rvvm_mmio_dev_t* dev, void* dest, size_t offset, uint
     return true;
 }
 
+/*
+ * These three are the public RAM accessors, and they are the reason the page
+ * table has to be reached from rvvm.c as well as from the MMU and rvvm_user.c.
+ * All three are whole-range operations, so they use the range form: it returns a
+ * pointer when the range is genuinely contiguous in host memory and NULL when it
+ * is not, and NULL here is not a failure - it means "copy a page at a time".
+ *
+ * rvvm_get_dma_ptr() is the awkward one: its contract is to hand back a writable
+ * pointer, and there is no page-at-a-time fallback for a caller that wants to
+ * scribble on guest memory directly. So it asks for the writable range, and if
+ * the range is not contiguous it falls back to a single page - refusing anything
+ * wider, rather than returning a pointer that would only be valid for part of
+ * what the caller asked for. Its users are device models (pci-vfio, eth-oc,
+ * mtd-ram), which are not attached to a paged userland machine, so in practice
+ * this is the contiguous case.
+ */
 PUBLIC bool rvvm_write_ram(rvvm_machine_t* machine, rvvm_addr_t dest, const void* src, size_t size)
 {
     if (likely(machine && dest >= machine->mem.addr && dest + size <= machine->mem.addr + machine->mem.size)) {
-        memcpy(((uint8_t*)machine->mem.data) + (dest - machine->mem.addr), src, size);
+        size_t off = (size_t)(dest - machine->mem.addr);
+        void*  ptr = rvvm_ram_ptr_range(&machine->mem, off, size, true);
+        if (likely(ptr != NULL)) {
+            memcpy(ptr, src, size);
+        } else {
+            // Page at a time, unsharing only the pages this write touches.
+            size_t done = 0;
+            size_t ps = vma_page_size();
+            while (done < size) {
+                size_t chunk = size - done;
+                void*  page;
+                if (chunk > ps) {
+                    chunk = ps;
+                }
+                page = rvvm_ram_ptr(&machine->mem, (off + done) & ~(ps - 1), true);
+                if (unlikely(!page)) {
+                    return false;
+                }
+                memcpy((uint8_t*)page + ((off + done) & (ps - 1)), (const uint8_t*)src + done, chunk);
+                done += chunk;
+            }
+        }
         riscv_jit_mark_dirty_mem(machine, dest, size);
         return true;
     }
@@ -842,7 +880,29 @@ PUBLIC bool rvvm_write_ram(rvvm_machine_t* machine, rvvm_addr_t dest, const void
 PUBLIC bool rvvm_read_ram(rvvm_machine_t* machine, void* dest, rvvm_addr_t src, size_t size)
 {
     if (likely(machine && src >= machine->mem.addr && src + size <= machine->mem.addr + machine->mem.size)) {
-        memcpy(dest, ((uint8_t*)machine->mem.data) + (src - machine->mem.addr), size);
+        size_t      off = (size_t)(src - machine->mem.addr);
+        const void* ptr = rvvm_ram_const_ptr_range(&machine->mem, off, size);
+        if (likely(ptr != NULL)) {
+            memcpy(dest, ptr, size);
+            return true;
+        }
+        // Not contiguous: read a page at a time. No unshare - a read must not
+        // make a page private.
+        size_t done = 0;
+        size_t ps = vma_page_size();
+        while (done < size) {
+            size_t      chunk = size - done;
+            const void* page;
+            if (chunk > ps) {
+                chunk = ps;
+            }
+            page = rvvm_ram_const_ptr(&machine->mem, (off + done) & ~(ps - 1));
+            if (unlikely(!page)) {
+                return false;
+            }
+            memcpy((uint8_t*)dest + done, (const uint8_t*)page + ((off + done) & (ps - 1)), chunk);
+            done += chunk;
+        }
         return true;
     }
     return false;
@@ -851,8 +911,23 @@ PUBLIC bool rvvm_read_ram(rvvm_machine_t* machine, void* dest, rvvm_addr_t src, 
 PUBLIC void* rvvm_get_dma_ptr(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size)
 {
     if (likely(machine && addr >= machine->mem.addr && addr + size <= machine->mem.addr + machine->mem.size)) {
-        riscv_jit_mark_dirty_mem(machine, addr, size);
-        return ((uint8_t*)machine->mem.data) + (addr - machine->mem.addr);
+        size_t off = (size_t)(addr - machine->mem.addr);
+        void*  ptr = rvvm_ram_ptr_range(&machine->mem, off, size, true);
+        if (likely(ptr != NULL)) {
+            riscv_jit_mark_dirty_mem(machine, addr, size);
+            return ptr;
+        }
+        // Not contiguous. Hand back a single page rather than a pointer that is
+        // only valid for part of the range: a caller that scribbles on the whole
+        // thing must be told, and there is no way to widen it later.
+        if (likely(size <= vma_page_size())) {
+            void* page = rvvm_ram_ptr(&machine->mem, off & ~(vma_page_size() - 1), true);
+            if (likely(page != NULL)) {
+                riscv_jit_mark_dirty_mem(machine, addr, size);
+                return (uint8_t*)page + (off & (vma_page_size() - 1));
+            }
+        }
+        return NULL;
     }
     return NULL;
 }
@@ -1138,6 +1213,49 @@ PUBLIC rvvm_machine_t* rvvm_create_userland(const char* isa)
 #endif
 
     return machine;
+}
+
+/*
+ * Paged half of the RAM translation primitives declared in rvvm.h. Everything
+ * here is reached only by a machine that has a page table, so none of it is on
+ * the path of a kernel-mode machine, a device model or a snapshot.
+ */
+
+void* rvvm_ram_ptr_paged(rvvm_ram_t* mem, size_t offset, bool write)
+{
+    return cow_pgt_ptr(mem->pgt, offset, write);
+}
+
+// Typed void* on purpose: see the note on rvvm_ram_read_ptr(). The primitive
+// called is the const one, so this cannot unshare.
+void* rvvm_ram_ptr_paged_read(rvvm_ram_t* mem, size_t offset)
+{
+    return rvvm_ram_read_ptr_from_const(cow_pgt_const_ptr(mem->pgt, offset));
+}
+
+void* rvvm_ram_ptr_range(rvvm_ram_t* mem, size_t offset, size_t size, bool write)
+{
+    if (likely(!mem->pgt)) {
+        return ((uint8_t*)mem->data) + offset;
+    }
+    return cow_pgt_ptr_range(mem->pgt, offset, size, write);
+}
+
+void* rvvm_ram_read_ptr_range(rvvm_ram_t* mem, size_t offset, size_t size)
+{
+    if (likely(!mem->pgt)) {
+        return ((uint8_t*)mem->data) + offset;
+    }
+    return rvvm_ram_read_ptr_from_const(cow_pgt_const_ptr_range(mem->pgt, offset, size));
+}
+
+const void* rvvm_ram_const_ptr_range(const rvvm_ram_t* mem, size_t offset, size_t size)
+{
+    if (likely(!mem->pgt)) {
+        return ((const uint8_t*)mem->data) + offset;
+    }
+    // NULL here means "not contiguous": the caller copies a page at a time.
+    return cow_pgt_const_ptr_range(mem->pgt, offset, size);
 }
 
 PUBLIC void rvvm_flush_icache(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size)

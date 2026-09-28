@@ -518,6 +518,47 @@ void* cow_pgt_ptr_range(cow_pgt_machine_t* machine, size_t offset, size_t size, 
     return cow_pgt_arena_page(machine, page, false) + (offset - page * region->page_size);
 }
 
+const void* cow_pgt_const_ptr_range(const cow_pgt_machine_t* machine, size_t offset, size_t size)
+{
+    // Same test as the writable read path, on const data. See the note on
+    // cow_pgt_ptr_range() for why contiguity holds in exactly these two cases.
+    const cow_pgt_region_t* region;
+    size_t                  page;
+    size_t                  last;
+    size_t                  i;
+
+    if (!machine || size == 0) {
+        return NULL;
+    }
+    region = machine->region;
+    if (offset & (region->page_size - 1)) {
+        return NULL;
+    }
+    if (offset > region->guest_size || size > region->guest_size - offset) {
+        return NULL;
+    }
+    page = offset / region->page_size;
+    last = (offset + size - 1) / region->page_size;
+
+    if (!cow_pgt_bit_test(machine->bitmap, page)) {
+        for (i = page + 1; i <= last; i++) {
+            if (cow_pgt_bit_test(machine->bitmap, i)) {
+                return NULL;
+            }
+        }
+        return region->base + offset;
+    }
+    if (last / region->chunk_pages != page / region->chunk_pages) {
+        return NULL;
+    }
+    for (i = page + 1; i <= last; i++) {
+        if (!cow_pgt_bit_test(machine->bitmap, i)) {
+            return NULL;
+        }
+    }
+    return cow_pgt_arena_page_const(machine, page) + (offset - page * region->page_size);
+}
+
 bool cow_pgt_take_unshared(cow_pgt_machine_t* machine, size_t* first_page, size_t* last_page)
 {
     if (!machine || !machine->dirty_pending) {

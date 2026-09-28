@@ -990,13 +990,46 @@ static void* to_ptr(rvvm_addr_t addr)
     if (addr < machine->mem.addr || (addr - machine->mem.addr) >= machine->mem.size) {
         return NULL;
     }
-    return ((uint8_t*)machine->mem.data) + (addr - machine->mem.addr);
+    // Read-only translation: to_ptr() must not unshare, or a caller that only
+    // inspects guest memory would make the page private and every later write
+    // would pay for a copy. A caller that WRITES has to say so with to_ptr_wr();
+    // getting that wrong yields a pointer into the read-only shared base and a
+    // fault on the store, which is the intended loud failure.
+    return rvvm_ram_read_ptr(&machine->mem, (size_t)(addr - machine->mem.addr));
+}
+
+// Writable counterpart of to_ptr(). Unshares the page on demand. Every writer
+// in the tree has to use this one; the set of them is reviewed line by line
+// because a missed writer is an access violation at run time rather than a
+// silently wrong result.
+static void* to_ptr_wr(rvvm_addr_t addr)
+{
+    rvvm_machine_t* machine = cur_machine();
+
+    if (!machine) {
+        // RVVM_USER_TEST* modes run the guest natively, guest == host
+        return (void*)(size_t)addr;
+    }
+    if (addr < machine->mem.addr || (addr - machine->mem.addr) >= machine->mem.size) {
+        return NULL;
+    }
+    return rvvm_ram_ptr(&machine->mem, (size_t)(addr - machine->mem.addr), true);
 }
 
 // Range-checked variant: the whole [addr, addr + size) window must lie inside
 // guest RAM. Use it wherever the host itself touches guest memory (copy, zero,
 // struct write) or hands a buffer to host code, so a bogus guest pointer fails
 // with -EFAULT instead of corrupting the host address space.
+//
+// A NULL result means "no single host pointer covers this range", which is not
+// the same as "bad address". Once guest RAM is a page table, a range that
+// straddles the shared/private boundary is a normal outcome: the caller has to
+// copy it a page at a time with guest_copy_read()/guest_copy_write(). Use those
+// directly for a guest-supplied size rather than range-checking by hand.
+//
+// Reads must not unshare: a caller that only looks at a page should not make it
+// private, or a guest that merely scans its own address space would pay for a
+// copy of everything it touched.
 static void* to_ptr_sz(rvvm_addr_t addr, size_t size)
 {
     rvvm_machine_t* machine = cur_machine();
@@ -1011,7 +1044,119 @@ static void* to_ptr_sz(rvvm_addr_t addr, size_t size)
     if (size > machine->mem.size || off > machine->mem.size - size) {
         return NULL;
     }
-    return ((uint8_t*)machine->mem.data) + off;
+    return rvvm_ram_read_ptr_range(&machine->mem, off, size);
+}
+
+// Writable range form. Returns NULL when the range cannot be made contiguous in
+// host memory - which is a normal outcome, not a fault, and the caller has to
+// fall back to guest_copy_write(). With write=true the range is unshared before
+// the contiguity test, so a NULL here may still have unshared pages; that is
+// safe, because the fallback would have unshared exactly the same ones.
+static void* to_ptr_sz_wr(rvvm_addr_t addr, size_t size)
+{
+    rvvm_machine_t* machine = cur_machine();
+
+    if (!machine) {
+        return (void*)(size_t)addr;
+    }
+    if (addr < machine->mem.addr) {
+        return NULL;
+    }
+    rvvm_addr_t off = addr - machine->mem.addr;
+    if (size > machine->mem.size || off > machine->mem.size - size) {
+        return NULL;
+    }
+    return rvvm_ram_ptr_range(&machine->mem, off, size, true);
+}
+
+/*
+ * Page-at-a-time copies between host buffers and guest RAM. These are the bottom
+ * layer: to_ptr_sz() above only hands back a pointer when the range is genuinely
+ * contiguous in host memory, and these are what a caller does when it is not.
+ *
+ * They walk the range page by page and ask for one page at a time, so a large
+ * guest-supplied read costs a copy only of the pages that are not already
+ * contiguous in the shared base - which, for a machine that has just booted, is
+ * none of them.
+ */
+static void guest_copy_read(rvvm_addr_t addr, void* host_buf, size_t size)
+{
+    rvvm_machine_t* machine = cur_machine();
+    size_t          ps;
+    uint8_t*        dst = (uint8_t*)host_buf;
+
+    if (!machine || !host_buf) {
+        return;
+    }
+    ps = vma_page_size();
+    while (size) {
+        size_t      off = (size_t)(addr - machine->mem.addr);
+        size_t      chunk;
+        const void* src;
+        if (addr < machine->mem.addr || off >= machine->mem.size) {
+            return;
+        }
+        chunk = machine->mem.size - off;
+        if (chunk > size) {
+            chunk = size;
+        }
+        if (chunk > ps) {
+            chunk = ps;
+        }
+        // One page at a time, so a range that is contiguous in the shared base
+        // costs a bounds test and a bitmap test per page and no copying at all.
+        src = rvvm_ram_const_ptr(&machine->mem, off);
+        if (!src) {
+            return;
+        }
+        memcpy(dst, src, chunk);
+        dst += chunk;
+        addr += chunk;
+        size -= chunk;
+    }
+}
+
+static bool guest_copy_write(rvvm_addr_t addr, const void* host_buf, size_t size)
+{
+    rvvm_machine_t* machine = cur_machine();
+    size_t          ps;
+    const uint8_t*  src = (const uint8_t*)host_buf;
+
+    if (!machine || !host_buf) {
+        return false;
+    }
+    ps = vma_page_size();
+    while (size) {
+        size_t off;
+        size_t chunk;
+        void*  dst;
+        if (addr < machine->mem.addr) {
+            return false;
+        }
+        off = (size_t)(addr - machine->mem.addr);
+        if (off >= machine->mem.size) {
+            return false;
+        }
+        chunk = machine->mem.size - off;
+        if (chunk > size) {
+            chunk = size;
+        }
+        if (chunk > ps) {
+            chunk = ps;
+        }
+        // Unshare only the pages this write really touches - the whole point of
+        // the page table, and why a large guest write costs its own size rather
+        // than the guest's.
+        dst = rvvm_ram_ptr(&machine->mem, off & ~(ps - 1), true);
+        if (!dst) {
+            return false;
+        }
+        memcpy((uint8_t*)dst + (off & (ps - 1)), src, chunk);
+        src += chunk;
+        addr += chunk;
+        size -= chunk;
+    }
+    return true;
 }
 
 // Short cast rvvm_addr_t -> const char*
@@ -3037,7 +3182,7 @@ static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, b
         if (hint < GUEST_PAGE_SIZE || hint + size > ctx->guest_mmap_end) {
             return false;
         }
-        memset(to_ptr(hint), 0, size);
+        memset(to_ptr_wr(hint), 0, size);
         *out = hint;
         return true;
     }
@@ -3051,7 +3196,7 @@ static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, b
             if (!ctx->guest_free[i].size) {
                 ctx->guest_free[i] = ctx->guest_free[--ctx->guest_free_num];
             }
-            memset(to_ptr(addr), 0, size);
+            memset(to_ptr_wr(addr), 0, size);
             *out = addr;
             return true;
         }
@@ -3059,7 +3204,7 @@ static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, b
 
     // Then a hint above the bump pointer, then the bump pointer itself
     if (hint >= ctx->guest_bump && hint >= GUEST_MMAP_BASE && hint + size <= ctx->guest_mmap_end) {
-        memset(to_ptr(hint), 0, size);
+        memset(to_ptr_wr(hint), 0, size);
         *out = hint;
         return true;
     }
@@ -3072,7 +3217,7 @@ static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, b
         RVVM_TRC(RVVM_TRC_MMAP, "DBG alloc: zeroing %llx bytes at %llx (mmap_end %llx)", (long long)size, (long long)addr,
                   (long long)ctx->guest_mmap_end);
     }
-    memset(to_ptr(addr), 0, size);
+    memset(to_ptr_wr(addr), 0, size);
     if (size >= (1u << 20)) {
         RVVM_TRC(RVVM_TRC_MMAP, "DBG alloc: zeroed ok");
     }
@@ -5851,11 +5996,13 @@ static void userland_fork_zero(rvvm_userland_t* child, rvvm_addr_t addr, rvvm_ad
  * the same as a fresh page on Linux. */
 static void userland_fork_memory(rvvm_userland_t* child, rvvm_userland_t* parent, rvvm_addr_t sp)
 {
-    rvvm_addr_t img = GUEST_DYN_BASE;
-    if (parent->elf.base) {
-        img = parent->machine->mem.addr +
-              ((const uint8_t*)parent->elf.base - (const uint8_t*)parent->machine->mem.data);
-    }
+    // elf.guest_base, not a pointer subtraction: elf.base is a host pointer that
+    // names three different things depending on which branch elf_load_file()
+    // took, and two of those are not guest memory at all. Deriving a guest
+    // address by subtracting mem.data was only ever right for the window case,
+    // and it silently produced a meaningless range otherwise. guest_base is
+    // nonzero exactly when the image is in the window.
+    rvvm_addr_t img = parent->elf.guest_base ? parent->elf.guest_base : GUEST_DYN_BASE;
 
     userland_fork_copy(child, parent, img, parent->guest_brk_ptr);
     userland_fork_copy(child, parent, GUEST_MMAP_BASE, parent->guest_bump);
@@ -6353,12 +6500,26 @@ static bool userland_threads_gone(rvvm_userland_t* ctx, uint32_t timeout_ms)
 static int guest_read_mem(rvvm_hart_t* cpu, uint64_t guest_addr, void* host_buf, size_t size)
 {
     (void)cpu;
+    // Try the single-pointer path first: for a range that is still contiguous in
+    // the shared base this is a bounds check and a memcpy, with no per-page work
+    // and no copying beyond the one the caller asked for. Only a range that
+    // straddles the shared/private boundary pays the page walk, which is what
+    // keeps a large guest read() in a freshly forked process free.
     const void* src = to_ptr_sz(guest_addr, size);
-    if (!src) {
-        return -1;
+    if (likely(src != NULL)) {
+        memcpy(host_buf, src, size);
+        return 0;
     }
-    memcpy(host_buf, src, size);
-    return 0;
+    // Not contiguous. Distinguish "not contiguous" from "bad address": re-check
+    // the bounds, because only the second is an error the guest should see.
+    rvvm_machine_t* machine = cur_machine();
+    if (machine && (guest_addr >= machine->mem.addr) &&
+        ((size_t)(guest_addr - machine->mem.addr) < machine->mem.size) &&
+        (size <= machine->mem.size - (size_t)(guest_addr - machine->mem.addr))) {
+        guest_copy_read((rvvm_addr_t)guest_addr, host_buf, size);
+        return 0;
+    }
+    return -1;
 }
 
 /*
@@ -6372,12 +6533,21 @@ static int guest_read_mem(rvvm_hart_t* cpu, uint64_t guest_addr, void* host_buf,
 static int guest_write_mem(rvvm_hart_t* cpu, uint64_t guest_addr, const void* host_buf, size_t size)
 {
     (void)cpu;
-    void* dst = to_ptr_sz(guest_addr, size);
-    if (!dst) {
-        return -1;
+    if (likely(size == 0)) {
+        return 0;
     }
-    memcpy(dst, host_buf, size);
-    return 0;
+    // Unsharing is idempotent, so the single-pointer path is safe to take for a
+    // write too: it hands back one pointer when the range can be made contiguous,
+    // and the page walk below is what unshares the rest anyway.
+    void* dst = to_ptr_sz_wr(guest_addr, size);
+    if (likely(dst != NULL)) {
+        memcpy(dst, host_buf, size);
+        return 0;
+    }
+    if (guest_copy_write((rvvm_addr_t)guest_addr, host_buf, size)) {
+        return 0;
+    }
+    return -1;
 }
 
 /*
@@ -6429,7 +6599,7 @@ static rvvm_addr_t rvvm_sys_brk(rvvm_addr_t brk_new)
     if (ctx->guest_brk_start && brk_new >= ctx->guest_brk_start && brk_new <= ctx->guest_brk_end) {
         if (brk_new > ctx->guest_brk_ptr) {
             // Newly allocated brk memory should be zeroed
-            memset(to_ptr(ctx->guest_brk_ptr), 0, brk_new - ctx->guest_brk_ptr);
+            memset(to_ptr_wr(ctx->guest_brk_ptr), 0, brk_new - ctx->guest_brk_ptr);
         }
         ctx->guest_brk_ptr = brk_new;
     } else if (brk_new) {
@@ -11391,7 +11561,7 @@ static void* rvvm_user_thread_wrap(void* arg)
             switch (a7) {
                 case 17: { // getcwd
                     rvvm_info("sys_getcwd(%lx, %lx)", a0, a1);
-                    char* buf = to_ptr_sz(a0, a1);
+                    char* buf = to_ptr_sz_wr(a0, a1);
                     a0 = buf ? rvvm_sys_getcwd(buf, a1) : (rvvm_addr_t)-UAPI_EFAULT;
                     break;
                 }
@@ -12699,7 +12869,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 98: // futex
                 {
-                    uint32_t* faddr = to_ptr(a0);
+                    uint32_t* faddr = to_ptr_wr(a0);
                     RVVM_TRC(RVVM_TRC_SYS, "DBG futex: uaddr=%llx op=%llx val=%llx timeout=%llx uaddr2=%llx val3=%llx word=%x ra=%llx sp=%llx",
                               (long long)a0, (long long)a1, (long long)a2, (long long)a3, (long long)a4, (long long)a5,
                               faddr ? *faddr : 0xdeadbeef,
@@ -12864,7 +13034,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     // The mask is not optional (there is nothing to report into
                     // and no way to answer the question without writing it)
-                    void* mask = to_ptr_sz(a2, a1);
+                    void* mask = to_ptr_sz_wr(a2, a1);
                     if (!mask) {
                         a0 = -UAPI_EFAULT;
                         break;
@@ -12990,7 +13160,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * sigwait()/sigtimedwait() is asking for. */
                     rvvm_userland_t* ctx = uctx();
                     const uint64_t* set = to_ptr(a0);
-                    void* info = to_ptr(a1);
+                    void* info = to_ptr_wr(a1);
                     const struct uapi_timespec32* tmo = to_ptr(a2);
                     uint64_t deadline = 0;
                     bool     timed = tmo != NULL;
@@ -13304,7 +13474,7 @@ case 179: // sysinfo
                     break;
                 case 202: { // accept
                     int        listen_fd = userland_fd_host(uctx(), (int)a0);
-                    void*      sa = to_ptr(a1);
+                    void*      sa = to_ptr_wr(a1);
                     socklen_t* lp = to_ptr(a2);
                     rvvm_info("sys_accept(guest %ld, host %d, %lx, %lx)", a0, listen_fd, a1, a2);
                     a0 = errno_ret(accept(listen_fd, sa, lp));
@@ -13388,7 +13558,7 @@ case 179: // sysinfo
                     break;
                 }
                 case 204: { // getsockname
-                    void*      sa  = to_ptr(a1);
+                    void*      sa  = to_ptr_wr(a1);
                     socklen_t* lp  = to_ptr(a2);
                     rvvm_info("sys_getsockname(%ld, %lx, %lx)", a0, a1, a2);
                     a0 = errno_ret(getsockname(userland_fd_host(uctx(), (int)a0), sa, lp));
@@ -13400,7 +13570,7 @@ case 179: // sysinfo
                     break;
                 }
                 case 205: { // getpeername
-                    void*      sa  = to_ptr(a1);
+                    void*      sa  = to_ptr_wr(a1);
                     socklen_t* lp  = to_ptr(a2);
                     rvvm_info("sys_getpeername(%ld, %lx, %lx)", a0, a1, a2);
                     a0 = errno_ret(getpeername(userland_fd_host(uctx(), (int)a0), sa, lp));
@@ -13496,9 +13666,9 @@ case 179: // sysinfo
                         a0 = -UAPI_ENOMEM;
                         break;
                     }
-                    memcpy(to_ptr(new_addr), old, copy_len);
+                    memcpy(to_ptr_wr(new_addr), old, copy_len);
                     if (a2 > a1) {
-                        memset(to_ptr(new_addr + a1), 0, a2 - a1);
+                        memset(to_ptr_wr(new_addr + a1), 0, a2 - a1);
                     }
                     spin_lock(&uctx()->guest_lock);
                     guest_range_free(a0, a1);
@@ -14108,12 +14278,41 @@ static uint8_t* guest_window(rvvm_machine_t* machine)
  * elsewhere, would otherwise leave the previous process readable where the old
  * one used to be. Zeroing the image extent is cheap (a few MiB); zeroing the
  * whole guest address space to get the same guarantee would be a GiB. */
+/* A page of zeroes, for the guest_copy_write() fallbacks. A static buffer rather
+ * than a per-call allocation: these paths run while a guest image is being torn
+ * down, and the alternative to one shared zero page is a heap allocation per page
+ * erased. */
+static const uint8_t pgt_zero_page[4096];
+
 static void guest_erase_image(elf_desc_t* elf)
 {
-    if (elf->base && elf->buf_size) {
-        void* base = to_ptr(to_addr(elf->base));
-        if (base) {
-            memset(base, 0, elf->buf_size);
+    // guest_base, and only when it is set: that is the "the image is in the
+    // guest window" case, and it is the only one where there is guest memory to
+    // erase. The old test was elf->base, which is non-NULL on the two paths whose
+    // buffer is not guest memory at all, where to_ptr() of a derived address was
+    // meaningless.
+    if (elf->guest_base && elf->buf_size) {
+        // Writable, and range-checked: this is a multi-MiB write, so it goes
+        // through the range form and falls back to a page walk when the extent is
+        // not contiguous in host memory.
+        size_t done = 0;
+        while (done < elf->buf_size) {
+            size_t      chunk = elf->buf_size - done;
+            void*       base;
+            if (chunk > vma_page_size()) {
+                chunk = vma_page_size();
+            }
+            base = to_ptr_sz_wr((rvvm_addr_t)(elf->guest_base + done), chunk);
+            if (!base) {
+                // Not contiguous: erase a page at a time.
+                if (!guest_copy_write((rvvm_addr_t)(elf->guest_base + done),
+                                      pgt_zero_page, chunk)) {
+                    return;
+                }
+            } else {
+                memset(base, 0, chunk);
+            }
+            done += chunk;
         }
     }
 }
@@ -14271,7 +14470,7 @@ static rvvm_addr_t guest_setup_stack(rvvm_userland_t* ctx, size_t argc, char** a
     // Only the top of the reservation is zeroed (see GUEST_STACK_ZERO): the
     // frame builder writes everything below that point before it is read, and on
     // a reused address space (execve) the fresh pages are demand-zero anyway.
-    uint8_t* stack_buffer = to_ptr(ctx->guest_stack_base);
+    uint8_t* stack_buffer = to_ptr_wr(ctx->guest_stack_base);
     memset(stack_buffer + GUEST_STACK_SIZE - GUEST_STACK_ZERO, 0, GUEST_STACK_ZERO);
     rvvm_addr_t stack_top = rvvm_user_init_stack(stack_buffer + GUEST_STACK_SIZE, &desc);
     rvvm_info("Stack top at %llx", (unsigned long long)stack_top);
@@ -14579,7 +14778,7 @@ static char* exec_host_str(const char* str)
 static bool rvvm_sys_execve(rvvm_hart_t* cpu, rvvm_user_thread_t* thread, char* path_buf,
                             rvvm_addr_t path, rvvm_addr_t uargv, rvvm_addr_t uenvp)
 {
-    char* guest_path = to_ptr(path);
+    char* guest_path = to_ptr_wr(path);
     char* argv[GUEST_EXEC_ARGV_MAX];
     char* envv[GUEST_EXEC_ARGV_MAX];
     int   args     = 0;
