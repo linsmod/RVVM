@@ -6537,7 +6537,27 @@ static int rvvm_sys_clone(rvvm_user_thread_t* self, rvvm_hart_t* cpu, uint32_t f
     rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_PC, rvvm_read_cpu_reg(cpu, RVVM_REGID_PC) + 4);
     rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_X0 + 10, 0);
 
-    userland_fork_memory(child, ctx, rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 2));
+    /* The child's stack pointer is the one clone() was handed, whenever it was
+     * handed one - the thread path above has always done this, and a caller that
+     * builds a child stack depends on it. musl's __clone (riscv64/clone.s) is
+     * the case that matters: it aligns the stack it was given, stores the entry
+     * function and its argument in the top 16 bytes, and the child reads them
+     * straight back off sp. Left on the parent's sp, the child reads whatever the
+     * parent's frame happens to hold there - for a posix_spawn()/system() stack,
+     * which the parent has just written and which nothing else has touched, that
+     * is two zero words, and the child calls address 0.
+     *
+     * fork() passes no stack and expects the child to keep the parent's, so this
+     * only moves sp when there is one to move to. */
+    rvvm_addr_t parent_sp = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 2);
+    if (stack) {
+        rvvm_write_cpu_reg(thread->cpu, RVVM_REGID_X0 + 2, stack);
+    }
+
+    /* A child stack below the parent's sp is outside the range the copy walks
+     * (which starts at the parent's sp), and the child is about to read the top
+     * of it. Start the copy at whichever of the two is lower. */
+    userland_fork_memory(child, ctx, (stack && stack < parent_sp) ? stack : parent_sp);
 
     child->userland_main_thread = thread;
     thread_detach(rvvm_thread_create_ex(rvvm_user_child_main, thread, 0));
