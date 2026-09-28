@@ -591,12 +591,46 @@ static void session_check_child(struct session* s)
     }
 }
 
+/* Clear what earlier runs left in this run's tree, before this run uses it.
+ *
+ * Two things, and neither of them belongs to the emulator:
+ *
+ *   - `rvvm_tmp.*` files. Windows has no anonymous file, so the guest's
+ *     O_TMPFILE is emulated by creating "<dir>\rvvm_tmp.<pid>.<seq>" and renaming
+ *     it into place when the guest links it (posix_shim.c). One that is never
+ *     published stays behind, and apk's atomic database updates make hundreds of
+ *     them: 285 in /lib/apk/db and 95 in the root of a tree that had seen a few
+ *     dozen `apk add` runs. They are all zero bytes - created, then abandoned -
+ *     and that is also what makes `-size 0` the right guard rather than a
+ *     detail: a temporary a run is still filling is not zero bytes, so this
+ *     cannot delete one in flight.
+ *   - /tmp, which is this run's scratch directory. It is cleared *here* rather
+ *     than after dlog_redirect() because that is where this daemon's own log
+ *     lives, and a wipe after the log is open would be deleting the log.
+ *
+ * It runs before the endpoint is published, so a client that can connect is a
+ * client whose run started on a clean tree. Best effort, and quiet about it: a
+ * filesystem that will not give up its scratch space is not a reason to refuse
+ * to serve sessions, and the failures that matter (mkdir, bind) are reported
+ * above this point where stderr still reaches the terminal. */
+static void run_init_sweep(void)
+{
+    mkdir("/tmp", 0777);   /* dlog_redirect() does this too; EEXIST is fine */
+    if (system("find / -xdev -name 'rvvm_tmp.*' -type f -size 0 -delete 2>/dev/null;"
+               " rm -rf /tmp/* /tmp/.[!.]* /tmp/..?* 2>/dev/null") == -1) {
+        fprintf(stderr, "vpsessiond: could not run the init sweep (no shell?)\n");
+    }
+}
+
 int main(int argc, char** argv)
 {
     /* argv[3], when given, is where this daemon's log goes; without it the log
      * lands in the run's /tmp under its own name. Parsed first, because the
      * redirect is the first thing that has to happen. */
     const char* dlog_path = (argc > 3 && argv[3] && *argv[3]) ? argv[3] : DLOG_DEFAULT;
+
+    /* Before the log is opened in it, and before the endpoint exists: see above. */
+    run_init_sweep();
 
     /* First, before anything can print: this daemon's log is a file, not the
      * host process's stdout, which belongs to whoever asked for a command. */
