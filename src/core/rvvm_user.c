@@ -1420,6 +1420,19 @@ typedef struct {
     // Only socket anchors need one: an ordinary file's host descriptor is the
     // file, open, and the CRT cannot reuse its number while it is.
     bool holds_anchor_ref;
+    // The guest path this descriptor was opened with, or NULL when the
+    // descriptor does not name a file (a socket, a pipe, a console) or when
+    // this layer does not know it. It exists for /proc/<pid>/fd/<n>, whose whole
+    // job is to tell a process the name of a descriptor it holds - apk reads
+    // that link to find where the file it just wrote went, and builds a
+    // destination from the answer.
+    //
+    // A pointer, not a buffer: the table has USERLAND_FD_TABLE_MAX slots per
+    // process and a UAPI_PATH_MAX array in each would cost 16 MB of address
+    // space for a process that may hold three descriptors. Each slot owns its
+    // own string, so a dup or a fork copies it and a close frees it, and no two
+    // slots ever share storage.
+    char* path;
 } rvvm_fd_entry_t;
 typedef struct rvvm_process {
     uint32_t     pid;         // Guest-visible process id
@@ -5534,6 +5547,38 @@ static bool userland_fd_write_blocks(rvvm_userland_t* ctx, int fd)
  *
  * A slot inherited without a copy of its own (see userland_fd_table_inherit) is
  * dropped without the host close: the host fd is the parent's as well. */
+/* A slot's own copy of a path. NULL in, NULL out: a descriptor that names no
+ * file keeps saying so rather than being given an empty name, which
+ * /proc/<pid>/fd/<n> would then have to report as a real one. */
+static char* userland_fd_path_copy(const char* path)
+{
+    size_t len;
+    char*  copy;
+
+    if (!path) {
+        return NULL;
+    }
+    len  = strlen(path) + 1;
+    copy = safe_malloc(len);
+    memcpy(copy, path, len);
+    return copy;
+}
+
+/* Name the file behind @fd, replacing any name it had. The slot owns the copy. */
+static void userland_fd_set_path(rvvm_userland_t* ctx, int fd, const char* path)
+{
+    char* copy;
+
+    if (!userland_fd_tracked(ctx, fd)) {
+        return;
+    }
+    copy                = userland_fd_path_copy(path);
+    RVVM_TRC(RVVM_TRC_FD, "fd_name pid=%u fd=%d path=%s",
+             (unsigned)ctx->pid, fd, path ? path : "(none)");
+    safe_free(ctx->fds[fd].path);
+    ctx->fds[fd].path    = copy;
+}
+
 static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
 {
     if (!userland_fd_tracked(ctx, fd)) {
@@ -5546,6 +5591,11 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
      * visible in a single line, where the bare fd_wr[close] below is not. */
     RVVM_TRC(RVVM_TRC_FD, "fd_drop pid=%u fd=%d host=%d%s", (unsigned)ctx->pid,
              fd, ctx->fds[fd].fd, ctx->fds[fd].shared ? " shared(kept)" : "");
+    /* The name goes with the slot. A shared slot keeps the descriptor alive but
+     * not this string: the child that inherited it holds its own copy, and
+     * nothing outlives the slot. */
+    safe_free(ctx->fds[fd].path);
+    ctx->fds[fd].path = NULL;
     if (win_socket_is_fd(ctx->fds[fd].fd)) {
         RVVM_TRC(RVVM_TRC_FD, "fd_drop pid=%u fd=%d host=%d socket peer %s",
                  (unsigned)ctx->pid, fd, ctx->fds[fd].fd,
@@ -5648,7 +5698,11 @@ static int userland_fd_add(rvvm_userland_t* ctx, int host_fd, bool cloexec)
  *
  * Its FD_CLOEXEC starts clear for dup(2)/dup2(2) and as asked for dup3(2) and
  * F_DUPFD_CLOEXEC. */
-static int userland_fd_dup(rvvm_userland_t* ctx, int source_fd, int host_fd, int min_fd, bool cloexec)
+/* The name a dup hands on. Split out because userland_fd_dup() has one exit per
+ * kind of thing the copy can be, and a path that was attached at only some of
+ * them would be a name that appears and disappears with which kind was duped. */
+static int userland_fd_dup_named(rvvm_userland_t* ctx, int source_fd, int host_fd,
+                                 int min_fd, bool cloexec)
 {
     int guest_fd = userland_fd_slot_alloc(ctx, min_fd);
     if (guest_fd < 0) {
@@ -5717,6 +5771,21 @@ static int userland_own_fd_dup(rvvm_userland_t* ctx, int source_fd, int host_fd,
         return guest_fd;
     }
     return -2;
+}
+
+/* A dup reaches the same file, so the copy is named for the same file: the two
+ * numbers are different descriptors of one object and /proc/<pid>/fd/<n> has to
+ * say so for each. The name is copied rather than shared, so closing one number
+ * cannot pull the name out from under the other. */
+static int userland_fd_dup(rvvm_userland_t* ctx, int source_fd, int host_fd,
+                           int min_fd, bool cloexec)
+{
+    int guest_fd = userland_fd_dup_named(ctx, source_fd, host_fd, min_fd, cloexec);
+
+    if (guest_fd >= 0) {
+        userland_fd_set_path(ctx, guest_fd, ctx->fds[source_fd].path);
+    }
+    return guest_fd;
 }
 
 /* F_GETFD / F_SETFD: the guest's FD_CLOEXEC, which the host fd does not carry. */
@@ -5899,6 +5968,12 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
              * the reference here was taken conditionally - the surplus release
              * that handed a number back to the CRT under a live slot. */
             child->fds[fd].holds_anchor_ref = shared_anchored;
+        }
+        /* The name travels with the descriptor: a child's /proc/<pid>/fd/<n> has
+         * to answer for the file its parent opened. Each slot owns its own copy,
+         * so parent and child may be closed independently. */
+        if (child->fds[fd].used) {
+            userland_fd_set_path(child, fd, parent->fds[fd].path);
         }
     }
 }
@@ -11242,6 +11317,23 @@ static const char* userland_proc_fd_link_target(uint32_t pid, uint32_t fd,
     if (proc && home && (int)fd < USERLAND_FD_TABLE_MAX && home->fds[fd].used) {
         hfd = home->fds[fd].fd;
     }
+    /* A descriptor opened from a path knows its own name, and that is the answer
+     * this link exists to give. Read it before the registry reference goes. */
+    if (proc && home && (int)fd < USERLAND_FD_TABLE_MAX && home->fds[fd].used &&
+        home->fds[fd].path) {
+        RVVM_TRC(RVVM_TRC_FD, "fd_link pid=%u fd=%d -> %s", (unsigned)pid, fd,
+                 home->fds[fd].path);
+        size_t len = strlen(home->fds[fd].path);
+        if (len >= size) {
+            len = size - 1;   /* readlink() truncates, it does not fail */
+        }
+        memcpy(buf, home->fds[fd].path, len);
+        buf[len] = '\0';
+        if (proc) {
+            userland_proc_unref(proc);
+        }
+        return buf;
+    }
     if (proc) {
         userland_proc_unref(proc);
     }
@@ -11903,6 +11995,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         userland_fds_write(uctx(), newfd, true, host_old,
                                            (a2 & UAPI_O_CLOEXEC) != 0, false,
                                            keep_be, keep_flags, "dup3_own");
+                        userland_fd_set_path(uctx(), newfd, uctx()->fds[oldfd].path);
                         a0 = newfd;
                         break;
                     }
@@ -11920,6 +12013,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                     userland_fd_close(uctx(), newfd);
                     userland_fd_install(uctx(), newfd, host_new, (a2 & UAPI_O_CLOEXEC) != 0);
                     userland_fd_set_flags(uctx(), newfd, userland_fd_flags(uctx(), oldfd));
+                    /* The copy reaches the same file, so it carries the same name.
+                     * dup2 is how a shell puts a redirect on a number it was given
+                     * - `exec 9<file` - so a name that stopped here would be
+                     * missing from exactly the descriptor a process most wants to
+                     * ask /proc/self/fd about. */
+                    userland_fd_set_path(uctx(), newfd, uctx()->fds[oldfd].path);
                     a0 = newfd;
                     break;
                 }
@@ -12317,6 +12416,13 @@ static void* rvvm_user_thread_wrap(void* arg)
                                 int host_fd  = (int)a0;
                                 int guest_fd = userland_fd_add(uctx(), host_fd,
                                                                (a2 & UAPI_O_CLOEXEC) != 0);
+                                if (guest_fd >= 0) {
+                                    /* Name the file, so /proc/<pid>/fd/<n> can
+                                     * answer for it later - read by a process
+                                     * that has to find where a write landed. */
+                                    userland_fd_set_path(uctx(), guest_fd,
+                                                         have_abs ? abs : path);
+                                }
                                 if (created) {
                                     mode_override_record_path(host_path, guest_create_mode(a3), true);
                                 }
