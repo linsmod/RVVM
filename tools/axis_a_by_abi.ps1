@@ -87,6 +87,21 @@ $exceptions = @{
     'sendmsg' = 'same shape; the backfilled buffers are in rvvm_msghdr_from_guest()'
 }
 
+# The complete set of ways this file can reach guest memory.
+#
+# This list is the reach criterion, so it is written out rather than left as a
+# shape like '\bto_ptr' that happens to cover most of it. A reach test built from
+# a partial shape is a fact rather than a guarantee: it says the syscalls below are
+# settled only for as long as nobody reaches guest memory a new way. The obvious
+# way that happens is someone calling guest_write_mem() straight from a `case`,
+# which is a perfectly reasonable refactor and which this list would then miss -
+# the syscall would be reported as touching no guest pointer, when it writes one.
+#
+# When a new entry point is added, add it here in the same commit. That is the same
+# discipline as TABLE 1 itself: a closed set that is written down, rather than a
+# convention that is remembered.
+$ReachPattern = '\bto_ptr\b|\bto_ptr_sz\b|\bto_ptr_wr\b|\bto_ptr_sz_wr\b|\bto_ptr_ioctl\b|\bto_str\b|\bguest_copy_read\b|\bguest_copy_write\b|\brvvm_user_guest_ptr\b'
+
 # ---------------------------------------------------------------------------
 # Index the dispatch: case number -> { name, start, end }
 # ---------------------------------------------------------------------------
@@ -141,7 +156,7 @@ foreach ($c in $cases) {
     if ($fills.ContainsKey($name) -or $fillsNothing.ContainsKey($name)) { continue }
     $ptrSites = @()
     for ($i = $c.Start; $i -lt $c.End; $i++) {
-        if ($lines[$i] -match '\bto_ptr|\bto_str') { $ptrSites += ($i + 1) }
+        if ($lines[$i] -match $ReachPattern) { $ptrSites += ($i + 1) }
     }
     if ($ptrSites.Count -eq 0) {
         # No guest-pointer access at all, so there is nothing to classify. Not a
