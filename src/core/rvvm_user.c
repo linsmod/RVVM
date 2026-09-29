@@ -1348,7 +1348,8 @@ static uint32_t userland_current_pid(void);
 static bool userland_proc_path_stat(const char* abs, uint32_t self_pid, bool follow,
                                     struct stat* st);
 /* 1 = ours and *out holds the target length, 0 = ours but not a symlink (the
- * caller answers EINVAL), -1 = not ours. */
+ * caller answers EINVAL), 2 = ours and there is no name to give (the caller
+ * answers ENOENT), -1 = not ours. */
 static int userland_proc_readlink(const char* abs, uint32_t self_pid, char* buffer,
                                   size_t size, rvvm_addr_t* out);
 
@@ -8256,6 +8257,11 @@ static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* bu
         if (rc == 0) {
             return -UAPI_EINVAL;   // ours, but not a symlink
         }
+        if (rc == 2) {
+            // ours, and there is no name to give. Falling through would let the
+            // host answer with its own descriptor of the same number.
+            return -UAPI_ENOENT;
+        }
     }
 
     /* Separate buffers: the mapped host path and the link target are both
@@ -11253,7 +11259,15 @@ static const char* userland_proc_fd_link_target(uint32_t pid, uint32_t fd,
     if (userland_proc_is_fd(hfd)) {
         return "/proc";
     }
-    return fd <= 2 ? "/dev/tty" : "/dev/null";
+    /* A host descriptor carries no name in the table - only a number - so there
+     * is nothing honest to answer with, and the old answer of "/dev/null" was
+     * worse than none. This link exists to tell a process the name of a
+     * descriptor it holds; apk reads it to learn where the file it just wrote
+     * went, builds a destination from the answer, and then reports the failure
+     * against that invented path rather than against the link that could not
+     * answer. A caller handed ENOENT fails at the question. 0/1/2 are the
+     * console, and are named as such. */
+    return fd <= 2 ? "/dev/tty" : NULL;
 }
 
 /* readlink(2) of a procfs link. See the header for the return convention. */
@@ -11281,6 +11295,14 @@ static int userland_proc_readlink(const char* abs, uint32_t self_pid, char* buff
         target = pidstr;
     } else if (pp.kind == RVVM_PROC_PID_FD_LINK) {
         target = userland_proc_fd_link_target(pp.pid, pp.fd, fdbuf, sizeof(fdbuf));
+        if (!target) {
+            /* Ours, and there is no name to give: either the number is not a
+             * live descriptor or it is one this layer does not track by name.
+             * Both are ENOENT to a caller, and neither may fall through to the
+             * host - a host descriptor of the same number would answer, and
+             * that answer describes the emulator, not the guest process. */
+            return 2;
+        }
     } else if (pp.kind == RVVM_PROC_PID_LINK) {
         if (!strcmp(pp.leaf, "cwd")) {
             target = uctx()->cwd;
