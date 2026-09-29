@@ -6,7 +6,12 @@
 #include <string.h>
 
 #include "core/rvvm_user.h" /* rvvm_user_guest_ptr */
+#include "util/utils.h"      /* RVVM_LOGx(): the one logger (see utils.h) */
 #include "virtpass/vp_gl.h" /* fn_id macros + gl_call ABI */
+
+/* This host's diagnostics, through the one logger. They used to printf to
+ * stdout, which here is the guest's console transcript, not a side channel. */
+#define WINHOST_TAG "WINHOST"
 
 static float vpgl_arg_f(int64_t v)
 {
@@ -87,8 +92,8 @@ static int64_t vpgl_string_out(const int64_t* a, const char* str)
      * slot value cannot run off the end of guest RAM. */
     if (!ga || !rvvm_user_guest_ptr(ga) ||
         !rvvm_user_guest_ptr(ga + GL_CALL_RETBUF_CAP - 1)) {
-        fprintf(stderr, "[gl] retbuf slot %llx unmapped; dropping string\n",
-                (unsigned long long)ga);
+        RVVM_LOGE(WINHOST_TAG, "GL retbuf slot %llx unmapped; dropping string",
+                  (unsigned long long)ga);
         return 0;
     }
     char* dst = (char*)rvvm_user_guest_ptr(ga);
@@ -109,8 +114,7 @@ static void vpgl_missing(const char* name)
     static int reported;
     if (reported >= 32) return;
     reported++;
-    fprintf(stderr, "[gl] %s not resolved by the host GL backend (call dropped)\n", name);
-    fflush(stderr);
+    RVVM_LOGE(WINHOST_TAG, "%s not resolved by the host GL backend (call dropped)", name);
 }
 
 #include "virtpass/vp_gl_dispatch_tables.h"
@@ -136,27 +140,36 @@ static bool gl_trace_enabled(void)
  * record of what it was handed. */
 static void gl_trace_args(const char* kind, uint32_t fn_id, const int64_t* a)
 {
+    char   line[256] = {0};
+    size_t pos        = 0;
+
     if (!gl_trace_enabled() || !a) return;
     const char* name = (kind[0] == 'g') ? vpgl_gl_name(fn_id) : vpgl_egl_name(fn_id);
-    printf("[gl] %s %-28s args=[", kind, name ? name : "?");
-    for (int i = 0; i < GL_CALL_MAX_ARGS; i++) printf(" %llx", (unsigned long long)a[i]);
-    printf(" ]\n");
-    fflush(stdout);
+    pos = rvvm_snprintf(line, sizeof(line), "%s %-28s args=[", kind, name ? name : "?");
+    for (int i = 0; i < GL_CALL_MAX_ARGS && pos < sizeof(line) - 12; i++) {
+        pos += rvvm_snprintf(line + pos, sizeof(line) - pos, " %llx", (unsigned long long)a[i]);
+    }
+    rvvm_strlcpy(line + pos, " ]", sizeof(line) - pos);
+    RVVM_LOGI(WINHOST_TAG, "%s", line);
 }
 
 static void gl_trace(const char* kind, uint32_t fn_id, const int64_t* a, int64_t ret)
 {
+    char   line[256] = {0};
+    size_t pos        = 0;
+
     g_gl_inflight = NULL;
     if (!gl_trace_enabled()) return;
     const char* name = (kind[0] == 'g') ? vpgl_gl_name(fn_id) : vpgl_egl_name(fn_id);
-    printf("[gl] %s %-28s ret=%lld", kind, name ? name : "?", (long long)ret);
-    if (a) {
-        printf(" [");
-        for (int i = 0; i < GL_CALL_MAX_ARGS; i++) printf(" %llx", (unsigned long long)a[i]);
-        printf(" ]");
+    pos = rvvm_snprintf(line, sizeof(line), "%s %-28s ret=%lld", kind, name ? name : "?", (long long)ret);
+    if (a && pos < sizeof(line) - 12) {
+        pos += rvvm_snprintf(line + pos, sizeof(line) - pos, " [");
+        for (int i = 0; i < GL_CALL_MAX_ARGS && pos < sizeof(line) - 12; i++) {
+            pos += rvvm_snprintf(line + pos, sizeof(line) - pos, " %llx", (unsigned long long)a[i]);
+        }
+        rvvm_strlcpy(line + pos, " ]", sizeof(line) - pos);
     }
-    printf("\n");
-    fflush(stdout);
+    RVVM_LOGI(WINHOST_TAG, "%s", line);
 }
 
 /* ============================================================
@@ -169,13 +182,12 @@ void on_egl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, in
     *ret = 0;
     g_gl_inflight = vpgl_egl_name(fn_id);
     gl_trace_args("egl", fn_id, args);
-    if (gl_trace_enabled()) fflush(stdout);
     switch (fn_id) {
     case EGL_FN_GETDISPLAY:
         *ret = (int64_t)(intptr_t)p_eglGetDisplay((vpgl_void*)0);
         break;
     case EGL_FN_CREATEWINDOWSURFACE: {
-        if (!g_gl_active) { g_gl_active = true; printf("[winhost] GL mode active\n"); }
+        if (!g_gl_active) { g_gl_active = true; RVVM_LOGI(WINHOST_TAG, "GL mode active"); }
         /* The win32 host has no native window to render into: back the
          * guest's window surface with an offscreen pbuffer instead. The
          * native win handle (args[2]) is dropped, the attribute list is
@@ -217,7 +229,7 @@ void on_egl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, in
         /* The first swap marks the GL path live. A guest that only ever makes
          * pbuffer surfaces never calls eglCreateWindowSurface, so hooking the
          * flag to that entry point alone would leave every frame unpresented. */
-        if (!g_gl_active) { g_gl_active = true; printf("[winhost] GL mode active (pbuffer)\n"); }
+        if (!g_gl_active) { g_gl_active = true; RVVM_LOGI(WINHOST_TAG, "GL mode active (pbuffer)"); }
         present_gl_frame();
         *ret = 1;
         break;
@@ -233,7 +245,7 @@ void on_egl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, in
                 if (a[0] == vpgl_EGL_HEIGHT) sh = a[1];
             }
             if (sw > 0 && sh > 0) {
-                if (!g_gl_active) { g_gl_active = true; printf("[winhost] GL mode active (pbuffer)\n"); }
+                if (!g_gl_active) { g_gl_active = true; RVVM_LOGI(WINHOST_TAG, "GL mode active (pbuffer)"); }
                 present_gl_set_surface_size(sw, sh);
             }
         }

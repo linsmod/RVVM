@@ -15,6 +15,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "atomics.h" // IWYU pragma: keep
 #include "rvvmlib.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 /*
@@ -325,12 +326,30 @@ PUBLIC uint64_t    rvvm_getarg_size(const char* arg);
 #define LOG_WARN  2
 #define LOG_INFO  3
 
+/* A debug build says more, not at another severity: LOG_DEBUG answers to the
+ * same switch as LOG_INFO, and only the word in the prefix differs - which is
+ * the whole point of having it, since a log you cannot tell a debug line from
+ * an info line is one you cannot filter. */
+#define LOG_DEBUG 4
+
+/* Not thresholds on rvvm_loglevel - these two say *how* a line reached the
+ * logger rather than how loudly it is. LOG_FATAL is the last line before the
+ * process dies, so it is never gated; LOG_TRACE has its own switch, the trace
+ * category. Both sort above the levels so an existing ">= LOG_INFO"
+ * comparison cannot mistake them for one the host asked for. */
+#define LOG_FATAL 5
+#define LOG_TRACE 6
+
 PUBLIC void rvvm_set_loglevel(int loglevel);
 
 #if GNU_ATTRIBUTE(__format__)
-#define PRINT_FORMAT __attribute__((__format__(printf, 1, 2)))
+#define PRINT_FORMAT     __attribute__((__format__(printf, 1, 2)))
+#define PRINT_FORMAT_ARG2 __attribute__((__format__(printf, 2, 3)))
+#define PRINT_FORMAT_ARG3 __attribute__((__format__(printf, 3, 4)))
 #else
-#define PRINT_FORMAT GNU_DUMMY_ATTRIBUTE
+#define PRINT_FORMAT     GNU_DUMMY_ATTRIBUTE
+#define PRINT_FORMAT_ARG2 GNU_DUMMY_ATTRIBUTE
+#define PRINT_FORMAT_ARG3 GNU_DUMMY_ATTRIBUTE
 #endif
 
 #if defined(USE_DEBUG)
@@ -354,11 +373,75 @@ PUBLIC PRINT_FORMAT void rvvm_warn(const char* format_str, ...);
 PUBLIC PRINT_FORMAT void rvvm_error(const char* format_str, ...);
 PUBLIC PRINT_FORMAT void rvvm_fatal(const char* format_str, ...); // Aborts the process
 
-#if GNU_ATTRIBUTE(__format__)
-#define PRINT_FORMAT_ARG2 __attribute__((__format__(printf, 2, 3)))
-#else
-#define PRINT_FORMAT_ARG2 GNU_DUMMY_ATTRIBUTE
-#endif
+/*
+ * The tagged entry point, and the one place a host decides where a line goes.
+ *
+ * Every log line in the tree - the core's own levels, the Android bridge's
+ * LOGI/LOGW/LOGE, the cmdpost bridge's CMDLOG, the sensor's SENSLOG, the
+ * win32 hosts' fprintf(stderr) - ends up in one function, log_emit(), and
+ * leaves through exactly one sink. What used to be a destination chosen by an
+ * #ifdef at each of those sites is now one decision made once, at startup.
+ *
+ * The sink sees the line already formatted, plus the three things a host
+ * genuinely needs to route it:
+ *
+ *   level  LOG_ERROR .. LOG_TRACE, so a host can map to its own severity
+ *          instead of pinning everything to one value (which is what made
+ *          logcat's priority filter useless here - see log_default_sink).
+ *   tag    the subsystem name, or NULL for a core line. Android wants it as
+ *          logcat's tag so `adb logcat RVVM-JNI:D` keeps working.
+ *   ids    who called: "[1234:1235]" for a guest thread, "[host:7]" for one
+ *          of the host's own. A sink is free to print it, or to ignore it
+ *          because its destination already attributes lines itself.
+ *   cat    the trace category, or 0 for a non-trace line.
+ *
+ * A sink must not call back into the logger; the reentrancy guard in
+ * log_emit() drops such a line rather than recursing. It runs with no lock
+ * held and must not block - it is called from paths where blocking is not
+ * an option (a fault handler, a render thread).
+ */
+typedef void (*rvvm_log_sink_fn)(int level, uint32_t cat, const char* tag, const char* ids, const char* line,
+                                 size_t len);
+
+PUBLIC void rvvm_log_set_sink(rvvm_log_sink_fn sink);
+
+/* The default sink: stderr everywhere, plus logcat on Android. Exposed so a
+ * host that installs its own can delegate to it instead of re-deriving the
+ * platform behaviour. */
+PUBLIC void rvvm_log_default_sink(int level, uint32_t cat, const char* tag, const char* ids, const char* line,
+                                  size_t len);
+
+PUBLIC PRINT_FORMAT_ARG3 void rvvm_log(int level, const char* tag, const char* format_str, ...);
+
+#define RVVM_LOGE(tag, ...) rvvm_log(LOG_ERROR, tag, __VA_ARGS__)
+#define RVVM_LOGW(tag, ...) rvvm_log(LOG_WARN, tag, __VA_ARGS__)
+#define RVVM_LOGI(tag, ...) rvvm_log(LOG_INFO, tag, __VA_ARGS__)
+
+/*
+ * The ring.
+ *
+ * Everything that reaches the sink also lands here, in a fixed static buffer
+ * with no allocation - which is the whole point: the lines worth having after
+ * a crash are the ones written when the heap and the process's streams were
+ * already going away. Old lines are overwritten, never the new ones, so the
+ * buffer always ends up holding the tail of the run.
+ *
+ * The ring is what makes a noisy trace affordable. RVVM_TRACE=sys is a few
+ * thousand lines a second and would bury the guest's console on win32, where
+ * the host's stderr is shared with it, but it costs nothing to keep the tail
+ * and dump it after the fact. It is also the answer to "which host thread
+ * said that" - [host:N] is stable per thread for the life of the process.
+ *
+ * Dumped on rvvm_fatal() before the abort, and available on demand:
+ *   rvvm_logring_dump(FILE*)        stream the contents out oldest-first
+ *   rvvm_logring_dump_path(path)    the same into a file, created if needed
+ *   rvvm_logring_clear()            drop the contents (a run's worth of history
+ *                                   between two guests, say)
+ */
+PUBLIC void rvvm_logring_dump(FILE* stream);
+PUBLIC bool rvvm_logring_dump_path(const char* path);
+PUBLIC void rvvm_logring_clear(void);
+PUBLIC size_t rvvm_logring_lines(void);
 
 /*
  * Trace logging, by category.
@@ -390,16 +473,25 @@ enum rvvm_trace_cat {
 /*
  * Optional identity appended to every log line, whatever its level: the
  * userland layer registers a formatter that writes the calling guest thread's
- * "[pid:tid]" (or "[host]" outside any guest), so interleaved lines from two
- * in-process fork()ed processes - a socketpair close on one side, a recv on the
- * other - can be told apart even when they share a millisecond timestamp.
+ * "[pid:tid]", so interleaved lines from two in-process fork()ed processes - a
+ * socketpair close on one side, a recv on the other - can be told apart even
+ * when they share a millisecond timestamp.
  *
  * This covers INFO/WARN/ERROR/FATAL as well as traces. It has to: a run's guest
  * processes all share one stderr stream, so an unattributed "INFO:
  * sys_connect(6, ...)" is a line nobody can act on - the question a log like
- * this gets opened to answer is precisely *whose* call that was. No formatter,
- * or an empty buffer, keeps the plain "INFO: " form, so a build with no
- * userland attached is unchanged.
+ * this gets opened to answer is precisely *whose* call that was.
+ *
+ * A formatter that leaves the buffer empty means "not a guest thread" - the
+ * host's own threads, of which there are several (the JNI binder thread, the
+ * GL render thread, an audio callback). Those are then labelled "[host:N]",
+ * with N stable for the life of the process. Without that, the Android
+ * bridge's GL lines and its binder lines were both just "[host]" and could
+ * not be told apart at all once they were out of logcat's own tid column.
+ *
+ * With no formatter registered at all (a build with no userland attached)
+ * lines keep the plain "INFO: " form, so rvvm_cli and the library are
+ * unchanged.
  */
 typedef void (*rvvm_trace_id_fn)(char* buf, size_t size);
 PUBLIC void rvvm_trace_set_id_fn(rvvm_trace_id_fn fn);

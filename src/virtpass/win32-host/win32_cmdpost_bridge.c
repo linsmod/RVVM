@@ -38,6 +38,7 @@
 #include "win32_cmdpost_bridge.h" /* self-protypes for forward refs (launcher) */
 #include "virtpass/vp_cmdpost.h"  /* single copy lives in src/virtpass */
 #include "core/rvvm_user.h"       /* rvvm_user_linux() guest entry point */
+#include "util/utils.h"           /* RVVM_LOGx(): the one logger (see utils.h) */
 #include "virtpass/vp_rootfs.h"   /* bundle archives -> guest rootfs + shadow */
 #include "virtpass/vp_bundle.h"   /* what a host does with a bundle (mount/apps/assets) */
 #include "virtpass/vp_android.h"  /* guest ABI constants: APP_CMD_*, WINDOW_FORMAT_*, ASENSOR_TYPE_* */
@@ -355,16 +356,17 @@ static HDC cmp_surface_get_locked(HDC ref, int32_t w, int32_t h)
     return g_cmp_dc;
 }
 
-static void winhost_log(const char* fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    printf("[winhost %10llu ms] ", (unsigned long long)GetTickCount64());
-    vprintf(fmt, ap);
-    printf("\n");
-    fflush(stdout);
-    va_end(ap);
-}
+/* Host diagnostics, through the one logger.
+ *
+ * These lines used to be printf'd, which on this host is not a side channel:
+ * the guest's console *is* this process's stdout (win32_main.c says so), so
+ * every one of them arrived interleaved into the transcript a driver reads as
+ * the guest's own output - the same accident that once made vpsessiond's
+ * diagnostics non-deterministically corrupt a `readlink /proc/self/cwd`
+ * check. stderr is the same terminal on a console run and is absent from a
+ * piped one, which is the whole difference. */
+#define WINHOST_TAG "WINHOST"
+#define winhost_log(...) RVVM_LOGI(WINHOST_TAG, __VA_ARGS__)
 
 /* ------------------------------------------------------------------ */
 /* Phase 4: Win32 vsync clock                                          */
@@ -2490,7 +2492,7 @@ static bool launcher_scan_apps(void)
     }
     g_guest_count = (int)n;
     if (n) {
-        winhost_log("launcher: %zu app(s) in %s", n, path);
+        winhost_log("launcher: %lu app(s) in %s", (unsigned long)n, path);
     }
     return n > 0;
 }
@@ -3071,8 +3073,9 @@ static void win32_guest_rootfs_mount(rvvm_machine_t* machine, const char* app_id
                     archive, error ? error : "?");
         return;
     }
-    winhost_log("rootfs: %zu archive entries, %zu files, %zu system file(s), %zu app(s) at %s",
-                stats.entries, stats.files, stats.system_files, stats.apps, dest);
+    winhost_log("rootfs: %lu archive entries, %lu files, %lu system file(s), %lu app(s) at %s",
+                (unsigned long)stats.entries, (unsigned long)stats.files, (unsigned long)stats.system_files,
+                (unsigned long)stats.apps, dest);
 
     /* An app's own resources are its /assets tree. The app is already installed
      * (provisioned with the bundle); this only points the mount at it. */

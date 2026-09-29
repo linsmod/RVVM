@@ -18,13 +18,6 @@
 /* write(): used to publish vsync frame times into the guest's Looper pipe */
 #include <unistd.h>
 
-#if defined(ANDROID)
-#include <android/log.h>
-#define CMDLOG(fmt, ...) __android_log_print(ANDROID_LOG_INFO, "CMDPOST", fmt, ##__VA_ARGS__)
-#else
-#define CMDLOG(fmt, ...) printf(fmt "\n", ##__VA_ARGS__)
-#endif
-
 /* Shared API header (queue functions, event ABI structs) */
 #include "vp_cmdpost.h"
 
@@ -33,6 +26,13 @@
 #include "rvvm_types.h"
 #include "core/rvvm_user.h"
 #include "virtpass/vp_gl.h" /* gl_call + fn_id macros (generated) */
+
+/* One tag for this file, one destination chosen at startup (see utils.h). It
+ * used to be an #if ANDROID between __android_log_print and printf - and the
+ * printf side wrote into the win32 host's stdout, which is the guest's console
+ * transcript, so the bridge's own lines arrived interleaved with the guest's. */
+#define VP_TAG "CMDPOST"
+#define CMDLOG(...) RVVM_LOGI(VP_TAG, __VA_ARGS__)
 
 /* ============================================================
  * Custom syscall numbers (must match the guest stub)
@@ -568,13 +568,13 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
 
                 case SYS_ANDROID_GAME_CREATE: {
                     /* Create GameActivity */
-                    printf("vp_cmdpost: GameActivity create (cmdpost)\n");
+                    CMDLOG("GameActivity create (cmdpost)");
                     return 0;
                 }
 
                 case SYS_ANDROID_GAME_DESTROY: {
                     /* Destroy GameActivity */
-                    printf("vp_cmdpost: GameActivity destroy (cmdpost)\n");
+                    CMDLOG("GameActivity destroy (cmdpost)");
                     cmdpost_clear_lifecycle_cmds(inst);
                     cmdpost_clear_motion_events(inst);
                     cmdpost_clear_key_events(inst);
@@ -882,7 +882,7 @@ int64_t cmdpost_dispatch(vp_cmdpost_t* inst, int64_t syscall_nr, int64_t a0, int
         }
 
         default:
-            fprintf(stderr, "cmdpost: Unknown syscall %" PRId64 "\n", syscall_nr);
+            RVVM_LOGE(VP_TAG, "Unknown syscall %" PRId64, syscall_nr);
             return -38; /* -ENOSYS */
     }
 }
@@ -914,10 +914,10 @@ void cmdpost_init(vp_cmdpost_t* inst)
     }
 
     if (!inst->initialized) {
-        printf("vp_cmdpost: Initializing Android NDK API proxy\n");
+        CMDLOG("Initializing Android NDK API proxy");
         inst->initialized = true;
     } else {
-        printf("vp_cmdpost: Guest run starting\n");
+        CMDLOG("Guest run starting");
     }
 
     /* Per-run state belongs to the run that is starting, not to the one that
@@ -997,7 +997,7 @@ void cmdpost_end_run(vp_cmdpost_t* inst)
     if (!inst) {
         return;
     }
-    printf("vp_cmdpost: Guest run ended\n");
+    CMDLOG("Guest run ended");
     cmdpost_drop_run_state(inst);
 }
 
@@ -1007,7 +1007,7 @@ void cmdpost_cleanup(vp_cmdpost_t* inst)
     if (!inst || !inst->initialized) {
         return;
     }
-    printf("vp_cmdpost: Cleaning up\n");
+    CMDLOG("Cleaning up");
 
     /* The per-run state first: a run whose exit never came through
      * cmdpost_end_run() still gets its streams closed and its queues dropped

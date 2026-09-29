@@ -21,9 +21,11 @@
  * around the console ones.
  *
  * Logging: this module does not log. The calls that change something say so in
- * their return value, because what is worth a log line differs per host - the
- * Android host logs through __android_log_print at a level of its own choosing,
- * while rvvm_info() below LOG_WARN is invisible there.
+ * their return value, because a line saying "the panel changed" is not the
+ * same fact as one saying "the guest's buffer changed" and only the caller
+ * knows which it did. When a caller does report it, it goes through
+ * rvvm_log() with its own tag, so every host's version of the same line reads
+ * the same and lands in the same log ring (see utils.h).
  */
 
 #ifndef VP_SESSION_H

@@ -769,6 +769,10 @@ uint64_t rvvm_getarg_size(const char* arg)
 
 /*
  * Logger
+ *
+ * One function builds every line in the tree (log_emit), one sink delivers it,
+ * and one static ring keeps the tail. See utils.h for the sink's shape and why
+ * each of its arguments is there.
  */
 
 static int rvvm_loglevel = LOG_WARN;
@@ -802,63 +806,413 @@ static uint64_t log_time_ms(void)
     return rvtimer_clocksource(1000);
 }
 
-static void log_print(const char* prefix, const char* fmt, const void* argv)
+/* ---------------------------------------------------------------- *
+ * The ring
+ *
+ * Length-prefixed records in a fixed static buffer: no allocation, so it is
+ * still there when the heap is what died, and on a host that never got far
+ * enough to call malloc. head/tail are absolute byte offsets and the index
+ * into the buffer is their remainder, so "how full is it" is a subtraction
+ * and the wrap is never a special case.
+ *
+ * The writer never waits and never drops the *newest* line: it overwrites
+ * from the tail until there is room. The lines worth having after a crash
+ * are the ones written when everything else was already going away, which
+ * is exactly the line a ring that refuses to overwrite would discard.
+ * ---------------------------------------------------------------- */
+
+#define LOGRING_BYTES  (128 * 1024)
+#define LOGRING_HDR    sizeof(uint16_t)
+
+static char        logring_buf[LOGRING_BYTES];
+static uint64_t    logring_head;
+static uint64_t    logring_tail;
+static uint64_t    logring_count;
+static rvvm_lock_t logring_lock = RVVM_LOCK_INIT;
+
+/* A record may straddle the end of the buffer, so both halves of every
+ * access go through these two. */
+static void logring_write(uint64_t at, const void* src, size_t len)
 {
-    char   buffer[384] = {0};
-    size_t pos         = rvvm_snprintf(buffer, sizeof(buffer), "[%9llu ms] ",
-                                       (unsigned long long)log_time_ms());
-    pos = EVAL_MIN(pos, sizeof(buffer) - 1);
-    pos += rvvm_strlcpy(buffer + pos, prefix, sizeof(buffer) - pos);
-    pos = EVAL_MIN(pos, sizeof(buffer) - 1);
-    size_t vsp_size    = sizeof(buffer) - EVAL_MIN(pos + 6, sizeof(buffer));
-    if (vsp_size > 1) {
-        int tmp = rvvm_vsnprintf(buffer + pos, vsp_size, fmt, argv);
-        if (tmp > 0) {
-            pos += EVAL_MIN(vsp_size - 1, (size_t)tmp);
-        }
+    size_t off   = (size_t)(at % LOGRING_BYTES);
+    size_t first = EVAL_MIN(len, LOGRING_BYTES - off);
+
+    memcpy(logring_buf + off, src, first);
+    if (len > first) {
+        memcpy(logring_buf, (const char*)src + first, len - first);
     }
-    rvvm_strlcpy(buffer + pos, log_has_colors() ? "\033[0m\n" : "\n", sizeof(buffer) - pos);
-    fputs(buffer, stderr);
-    // Flush right away: a crash or a kill must not swallow the last messages
-    fflush(stderr);
-#if defined(ANDROID)
-    {
-        char* log_body = buffer;
-        while (*log_body == ' ') {
-            log_body++;
-        }
-        __android_log_print(ANDROID_LOG_WARN, "RVVM", "%s", log_body);
-    }
-#endif
 }
+
+static void logring_read(uint64_t at, void* dst, size_t len)
+{
+    size_t off   = (size_t)(at % LOGRING_BYTES);
+    size_t first = EVAL_MIN(len, LOGRING_BYTES - off);
+
+    memcpy(dst, logring_buf + off, first);
+    if (len > first) {
+        memcpy((char*)dst + first, logring_buf, len - first);
+    }
+}
+
+static uint64_t logring_record_size(uint64_t at)
+{
+    uint16_t len = 0;
+    logring_read(at, &len, sizeof(len));
+    return LOGRING_HDR + len;
+}
+
+static void logring_append(const char* line, size_t len)
+{
+    uint64_t need = LOGRING_HDR + len;
+    uint16_t rec  = (uint16_t)len;
+
+    if (len > LOGRING_BYTES - LOGRING_HDR) {
+        return; /* one line longer than the whole ring: it would evict everything */
+    }
+    rvvm_lock(&logring_lock);
+    while (logring_head - logring_tail + need > LOGRING_BYTES) {
+        logring_tail += logring_record_size(logring_tail);
+        logring_count--;
+    }
+    logring_write(logring_head, &rec, sizeof(rec));
+    logring_write(logring_head + LOGRING_HDR, line, len);
+    logring_head += need;
+    logring_count++;
+    rvvm_unlock(&logring_lock);
+}
+
+PUBLIC void rvvm_logring_dump(FILE* stream)
+{
+    uint64_t at;
+    char     line[512];
+
+    if (!stream) {
+        return;
+    }
+    rvvm_lock_slow(&logring_lock);
+    for (at = logring_tail; at < logring_head;) {
+        uint16_t len = 0;
+        logring_read(at, &len, sizeof(len));
+        at += LOGRING_HDR;
+        if (at + len > logring_head) {
+            break; /* truncated by a concurrent writer past the tail: nothing readable */
+        }
+        if (len < sizeof(line)) {
+            logring_read(at, line, len);
+            line[len] = '\0';
+            fputs(line, stream);
+            fputc('\n', stream);
+        } else {
+            /* A line that does not fit the reader's buffer is not a reason to
+             * lose it: note the loss and keep the rest. */
+            fprintf(stream, "---- rvvm: a %u byte log line was too long to dump ----\n", (unsigned)len);
+        }
+        at += len;
+    }
+    fflush(stream);
+    rvvm_unlock(&logring_lock);
+}
+
+PUBLIC bool rvvm_logring_dump_path(const char* path)
+{
+    FILE* f;
+
+    if (!path || !*path) {
+        return false;
+    }
+    f = fopen(path, "w");
+    if (!f) {
+        return false;
+    }
+    fprintf(f, "---- rvvm log ring ----\n");
+    rvvm_logring_dump(f);
+    fclose(f);
+    return true;
+}
+
+PUBLIC void rvvm_logring_clear(void)
+{
+    rvvm_lock(&logring_lock);
+    logring_head  = 0;
+    logring_tail  = 0;
+    logring_count = 0;
+    rvvm_unlock(&logring_lock);
+}
+
+PUBLIC size_t rvvm_logring_lines(void)
+{
+    rvvm_lock(&logring_lock);
+    size_t n = (size_t)logring_count;
+    rvvm_unlock(&logring_lock);
+    return n;
+}
+
+/* ---------------------------------------------------------------- *
+ * Identity
+ * ---------------------------------------------------------------- */
 
 /* The identity a trace line can carry, see rvvm_trace_set_id_fn(). Declared
  * here rather than next to the trace machinery because every level wants it. */
 static rvvm_trace_id_fn rvvm_trace_id;
 
-/*
- * One prefix builder for every level, so "INFO" and "TRACE" are attributed the
+/* [host:N] rather than the bare "[host]" the guest formatter used to fall back
+ * to. The host runs several threads at once - the Android bridge's binder
+ * thread, its GL render thread, an audio callback - and once the lines are out
+ * of logcat (which carries its own tid column) two of them both reading
+ * "[host]" says nothing about which thread wrote them. N is handed out once
+ * per thread and never reused, so it names a thread for the life of the
+ * process.
+ *
+ * Deliberately not the OS thread id: reading that costs a syscall or a
+ * platform call on every log line, and what the log needs is to tell two
+ * threads apart, not to agree with a debugger's tid column. */
+static THREAD_LOCAL uint32_t log_host_tid;
+static THREAD_LOCAL bool    log_host_tid_ready;
+static uint32_t             log_host_tid_next;
+
+static uint32_t log_host_id(void)
+{
+    if (!log_host_tid_ready) {
+        /* 1-based: [host:0] would read as "no thread", which is the one thing
+         * this exists to rule out. */
+        log_host_tid       = atomic_add_uint32(&log_host_tid_next, 1) + 1;
+        log_host_tid_ready = true;
+    }
+    return log_host_tid;
+}
+
+/* ---------------------------------------------------------------- *
+ * Sinks
+ * ---------------------------------------------------------------- */
+
+#if defined(ANDROID)
+/* logcat's priority for a level. Pinning every line to one priority - which is
+ * what the Android leg used to do - makes `adb logcat RVVM:*:D` useless,
+ * because a trace and an error arrive at the same severity and neither can be
+ * filtered against the other. */
+static int log_android_prio(int level)
+{
+    switch (level) {
+        case LOG_FATAL:
+            return ANDROID_LOG_FATAL;
+        case LOG_ERROR:
+            return ANDROID_LOG_ERROR;
+        case LOG_WARN:
+            return ANDROID_LOG_WARN;
+        case LOG_DEBUG:
+            return ANDROID_LOG_DEBUG;
+        default:
+            return ANDROID_LOG_INFO; /* LOG_INFO, LOG_TRACE */
+    }
+}
+#endif
+
+PUBLIC void rvvm_log_default_sink(int level, uint32_t cat, const char* tag, const char* ids, const char* line,
+                                  size_t len)
+{
+    UNUSED(cat);
+    UNUSED(ids);
+#if !defined(ANDROID)
+    UNUSED(level);
+    UNUSED(tag);
+#endif
+
+    fwrite(line, 1, len, stderr);
+    fputc('\n', stderr);
+    // Flush right away: a crash or a kill must not swallow the last messages
+    fflush(stderr);
+#if defined(ANDROID)
+    /* The subsystem's own tag, so `adb logcat RVVM-JNI:D` keeps selecting the
+     * lines it always did; a core line has none and stays under "RVVM". */
+    __android_log_print(log_android_prio(level), tag ? tag : "RVVM", "%s", line);
+#endif
+}
+
+static rvvm_log_sink_fn rvvm_log_sink = rvvm_log_default_sink;
+
+PUBLIC void rvvm_log_set_sink(rvvm_log_sink_fn sink)
+{
+    rvvm_log_sink = sink ? sink : rvvm_log_default_sink;
+}
+
+/* ---------------------------------------------------------------- *
+ * Line assembly
+ * ---------------------------------------------------------------- */
+
+/* Set for the duration of our own call out, so a sink (or a dump) that logs
+ * drops the line instead of recursing until the stack runs out. */
+static THREAD_LOCAL bool log_in_call;
+
+#define LOG_LINE_MAX   512
+#define LOG_IDS_MAX    48
+#define LOG_ATTR_MAX   96
+#define LOG_PREFIX_MAX 80
+
+/* Indexed by level. The name is what a line reads as; the color is the ANSI
+ * SGR the prefix wraps it in. */
+static const struct {
+    const char* name;
+    const char* color;
+} log_levels[] = {
+    { "LOG",   "0"  }, /* LOG_NONE   */
+    { "ERROR", "31" }, /* LOG_ERROR  */
+    { "WARN",  "31" }, /* LOG_WARN   */
+    { "INFO",  "33" }, /* LOG_INFO   */
+    { "DEBUG", "33" }, /* LOG_DEBUG  */
+    { "FATAL", "31" }, /* LOG_FATAL  */
+    { "TRACE", "36" }, /* LOG_TRACE  */
+};
+
+/* One prefix builder for every level, so "INFO" and "TRACE" are attributed the
  * same way. The identity is not decoration: with a run's guest processes
  * interleaved into one stderr stream, "INFO: sys_connect(6, ...)" cannot be
  * told apart from a different process's line, and that is exactly the question
- * a log like this gets opened to answer. A run with no userland attached, or
- * one calling from outside any guest thread, still reads "INFO: " / "[host]".
- */
-#define LOG_PREFIX_SIZE 64
-static const char* log_prefix(char* buf, size_t size, const char* level, const char* color)
+ * a log like this gets opened to answer. */
+static size_t log_prefix(char* buf, size_t size, int level, const char* attr)
 {
-    char ids[40] = {0};
+    const char* name  = "LOG";
+    const char* color = "0";
+    size_t      pos;
 
-    if (rvvm_trace_id) {
-        rvvm_trace_id(ids, sizeof ids);
+    if (level >= 0 && (size_t)level < STATIC_ARRAY_SIZE(log_levels)) {
+        name  = log_levels[level].name;
+        color = log_levels[level].color;
     }
     if (log_has_colors()) {
-        rvvm_snprintf(buf, size, ids[0] ? "\033[%s1m%s\033[0;1m%s: " : "\033[%s1m%s\033[0;1m: ",
-                     color, level, ids);
+        pos = rvvm_snprintf(buf, size, attr[0] ? "\033[%s1m%s\033[0;1m%s: " : "\033[%s1m%s\033[0;1m: ",
+                           color, name, attr);
     } else {
-        rvvm_snprintf(buf, size, ids[0] ? "%s%s: " : "%s: ", level, ids);
+        pos = rvvm_snprintf(buf, size, attr[0] ? "%s%s: " : "%s: ", name, attr);
     }
-    return buf;
+    return EVAL_MIN(pos, size - 1);
+}
+
+/* RVVM_LOG_FILE: every line also into a file, independently of whatever sink
+ * is installed. It is how a run's diagnostics get separated from the guest's
+ * console on the win32 host, where the two share one process and one terminal
+ * and a driver reading the transcript cannot tell them apart - the same reason
+ * vpsessiond's own log had to leave fd 1. */
+static FILE* log_file(void)
+{
+    static FILE*  f;
+    static bool   ready;
+    static rvvm_lock_t lock = RVVM_LOCK_INIT;
+
+    if (!ready) {
+        rvvm_lock(&lock);
+        if (!ready) {
+            const char* path = getenv("RVVM_LOG_FILE");
+            ready            = true;
+            if (path && *path) {
+                f = fopen(path, "a");
+            }
+        }
+        rvvm_unlock(&lock);
+    }
+    return f;
+}
+
+static void log_emit(int level, uint32_t cat, const char* tag, const char* fmt, const void* argv)
+{
+    char   ids[LOG_IDS_MAX]    = {0};
+    char   attr[LOG_ATTR_MAX]  = {0};
+    char   buffer[LOG_LINE_MAX] = {0};
+    size_t pos;
+
+    if (unlikely(log_in_call)) {
+        return;
+    }
+    log_in_call = true;
+
+    if (rvvm_trace_id) {
+        rvvm_trace_id(ids, sizeof(ids));
+        if (!ids[0]) {
+            /* Registered, but not from a guest thread: one of the host's own. */
+            rvvm_snprintf(ids, sizeof(ids), "[host:%u]", log_host_id());
+        }
+    }
+    /* One bracket for the whole attribution. A tagged subsystem that says
+     * nothing about who called still gets named, so a sink that ignores `ids`
+     * does not lose the tag. `ids` brings its own brackets ("[1234:1235]"), so
+     * the tag goes *inside* them rather than beside them - two bracket pairs
+     * for one field is what a sink's tag/ids split is for.
+     *
+     * Copied out rather than formatted with a precision: rvvm_snprintf() reads
+     * the parsed precision and then ignores it for %s, so "%.6s" would copy the
+     * whole string and leave the closing bracket where it was not wanted. */
+    if (tag && *tag) {
+        size_t idlen = rvvm_strlen(ids);
+        if (idlen >= 2) {
+            char inner[LOG_IDS_MAX];
+            rvvm_strlcpy(inner, ids + 1, idlen - 1); /* drops the trailing ']' too */
+            rvvm_snprintf(attr, sizeof(attr), "[%s %s]", tag, inner);
+        } else {
+            rvvm_snprintf(attr, sizeof(attr), "[%s]", tag);
+        }
+    } else {
+        rvvm_strlcpy(attr, ids, sizeof(attr));
+    }
+
+    pos = rvvm_snprintf(buffer, sizeof(buffer), "[%9llu ms] ", (unsigned long long)log_time_ms());
+    pos = EVAL_MIN(pos, sizeof(buffer) - 1);
+    pos = EVAL_MIN(pos + log_prefix(buffer + pos, sizeof(buffer) - pos, level, attr), sizeof(buffer) - 1);
+    {
+        /* room is >= 1 and vsnprintf always terminates, so the only thing left
+         * to do is not count the terminator as content. */
+        size_t room = sizeof(buffer) - pos;
+        size_t tmp  = rvvm_vsnprintf(buffer + pos, room, fmt, argv);
+        if (tmp) {
+            pos += EVAL_MIN(tmp, room - 1);
+        }
+    }
+    buffer[pos] = '\0';
+
+    /* No trailing newline: it belongs to the sink. The ring stores lines
+     * without one so a reader can tell a whole line from a truncated one, and
+     * logcat does not want it. */
+    logring_append(buffer, pos);
+
+    {
+        FILE* f = log_file();
+        if (f) {
+            fwrite(buffer, 1, pos, f);
+            fputc('\n', f);
+            fflush(f);
+        }
+    }
+
+    rvvm_log_sink(level, cat, tag, ids, buffer, pos);
+    log_in_call = false;
+}
+
+/* LOG_FATAL and LOG_TRACE are not thresholds on rvvm_loglevel: the first is
+ * the last line before the process dies, the second is switched by its trace
+ * category rather than by how much noise the host asked for. */
+static bool log_level_enabled(int level)
+{
+    switch (level) {
+        case LOG_FATAL:
+        case LOG_TRACE:
+            return true;
+        case LOG_DEBUG:
+            /* Answers to the same switch as rvvm_info: a debug build says
+             * more, it does not say it at another severity. */
+            return rvvm_loglevel >= LOG_INFO;
+        default:
+            return rvvm_loglevel >= level;
+    }
+}
+
+PUBLIC PRINT_FORMAT_ARG3 void rvvm_log(int level, const char* tag, const char* format_str, ...)
+{
+    va_list args;
+
+    if (!log_level_enabled(level)) {
+        return;
+    }
+    va_start(args, format_str);
+    log_emit(level, 0, tag, format_str, &args);
+    va_end(args);
 }
 
 #if defined(USE_DEBUG)
@@ -866,10 +1220,9 @@ static const char* log_prefix(char* buf, size_t size, const char* level, const c
 PRINT_FORMAT void rvvm_debug(const char* format_str, ...)
 {
     if (rvvm_loglevel >= LOG_INFO) {
-        char   prefix[LOG_PREFIX_SIZE];
         va_list args;
         va_start(args, format_str);
-        log_print(log_prefix(prefix, sizeof prefix, "DEBUG", "33"), format_str, &args);
+        log_emit(LOG_DEBUG, 0, NULL, format_str, &args);
         va_end(args);
     }
 }
@@ -879,10 +1232,9 @@ PRINT_FORMAT void rvvm_debug(const char* format_str, ...)
 PRINT_FORMAT void rvvm_info(const char* format_str, ...)
 {
     if (rvvm_loglevel >= LOG_INFO) {
-        char   prefix[LOG_PREFIX_SIZE];
         va_list args;
         va_start(args, format_str);
-        log_print(log_prefix(prefix, sizeof prefix, "INFO", "33"), format_str, &args);
+        log_emit(LOG_INFO, 0, NULL, format_str, &args);
         va_end(args);
     }
 }
@@ -890,10 +1242,9 @@ PRINT_FORMAT void rvvm_info(const char* format_str, ...)
 PRINT_FORMAT void rvvm_warn(const char* format_str, ...)
 {
     if (rvvm_loglevel >= LOG_WARN) {
-        char   prefix[LOG_PREFIX_SIZE];
         va_list args;
         va_start(args, format_str);
-        log_print(log_prefix(prefix, sizeof prefix, "WARN", "31"), format_str, &args);
+        log_emit(LOG_WARN, 0, NULL, format_str, &args);
         va_end(args);
     }
 }
@@ -1015,33 +1366,40 @@ PUBLIC PRINT_FORMAT_ARG2 void rvvm_trace(uint32_t cat, const char* format_str, .
     if (!rvvm_trace_enabled(cat)) {
         return;
     }
-    {
-        char prefix_buf[LOG_PREFIX_SIZE];
-        va_start(args, format_str);
-        log_print(log_prefix(prefix_buf, sizeof prefix_buf, "TRACE", "36"), format_str, &args);
-        va_end(args);
-    }
+    va_start(args, format_str);
+    log_emit(LOG_TRACE, cat, NULL, format_str, &args);
+    va_end(args);
 }
 
 PRINT_FORMAT void rvvm_error(const char* format_str, ...)
 {
     if (rvvm_loglevel >= LOG_ERROR) {
-        char   prefix[LOG_PREFIX_SIZE];
         va_list args;
         va_start(args, format_str);
-        log_print(log_prefix(prefix, sizeof prefix, "ERROR", "31"), format_str, &args);
+        log_emit(LOG_ERROR, 0, NULL, format_str, &args);
         va_end(args);
     }
 }
 
 PRINT_FORMAT void rvvm_fatal(const char* format_str, ...)
 {
-    char   prefix[LOG_PREFIX_SIZE];
     va_list args;
+
     va_start(args, format_str);
-    log_print(log_prefix(prefix, sizeof prefix, "FATAL", "31"), format_str, &args);
+    log_emit(LOG_FATAL, 0, NULL, format_str, &args);
     va_end(args);
+
+    /* The stacktrace first, then the ring: both write for the last time here,
+     * and the ring is what the sink may not have got - it holds the tail of
+     * the run in static storage, with no heap and no stream behind it. Its
+     * own entries (including the two lines above) come out with it. */
     stacktrace_print();
+    {
+        size_t lines = rvvm_logring_lines();
+        fprintf(stderr, "---- rvvm log ring (%llu line%s) ----\n", (unsigned long long)lines,
+                lines == 1 ? "" : "s");
+    }
+    rvvm_logring_dump(stderr);
     abort();
     // cppcheck-suppress unreachableCode
     must_never_reach();
@@ -1100,6 +1458,24 @@ GNU_DESTRUCTOR void full_deinit(void)
             func();
             func = dequeue_func();
         } while (func);
+    }
+
+    /* RVVM_LOG_RING_DUMP: the ring written out at a *clean* exit, which is
+     * the other moment it is worth having - the run is over and the question
+     * is what the host complained about during it. Deliberately a file and not
+     * stderr: on the win32 hosts stderr and the guest's console are the same
+     * terminal, and a run's diagnostics are exactly what should not land in
+     * the transcript a driver reads as the guest's output. rvvm_fatal() dumps
+     * the same ring to stderr, where there is no longer a transcript to
+     * protect. */
+    {
+        const char* path = getenv("RVVM_LOG_RING_DUMP");
+        if (path && *path && rvvm_logring_dump_path(path)) {
+            /* The one line this path owns: whether the dump itself worked is
+             * exactly the kind of fact that is otherwise unrecoverable. */
+            fprintf(stderr, "rvvm: log ring (%llu lines) written to %s\n",
+                    (unsigned long long)rvvm_logring_lines(), path);
+        }
     }
 }
 

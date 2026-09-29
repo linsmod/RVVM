@@ -45,10 +45,21 @@
 #include "rvvm_user.h"
 #include "virtpass/vp_bundle.h"   /* the bundle: guest rootfs, apps, /assets */
 
-#define LOG_TAG "RVVM-JNI"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+/* The one logger: rvvm_log() + the RVVM_LOGx() shorthands every host file
+ * forwards to (see utils.h). */
+#include "util/utils.h"
+
+/* One tag for this file, one destination chosen at startup (see utils.h). The
+ * destination is no longer decided here: __android_log_print at a level of
+ * this file's own choosing meant the core's rvvm_info() lines - the syscall
+ * trace, several hundred of them in a run - could not be turned on at all on
+ * this host, because nothing here ever raised the core's loglevel. The tag is
+ * still the subsystem's name, so `adb logcat RVVM-JNI:D` keeps selecting the
+ * same lines it always did. */
+#define VP_TAG "RVVM-JNI"
+#define LOGI(...) RVVM_LOGI(VP_TAG, __VA_ARGS__)
+#define LOGW(...) RVVM_LOGW(VP_TAG, __VA_ARGS__)
+#define LOGE(...) RVVM_LOGE(VP_TAG, __VA_ARGS__)
 
 /* Global references to Java objects */
 static JavaVM* g_jvm = NULL;
@@ -1870,15 +1881,22 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved)
 {
     (void)reserved;
     g_jvm = vm;
-    /* Device-side debug switch: the trace gates in the core read the
-     * environment (RVVM_TRACE), which an app process inherits from the
-     * zygote and cannot get from `am start`. `adb shell setprop
-     * debug.rvvm.trace sys,path` before launching the app turns those traces
-     * on (this runs before any guest, and getenv is cached in the core).
+    /* Device-side debug switches: the trace gates in the core read the
+     * environment (RVVM_TRACE, RVVM_VERBOSE), which an app process inherits
+     * from the zygote and cannot get from `am start`. `adb shell setprop
+     * debug.rvvm.trace sys,path` / `debug.rvvm.verbose 1` before launching the
+     * app turns those on (this runs before any guest, and getenv is cached in
+     * the core).
      *
      * The property value is forwarded as-is rather than naming one category:
      * the core reads a comma-separated list, and a switch that could only
-     * reach one of them was a switch that could not answer most questions. */
+     * reach one of them was a switch that could not answer most questions.
+     *
+     * RVVM_VERBOSE is the switch that was missing on this host entirely: the
+     * core has only ever been set to its default LOG_WARN here, which is why
+     * rvvm_info()'s several hundred syscall lines could not be turned on at
+     * all from a device, and why this file had to hand-roll a "log one line
+     * when the geometry changes" guard to keep 60fps chatter out of logcat. */
     {
         char value[PROP_VALUE_MAX] = "";
         if (__system_property_get("debug.rvvm.trace", value) > 0 && value[0]) {
@@ -1890,6 +1908,19 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved)
             LOGI("RVVM_TRACE enabled via debug.rvvm.trace=%s", value);
         }
     }
+    {
+        char value[PROP_VALUE_MAX] = "";
+        if (__system_property_get("debug.rvvm.verbose", value) > 0 && value[0] && strcmp(value, "0")) {
+            static char env[] = "RVVM_VERBOSE=1";
+            putenv(env);
+            LOGI("RVVM_VERBOSE enabled via debug.rvvm.verbose=%s", value);
+        }
+    }
+    /* The core's own loglevel, not just the trace categories: from here on the
+     * rvvm_info() syscall trace is reachable on this host, and it lands in the
+     * ring whether or not it is mirrored to logcat. */
+    rvvm_set_loglevel(getenv("RVVM_VERBOSE") ? LOG_INFO : LOG_WARN);
+
     LOGI("JNI_OnLoad: RVVM JNI bridge loaded");
     return JNI_VERSION_1_6;
 }
@@ -2696,8 +2727,8 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
                 if (strlen(str) >= cap) {
                     /* Loud on purpose: a silently cut argument is a confusing
                      * thing to debug from the guest's end. */
-                    LOGW("Guest %d argv[%d] truncated to %zu bytes",
-                         run->id, run->argc, cap - 1);
+                    LOGW("Guest %d argv[%d] truncated to %lu bytes",
+                         run->id, run->argc, (unsigned long)(cap - 1));
                 }
                 snprintf(dst, cap, "%s", str);
                 run->argv[run->argc] = dst;
@@ -2785,8 +2816,9 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
                                 g_bundle_system[0] ? g_bundle_system : NULL,
                                 g_bundle_apps[0] ? g_bundle_apps : NULL,
                                 dest, &stats, &error)) {
-                LOGI("bundle: %zu entries, %zu files, %zu system file(s), %zu app(s) at %s",
-                     stats.entries, stats.files, stats.system_files, stats.apps, dest);
+                LOGI("bundle: %lu entries, %lu files, %lu system file(s), %lu app(s) at %s",
+                     (unsigned long)stats.entries, (unsigned long)stats.files,
+                     (unsigned long)stats.system_files, (unsigned long)stats.apps, dest);
             } else {
                 LOGE("bundle: %s could not be mounted: %s", g_bundle_rootfs,
                      error ? error : "?");

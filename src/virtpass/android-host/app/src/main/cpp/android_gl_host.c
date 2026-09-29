@@ -34,6 +34,7 @@
 #include <string.h>
 
 #include "core/rvvm_user.h"   /* rvvm_user_guest_ptr */
+#include "util/utils.h"        /* RVVM_LOGx(): the one logger (see utils.h) */
 #include "virtpass/vp_cmdpost.h" /* cmdpost_set_gl_callbacks */
 #include "virtpass/vp_gl.h"   /* fn_id macros + gl_call ABI */
 
@@ -45,10 +46,11 @@
 void on_egl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, int64_t* ret);
 void on_gl_dispatch(vp_cmdpost_t* inst, uint32_t fn_id, const int64_t* args, int64_t* ret);
 
-#define LOG_TAG "RVVM-GL"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+/* One tag for this file, one destination chosen at startup (see utils.h). */
+#define VP_TAG "RVVM-GL"
+#define LOGI(...) RVVM_LOGI(VP_TAG, __VA_ARGS__)
+#define LOGW(...) RVVM_LOGW(VP_TAG, __VA_ARGS__)
+#define LOGE(...) RVVM_LOGE(VP_TAG, __VA_ARGS__)
 
 /* ============================================================
  * System backend loading

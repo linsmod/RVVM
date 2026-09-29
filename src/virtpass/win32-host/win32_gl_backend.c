@@ -1,5 +1,6 @@
 #include "win32_gl_backend.h"
 #include "virtpass/vp_gl_host_entries.h" /* p_* storage (generated, shared with android) */
+#include "util/utils.h" /* RVVM_LOGx(): the one logger (see utils.h) */
 
 #include <windows.h>
 #include <stdio.h>
@@ -12,16 +13,11 @@ static bool   g_loaded  = false;
 static int    g_refcnt  = 0;
 
 
-static void gl_log(const char* fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    printf("[winhost %10llu ms] ", (unsigned long long)GetTickCount64());
-    vprintf(fmt, ap);
-    printf("\n");
-    fflush(stdout);
-    va_end(ap);
-}
+/* Host diagnostics, through the one logger. This used to printf to stdout,
+ * which on the win32 host is the guest's console transcript rather than a side
+ * channel - see winhost_log() in win32_cmdpost_bridge.c for the same note. */
+#define GLHOST_TAG "RVVM-GL"
+#define gl_log(...) RVVM_LOGI(GLHOST_TAG, __VA_ARGS__)
 
 static inline float vpgl_arg_f(int64_t v)
 {

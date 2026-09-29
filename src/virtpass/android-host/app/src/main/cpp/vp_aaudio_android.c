@@ -7,8 +7,6 @@
  * AAudioStream_write/read. No pump threads, no shared ring buffer.
  */
 
-#define LOG_TAG "RVVM-AAudio"
-#include <android/log.h>
 #include <aaudio/AAudio.h>
 
 #include <stdint.h>
@@ -18,12 +16,15 @@
 #include <pthread.h>
 #include <time.h>
 
+#include "util/utils.h" /* RVVM_LOGx(): the one logger (see utils.h) */
 #include "virtpass/vp_audio_ringbuf.h"
 #include "virtpass/vp_cmdpost.h"
 
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+/* One tag for this file, one destination chosen at startup. */
+#define VP_TAG "RVVM-AAudio"
+#define LOGI(...) RVVM_LOGI(VP_TAG, __VA_ARGS__)
+#define LOGW(...) RVVM_LOGW(VP_TAG, __VA_ARGS__)
+#define LOGE(...) RVVM_LOGE(VP_TAG, __VA_ARGS__)
 
 /* ============================================================
  * Stream bookkeeping

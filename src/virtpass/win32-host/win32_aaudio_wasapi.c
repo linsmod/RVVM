@@ -9,6 +9,7 @@
 
 #include "virtpass/vp_audio_ringbuf.h"
 #include "virtpass/vp_cmdpost.h"
+#include "util/utils.h" /* RVVM_LOGx(): the one logger (see utils.h) */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -60,7 +61,11 @@ static void com_unload(void)
 /* ============================================================
  * Logging
  * ============================================================ */
-#define wasapi_log(...) fprintf(stderr, "[WASAPI] " __VA_ARGS__)
+/* Through the one logger like every other host file, so this backend's lines
+ * carry a subsystem tag and land in the ring like the rest (see utils.h).
+ * stderr was already the right stream here - it is not the guest's console. */
+#define WASAPI_TAG "RVVM-AAudio"
+#define wasapi_log(...) RVVM_LOGI(WASAPI_TAG, __VA_ARGS__)
 
 /* ============================================================
  * COM vtable wrappers (deliberately NOT defined here: system headers

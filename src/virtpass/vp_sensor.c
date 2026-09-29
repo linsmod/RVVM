@@ -33,12 +33,12 @@
 
 #include "vp_sensor.h"
 
-#if defined(ANDROID)
-#include <android/log.h>
-#define SENSLOG(fmt, ...) __android_log_print(ANDROID_LOG_INFO, "RVVM-SENSOR", fmt, ##__VA_ARGS__)
-#else
-#define SENSLOG(fmt, ...) printf("[sensor] " fmt "\n", ##__VA_ARGS__)
-#endif
+/* One tag for this file, one destination chosen at startup (see utils.h). The
+ * #if ANDROID this replaces chose between __android_log_print and printf, and
+ * the printf side landed in the win32 host's stdout - the guest's console
+ * transcript, which a driver reads as the guest's own output. */
+#define VP_TAG "RVVM-SENSOR"
+#define SENSLOG(...) RVVM_LOGI(VP_TAG, __VA_ARGS__)
 
 /* How many guests can have sensors at once in one process. Each host runs one
  * guest at a time today; this is the ceiling for the day one wants more, and

@@ -4749,17 +4749,23 @@ static THREAD_LOCAL rvvm_user_thread_t* current_user_thread = NULL;
 
 /*
  * Trace identity for this thread: the guest process and thread ids as
- * "[pid:tid]", or "[host]" outside any guest (the stdin pump, a flusher
- * thread). Registered with the trace core by rvvm_user_thread_wrap() so
+ * "[pid:tid]". Registered with the trace core by rvvm_user_thread_wrap() so
  * interleaved lines from two in-process fork()ed processes - a socketpair
  * close on one side, a recv on the other - can be told apart even when
  * they share a millisecond timestamp.
+ *
+ * An empty buffer outside a guest thread means "one of the host's own" - the
+ * stdin pump, a flusher thread, the launcher's window proc, the Android
+ * bridge's binder and GL threads. The logger labels those "[host:N]" with a
+ * per-thread number; this used to answer a flat "[host]" instead, which made
+ * every one of those threads indistinguishable the moment the lines were no
+ * longer on a terminal that labelled them.
  */
 static void userland_trace_ids(char* buf, size_t size)
 {
     rvvm_user_thread_t* self = current_user_thread;
     if (!self) {
-        rvvm_strlcpy(buf, "[host]", size);
+        buf[0] = '\0';
         return;
     }
     rvvm_snprintf(buf, size, "[%u:%u]", self->proc ? self->proc->pid : 0, self->tid);

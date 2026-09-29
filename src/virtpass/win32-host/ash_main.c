@@ -66,7 +66,12 @@ static void print_usage(const char* self)
             "A client that starts one by itself is convenient and wrong for a test:\n"
             "the core it starts is a different run, with its own rootfs, and nothing\n"
             "bounds how long it lives, so a driver that lost its core would go on to\n"
-            "pass against a run it never set up.\n",
+            "pass against a run it never set up.\n"
+            "\n"
+            "Host diagnostics (RVVM_VERBOSE=1) go to stderr, never to this process's\n"
+            "stdout, which is the guest's console transcript. RVVM_LOG_FILE=<path>\n"
+            "appends them to a file instead, and RVVM_LOG_RING_DUMP=<path> writes the\n"
+            "log ring - the last 128 KiB of the run, kept in static storage - at exit.\n",
             self, self, self, self, self, self, self, ASH_PORT_DEFAULT);
 }
 

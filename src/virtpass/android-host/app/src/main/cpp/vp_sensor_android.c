@@ -13,9 +13,6 @@
  * nobody drained.
  */
 
-#define LOG_TAG "RVVM-SENSOR"
-
-#include <android/log.h>
 #include <android/sensor.h>
 #include <android/looper.h>
 
@@ -25,10 +22,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "util/utils.h" /* RVVM_LOGx(): the one logger (see utils.h) */
 #include "vp_sensor_android.h"
 
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+/* One tag for this file, one destination chosen at startup. */
+#define VP_TAG "RVVM-SENSOR"
+#define LOGI(...) RVVM_LOGI(VP_TAG, __VA_ARGS__)
+#define LOGW(...) RVVM_LOGW(VP_TAG, __VA_ARGS__)
 
 /* The Virtpass sensor ABI is byte-identical to the NDK event, which is what
  * lets a platform event be memcpy'd straight into the wire struct (the
