@@ -118,15 +118,70 @@ $ReachEntries = @(
 # nine of their call sites sit below the dispatch, so they contribute zero to every
 # case and dropping them from the list changes nothing the gate reports.
 $text = $lines -join "`n"
+
+# Count call sites, not occurrences of a name.
+#
+# The first version of this guard asked "\bguest_copy_write\s*\(" and called the
+# answer a call count. It is not one: a prose mention of `guest_copy_write()` in a
+# comment satisfies it, and so does the function's own definition. Of the six
+# matches guest_copy_write had, three were real call sites, two were comments and
+# one was the definition.
+#
+# That makes the guard bypassable in the most natural way possible, and bypassable
+# in the flattering direction, which is the only direction that matters here.
+# Renaming the function updates its three call sites and its definition; it does
+# not update the explanatory prose at :1027, :1052 or :14422, because nobody
+# renames a function by grepping the comments that mention it. So the guard keeps
+# counting 2-3 matches, stays green, and the reach criterion for that entry is
+# dead - precisely the event the guard exists to catch.
+#
+# This is the fourth time a check here has verified a proxy instead of the thing
+# itself: the TABLE 1 name drift (a filter that stopped filtering), a mutation
+# harness whose target string never matched so the mutation never applied, the
+# probe reading a fixed three log lines as a sync point, and now this. The rule
+# the four have in common: any check that proves some code exists by matching text
+# has to count real call sites, not occurrences of a name. Occurrences are what a
+# comment can satisfy.
+$codeOnly = [regex]::Replace($text, '/\*.*?\*/', ' ', 'Singleline')
+$codeOnly = [regex]::Replace($codeOnly, '//[^\n]*', ' ')
+
 $drifted = @()
 $entryHits = @{}
+$entryRaw  = @{}
+$entryOut  = @{}
 foreach ($e in $ReachEntries) {
-    $n = ([regex]::Matches($text, "\b$e\s*\(")).Count
+    $pat = [regex]::Escape($e)
+    $entryRaw[$e]  = ([regex]::Matches($text, "\b$e\s*\(")).Count
+    # An exported definition is a live entry point even with no caller here:
+    # rvvm_user_guest_ptr() is declared PUBLIC below the dispatch and called from
+    # another translation unit, so it has exactly one occurrence in this file and
+    # that occurrence *is* its definition. Counting call sites alone would report
+    # it as permanently drifted - the criterion proposed in review - which is how a
+    # guard turns into noise and gets ignored, and then it catches nothing.
+    $exported = [regex]::IsMatch($codeOnly, "(?m)^\s*PUBLIC\b[^\n]*?\b$pat\s*\(")
+    $entryOut[$e] = $exported
+    # Drop the definition line. It has to be anchored on a storage class or type
+    # keyword at the start of the line, not merely on the name appearing with a
+    # '(' after it: every real call site also has that shape, and a looser pattern
+    # deletes the whole line, so a file of nothing but call sites counts as zero
+    # call sites and the guard reports total drift.
+    $body = [regex]::Replace($codeOnly, "(?m)^\s*(?:static|inline|forceinline|PUBLIC)\b[^\n]*?\b$pat\s*\([^\n]*$", ' ')
+    $n = ([regex]::Matches($body, "\b$e\s*\(")).Count
     $entryHits[$e] = $n
-    if ($n -eq 0) { $drifted += $e }
+    # Live means either called from here, or exported for somewhere else. Only a
+    # name that is neither has actually drifted - i.e. what is left is prose.
+    if ($n -eq 0 -and -not $exported) { $drifted += $e }
 }
 
 $ReachPattern = ($ReachEntries | ForEach-Object { "\b$_\b" }) -join '|'
+
+# The subset of $ReachEntries that soundness classifies: the ones that take a
+# register argument at all. guest_copy_* and rvvm_user_guest_ptr are in the reach
+# set because they reach guest memory, but they are not register accessors, so
+# matching them here would be noise. Deriving it means adding an accessor to
+# $ReachEntries cannot leave this direction behind.
+$SoundnessEntries = $ReachEntries | Where-Object { $_ -like 'to_*' }
+$SoundnessPattern = ($SoundnessEntries | ForEach-Object { [regex]::Escape($_) }) -join '|'
 
 # ---------------------------------------------------------------------------
 # Index the dispatch: case number -> { name, start, end }
@@ -156,7 +211,14 @@ foreach ($c in $cases) {
     if (-not $fills.ContainsKey($name)) { continue }
     for ($i = $c.Start; $i -lt $c.End; $i++) {
         $line = $lines[$i]
-        foreach ($m in [regex]::Matches($line, '(?<fn>to_ptr|to_str|to_ptr_sz|to_ptr_wr|to_ptr_sz_wr|to_ptr_ioctl)\s*\(\s*(?<arg>[^,)]*)')) {
+        # The accessors soundness knows about come from $ReachEntries, not from a
+        # second hand-written list. Two lists meant two places for an entry point
+        # to drift, and only one of them was guarded - so the reach criterion
+        # recognised guest_copy_write while soundness did not, and a case writing
+        # guest memory through it would never be told it needed a _wr variant.
+        # The classification is derived, not listed: an accessor is writable if its
+        # name says so.
+        foreach ($m in [regex]::Matches($line, "(?<fn>$SoundnessPattern)\s*\(\s*(?<arg>[^,)]*)")) {
             $fn = $m.Groups['fn'].Value
             $isWritable = ($fn -like '*_wr') -or ($fn -eq 'to_ptr_ioctl')
             $am = [regex]::Match($m.Groups['arg'].Value, '\ba([0-5])\b')
@@ -198,13 +260,14 @@ foreach ($c in $cases) {
 Write-Host "TABLE 1 (from src/core/rvvm_user.c): $($fills.Count) filling, $($fillsNothing.Count) explicitly empty"
 Write-Host "dispatch: $($cases.Count) named cases; $benign of the unclassified ones touch no guest pointer"
 Write-Host ''
-Write-Host 'reach criterion - file-wide call sites per entry:'
+Write-Host 'reach criterion - call sites per entry (raw name matches in parens):'
 $standby = @()
 foreach ($e in $ReachEntries) {
     # An entry that is never called from inside a case is on standby: correct
     # today, because the calls sit below the dispatch. Printed so a reader knows
     # it is deliberate rather than redundant.
     $inCase = 0
+    $caseBody = $codeOnly
     foreach ($c in $cases) {
         for ($i = $c.Start; $i -lt $c.End; $i++) {
             if ($lines[$i] -match "\b$e\s*\(") { $inCase++ }
@@ -212,7 +275,10 @@ foreach ($e in $ReachEntries) {
     }
     $tag = if ($inCase -eq 0) { '  (on standby: never called from a case)' } else { '' }
     if ($inCase -eq 0) { $standby += $e }
-    Write-Host "    $e = $($entryHits[$e])$tag"
+    if ($entryOut[$e]) { $tag += '  (PUBLIC: called from another unit)' }
+    # All three numbers are printed, so the share of the count that is comments
+    # and definitions is visible rather than swallowed.
+    Write-Host "    $e = $($entryHits[$e]) (raw $($entryRaw[$e]))$tag"
 }
 if ($drifted.Count) {
     Write-Host ''

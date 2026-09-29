@@ -132,6 +132,34 @@ if ($orig.Contains('guest_copy_write')) {
     $failed++
 }
 
+# Direction 5 - the same rename, but leaving the prose behind. This is the shape
+# that got past the first version of the guard: renaming a function updates its
+# call sites and its definition, and does not update the explanatory comments that
+# mention it, so a name-only count still sees matches and stays green while the
+# entry is dead. A mutation that renames only the code and leaves the comments is
+# therefore the one that matters, and the plain rename above does not test it.
+Write-Host ''
+Write-Host 'MUTATION: rename guest_copy_write in code only, leaving the comments intact'
+if ($orig.Contains('guest_copy_write')) {
+    # Rewrite only the lines that are not comments, i.e. what an IDE rename does.
+    $code = $orig
+    $code = [regex]::Replace($code, '(?m)^(?!\s*(?://|/\*|\*)).*\bguest_copy_write\b.*$', {
+        param($m) $m.Value.Replace('guest_copy_write', 'guest_copy_write_renamed')
+    })
+    [System.IO.File]::WriteAllText($src, $code)
+    $stillInComments = ([regex]::Matches($code, '(?m)^\s*(?://|/\*|\*)[^\n]*\bguest_copy_write\b')).Count
+    Write-Host "  (left $stillInComments comment mention(s) on purpose)"
+    $r = Invoke-Gate
+    Write-Host "  exit=$($r.Code)"
+    ($r.Text -split "`n" | Where-Object { $_ -match 'drift|guest_copy' }) | ForEach-Object { Write-Host "  $_" }
+    if ($r.Code -eq 0) { Write-Host '  NOT CAUGHT - a comment is satisfying the reach guard'; $failed++ }
+    else { Write-Host '  caught' }
+    [System.IO.File]::WriteAllText($src, $orig)
+} else {
+    Write-Host '  HARNESS BUG: guest_copy_write is not in the source'
+    $failed++
+}
+
 Write-Host ''
 Write-Host 'final restore check'
 $final = Invoke-Gate
@@ -140,5 +168,5 @@ if ($final.Code -ne 0 -or $final.Text -ne $base.Text) { Write-Host 'RESTORE FAIL
 
 if ($failed) { Write-Host "`n$failed mutation(s) not caught"; exit 1 }
 Write-Host ''
-Write-Host 'all four mutations caught, tree restored'
+Write-Host 'all five mutations caught, tree restored'
 exit 0

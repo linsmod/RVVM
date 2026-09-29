@@ -30,9 +30,21 @@ param(
 $exe = Join-Path $PSScriptRoot '..\release.windows.x86_64\rvvm_winhost_x86_64.exe'
 $exe = (Resolve-Path -LiteralPath $exe).Path
 
-# Each child is a shell spinning on sleep, so it holds its address space for the whole
-# sample without consuming CPU worth measuring.
-$kid = 'sh -c "while :; do sleep 1; done"'
+# Each child is a shell that holds its address space for the whole sample without
+# consuming CPU worth measuring.
+#
+# It must be a busybox *builtin* loop, and that is not a style preference. The
+# obvious spelling - `while :; do sleep 1; done` - forks once per iteration, and
+# in rvvm-user a guest fork is a whole new machine, i.e. another guest_size
+# arena. The child therefore holds two machines instead of one for a large part
+# of every second, and the measured cost per child comes out at 1,058.9 MB
+# rather than 529.4 - exactly double, because it *is* double. `:` is a builtin,
+# so this variant forks nothing and the slope is the machine's own cost.
+#
+# Worth stating plainly: the earlier number was wrong in the flattering
+# direction, and nothing about it looked wrong. It was linear, it was stable to
+# a tenth of a megabyte across three intervals, and it was 2x a round number.
+$kid = 'sh -c "while :; do :; done"'
 
 function Measure-Run([int]$n, [int]$secs) {
     $script = ''

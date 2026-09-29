@@ -620,6 +620,29 @@ void* vma_mmap(void* addr, size_t size, uint32_t flags, rvfile_t* file, uint64_t
         ret = NULL;
     }
 
+    /*
+     * Allocation/free pairing, on the switch that already exists.
+     *
+     * This is here to answer one question that reading the code cannot: of the
+     * full-size blocks a userland run maps, which are still mapped at exit. The
+     * count and the sizes are the answer, and they distinguish the two cases
+     * that look identical from the outside - a block that is one-per-process and
+     * released at run teardown (harmless) versus one that is one-per-machine and
+     * never released (the whole per-child cost, unrelated to the page table).
+     * A trace of the size alone cannot tell them apart; the pairing can.
+     *
+     * Gated rather than unconditional because this is a hot path and because
+     * winhost's fd 1/2 *is* the guest console: an unconditional line here is the
+     * same class of bug as the vpsessiond diagnostics that landed non-
+     * deterministically inside guest transcripts and made one-line checks like
+     * readlink /proc/self/cwd flaky. Off unless asked for.
+     */
+    if (ret) {
+        RVVM_TRC(RVVM_TRC_MMAP, "alloc %p size=%llu %s%s", (void*)(ret + ptr_diff), //
+                 (unsigned long long)size, file ? "file" : "anon",            //
+                 (flags & VMA_SHARED) ? " shared" : "");
+    }
+
     return ret ? (ret + ptr_diff) : NULL;
 }
 
@@ -786,6 +809,8 @@ bool vma_free(void* addr, size_t size)
 {
     vma_align_outward(&addr, &size);
     if (addr && size) {
+        /* The counterpart of the alloc trace in vma_mmap(), same reasoning. */
+        RVVM_TRC(RVVM_TRC_MMAP, "free  %p size=%llu", addr, (unsigned long long)size);
 #if defined(VMA_WIN32_IMPL)
         MEMORY_BASIC_INFORMATION mbi = {0};
         if (!VirtualQuery(addr, &mbi, sizeof(mbi))) {
