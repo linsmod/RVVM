@@ -3947,6 +3947,30 @@ static void shadow_hide_tree(const char* abs)
  * prefix is concatenated (otherwise "/bin/sh -> /bin/busybox" would name the
  * host's /bin), the second must NOT - dereferencing there would delete the
  * target instead of the link. */
+typedef enum {
+    RVVM_PROC_NONE = 0,
+    RVVM_PROC_ROOT_DIR,    // /proc
+    RVVM_PROC_ROOT_FILE,   // /proc/uptime, /proc/stat, ...
+    RVVM_PROC_SELF_LINK,   // /proc/self / /proc/thread-self (open follows it)
+    RVVM_PROC_PID_DIR,     // /proc/<pid>
+    RVVM_PROC_PID_FILE,    // /proc/<pid>/stat, status, ...
+    RVVM_PROC_PID_LINK,    // /proc/<pid>/cwd, exe, root
+    RVVM_PROC_PID_FD_DIR,  // /proc/<pid>/fd
+    RVVM_PROC_PID_FD_LINK, // /proc/<pid>/fd/<n>
+} rvvm_proc_kind_t;
+
+typedef struct {
+    rvvm_proc_kind_t kind;
+    uint32_t         pid;
+    uint32_t         fd;      // RVVM_PROC_PID_FD_LINK: which descriptor
+    char             leaf[RVVM_PROC_NAME_MAX];
+} rvvm_proc_path_t;
+
+static const char* userland_proc_fd_path_target(char* buffer, size_t size, const char* path);
+static const char* userland_proc_fd_link_target(uint32_t pid, uint32_t fd,
+                                                char* buf, size_t size);
+static bool userland_proc_parse(const char* abs, uint32_t self_pid, rvvm_proc_path_t* out);
+
 static const char* map_abs_path_ex(char* buffer, const char* path, bool follow_final)
 {
     const char* prefix = uctx()->prefix_path;
@@ -3958,8 +3982,16 @@ static const char* map_abs_path_ex(char* buffer, const char* path, bool follow_f
         if (rvvm_strfind(path, "/") == path) {
             char followed[UAPI_PATH_MAX];
             size_t prefix_len;
-            if (follow_final ? shadow_follow_path(followed, sizeof(followed), path)
-                             : shadow_resolve_parent(followed, sizeof(followed), path)) {
+            /* A /proc/<pid>/fd/<n> path names a descriptor, not a place. Acting
+             * through one has to act on what it points at, because the prefix
+             * below would otherwise produce <prefix>/proc/self/fd/7 - a
+             * directory that is not there - and the operation fails with ENOENT
+             * against a path the caller never wrote. */
+            const char* fd_target = userland_proc_fd_path_target(followed, sizeof(followed), path);
+            if (fd_target) {
+                path = fd_target;
+            } else if (follow_final ? shadow_follow_path(followed, sizeof(followed), path)
+                                    : shadow_resolve_parent(followed, sizeof(followed), path)) {
                 path = followed;
             }
             prefix_len = rvvm_strlcpy(buffer, prefix, UAPI_PATH_MAX);
@@ -3989,7 +4021,11 @@ static const char* map_abs_path(char* buffer, const char* path)
 /* Resolve a path against the guest's virtual cwd and normalize it into an
  * absolute guest path. "." drops out and ".." pops a component, so the result
  * can never walk above "/". Returns false when it would not fit in @size. */
-static bool guest_path_absolutize(char* out, size_t size, const char* path)
+/* Join @base and @path and fold the result: duplicate slashes collapse, "." and
+ * ".." go, and the answer is always absolute. An absolute @path ignores @base.
+ * A NULL @base means the virtual cwd, which is what every caller that is not
+ * resolving against a descriptor wants. */
+static bool guest_path_resolve_from(char* out, size_t size, const char* base, const char* path)
 {
     char full[UAPI_PATH_MAX];
     const char* segs[GUEST_PATH_MAX_SEGS];
@@ -4001,12 +4037,13 @@ static bool guest_path_absolutize(char* out, size_t size, const char* path)
     if (path[0] == '/') {
         rvvm_strlcpy(full, path, sizeof(full));
     } else {
-        // The virtual cwd is always absolute, so a plain join is enough
-        size_t n = rvvm_strlen(uctx()->cwd);
+        // The base is absolute by the time it is used, so a plain join is enough
+        const char* b = base ? base : uctx()->cwd;
+        size_t n = rvvm_strlen(b);
         if (n + 1 >= sizeof(full)) {
             return false;
         }
-        memcpy(full, uctx()->cwd, n);
+        memcpy(full, b, n);
         full[n] = '/';
         rvvm_strlcpy(full + n + 1, path, sizeof(full) - n - 1);
     }
@@ -4066,6 +4103,39 @@ static bool guest_path_absolutize(char* out, size_t size, const char* path)
     }
     out[o] = 0;
     return true;
+}
+
+static bool guest_path_absolutize(char* out, size_t size, const char* path)
+{
+    return guest_path_resolve_from(out, size, NULL, path);
+}
+
+/* The file a "/proc/<pid>/fd/<n>" path names, or NULL when @path is not one.
+ * Declared this far up because the path mapper needs it, and the reason is not
+ * cosmetic: a caller that acts *through* such a path has to be given what the
+ * descriptor points at, not a prefixed path to a directory that does not exist.
+ * rename("/proc/self/fd/7", dirfd, "name", 0) is how a process renames a file it
+ * holds open but cannot name - the kernel resolves the magic link - and apk
+ * fetches an index exactly that way. */
+static const char* userland_proc_fd_path_target(char* buffer, size_t size, const char* path)
+{
+    rvvm_proc_path_t pp;
+
+    if (!path) {
+        return NULL;
+    }
+    /* The same parse the readlink side uses, so "self", "thread-self" and a
+     * numeric pid all mean here what they mean there - and so that the pid
+     * handed to the registry is the one it is keyed by. That is the *host
+     * thread's* pid, not the context's: a process with threads has more than
+     * one, and /proc/self is per thread. */
+    if (!userland_proc_parse(path, userland_current_pid(), &pp) ||
+        pp.kind != RVVM_PROC_PID_FD_LINK) {
+        return NULL;
+    }
+    /* A link this layer cannot name has no honest target, and inventing one here
+     * would turn a "cannot describe" into a wrong place. */
+    return userland_proc_fd_link_target(pp.pid, pp.fd, buffer, size);
 }
 
 /* The syscall number of the ecall currently being dispatched on this thread
@@ -5553,6 +5623,44 @@ static bool userland_fd_write_blocks(rvvm_userland_t* ctx, int fd)
  *
  * A slot inherited without a copy of its own (see userland_fd_table_inherit) is
  * dropped without the host close: the host fd is the parent's as well. */
+/* Name a slot free; see userland_fd_set_path below. */
+static char* userland_fd_path_copy(const char* path);
+
+/* The name a descriptor opened as openat(@dirfd, @path) should be recorded
+ * under.
+ *
+ * /proc/<pid>/fd/<n> has to answer with a path the reader can open, so a
+ * relative name is not an answer at all: apk holds the root descriptor and
+ * opens everything under it, and recorded the way this first was, its own files
+ * came back named "var/cache/apk" rather than "/var/cache/apk" - which it then
+ * used to build a destination that does not exist, and reported the failure
+ * against that.
+ *
+ * The dirfd's own name is absolute, because it was resolved the same way when it
+ * was recorded, so one join settles it. A dirfd whose name is not absolute (an
+ * emulator-owned object, a descriptor from before this layer named it) falls back
+ * to the cwd: still absolute, which is what matters. */
+static void userland_fd_name_for(char* out, size_t size, int dirfd, const char* path)
+{
+    const char* base = NULL;
+
+    if (path && path[0] == '/') {
+        rvvm_strlcpy(out, path, size);
+        return;
+    }
+    if (dirfd != UAPI_AT_FDCWD && dirfd >= 0 && dirfd < USERLAND_FD_TABLE_MAX &&
+        uctx()->fds[dirfd].used && uctx()->fds[dirfd].path &&
+        uctx()->fds[dirfd].path[0] == '/') {
+        base = uctx()->fds[dirfd].path;
+    }
+    if (!guest_path_resolve_from(out, size, base, path ? path : "")) {
+        /* Too long to fold, or too many segments. The relative name is worse than
+         * useless here, so there is no good answer; keeping the input at least
+         * says what was asked for. */
+        rvvm_strlcpy(out, path ? path : "", size);
+    }
+}
+
 /* A slot's own copy of a path. NULL in, NULL out: a descriptor that names no
  * file keeps saying so rather than being given an empty name, which
  * /proc/<pid>/fd/<n> would then have to report as a real one. */
@@ -10168,24 +10276,7 @@ static bool userland_dev_stat_path(const char* abs, struct stat* st)
  * stale one); a file carries its generated text and a read cursor.
  * ============================================================ */
 
-typedef enum {
-    RVVM_PROC_NONE = 0,
-    RVVM_PROC_ROOT_DIR,    // /proc
-    RVVM_PROC_ROOT_FILE,   // /proc/uptime, /proc/stat, ...
-    RVVM_PROC_SELF_LINK,   // /proc/self / /proc/thread-self (open follows it)
-    RVVM_PROC_PID_DIR,     // /proc/<pid>
-    RVVM_PROC_PID_FILE,    // /proc/<pid>/stat, status, ...
-    RVVM_PROC_PID_LINK,    // /proc/<pid>/cwd, exe, root
-    RVVM_PROC_PID_FD_DIR,  // /proc/<pid>/fd
-    RVVM_PROC_PID_FD_LINK, // /proc/<pid>/fd/<n>
-} rvvm_proc_kind_t;
 
-typedef struct {
-    rvvm_proc_kind_t kind;
-    uint32_t         pid;
-    uint32_t         fd;      // RVVM_PROC_PID_FD_LINK: which descriptor
-    char             leaf[RVVM_PROC_NAME_MAX];
-} rvvm_proc_path_t;
 
 static const char* const userland_proc_root_names[] = {
     "self", "thread-self", "mounts", "uptime", "stat", "meminfo",
@@ -12425,9 +12516,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                                 if (guest_fd >= 0) {
                                     /* Name the file, so /proc/<pid>/fd/<n> can
                                      * answer for it later - read by a process
-                                     * that has to find where a write landed. */
-                                    userland_fd_set_path(uctx(), guest_fd,
-                                                         have_abs ? abs : path);
+                                     * that has to find where a write landed. The
+                                     * name is resolved against the dirfd, not
+                                     * copied as given: a reader of that link has
+                                     * to be able to open what it names. */
+                                    char fdname[UAPI_PATH_MAX];
+                                    userland_fd_name_for(fdname, sizeof(fdname),
+                                                         (int)a0, path);
+                                    userland_fd_set_path(uctx(), guest_fd, fdname);
                                 }
                                 if (created) {
                                     mode_override_record_path(host_path, guest_create_mode(a3), true);
