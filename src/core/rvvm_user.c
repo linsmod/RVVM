@@ -198,9 +198,20 @@ ssize_t android_io_callback(int fd, const void* buf, size_t count)
             __android_log_print(ANDROID_LOG_INFO, "RVVM-GUEST", "%s", sbuf);
 
             /* Forward the raw bytes to the JNI console bridge, which buffers
-             * them into lines for the app UI and its log file. */
-            extern void jni_guest_output(const char* data, size_t count);
-            jni_guest_output(data, count);
+             * them into lines for the app UI and its log file.
+             *
+             * The descriptor travels with them, and it is the guest's own: a
+             * console write reaches this callback with host_fd == the number
+             * the guest wrote to, because a console is an attach rather than a
+             * descriptor (see userland_fd_is_console). That is what lets a
+             * client tell a program's stderr from its stdout - they are
+             * indistinguishable by the time they reach the virtual TTY, which
+             * shows both on one screen, and keeping them apart is the only way
+             * a reader can act on the difference. The two callers that pass 1
+             * literally are the host's own echo of a signal and the
+             * /dev/console writer; both are the shell's side of the line. */
+            extern void jni_guest_output(int fd, const char* data, size_t count);
+            jni_guest_output(fd, data, count);
         }
         return count;
     } else {

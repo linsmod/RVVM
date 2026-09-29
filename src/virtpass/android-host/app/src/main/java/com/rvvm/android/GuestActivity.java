@@ -79,6 +79,7 @@ public class GuestActivity extends Activity {
 
     public static final String EXTRA_APP_NAME = "guest_app_name";
 
+
     /** Guest exit behavior: "finish" closes the activity when the guest exits,
      *  any other value (e.g. "stay") keeps it up so the user can read the
      *  console / last screen. */
@@ -429,7 +430,6 @@ public class GuestActivity extends Activity {
         if (intent.getBooleanExtra(EXTRA_CONSOLE, false)
                 || intent.hasExtra(EXTRA_CONSOLE_PORT)) {
             host.enableConsoleServer(intent.getIntExtra(EXTRA_CONSOLE_PORT, 0));
-            Log.i(TAG, "Scripted console on port " + host.consoleServerPort());
         }
     }
 

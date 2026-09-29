@@ -168,6 +168,9 @@ target_link_options(rvvm_core PRIVATE -Wl,-z,max-page-size=16384)
 add_library(rvvm_jni SHARED
     jni_bridge.c
     vp_aaudio_android.c
+    # The console: listener, framing and the two blocking threads per client.
+    # In C because a blocking push has no counterpart on the Java side of JNI.
+    vp_console.c
     vp_sensor_android.c
     android_gl_host.c
     # Bundle archive reader (gzip + tar): host side, hence linked against zlib

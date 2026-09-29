@@ -140,6 +140,16 @@ public class SimpleLauncherActivity extends Activity {
         RvvmHost host = RvvmHost.getInstance();
         host.acquire();
         try {
+            // The console, if a driver asked for it, on the way past. The
+            // picker is the front door a driver can come through without
+            // naming a guest: it brings the host up and the listener binds,
+            // and the guest goes in afterwards through its own task. That
+            // order is what makes a batch guest usable on a live byte pipe -
+            // see Start-ShellHost in tools/android_console.ps1.
+            if (getIntent().getBooleanExtra(GuestActivity.EXTRA_CONSOLE, false)) {
+                host.enableConsoleServer(
+                        getIntent().getIntExtra(GuestActivity.EXTRA_CONSOLE_PORT, 0));
+            }
             String[] apps = RvvmNative.nativeListApps();
             if (apps != null && apps.length > 0) {
                 guestApps = apps;

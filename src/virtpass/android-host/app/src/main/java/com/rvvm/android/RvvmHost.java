@@ -31,7 +31,11 @@ public final class RvvmHost extends Application {
     private RvvmNative.ExitListener exitListener;
     private RvvmNative.ConsoleListener consoleListener;
     private RvvmNative.FrameCallback frameCallback;
-    private RvvmConsoleServer consoleServer;
+    /** Whether the scripted console's listener is up. */
+    private boolean consoleStarted;
+    /** The property that turns the console on for every launch; its value is the port. */
+    public static final String CONSOLE_PROP = "debug.rvvm.console";
+    private static final int DEFAULT_CONSOLE_PORT = 7979;
 
     public static RvvmHost getInstance() {
         if (instance == null) {
@@ -70,7 +74,7 @@ public final class RvvmHost extends Application {
                 RvvmNative.nativeSetPanelSize(panelWidth, panelHeight);
             }
             if (exitListener != null) {
-                RvvmNative.nativeSetExitCallback(wrapExit(exitListener));
+                RvvmNative.nativeSetExitCallback(exitListener);
             }
             if (consoleListener != null) {
                 RvvmNative.nativeSetConsoleListener(consoleListener);
@@ -83,7 +87,7 @@ public final class RvvmHost extends Application {
             // look when asking "why is this or that on"; an Activity that wants
             // the console calls enableConsoleServer() itself, which is what an
             // `am start` carrying EXTRA_CONSOLE does.
-            String want = RvvmNative.nativeGetSystemProperty(RvvmConsoleServer.PROP);
+            String want = RvvmNative.nativeGetSystemProperty(CONSOLE_PROP);
             if (want != null) {
                 enableConsoleServer(parsePort(want));
             }
@@ -98,30 +102,45 @@ public final class RvvmHost extends Application {
     /**
      * The scripted console, off unless a driver asked for it.
      *
-     * <p>Loopback only and off by default: see {@link RvvmConsoleServer}. The
-     * port comes from {@code debug.rvvm.console} (its value, or the default when
-     * it is not a number), and an Activity can also turn it on for this process
-     * with an intent extra - which is the difference between a driver that has
-     * to `setprop` before every launch and one that does not.</p>
+     * <p>Loopback only and off by default: this is a shell into every guest
+     * on the device, and it is only meant to be reached from the machine
+     * holding the cable. The port comes from {@code debug.rvvm.console} (its
+     * value, or the default when it is not a number), and an Activity can also
+     * turn it on for this process with an intent extra - which is the
+     * difference between a driver that has to `setprop` before every launch
+     * and one that does not.</p>
+     *
+     * <p>The socket, its threads and its framing all live in native
+     * ({@code vp_console.c}). A blocking push has no counterpart on this side
+     * of JNI - there is no way to park a Java thread on a native event - so
+     * the split is not a preference, it is what makes the guest's writer able
+     * to block without a poll loop.</p>
      */
     public synchronized void enableConsoleServer(int requestedPort) {
-        if (consoleServer == null) {
-            consoleServer = new RvvmConsoleServer();
+        int port = (requestedPort > 0 && requestedPort <= 65535)
+                ? requestedPort : DEFAULT_CONSOLE_PORT;
+        if (consoleStarted) {
+            return;
         }
-        consoleServer.start(requestedPort > 0 ? requestedPort : RvvmConsoleServer.DEFAULT_PORT);
+        if (RvvmNative.nativeConsoleStart(port)) {
+            consoleStarted = true;
+            Log.i(TAG, "Console listening on 127.0.0.1:" + port);
+        } else {
+            Log.w(TAG, "Console did not start on port " + port);
+        }
     }
 
-    /** Whether the scripted console is listening, and on what port (0 = no). */
-    public synchronized int consoleServerPort() {
-        return (consoleServer != null && consoleServer.isRunning()) ? consoleServer.port() : 0;
+    /** Whether the scripted console is listening. */
+    public synchronized boolean isConsoleServerRunning() {
+        return consoleStarted;
     }
 
     private static int parsePort(String value) {
         try {
             int port = Integer.parseInt(value.trim());
-            return (port > 0 && port <= 65535) ? port : RvvmConsoleServer.DEFAULT_PORT;
+            return (port > 0 && port <= 65535) ? port : DEFAULT_CONSOLE_PORT;
         } catch (NumberFormatException e) {
-            return RvvmConsoleServer.DEFAULT_PORT;
+            return DEFAULT_CONSOLE_PORT;
         }
     }
 
@@ -200,26 +219,13 @@ public final class RvvmHost extends Application {
     public synchronized void setExitListener(RvvmNative.ExitListener listener) {
         exitListener = listener;
         if (initialized) {
-            // Wrapped, not replaced: the console needs the same event the
-            // Activity does, and only one listener is installed at a time. A
-            // batch guest's result is its exit status, so a driver that can
-            // read what it printed but not whether it worked would pass a guest
-            // that failed.
-            RvvmNative.nativeSetExitCallback(wrapExit(listener));
+            // Straight through, not wrapped. This used to tee the event into
+            // the console so a driver could ask for the status afterwards; the
+            // status now travels in band as its own packet, in order, after
+            // the output - so the Activity's event is the only consumer of
+            // this callback again.
+            RvvmNative.nativeSetExitCallback(listener);
         }
-    }
-
-    /** The user's listener, with the console's record of the exit in front. */
-    private RvvmNative.ExitListener wrapExit(RvvmNative.ExitListener inner) {
-        return (id, code) -> {
-            RvvmConsoleServer cs = consoleServer;
-            if (cs != null) {
-                cs.recordExit(id, code);
-            }
-            if (inner != null) {
-                inner.onExit(id, code);
-            }
-        };
     }
 
     public synchronized void setConsoleListener(RvvmNative.ConsoleListener listener) {

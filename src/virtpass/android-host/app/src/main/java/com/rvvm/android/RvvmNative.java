@@ -360,6 +360,23 @@ public class RvvmNative {
     public static native String nativeGetSystemProperty(String name);
 
     /**
+     * Start the console's loopback listener, or report that it did not come up.
+     *
+     * <p>The wire format is adb's ShellProtocol: a 5-byte header (one id
+     * byte, then a 4-byte little-endian length) and a payload, with one id per
+     * logical stream - stdin, stdout, stderr, exit, close-stdin and window
+     * size. Blocking, in both directions: a client waits on a read and a
+     * driver writes keystrokes without a round trip.</p>
+     *
+     * @param port TCP port on 127.0.0.1
+     * @return true once it is listening
+     */
+    public static native boolean nativeConsoleStart(int port);
+
+    /** Stop the listener and drop every client. */
+    public static native void nativeConsoleStop();
+
+    /**
      * Send host keyboard input to the guest's virtual TTY - the input half of
      * the console.
      *

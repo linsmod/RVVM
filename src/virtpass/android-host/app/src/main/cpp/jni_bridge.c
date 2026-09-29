@@ -34,6 +34,7 @@
 /* Include vp_cmdpost API */
 #include "virtpass/vp_cmdpost.h"
 #include "virtpass/vp_session.h"
+#include "vp_console.h"
 
 /* System EGL/GLES backend (marshalled GL dispatch) */
 #include "android_gl_host.h"
@@ -1190,15 +1191,47 @@ static void on_console_line(void* user, const char* line)
 /* Called by rvvm_user's io callback for every write to fd 1/2. The splitting
  * into lines lives in the session, so both hosts split identically; what is
  * here is the locking and the crossing into Java. */
-void jni_guest_output(const char* data, size_t count)
+void jni_guest_output(int fd, const char* data, size_t count)
 {
     struct android_run* run = android_run_active();
 
     if (!data || !count || !run) return;
 
+    /* The byte pipe, first: it is the copy that matters, and it must see the
+     * bytes before anything below reshapes them. */
+    vp_console_tap(fd, data, count);
+
     pthread_mutex_lock(&g_console_mutex);
     vp_session_console_output(&run->session, data, count);
     pthread_mutex_unlock(&g_console_mutex);
+}
+
+/* ============================================================
+ * The console: a byte pipe on loopback
+ * ============================================================ */
+
+/* The machine the console types into. The tap only ever runs inside a guest,
+ * and a run is created before its thread starts and freed after it ends, so
+ * this is set once at the start of a run and cleared by its own exit - a
+ * stale pointer here would be a write into freed memory from whichever guest
+ * wrote next. */
+void vp_console_bind(rvvm_machine_t* machine)
+{
+    vp_console_set_machine(machine);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_rvvm_android_RvvmNative_nativeConsoleStart(JNIEnv* env, jobject thiz, jint port)
+{
+    (void)env; (void)thiz;
+    return (port > 0 && vp_console_start(port) == 0) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeConsoleStop(JNIEnv* env, jobject thiz)
+{
+    (void)env; (void)thiz;
+    vp_console_stop();
 }
 
 /* Mark the first presented frame. Called from both present paths: the CPU
@@ -1278,8 +1311,11 @@ static void* guest_thread_func(void* arg)
      * here, where no guest code can run anymore. */
     surf_finish_pending_lock(run);
 
-    /* rvvm_user_linux_ex() owns and has just freed the machine */
+    /* rvvm_user_linux_ex() owns and has just freed the machine. The console
+     * must stop pointing at it here: a tap from whichever guest writes next
+     * would type into freed memory. */
     run->machine = NULL;
+    vp_console_set_machine(NULL);
 
     /* This run is over, so it goes now - its cmdpost instance and the sensor
      * state hanging off it with it. It goes *before* "not running" becomes
@@ -2964,6 +3000,10 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
      * so there is nothing per-run to wire up here. */
     rvvm_user_set_exit_callback(run->machine, on_guest_exit);
 
+    /* The console types into this machine. Bound before the thread starts,
+     * because the first thing a guest does may be to read its console. */
+    vp_console_bind(run->machine);
+
     /* This run's cmdpost instance is normally made by nativeClearLifecycleCmds()
      * (Java queues the startup sequence right after that call, and it has to
      * land in this run's instance); this is the safety net for a caller that
@@ -3199,6 +3239,14 @@ static void on_guest_exit(rvvm_machine_t* machine, int exit_code)
     int guest_id = -1;
 
     LOGI("Guest exited with code: %d", exit_code);
+
+    /* The run's status, as its own packet. In band, and before anything that
+     * tears the run down: a client that sees `exit` must already have been
+     * given the output, or it stops reading a transcript that is still in
+     * flight and reports a complete run as a truncated one. The tap has
+     * already copied every byte this guest wrote by the time its thread
+     * reaches here. */
+    vp_console_exit(exit_code);
 
     /* The machine comes with the callback, so the run is identified the same
      * way no matter which thread fired the event: a guest vCPU thread on a
