@@ -2354,6 +2354,9 @@ static void user_tty_init(rvvm_userland_t* ctx)
     ctx->tty_owned = true;
 }
 
+static size_t tty_cooked_push(rvvm_userland_t* ctx, const void* buf, size_t len);
+static size_t tty_cooked_push_front(rvvm_userland_t* ctx, const void* buf, size_t len);
+
 // Feed guest output on fd 1/2 through libvterm. No-op unless a session exists -
 // either attached by the host via rvvm_tty_attach() or created on demand when a
 // host registered a tty callback. This only mirrors the bytes into the screen
@@ -2388,8 +2391,41 @@ static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t
     if (start < count) {
         vterm_input_write(tty->vt, (const char*)p + start, count - start);
     }
+    /* A guest that asks where the cursor is (ESC [ 6 n) is telling us it will
+     * block until it hears back. This is the one place that sees the question
+     * and holds the answer: the VTerm it was just written to is the screen
+     * whose cursor the guest is asking about. Answering here, at the moment of
+     * the question, is what makes the reply land while the guest is still
+     * waiting for it - an answer synthesised later, or by a client on the far
+     * end of a pipe, races the app's own termios and can arrive after it
+     * restored canonical mode, where a report is not typing and is not wanted.
+     *
+     * Counted under the VTerm lock, pushed after releasing it: the input ring
+     * has its own lock, and the guest-input path takes them in the other order
+     * (tty_in_lock, then tty->lock), so nesting them here would deadlock. */
+    int dsr = 0;
+    for (size_t i = 0; i + 3 < count; ++i) {
+        if (p[i] == 0x1b && p[i + 1] == '[' && p[i + 2] == '6' && p[i + 3] == 'n') {
+            dsr++;
+            i += 3;
+        }
+    }
+    VTermPos cur = { 0, 0 };
+    if (dsr) {
+        vterm_state_get_cursorpos(vterm_obtain_state(tty->vt), &cur);
+    }
     tty->serial++;  /* there is a newer screen than the last snapshot */
     spin_unlock(&tty->lock);
+    if (dsr) {
+        char reply[32];
+        int  n = snprintf(reply, sizeof(reply), "\x1b[%d;%dR", cur.row + 1, cur.col + 1);
+        spin_lock(&ctx->tty_in_lock);
+        tty_cooked_push_front(ctx, reply, (size_t)n);
+        spin_unlock(&ctx->tty_in_lock);
+        rvvm_event_wake(&ctx->tty_in_event);
+        RVVM_TRC(RVVM_TRC_TTY, "tty:  answered %d cursor query(s) with %.*s",
+                  dsr, n, reply);
+    }
     // Notify the host; it decides when to flush/render (throttling is its job).
     if (ctx->tty_cb) {
         ctx->tty_cb(ctx->tty_userdata, fd, tty->vt);
@@ -2674,6 +2710,34 @@ static size_t tty_cooked_push(rvvm_userland_t* ctx, const void* buf, size_t len)
     return len;
 }
 
+// Queue cooked bytes for the guest, in front of whatever is already waiting.
+// Caller holds tty_in_lock. For a terminal's answer to a cursor query: the
+// guest asked the question while input typed by a script was already queued,
+// and it is about to read that answer first. A report appended behind the
+// script is read as the first characters of the script - the line is eaten as
+// a malformed report and the shell waits for a line that never comes. The
+// head cursor moves back into space already consumed, so nothing queued is
+// moved or lost.
+static size_t tty_cooked_push_front(rvvm_userland_t* ctx, const void* buf, size_t len)
+{
+    const uint8_t* p = buf;
+    size_t space = TTY_IN_RING - ctx->tty_cooked_len;
+    if (len > space) {
+        len = space;
+    }
+    if (!len) {
+        return 0;
+    }
+    ctx->tty_cooked_head =
+        (ctx->tty_cooked_head + TTY_IN_RING - len) % TTY_IN_RING;
+    for (size_t i = 0; i < len; ++i) {
+        size_t idx = (ctx->tty_cooked_head + i) % TTY_IN_RING;
+        ctx->tty_cooked[idx] = p[i];
+    }
+    ctx->tty_cooked_len += len;
+    return len;
+}
+
 // Drain up to len bytes out of the ring. Caller holds tty_in_lock.
 static size_t tty_cooked_pop(rvvm_userland_t* ctx, void* buf, size_t len)
 {
@@ -2913,9 +2977,12 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
         // ESC[<row>;<col>R back into the input - the same channel as typed
         // keys. The guest asks (and consumes the answer) in raw mode, but the
         // answer can come back after it restored canonical mode (busybox ash
-        // runs every command that way), and a real terminal never delivers
-        // the report as typing: scanning it out here is what keeps a prompt
-        // from growing a "[30;1R" prefix. Raw mode below passes everything
+        // runs every command that way), so the scan below has to recognise a
+        // report in either mode or the reply is read as the start of a typed
+        // line. What a real terminal never does is *echo* the report - that is
+        // what would put a "[30;1R" prefix on the prompt - and it does not put
+        // it in the line being assembled, which would do the same. It goes to
+        // the guest's read(0) and nowhere else. Raw mode passes everything
         // through untouched - the waiting guest consumes the report itself.
         if (c == 0x1b && ctx->tty_esc_state != 1) {
             // Hold a fresh ESC: it may grow into a cursor report.
@@ -2954,15 +3021,33 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
                     ctx->tty_line[ctx->tty_line_len++] = 0x1b;
                     ctx->tty_line[ctx->tty_line_len++] = '[';
                 }
-            } else if (c == 'R' && ctx->tty_esc_hold_len < sizeof(ctx->tty_esc_hold)) {
-                // A complete cursor-position report: control traffic, not
-                // typing. Drop it whole - nothing echoed, nothing delivered.
-                    RVVM_TRC(RVVM_TRC_TTY, "tty:  dropped cursor report ESC[%.*sR",
-                              (int)ctx->tty_esc_hold_len, (const char*)ctx->tty_esc_hold);
+                        } else if (c == 'R' && ctx->tty_esc_hold_len < sizeof(ctx->tty_esc_hold)) {
+                // A complete cursor-position report. It is not typing - it is
+                // not echoed, and it does not join the line being assembled -
+                // but it IS the answer the guest is parked waiting for, and it
+                // was being dropped whole. That left an interactive shell
+                // blocked on its first prompt with no way out, which reads as
+                // a dead console and is not one: the guest asked a question
+                // and the terminal was swallowing the answer. Delivered to
+                // read(0) instead, which is where the app that asked expects
+                // to find it.
+                /* One insertion, in order: pushing the three pieces
+                 * separately would reverse them, and the guest reads this as
+                 * a single report. */
+                char report[3 + sizeof(ctx->tty_esc_hold) + 1];
+                report[0] = 0x1b;
+                report[1] = '[';
+                memcpy(report + 2, ctx->tty_esc_hold, ctx->tty_esc_hold_len);
+                report[2 + ctx->tty_esc_hold_len] = 'R';
+                tty_cooked_push_front(ctx, report, 3 + ctx->tty_esc_hold_len);
+                RVVM_TRC(RVVM_TRC_TTY, "tty:  delivered cursor report ESC[%.*sR",
+                          (int)ctx->tty_esc_hold_len, (const char*)ctx->tty_esc_hold);
                 ctx->tty_esc_state = 0;
                 ctx->tty_esc_hold_len = 0;
+                wake = true;
                 continue;
-            } else {
+            }
+ else {
                 // The sequence is not a report: deliver what was held, then
                 // let c fall through to the ordinary handling below.
                 ctx->tty_esc_state = 0;

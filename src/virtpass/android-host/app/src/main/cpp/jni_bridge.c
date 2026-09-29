@@ -706,6 +706,12 @@ static pthread_mutex_t g_console_mutex = PTHREAD_MUTEX_INITIALIZER;
 static jobject    g_frame_callback = NULL;
 static jmethodID  g_frame_first_frame_mid = NULL;
 
+/* The console's "a client is here" listener. Separate from the frame callback
+ * because it belongs to the launcher, not to a run, and because it fires while
+ * no run exists at all - that is the whole point of it. */
+static jobject    g_connect_callback = NULL;
+static jmethodID  g_connect_client_mid = NULL;
+
 /* ============================================================
  * Guest virtual TTY: host-owned libvterm session
  * ============================================================
@@ -1266,6 +1272,72 @@ void jni_guest_first_frame(vp_cmdpost_t* inst)
     }
 }
 
+/* Called on the console's accept thread the moment a client is attached.
+ * Java is told because the launcher is holding a guest request it was given in
+ * its launch intent: a run started before anyone was listening writes into a
+ * pipe with no reader, and the client that eventually connects sees a run that
+ * is already over. Starting on connect is what makes the console a byte pipe
+ * rather than a transcript.
+ *
+ * Deliberately fire-and-forget: this runs on the accept thread, and an
+ * exception escaping into C would take the listener down with it. */
+static void console_client_connected(void* ud)
+{
+    (void)ud;
+    JNIEnv*    env;
+    int        attached = 0;
+    jobject    target;
+
+    env = console_env(&attached);
+    if (!env) {
+        return;
+    }
+    pthread_mutex_lock(&g_console_mutex);
+    target = g_connect_callback ? (*env)->NewLocalRef(env, g_connect_callback) : NULL;
+    pthread_mutex_unlock(&g_console_mutex);
+    if (target) {
+        (*env)->CallVoidMethod(env, target, g_connect_client_mid);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionDescribe(env);
+            (*env)->ExceptionClear(env);
+        }
+        (*env)->DeleteLocalRef(env, target);
+    }
+    if (attached) {
+        (*g_jvm)->DetachCurrentThread(g_jvm);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeSetConsoleConnectCallback(JNIEnv* env, jobject thiz,
+                                                                 jobject callback)
+{
+    (void)thiz;
+
+    pthread_mutex_lock(&g_console_mutex);
+    if (g_connect_callback) {
+        (*env)->DeleteGlobalRef(env, g_connect_callback);
+        g_connect_callback   = NULL;
+        g_connect_client_mid = NULL;
+    }
+    if (callback) {
+        jclass clazz = (*env)->GetObjectClass(env, callback);
+        jobject ref  = (*env)->NewGlobalRef(env, callback);
+        jmethodID mid = (*env)->GetMethodID(env, clazz, "run", "()V");
+        (*env)->DeleteLocalRef(env, clazz);
+        if (mid) {
+            g_connect_callback   = ref;
+            g_connect_client_mid = mid;
+        } else {
+            LOGE("console connect callback: no run()V");
+            (*env)->DeleteGlobalRef(env, ref);
+        }
+    }
+    int live = g_connect_callback != NULL;
+    pthread_mutex_unlock(&g_console_mutex);
+
+    vp_console_set_connect_hook(live ? console_client_connected : NULL, NULL);
+}
 /* Flush a trailing partial line and re-arm the first-frame note. */
 static void console_reset(struct android_run* run)
 {

@@ -44,6 +44,16 @@ public class SimpleLauncherActivity extends Activity {
       * files in assets (how the samples ran before the app model). */
     private String[] guestApps;
 
+    /** A run a driver named in the launch intent, waiting for a client. */
+    private String pendingApp;
+    private String pendingArgvB64;
+    private boolean pendingLaunched;
+    /** Whether any client is on the socket, so a later arming can answer an
+     *  attach that has already happened instead of waiting for a second one. */
+    private boolean clientAttached;
+    private final android.os.Handler mainHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -143,10 +153,16 @@ public class SimpleLauncherActivity extends Activity {
             // The console, if a driver asked for it, on the way past. The
             // picker is the front door a driver can come through without
             // naming a guest: it brings the host up and the listener binds,
-            // and the guest goes in afterwards through its own task. That
-            // order is what makes a batch guest usable on a live byte pipe -
-            // see Start-ShellHost in tools/android_console.ps1.
+            // and the guest goes in afterwards through its own task.
+            //
+            // When the same intent names a guest too, that run is held until a
+            // client is actually on the socket. Starting it at launch instead
+            // would be a race the driver always loses: the console is a live
+            // pipe and does not replay, so a guest that got going before the
+            // client attached would be finished - or waiting on a line nobody
+            // typed - by the time the client connected.
             if (getIntent().getBooleanExtra(GuestActivity.EXTRA_CONSOLE, false)) {
+                armPendingRun(getIntent());
                 host.enableConsoleServer(
                         getIntent().getIntExtra(GuestActivity.EXTRA_CONSOLE_PORT, 0));
             }
@@ -177,6 +193,90 @@ public class SimpleLauncherActivity extends Activity {
             Log.e(TAG, "Failed to list assets", e);
             guestApps = new String[]{ "test_game_activity.exe" };
         }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        // singleTask, so a second `am start` arrives here and never in onCreate.
+        // Without this the second run of a driver finds an Activity that has
+        // nothing pending and a client that waits forever for output.
+        setIntent(intent);
+        armPendingRun(intent);
+    }
+
+    /**
+     * Take a guest request out of a launch intent and hold it until a client
+     * attaches. Nothing is started here: see {@link #onConsoleClient}.
+     */
+    private void armPendingRun(Intent intent) {
+        if (intent == null || !intent.getBooleanExtra(GuestActivity.EXTRA_CONSOLE, false)) {
+            return;
+        }
+        String app = intent.getStringExtra(GuestActivity.EXTRA_APP_NAME);
+        if (app == null || app.isEmpty()) {
+            return;
+        }
+        pendingApp       = app;
+        pendingArgvB64   = intent.getStringExtra(GuestActivity.EXTRA_GUEST_ARGS_B64);
+        pendingLaunched  = false;
+        /* A client that attached *before* this arming is still waiting, and its
+         * attach was spent on the previous run's already-cleared pendingApp - the
+         * hook fired, found nothing to launch, and returned. `am start` returns
+         * to the client before onNewIntent has run here, so a client that
+         * connects promptly beats the arming of the run it asked for and then
+         * waits for a READY that nothing is going to send.
+         *
+         * So the arming answers an attach that already happened, rather than
+         * only watching for the next one. Checking pendingApp is what makes it
+         * safe: a client that has not attached yet leaves it set, and the
+         * arriving client takes this path as before. */
+        if (clientAttached) {
+            onConsoleClient();
+        } else {
+            RvvmHost.getInstance().setConsoleClientHook(this::onConsoleClient);
+        }
+    }
+
+    /**
+     * A client attached to the console socket, so the run held for it can go.
+     *
+     * <p>Called on the accept thread; starting an Activity from there is not
+     * allowed, so the work moves to the UI thread. Once is enough - a second
+     * client arriving while the first run is in flight must not start a
+     * second guest behind it.</p>
+     */
+    private void onConsoleClient() {
+        clientAttached = true;
+        Log.i(TAG, "console client attached; starting " + pendingApp);
+        /* The pending fields are captured here, on the accept thread, and not
+         * read inside the posted runnable. Reading them there is a race with the
+         * next `am start`: onNewIntent arms the following run on this same UI
+         * thread, so a runnable queued behind it would pick up the *new* app and
+         * argv, launch those, and leave the client that attached holding a guest
+         * running someone else's command. The capture is what makes the run that
+         * was armed the run that starts. */
+        final String app = pendingApp;
+        final String argvB64 = pendingArgvB64;
+        mainHandler.post(() -> {
+            if (pendingLaunched) {
+                return;
+            }
+            pendingLaunched = true;
+            pendingApp = null;
+            if (app == null) {
+                return;
+            }
+            Intent intent = new Intent(this, GuestActivity.class);
+            intent.setAction(app);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT
+                    | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
+            intent.putExtra(GuestActivity.EXTRA_APP_NAME, app);
+            if (argvB64 != null && !argvB64.isEmpty()) {
+                intent.putExtra(GuestActivity.EXTRA_GUEST_ARGS_B64, argvB64);
+            }
+            startActivity(intent);
+        });
     }
 
     /** Launch the given guest app using GuestActivity (default exit behavior). */

@@ -22,6 +22,10 @@ enum {
     VP_CONSOLE_EXIT         = 3,
     VP_CONSOLE_CLOSESTDIN   = 4,
     VP_CONSOLE_WINDOWSIZE   = 5,
+    /* Client -> guest. The first thing a console says, sent before anything
+     * else on the connection: the client waits for it, so nothing the driver
+     * types can arrive before the console is there to receive it. */
+    VP_CONSOLE_READY        = 6,
 };
 
 /* The machine the console types into. Set once, at the point the run is
@@ -40,6 +44,12 @@ void vp_console_exit(int code);
 /* Loopback listener. 0 on success. */
 int  vp_console_start(int port);
 void vp_console_stop(void);
+
+/* Called on the accept thread once a client is actually attached - not when
+ * the listener binds. The hook runs on that thread and must not block; it is
+ * how a host that was launched with a guest named waits for a driver to arrive
+ * before starting the run. NULL clears it. */
+void vp_console_set_connect_hook(void (*hook)(void*), void* ud);
 
 #ifdef __cplusplus
 }

@@ -384,6 +384,21 @@ override bin_src_rvvm_ash     := $(SRCDIR)/virtpass/win32-host/ash_main.c \
                                  $(SRCDIR)/virtpass/win32-host/ash_client.c \
                                  $(filter-out $(SRCDIR)/virtpass/win32-host/win32_main.c,$(bin_src_rvvm_winhost))
 override bin_libs_rvvm_ash    := rvvm zlib
+
+# vp: a client for the *Android* host's guest console, shaped like adb. It is
+# the counterpart of rvvm_ash - where that one is a console app for this
+# host's own guest, this is the thing that drives the other one over USB, and
+# it borrows adb's verbs so that anyone used to adb is already right about how
+# to spell it.
+#
+# It links nothing of RVVM: it is a socket client, and everything it knows
+# about the other end is five bytes of header and six packet ids. It compiles
+# the WinSock backend in directly rather than linking `rvvm` for it - that
+# library is the emulator, and a tool that never runs a guest should not drag
+# one in behind it.
+override BIN_TARGETS          := $(BIN_TARGETS) vp
+override bin_src_vp            := $(SRCDIR)/virtpass/win32-host/vp_client.c
+override bin_libs_vp           :=
 endif
 endif
 

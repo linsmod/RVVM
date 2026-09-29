@@ -31,6 +31,8 @@ public final class RvvmHost extends Application {
     private RvvmNative.ExitListener exitListener;
     private RvvmNative.ConsoleListener consoleListener;
     private RvvmNative.FrameCallback frameCallback;
+    /** Told when a client attaches to the scripted console's socket. */
+    private Runnable consoleClientHook;
     /** Whether the scripted console's listener is up. */
     private boolean consoleStarted;
     /** The property that turns the console on for every launch; its value is the port. */
@@ -81,6 +83,9 @@ public final class RvvmHost extends Application {
             }
             if (frameCallback != null) {
                 RvvmNative.nativeSetFrameCallback(frameCallback);
+            }
+            if (consoleClientHook != null) {
+                RvvmNative.nativeSetConsoleConnectCallback(consoleClientHook);
             }
             // Off unless asked for. The property is the switch the trace gates
             // and the guest-capacity knob already use, so there is one place to
@@ -232,6 +237,25 @@ public final class RvvmHost extends Application {
         consoleListener = listener;
         if (initialized) {
             RvvmNative.nativeSetConsoleListener(listener);
+        }
+    }
+
+    /**
+     * Told when a client attaches to the scripted console's socket - not when
+     * the listener binds, which the launcher can learn on its own and which
+     * tells it nothing about whether anyone is there.
+     *
+     * <p>The run it is used to start has to wait for this: the console is a
+     * live pipe that does not replay, so a guest started before a client
+     * attached would be writing into a pipe with no reader, and the client that
+     * finally connects would find the run already over.</p>
+     *
+     * <p>Called on the accept thread, not the UI thread.</p>
+     */
+    public synchronized void setConsoleClientHook(Runnable hook) {
+        consoleClientHook = hook;
+        if (initialized) {
+            RvvmNative.nativeSetConsoleConnectCallback(hook);
         }
     }
 

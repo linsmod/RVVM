@@ -377,6 +377,22 @@ public class RvvmNative {
     public static native void nativeConsoleStop();
 
     /**
+     * Register (or with null, clear) the console's "a client is here" listener.
+     *
+     * <p>Distinct from {@link #nativeConsoleStart(int)}: that returns once the
+     * listener is bound, which says the port is open and nothing about whether
+     * a driver is on the other end of it. A launcher holding a guest request
+     * starts the run on this instead - the console does not replay, so a run
+     * that began before anyone was listening would be over by the time the
+     * client connected.</p>
+     *
+     * <p>A {@link Runnable}, called on the accept thread: the host's own job is
+     * to get that onto the UI thread, which is where an Activity may be
+     * touched.</p>
+     */
+    public static native void nativeSetConsoleConnectCallback(Runnable listener);
+
+    /**
      * Send host keyboard input to the guest's virtual TTY - the input half of
      * the console.
      *
