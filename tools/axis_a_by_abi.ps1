@@ -198,7 +198,42 @@ for ($i = 0; $i -lt $lines.Count; $i++) {
     }
 }
 for ($k = 0; $k -lt ($cases.Count - 1); $k++) { $cases[$k].End = $cases[$k + 1].Start }
-if ($cases.Count) { $cases[$cases.Count - 1].End = $lines.Count }
+
+# The last case must stop at the end of the switch, not at end of file.
+#
+# Without this the final case's range runs to EOF, so every line after the
+# dispatch is attributed to it - and rvvm_user.c has 4,000 lines after the last
+# case, including guest_erase_image(), which calls guest_copy_write(). That is
+# why guest_copy_write did not come out as on standby: its only in-case hit was
+# 1,600 lines past the end of the switch. It also meant the completeness
+# direction was scanning the whole tail of the file as if it were syscall
+# dispatch, which is the direction that decides whether a syscall is accounted
+# for.
+#
+# Found while bounding the last case, and it is the same species as the reach
+# guard's problem: a range that is wider than the thing it is supposed to
+# describe, so it credits hits that are somewhere else entirely.
+$switchEnd = $lines.Count
+if ($cases.Count) {
+    # Walk back to the `switch (...)` that owns the first case.
+    $depth = 0
+    $open  = -1
+    for ($i = $cases[0].Start; $i -ge 0; $i--) {
+        $depth += ([regex]::Matches($lines[$i], '}')).Count
+        $depth -= ([regex]::Matches($lines[$i], '{')).Count
+        if ($depth -lt 0) { $open = $i; break }
+    }
+    if ($open -ge 0) {
+        # Walk forward to the brace that closes it.
+        $depth = 0
+        for ($i = $open; $i -lt $lines.Count; $i++) {
+            $depth += ([regex]::Matches($lines[$i], '{')).Count
+            $depth -= ([regex]::Matches($lines[$i], '}')).Count
+            if ($depth -eq 0 -and $i -gt $open) { $switchEnd = $i; break }
+        }
+    }
+}
+if ($cases.Count) { $cases[$cases.Count - 1].End = $switchEnd }
 
 # ---------------------------------------------------------------------------
 # Direction 1: soundness
@@ -267,7 +302,6 @@ foreach ($e in $ReachEntries) {
     # today, because the calls sit below the dispatch. Printed so a reader knows
     # it is deliberate rather than redundant.
     $inCase = 0
-    $caseBody = $codeOnly
     foreach ($c in $cases) {
         for ($i = $c.Start; $i -lt $c.End; $i++) {
             if ($lines[$i] -match "\b$e\s*\(") { $inCase++ }

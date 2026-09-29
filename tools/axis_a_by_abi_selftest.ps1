@@ -166,7 +166,31 @@ $final = Invoke-Gate
 Write-Host "  exit=$($final.Code)"
 if ($final.Code -ne 0 -or $final.Text -ne $base.Text) { Write-Host 'RESTORE FAILED'; exit 2 }
 
+# Direction 6 - the dispatch's extent. The last case used to run to end of file,
+# so anything after the switch counted as syscall dispatch. A call to
+# guest_copy_write() placed after the dispatch must therefore leave the standby
+# count alone: it is not in a case, and a tool that thought it was would stop
+# being able to tell a dispatch write from a helper write - which is the whole
+# question the A axis asks.
+Write-Host ''
+Write-Host 'MUTATION: add a guest_copy_write() call after the dispatch, outside any case'
+$tail = "`nstatic void selftest_tail_helper(void)`n{`n    guest_copy_write(0, ""selftest"", 8);`n}`n"
+[System.IO.File]::WriteAllText($src, $orig + $tail)
+$r = Invoke-Gate
+Write-Host "  exit=$($r.Code)"
+$sb = ($r.Text -split "`n" | Where-Object { $_ -match 'guest_copy_write = ' })
+$sb | ForEach-Object { Write-Host "  $_" }
+$standbyLine = ($r.Text -split "`n" | Where-Object { $_ -match 'reach entries are on standby' })
+$standbyLine | ForEach-Object { Write-Host "  $_" }
+if ($sb -and ($sb -notmatch 'on standby')) {
+    Write-Host '  NOT CAUGHT - a call outside the switch was credited to the dispatch'
+    $failed++
+} else {
+    Write-Host '  caught (still on standby, i.e. not attributed to a case)'
+}
+[System.IO.File]::WriteAllText($src, $orig)
+
 if ($failed) { Write-Host "`n$failed mutation(s) not caught"; exit 1 }
 Write-Host ''
-Write-Host 'all five mutations caught, tree restored'
+Write-Host 'all six mutations caught, tree restored'
 exit 0
