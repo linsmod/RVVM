@@ -13738,11 +13738,23 @@ case 179: // sysinfo
                 case 212: { // recvmsg
                     // struct msghdr embeds three guest pointers plus an iovec array
                     rvvm_info("sys_%smsg(%ld, %lx, %lx)", a7 == 211 ? "send" : "recv", a0, a1, a2);
-                    const struct uapi_msghdr* gmsg = to_ptr_sz(a1, sizeof(*gmsg));
-                    if (!gmsg) {
-                        a0 = -UAPI_EFAULT;
-                        break;
-                    }
+            const struct uapi_msghdr* gmsg = to_ptr_sz(a1, sizeof(*gmsg));
+            if (!gmsg) {
+                a0 = -UAPI_EFAULT;
+                break;
+            }
+            /* Recorded gap, deliberately not fixed here. A real recvmsg writes
+             * msg_namelen, msg_controllen and msg_flags back into the guest
+             * msghdr; there is no reverse translation in this file, so the guest
+             * reads whatever it left there. The buffers the *kernel* fills are a
+             * different matter and are handled - see rvvm_msghdr_from_guest(),
+             * whose name and control translations are writable.
+             *
+             * The failure direction is fidelity, not corruption: a stale length
+             * field, not a wrong address and not a fault. That is a different
+             * class from the copy-on-write classification this patch is about, and
+             * mixing the two would blur an argument that depends on failures being
+             * loud. Left for whoever is chasing recvmsg behaviour, if anyone is. */
                     if (gmsg->iovlen > IOV_HARD_MAX) {
                         a0 = -UAPI_EINVAL;
                         break;
