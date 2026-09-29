@@ -1871,15 +1871,23 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved)
     (void)reserved;
     g_jvm = vm;
     /* Device-side debug switch: the trace gates in the core read the
-     * environment (RVVM_TRACE_PATH), which an app process inherits from the
+     * environment (RVVM_TRACE), which an app process inherits from the
      * zygote and cannot get from `am start`. `adb shell setprop
-     * debug.rvvm.trace 1` before launching the app turns the path/tty traces
-     * on (this runs before any guest, and getenv is cached in the core). */
+     * debug.rvvm.trace sys,path` before launching the app turns those traces
+     * on (this runs before any guest, and getenv is cached in the core).
+     *
+     * The property value is forwarded as-is rather than naming one category:
+     * the core reads a comma-separated list, and a switch that could only
+     * reach one of them was a switch that could not answer most questions. */
     {
         char value[PROP_VALUE_MAX] = "";
         if (__system_property_get("debug.rvvm.trace", value) > 0 && value[0]) {
-            putenv("RVVM_TRACE_PATH=1");
-            LOGI("RVVM_TRACE_PATH enabled via debug.rvvm.trace=%s", value);
+            /* Static storage, not a local: putenv keeps the pointer rather than a
+             * copy, and the core reads this long after JNI_OnLoad has returned. */
+            static char env[PROP_VALUE_MAX + 16] = "RVVM_TRACE=";
+            strncat(env, value, sizeof(env) - strlen(env) - 1);
+            putenv(env);
+            LOGI("RVVM_TRACE enabled via debug.rvvm.trace=%s", value);
         }
     }
     LOGI("JNI_OnLoad: RVVM JNI bridge loaded");
