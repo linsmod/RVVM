@@ -139,95 +139,84 @@ backend behind each callback differs.
   enumeration is the NDK's, so it reports the *files* at that level and does not
   return subdirectory names: `ls /assets` lists the guest ELFs but not `fonts/`,
   which stays reachable by name (`ls /assets/fonts`).
-- Scripted runs: the console is a text protocol on loopback, so a run can be
-  driven and read without the screen — no screenshot, no synthesised tap.
+- Scripted runs: the console is a byte pipe on loopback, framed exactly as adb
+  frames a shell (`ShellProtocol` — a 5-byte header of one id plus a 4-byte
+  little-endian length, then a payload). One id per logical stream:
 
-  `GuestActivity` is exported (`android:exported="true"` — the shell uid is
-  refused for a non-exported activity, silently) and takes the guest's argv as
-  a string array, the same extra name `MainActivity` uses. `--ez console true`
-  turns the server on for the process:
+  | id | stream | direction |
+  |----|--------|-----------|
+  | 0 | stdin | client → guest, raw keystrokes |
+  | 1 | stdout | guest → client |
+  | 2 | stderr | guest → client |
+  | 3 | exit | guest → client, the status as text |
+  | 4 | close stdin | client → guest, the guest sees EOF |
+  | 5 | window size | client → guest, ASCII winsize |
 
-  ```sh
-  adb shell "am start -n com.rvvm.android/.GuestActivity \
-      --es guest_app_name test_cli --ez console true"
-  adb forward tcp:7979 tcp:7979
-  ```
+  Everything blocks: a client waits on a read, and a driver writes keystrokes
+  without a round trip. There is no poll loop and no sleep to tune.
 
-  Then `tools/android_console.ps1`, which is the driver and a dot-sourceable
-  library:
+  Two of those ids are the reason it is worth having. **stdout and stderr are
+  separate**, and they are not separable further in: the virtual TTY shows
+  both on one screen, so this is the only place the distinction survives — and
+  it reaches whoever writes the client, who can then match on stdout without an
+  error message satisfying it. (Busybox ash writes its prompt to stderr and the
+  echoed command line to stdout; they arrive as different ids.) And **exit
+  carries the result in band**, after the output: a batch guest's answer *is*
+  its status, and it arrives once the guest's thread has handed over every byte
+  it wrote, so a client that stops reading on `exit` has the whole transcript.
 
   ```powershell
-  # launch, type, wait for the answer, and get an exit code
-  pwsh ./tools/android_console.ps1 -Serial <adb-serial> -App test_cli `
-       -Command 'ls /' -Expect '\bvar\b'
+  # a guest that prints and exits 7 — the driver's exit code is 7
+  pwsh ./tools/android_console.ps1 -Serial <adb-serial> \
+       -App test_busybox -Argv '-c|exit 7' -ExpectExit
+
+  # a shell to type in (the default guest is an interactive busybox)
+  pwsh ./tools/android_console.ps1 -Serial <adb-serial> -Interactive
 
   # or drive it directly
   . ./tools/android_console.ps1
-  $s = New-ConsoleSession -PortNumber 7979 -Serial <adb-serial>
-  Send-Console $s -Key CtrlC          # the core's line discipline runs it
-  Wait-ConsoleScreen $s -Pattern 'vp>' -NotExpect 'No such file'
-  Close-ConsoleSession $s
+  $s = New-ShellSession -Serial <adb-serial>
+  Send-Shell $s -Keys CtrlC           # the core's line discipline runs it
+  Wait-ShellText $s -Pattern 'localhost' -Stream stdout
+  Close-ShellSession $s
 
-  pwsh ./tools/android_console.ps1 -SelfTest    # no device needed
+  pwsh ./tools/android_console.ps1 -SelfTest     # no device needed
   ```
 
-  The protocol is one ASCII request line per command; the response is a status
-  line, then payload lines, then a lone `.`. Commands: `attach [id]`, `snap`,
-  `follow`, `in <hex>`, `resize <rows>`, `scroll <lines>`, `status`, `ping`,
-  `exit`. Bytes go in as hex so the ones a terminal protocol needs survive
-  (`0d` Enter, `03` Ctrl-C, `1b5b41` up arrow), and the core's own line
-  discipline turns them into what a guest's `read(0)` sees — an agent types
-  keystrokes, not terminal escapes.
+  Keystrokes go in raw; the core's own line discipline (ICRNL, ISIG, erase,
+  echo) runs them, so a client types and does not emulate a terminal.
 
-  Three properties worth knowing before writing a driver against it:
+  Starting one is two steps, in that order, and the order is the point: the
+  console is live and does not replay, so a driver that launched the guest and
+  *then* connected was racing a run that may be over already —
+  `busybox sh -c "..."` finishes in milliseconds. Host first, guest second:
 
-  - **Pull-only.** `snap` returns the screen as it is now, so there is no
-    partial frame and nothing to interleave; `serial` in the header says
-    whether it moved. A pattern that only held for one frame was not worth
-    waiting on.
-  - **The launch does not boot the guest** — the Activity starts it from
-    `surfaceCreated`. `Wait-ConsoleRunning` exists for that race, and the
-    console refuses input to a run that is not running rather than falling
-    back to the foreground one.
-  - **It outlives the run.** The Activity finishing releases the host, but
-    not this server, so the last screen and the scrollback stay readable —
-    which is why the driver passes `after_guest_exit=stay` at launch.
+  ```sh
+  adb shell "am start -n com.rvvm.android/.SimpleLauncherActivity --ez console true"
+  adb forward tcp:7979 tcp:7979
+  adb shell "am start -n com.rvvm.android/.GuestActivity \
+      --es guest_app_name test_busybox --es argv_b64 <base64 of NUL-joined argv>"
+  ```
 
-  Binding is loopback only and the switch is per-launch, on purpose: a debug
-  channel reachable from the network is a remote shell into every guest on the
-  device. `adb shell setprop debug.rvvm.console 7979` turns it on for every
-  launch instead, the same property the trace switch uses.
+  The picker is the first step because it and the guest live in different
+  tasks. Note `argv_b64` rather than `--esa argv`: `--esa` is a multi-value
+  option, and multi-value options are where shells disagree — on a ColorOS
+  build `--esa argv a b c` puts `[a]` in the intent and `--esa argv -c "ls"`
+  throws `Argument expected after "-c"` out of `Intent.parseCommandArgs`.
+
+  Binding is loopback only and the switch is per-launch: a debug channel
+  reachable from the network is a remote shell into every guest on the device.
+  `adb shell setprop debug.rvvm.console 7979` turns it on for every launch
+  instead, the same property the trace switch uses. A client that stops
+  reading is dropped rather than waited for — the writer is a guest thread, and
+  a wedged client would take the emulator with it.
 
   Without any of this, the older path still works and is one command plus
   logcat: `am start` with `--es guest test_cli.exe --esa argv '...'`.
   `test_cli` treats its arguments as a command line (`;` separates commands)
   and exits with the number of failures, so the result is the guest's exit code
-  in logcat plus the `RVVM-GUEST` output. It just cannot answer "what does the
-  screen say now", which is what an interactive guest needs.
+  in logcat plus the `RVVM-GUEST` output. It just cannot be *talked to*.
 
-  For a person rather than a check, `-Interactive` is the same channel as a
-  shell:
-
-  ```powershell
-  pwsh ./tools/android_console.ps1 -Serial <serial> -App test_cli -Interactive
-  ```
-
-  ```
-  rvvm> cat /etc/hostname
-  ------------------------------------------------------------
-  vp> cat /etc/hostname
-  localhost
-  vp>
-  ------------------------------------------------------------
-  rvvm> :keys CtrlC
-  ```
-
-  It prints what the guest *added*, not the grid again. A terminal scrolls
-  rather than appends, so the new rows are what sits below the longest prefix
-  the two screens still agree on — which is the scroll distance, and is where
-  the new output starts. Reprinting the whole screen instead (the first cut)
-  makes three commands into a session unreadable: you are reading the banner
-  and every earlier answer again, with the answer at the bottom.
 
 ## Test knobs (guest side, `guest-samples/test_render_gles.c`)
 
