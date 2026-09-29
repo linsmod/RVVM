@@ -43,6 +43,13 @@
 .PARAMETER Screen
     Print the screen and exit - the "what does it say now" one-liner.
 
+.PARAMETER Interactive
+    A shell at the guest, for a person rather than a check. Type a line, it is
+    typed at the guest, and what the guest added comes back when the guest stops
+    talking - `serial` decides that, not a sleep. `:keys CtrlC` sends a
+    keystroke, `:scroll n` walks the scrollback, `:screen` repaints everything,
+    `:clear` forgets the baseline, `:quit` leaves.
+
 .EXAMPLE
     # launch, type a command, wait for its answer
     pwsh ./tools/android_console.ps1 -App test_cli -Command 'ls /' -Expect 'bin'
@@ -78,6 +85,7 @@ param(
     [string]$Serial,
     [switch]$NoForward,
     [switch]$NoLaunch,
+    [switch]$Interactive,
     [ValidateSet('finish', 'stay')][string]$AfterExit = 'stay',
     [switch]$SelfTest
 )
@@ -413,6 +421,100 @@ function Get-ConsoleScreen {
     return $r
 }
 
+function Wait-ConsoleSettle {
+    <#
+      The screen has stopped changing.
+
+      `serial` is exactly this question - native bumps it on every output burst,
+      resize, reset and scroll - so "wait until it stops moving" is a poll on one
+      int, not a heuristic about elapsed time. Two consecutive reads of the same
+      serial mean the guest has nothing more to say right now.
+
+      This is what makes a read usable by a person. A fixed sleep is either too
+      short (the answer is still arriving, so you see half of it) or too long
+      (you wait a second for a command that answered in 20 ms); the serial says
+      when the answer is complete, whatever that turns out to be.
+    #>
+    param($Session, [int]$QuietMs = 120, [int]$TimeoutMs = 15000)
+    $last = -1
+    $stillSince = [DateTime]::UtcNow
+    $deadline = $stillSince.AddMilliseconds($TimeoutMs)
+    while ($true) {
+        $snap = Get-ConsoleScreen $Session
+        $ser = if ($snap.Fields.ContainsKey('serial')) { [int]$snap.Fields['serial'] } else { -1 }
+        if ($ser -ne $last) {
+            $last = $ser
+            $stillSince = [DateTime]::UtcNow
+        } elseif (([DateTime]::UtcNow - $stillSince).TotalMilliseconds -ge $QuietMs) {
+            return $snap
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            # Still moving at the deadline: return what is there rather than
+            # nothing. A guest that never stops printing is a real case, and
+            # its output is worth reading even though it is not finished.
+            return $snap
+        }
+        Start-Sleep -Milliseconds 30
+    }
+}
+
+function Get-ConsoleDelta {
+    <#
+      The rows the guest added since the last read.
+
+      A terminal does not append, it scrolls: the grid shifts up and the new
+      lines appear at the bottom. So "what is new" is what sits below the longest
+      run of leading rows the two screens still agree on - which is the scroll
+      distance, and is exactly where the guest's new output starts.
+
+      Printing the whole screen instead is what a first cut did, and it is
+      unusable: three commands into a session and you are reading the banner
+      and every earlier answer again, with the actual answer at the bottom. The
+      screen is the truth; this is the difference between two truths.
+
+      A screen that got shorter (cleared, resized) shares no prefix worth
+      trusting, so everything is new - which is the honest answer, not a
+      heuristic that hides output.
+    #>
+    param([string[]]$Previous, [string[]]$Current)
+    $n = [Math]::Min($Previous.Count, $Current.Count)
+    $keep = 0
+    while ($keep -lt $n -and $Previous[$keep] -ceq $Current[$keep]) { $keep++ }
+    if ($keep -ge $Current.Count) { return @() }
+    return @($Current[$keep..($Current.Count - 1)])
+}
+
+function Write-ConsoleScreen {
+    <#
+      Print what the guest added since @Baseline, not the whole grid again.
+      An empty baseline means "everything", which is what the first read wants.
+    #>
+    param($Screen, [string[]]$Baseline = @())
+    $rows = Get-ConsoleDelta -Previous $Baseline -Current @($Screen.Rows)
+    $trimmed = @(Format-ConsoleRows $rows)
+    if ($trimmed.Count -eq 0) { return }
+    Write-Host ('-' * 60) -ForegroundColor DarkGray
+    foreach ($r in $trimmed) { Write-Host $r -ForegroundColor Gray }
+    Write-Host ('-' * 60) -ForegroundColor DarkGray
+}
+
+function Format-ConsoleRows {
+    <#
+      Rows between the first and the last that have anything on them, so a
+      reply does not arrive padded out with blank rows. Blank rows in the
+      middle stay: their absence is information, and that is where a prompt
+      and the output below it are separated.
+    #>
+    param([string[]]$Rows)
+    if (-not $Rows -or $Rows.Count -eq 0) { return @() }
+    $first = -1; $last = -1
+    for ($i = 0; $i -lt $Rows.Count; $i++) {
+        if (($Rows[$i] -replace '\s', '') -ne '') { if ($first -lt 0) { $first = $i }; $last = $i }
+    }
+    if ($first -lt 0) { return @() }
+    return $Rows[$first..$last]
+}
+
 function Wait-ConsoleScreen {
     <#
       Poll until the screen matches, or the deadline passes.
@@ -601,6 +703,26 @@ function Invoke-ConsoleSelfTest {
     $serverSide.Close()
     $listener.Stop()
 
+    Write-Host "delta"
+    # The scroll rule, without a screen. These are the shapes a terminal
+    # actually produces, and getting any of them wrong either hides output or
+    # replays the whole grid after every command.
+    $a = @('one', 'two', 'three')
+    $same = @('one', 'two', 'three')
+    Check 'unchanged is empty'   ((Get-ConsoleDelta $a $same).Count -eq 0)
+    $appended = @('one', 'two', 'three', 'four', 'five')
+    Check 'append at the bottom'  ((Get-ConsoleDelta $a $appended) -join ',') -eq 'four,five'
+    $scrolled = @('two', 'three', 'four', 'five')
+    Check 'scroll shows the new'  ((Get-ConsoleDelta $a $scrolled) -join ',') -eq 'four,five'
+    $cleared = @('fresh')
+    Check 'a clear is all new'   ((Get-ConsoleDelta $a $cleared) -join ',') -eq 'fresh'
+    Check 'nothing before, all'   ((Get-ConsoleDelta @() $a) -join ',') -eq 'one,two,three'
+    $edited = @('one', 'TWO', 'three')
+    Check 'in-place edit, from there' ((Get-ConsoleDelta $a $edited) -join ',') -eq 'TWO,three'
+    $blank = @('one', '', 'three')
+    Check 'blank rows inside kept'   ((Get-ConsoleDelta $a $blank) -join '|') -eq '|three'
+    Check 'all blank prints nothing' ((Format-ConsoleRows @('', '  ', '')).Count -eq 0)
+
     Write-Host ""
     if ($script:stFails -eq 0) { Write-Host "self-test PASS" -ForegroundColor Green }
     else { Write-Host "self-test FAIL ($script:stFails)" -ForegroundColor Red }
@@ -615,6 +737,78 @@ if ($SelfTest) {
     exit ([int]((Invoke-ConsoleSelfTest) -gt 0))
 }
 
+function Invoke-ConsoleRepl {
+    <#
+      The human form of the same thing.
+
+      A person at a terminal does not want a protocol; they want a shell. This
+      is that: type a line, it is typed at the guest, and the screen comes back
+      when the guest stops talking about it - which the serial decides, not a
+      sleep. Ctrl-D leaves, `:quit` too.
+
+      The screen is redrawn rather than appended, because that is what the guest
+      did: it rewrote its own screen. Printing only what is new would need a
+      diff against the previous read, and a diff of a grid that scrolls and
+      repaints in place is harder to make honest than the grid itself.
+
+      `:keys <name>...` sends keystrokes instead of text, for the ones that are
+      not words - Ctrl-C, the arrows. `:scroll <n>` walks the scrollback.
+      Anything else is sent as typed, Enter included.
+    #>
+    param($Session, [string]$Prompt = 'rvvm> ')
+    Write-Host 'Ctrl-D or :quit to leave. :keys CtrlC to send a keystroke, :clear to forget the screen.' -ForegroundColor DarkGray
+    $baseline = @()
+    while ($true) {
+        Write-Host -NoNewline $Prompt -ForegroundColor Cyan
+        $line = Read-Host
+        if ($null -eq $line) { return 0 }
+
+        switch -Regex ($line.Trim()) {
+            '^(:q|quit|exit|:quit)$' { return 0 }
+            '^:clear$' { $baseline = @(); Write-Host 'screen forgotten' -ForegroundColor DarkGray; continue }
+            '^:keys\s+(.+)$' {
+                $names = $Matches[1] -split '\s+'
+                $r = Send-Console $Session -Key $names
+                if ($r -and -not $r.Ok) {
+                    Write-Host $r.Body -ForegroundColor Red
+                } else {
+                    $snap = Wait-ConsoleSettle $Session
+                    Write-ConsoleScreen $snap $baseline
+                    $baseline = @($snap.Rows)
+                }
+                continue
+            }
+            '^:scroll\s+(-?\d+)$' {
+                $snap = Invoke-Console $Session -Command "scroll $($Matches[1])"
+                if ($snap.Ok) {
+                    $s2 = Wait-ConsoleSettle $Session
+                    Write-ConsoleScreen $s2 @()      # a scroll is not new output
+                }
+                continue
+            }
+            '^:screen$' {
+                $snap = Get-ConsoleScreen $Session
+                $rows = Format-ConsoleRows @($snap.Rows)
+                Write-Host ('-' * 60) -ForegroundColor DarkGray
+                foreach ($r in $rows) { Write-Host $r -ForegroundColor Gray }
+                Write-Host ('-' * 60) -ForegroundColor DarkGray
+                continue
+            }
+            default {
+                if ($line.Trim() -eq '') { continue }
+                $sent = Send-Console $Session -Text $line
+                if ($sent -and -not $sent.Ok) {
+                    Write-Host "not typed: $($sent.Body)" -ForegroundColor Red
+                    continue
+                }
+                $snap = Wait-ConsoleSettle $Session
+                Write-ConsoleScreen $snap $baseline
+                $baseline = @($snap.Rows)
+            }
+        }
+    }
+}
+
 function Invoke-ConsoleDriver {
     <#
       The command-line form: one launch, one command, one assertion. The
@@ -625,7 +819,7 @@ function Invoke-ConsoleDriver {
     param(
         [string]$App, [string[]]$Argv, [int]$Port = 7979, [int]$GuestId = -1,
         [string]$Command, [switch]$NoEnter, [string]$Expect, [string]$NotExpect,
-        [switch]$ExpectExit, [switch]$Screen, [int]$TimeoutSec = 20,
+        [switch]$ExpectExit, [switch]$Screen, [switch]$Interactive, [int]$TimeoutSec = 20,
         [string]$Adb = 'adb', [string]$Serial, [switch]$NoForward, [switch]$NoLaunch,
         [ValidateSet('finish','stay')][string]$AfterExit = 'stay'
     )
@@ -655,6 +849,9 @@ function Invoke-ConsoleDriver {
             Write-Host ('-' * 60)
             Write-Host $snap.Text
             Write-Host ('-' * 60)
+        }
+        if ($Interactive) {
+            $exitCode = Invoke-ConsoleRepl $s
         }
         if ($Command) {
             $sent = Send-Console $s -Text $Command -NoEnter:$NoEnter

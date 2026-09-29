@@ -205,6 +205,30 @@ backend behind each callback differs.
   in logcat plus the `RVVM-GUEST` output. It just cannot answer "what does the
   screen say now", which is what an interactive guest needs.
 
+  For a person rather than a check, `-Interactive` is the same channel as a
+  shell:
+
+  ```powershell
+  pwsh ./tools/android_console.ps1 -Serial <serial> -App test_cli -Interactive
+  ```
+
+  ```
+  rvvm> cat /etc/hostname
+  ------------------------------------------------------------
+  vp> cat /etc/hostname
+  localhost
+  vp>
+  ------------------------------------------------------------
+  rvvm> :keys CtrlC
+  ```
+
+  It prints what the guest *added*, not the grid again. A terminal scrolls
+  rather than appends, so the new rows are what sits below the longest prefix
+  the two screens still agree on — which is the scroll distance, and is where
+  the new output starts. Reprinting the whole screen instead (the first cut)
+  makes three commands into a session unreadable: you are reading the banner
+  and every earlier answer again, with the answer at the bottom.
+
 ## Test knobs (guest side, `guest-samples/test_render_gles.c`)
 
 - default: window-surface mode — the path a real app takes (native present).
