@@ -139,19 +139,71 @@ backend behind each callback differs.
   enumeration is the NDK's, so it reports the *files* at that level and does not
   return subdirectory names: `ls /assets` lists the guest ELFs but not `fonts/`,
   which stays reachable by name (`ls /assets/fonts`).
-- Scripted runs: `MainActivity` is exported (`android:exported="true"` - the
-  shell uid is refused for a non-exported activity) and takes the guest's argv
-  as a string array, which is what lets a device test be one command:
+- Scripted runs: the console is a text protocol on loopback, so a run can be
+  driven and read without the screen — no screenshot, no synthesised tap.
+
+  `GuestActivity` is exported (`android:exported="true"` — the shell uid is
+  refused for a non-exported activity, silently) and takes the guest's argv as
+  a string array, the same extra name `MainActivity` uses. `--ez console true`
+  turns the server on for the process:
 
   ```sh
-  adb shell "am start -n com.rvvm.android/.MainActivity \
-      --es guest test_cli.exe \
-      --esa argv 'stat /assets/fonts/JetBrainsMono-OFL.txt; cat /assets/nope'"
+  adb shell "am start -n com.rvvm.android/.GuestActivity \
+      --es guest_app_name test_cli --ez console true"
+  adb forward tcp:7979 tcp:7979
   ```
 
-  `test_cli` treats its arguments as a command line (`;` separates commands) and
-  exits with the number of failures, so the result is the guest's exit code in
-  logcat plus the `RVVM-GUEST` output - no on-screen interaction.
+  Then `tools/android_console.ps1`, which is the driver and a dot-sourceable
+  library:
+
+  ```powershell
+  # launch, type, wait for the answer, and get an exit code
+  pwsh ./tools/android_console.ps1 -Serial <adb-serial> -App test_cli `
+       -Command 'ls /' -Expect '\bvar\b'
+
+  # or drive it directly
+  . ./tools/android_console.ps1
+  $s = New-ConsoleSession -PortNumber 7979 -Serial <adb-serial>
+  Send-Console $s -Key CtrlC          # the core's line discipline runs it
+  Wait-ConsoleScreen $s -Pattern 'vp>' -NotExpect 'No such file'
+  Close-ConsoleSession $s
+
+  pwsh ./tools/android_console.ps1 -SelfTest    # no device needed
+  ```
+
+  The protocol is one ASCII request line per command; the response is a status
+  line, then payload lines, then a lone `.`. Commands: `attach [id]`, `snap`,
+  `follow`, `in <hex>`, `resize <rows>`, `scroll <lines>`, `status`, `ping`,
+  `exit`. Bytes go in as hex so the ones a terminal protocol needs survive
+  (`0d` Enter, `03` Ctrl-C, `1b5b41` up arrow), and the core's own line
+  discipline turns them into what a guest's `read(0)` sees — an agent types
+  keystrokes, not terminal escapes.
+
+  Three properties worth knowing before writing a driver against it:
+
+  - **Pull-only.** `snap` returns the screen as it is now, so there is no
+    partial frame and nothing to interleave; `serial` in the header says
+    whether it moved. A pattern that only held for one frame was not worth
+    waiting on.
+  - **The launch does not boot the guest** — the Activity starts it from
+    `surfaceCreated`. `Wait-ConsoleRunning` exists for that race, and the
+    console refuses input to a run that is not running rather than falling
+    back to the foreground one.
+  - **It outlives the run.** The Activity finishing releases the host, but
+    not this server, so the last screen and the scrollback stay readable —
+    which is why the driver passes `after_guest_exit=stay` at launch.
+
+  Binding is loopback only and the switch is per-launch, on purpose: a debug
+  channel reachable from the network is a remote shell into every guest on the
+  device. `adb shell setprop debug.rvvm.console 7979` turns it on for every
+  launch instead, the same property the trace switch uses.
+
+  Without any of this, the older path still works and is one command plus
+  logcat: `am start` with `--es guest test_cli.exe --esa argv '...'`.
+  `test_cli` treats its arguments as a command line (`;` separates commands)
+  and exits with the number of failures, so the result is the guest's exit code
+  in logcat plus the `RVVM-GUEST` output. It just cannot answer "what does the
+  screen say now", which is what an interactive guest needs.
 
 ## Test knobs (guest side, `guest-samples/test_render_gles.c`)
 
