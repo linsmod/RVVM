@@ -37,7 +37,6 @@ $src = Join-Path $Repo 'src\core\rvvm_user.c'
 $gate = Join-Path $Repo 'tools\axis_a_by_abi.ps1'
 $orig = [System.IO.File]::ReadAllText($src)
 $failed = 0
-
 function Invoke-Gate {
     $out = & pwsh -NoProfile -File $gate 2>&1
     return [pscustomobject]@{
@@ -111,7 +110,35 @@ Write-Host "  exit=$($after.Code)"
 if ($after.Code -ne 0) { Write-Host 'RESTORE FAILED - the tree is dirty'; exit 2 }
 if ($after.Text -ne $base.Text) { Write-Host 'RESTORE MISMATCH'; exit 2 }
 
+# Direction 4 - the reach list. Renaming an entry point must not be silent: the
+# completeness direction skips a syscall it cannot classify, so a reach list that
+# stops recognising guest_copy_write would reclassify every syscall reaching guest
+# memory through it as "touches no guest pointer" - and the reported count of
+# benign entries would rise, which reads as progress. This is the one failure that
+# points in the flattering direction, so it is the one worth a test.
+Write-Host ''
+Write-Host 'MUTATION: rename guest_copy_write so the reach list no longer matches it'
+if ($orig.Contains('guest_copy_write')) {
+    $mutated = $orig.Replace('guest_copy_write', 'guest_copy_write_renamed')
+    [System.IO.File]::WriteAllText($src, $mutated)
+    $r = Invoke-Gate
+    Write-Host "  exit=$($r.Code)"
+    ($r.Text -split "`n" | Where-Object { $_ -match 'drift|standby|guest_copy' }) | ForEach-Object { Write-Host "  $_" }
+    if ($r.Code -eq 0) { Write-Host '  NOT CAUGHT - the reach list is not falsifiable'; $failed++ }
+    else { Write-Host '  caught' }
+    [System.IO.File]::WriteAllText($src, $orig)
+} else {
+    Write-Host '  HARNESS BUG: guest_copy_write is not in the source'
+    $failed++
+}
+
+Write-Host ''
+Write-Host 'final restore check'
+$final = Invoke-Gate
+Write-Host "  exit=$($final.Code)"
+if ($final.Code -ne 0 -or $final.Text -ne $base.Text) { Write-Host 'RESTORE FAILED'; exit 2 }
+
 if ($failed) { Write-Host "`n$failed mutation(s) not caught"; exit 1 }
 Write-Host ''
-Write-Host 'all three mutations caught, tree restored'
+Write-Host 'all four mutations caught, tree restored'
 exit 0

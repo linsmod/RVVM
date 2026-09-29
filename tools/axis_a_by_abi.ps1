@@ -100,7 +100,33 @@ $exceptions = @{
 # When a new entry point is added, add it here in the same commit. That is the same
 # discipline as TABLE 1 itself: a closed set that is written down, rather than a
 # convention that is remembered.
-$ReachPattern = '\bto_ptr\b|\bto_ptr_sz\b|\bto_ptr_wr\b|\bto_ptr_sz_wr\b|\bto_ptr_ioctl\b|\bto_str\b|\bguest_copy_read\b|\bguest_copy_write\b|\brvvm_user_guest_ptr\b'
+$ReachEntries = @(
+    'to_ptr', 'to_ptr_sz', 'to_ptr_wr', 'to_ptr_sz_wr', 'to_ptr_ioctl', 'to_str',
+    'guest_copy_read', 'guest_copy_write', 'rvvm_user_guest_ptr'
+)
+
+# Each entry's name must still occur in the source at all. Without this, the reach
+# criterion is not falsifiable: renaming guest_copy_write would leave the
+# completeness direction silently reclassifying every syscall that reached guest
+# memory through it as "touches no guest pointer" - and the reported count of
+# unclassified-but-benign syscalls would *rise*, which reads as an improvement.
+# A filter that stops recognising an entry is the worst failure mode here, because
+# it points in the flattering direction and no guard speaks.
+#
+# The count has to be file-wide, not per-case. Per-case is exactly why
+# guest_copy_read/write and rvvm_user_guest_ptr are currently unfalsifiable: all
+# nine of their call sites sit below the dispatch, so they contribute zero to every
+# case and dropping them from the list changes nothing the gate reports.
+$text = $lines -join "`n"
+$drifted = @()
+$entryHits = @{}
+foreach ($e in $ReachEntries) {
+    $n = ([regex]::Matches($text, "\b$e\s*\(")).Count
+    $entryHits[$e] = $n
+    if ($n -eq 0) { $drifted += $e }
+}
+
+$ReachPattern = ($ReachEntries | ForEach-Object { "\b$_\b" }) -join '|'
 
 # ---------------------------------------------------------------------------
 # Index the dispatch: case number -> { name, start, end }
@@ -172,11 +198,35 @@ foreach ($c in $cases) {
 Write-Host "TABLE 1 (from src/core/rvvm_user.c): $($fills.Count) filling, $($fillsNothing.Count) explicitly empty"
 Write-Host "dispatch: $($cases.Count) named cases; $benign of the unclassified ones touch no guest pointer"
 Write-Host ''
+Write-Host 'reach criterion - file-wide call sites per entry:'
+$standby = @()
+foreach ($e in $ReachEntries) {
+    # An entry that is never called from inside a case is on standby: correct
+    # today, because the calls sit below the dispatch. Printed so a reader knows
+    # it is deliberate rather than redundant.
+    $inCase = 0
+    foreach ($c in $cases) {
+        for ($i = $c.Start; $i -lt $c.End; $i++) {
+            if ($lines[$i] -match "\b$e\s*\(") { $inCase++ }
+        }
+    }
+    $tag = if ($inCase -eq 0) { '  (on standby: never called from a case)' } else { '' }
+    if ($inCase -eq 0) { $standby += $e }
+    Write-Host "    $e = $($entryHits[$e])$tag"
+}
+if ($drifted.Count) {
+    Write-Host ''
+    Write-Host "reach entries with no call site in the file - the list has drifted: $($drifted -join ', ')"
+    Write-Host '  either the entry was renamed, or it was removed. Update $ReachEntries in the same commit.'
+}
+Write-Host ''
 Write-Host "soundness    a wr accessor missing: $($soundness.Count)"
 foreach ($s in $soundness) { Write-Host "    :$($s.Line)  $($s.Syscall) $($s.Arg) -> $($s.Fn)  |  $($s.Text)" }
 Write-Host "completeness a dispatched syscall that touches guest memory but is not in TABLE 1: $($missing.Count)"
 foreach ($m in $missing) { Write-Host "    case $($m.Num)  $($m.Name)  pointer sites: $($m.PtrSites -join ',')" }
 
+if ($drifted.Count) { exit 1 }
 if ($soundness.Count -or $missing.Count) { exit 1 }
-Write-Host 'both directions clean'
+Write-Host ''
+Write-Host "both directions clean; $($standby.Count) reach entr$($(if($standby.Count -eq 1){'y is'}else{'ies are'})) on standby"
 exit 0
