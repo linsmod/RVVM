@@ -163,12 +163,7 @@ if ($null -eq $prevTrace) { Remove-Item Env:RVVM_TRACE -EA SilentlyContinue } el
 
 # Ready when the endpoint answers. A poll on a real condition: there is no output
 # to wait on before the socket exists.
-$up = $false
-for ($i = 0; $i -lt 600; $i++) {
-    if (Test-AshUp -Exe $exe -Port $Port) { $up = $true; break }
-    if ($core.HasExited) { break }
-    Start-Sleep -Milliseconds 100
-}
+$up = Wait-AshUp -Exe $exe -Port $Port -Process $core -TimeoutMs 60000
 Check $up "the core (ash --serve) publishes its endpoint (port $Port)"
 if (-not $up) {
     "--- core stderr ---"; Get-Content -LiteralPath $errfile -EA SilentlyContinue | Select-Object -Last 20

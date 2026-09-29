@@ -52,6 +52,44 @@ function Test-AshUp {
     }
 }
 
+# How long to wait for a core to publish its endpoint.
+#
+# Derived, not guessed: before it binds, the core reads and unpacks a 515-entry
+# rootfs archive, and that has been measured at over six seconds from launch. A
+# window that short does not read as a timeout when it expires - it reads as a
+# flake, which is what it was.
+$script:AshUpTimeoutMs = 30000
+
+# Poll Test-AshUp until the endpoint answers, up to $TimeoutMs. $true only if it
+# answered inside the window.
+#
+# This loop used to be spelled out in each driver with its own iteration count,
+# and the six counts disagreed by 30x to 120x - two of them allowed 500 ms, an
+# order of magnitude less than the work being waited for, and those two are the
+# ones that flaked. One number, stated once, next to the reason for it.
+#
+# $Process, when given, ends the wait as soon as that process is gone: a core
+# that has died will never publish, so a driver that is testing the death (see
+# sshd_crash_e2e) should not sit out the whole window waiting for it. The probe
+# outside the loop is why a core that binds in the final poll interval still
+# counts as up instead of being lost to the clock.
+function Wait-AshUp {
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [Parameter(Mandatory)][int]$Port,
+        [int]$TimeoutMs = $script:AshUpTimeoutMs,
+        [Diagnostics.Process]$Process,
+        [int]$PollMs = 200
+    )
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-AshUp -Exe $Exe -Port $Port) { return $true }
+        if ($Process -and $Process.HasExited) { return $false }
+        Start-Sleep -Milliseconds $PollMs
+    }
+    return (Test-AshUp -Exe $Exe -Port $Port)
+}
+
 # The pid of the live core registered on @Port, or $null when none owns it.
 #
 # The registry is written by the core itself, once it has won the port, and

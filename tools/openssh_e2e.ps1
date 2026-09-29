@@ -179,11 +179,7 @@ $errTask = $core.StandardError.ReadToEndAsync()
 
 # Ready when the endpoint answers: the socket is the contract. A poll on a real
 # condition, not a schedule - there is no output to wait on before it is up.
-$up = $false
-for ($i = 0; $i -lt 300; $i++) {
-    if (Test-AshUp -Exe $exe -Port $Port) { $up = $true; break }
-    Start-Sleep -Milliseconds 100
-}
+$up = Wait-AshUp -Exe $exe -Port $Port -Process $core
 Check $up "the core (ash --serve) publishes its endpoint (port $Port)"
 if (-not $up) {
     try { $core.Kill() } catch { }

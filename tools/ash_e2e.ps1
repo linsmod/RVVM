@@ -63,11 +63,7 @@ $core = Start-Process -FilePath $exe -ArgumentList '--serve', '--port', "$Port" 
                       -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow
 
 # Ready when the endpoint answers, not when a log line shows up.
-$up = $false
-for ($i = 0; $i -lt 5; $i++) {
-    if (Test-AshUp -Exe $exe -Port $Port) { $up = $true; break }
-    Start-Sleep -Milliseconds 100
-}
+$up = Wait-AshUp -Exe $exe -Port $Port -Process $core
 Check $up "the core (ash --serve) publishes its endpoint (port $Port)"
 if (-not $up) {
     try { $core.Kill() } catch { }

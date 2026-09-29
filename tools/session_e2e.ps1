@@ -142,11 +142,7 @@ $errTask = $p.StandardError.ReadToEndAsync()
 
 # Ready when the endpoint answers, not when a log line shows up: the socket is
 # the contract, and reading the pipe would mean waiting for the whole run.
-$up = $false
-for ($i = 0; $i -lt 150; $i++) {
-    if (Test-AshUp -Exe $exe -Port $Port) { $up = $true; break }
-    Start-Sleep -Milliseconds 100
-}
+$up = Wait-AshUp -Exe $exe -Port $Port -Process $p
 Check $up "vpsessiond publishes its endpoint (port $Port)"
 if (-not $up) {
     try { $p.Kill() } catch { }

@@ -30,6 +30,7 @@
 
     Scenarios (each asserts on the session output):
 
+      all          every scenario below, one core at a time, in this order.
       sigint       ^C kills the foreground command and the shell survives.
       sigtstp      ^Z stops the job, jobs reports it, fg resumes it, ^C kills it.
       fg-resume    fg really resumes: the stopped job's own output appears only
@@ -47,19 +48,30 @@
                    background job keeps running.
 
 .PARAMETER Scenario
-    Which scenario to run (see above).
+    Which scenario to run, or 'all' for every one of them (see above). Each gets
+    its own core, its own session and its own log: a scenario that leaves a job
+    stopped must not be able to reach into the next one's shell state.
 
 .PARAMETER Exe
     The host binary to run as the core. Defaults to the build tree's rvvm_ash.
 
 .PARAMETER Port
-    The core's port (default 7950).
+    The core's port (default 7950). One port, so the scenarios are sequential -
+    they cannot share it.
+
+.PARAMETER NoJit
+    Run the scenarios with RVVM_NOJIT=1, i.e. the interpreter path. That is the
+    path a page table would be enabled on, so a job-control regression that only
+    shows up there needs this to be visible.
 
 .PARAMETER ShowRate
     Print a per-second character-arrival histogram for the session.
 
 .EXAMPLE
     pwsh ./tools/jobctl_e2e.ps1 -Scenario sigtstp
+
+.EXAMPLE
+    pwsh ./tools/jobctl_e2e.ps1 -Scenario all
 
 .EXAMPLE
     $env:RVVM_TRACE = 'job'   # and the job: trace lines show up in the core log
@@ -69,11 +81,35 @@ param(
     [Parameter(Mandatory = $true)][string]$Scenario,
     [string]$Exe = (Join-Path $PSScriptRoot '..\release.windows.x86_64\rvvm_ash_x86_64.exe'),
     [int]$Port = 7950,
+    [switch]$NoJit,
     [switch]$ShowRate
 )
 
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $Exe).Path
+
+# Read before anything starts a core: rvvm_create_userland() decides whether to
+# enable the JIT from this, and a core that came up under the other setting would
+# be a run of a different binary's behaviour than the one asked for.
+if ($NoJit) { $env:RVVM_NOJIT = '1' } else { Remove-Item Env:RVVM_NOJIT -ErrorAction SilentlyContinue }
+
+# The scenario set, written down once. 'all' is not a special case in the switch
+# below - it expands to this list here, so a scenario added to the driver without
+# being added here is a scenario 'all' silently skips. An unknown name lists
+# these rather than just saying it does not know the word.
+$script:JobctlScenarios = @(
+    'sigint', 'sigtstp', 'fg-resume', 'fg-again', 'killpg', 'killpg-cont', 'bg',
+    'wait-bg', 'wait-int'
+)
+$run = if ($Scenario -eq 'all') { $script:JobctlScenarios } else { @($Scenario) }
+foreach ($s in $run) {
+    if ($script:JobctlScenarios -notcontains $s) {
+        "unknown scenario '$s'; known: $script:JobctlScenarios, all"
+        exit 2
+    }
+}
+$mode = if ($NoJit) { 'RVVM_NOJIT=1 (interpreter path)' } else { 'default (JIT path)' }
+if ($run.Count -gt 1) { "=== jobctl: $($run.Count) scenarios, $mode ===" }
 
 # The session driving layer - socket, action queue, output-event waits - now
 # lives in ash_drive.ps1. This driver is one session for the whole run: queue
@@ -98,52 +134,70 @@ function Check([bool]$ok, [string]$what) {
 
 # $sess is opened below, once the core has published its endpoint.
 
-# --- one core for the whole run --------------------------------------------
-Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($exe)) -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -eq $exe } | Stop-Process -Force -ErrorAction SilentlyContinue
-& $exe --port $Port --shutdown 2>$null | Out-Null
-Start-Sleep -Milliseconds 300
-
-$coreLog = Join-Path ([IO.Path]::GetTempPath()) "jobctl_core_$Port.log"
-$coreErr = Join-Path ([IO.Path]::GetTempPath()) "jobctl_core_$Port.err"
-$core = Start-Process -FilePath $exe -ArgumentList '--serve', '--port', "$Port" `
-    -NoNewWindow -PassThru -RedirectStandardOutput $coreLog -RedirectStandardError $coreErr
-
-$up = $false
-for ($i = 0; $i -lt 150; $i++) {
-    if (Test-AshUp -Exe $exe -Port $Port) {
-        $up = $true
-        break
-    }
-    Start-Sleep -Milliseconds 100
-}
-if (-not $up) {
-    $core.Kill()
-    "core did not come up (port $Port); log:"
-    Get-Content $coreLog, $coreErr -ErrorAction SilentlyContinue
-    exit 1
-}
-
-# The one session for the run. The frame makes the server start the shell
-# immediately (rather than after its own grace delay). Opened now that the
-# endpoint is live, so Connect-AshSession has something to talk to.
-$sess = New-AshSession -Exe $exe -Port $Port -Frame 'R24;80'
-
 # Always leave the port/rootfs free, even when a scenario throws mid-session:
 # a lingering core would hold the one-core-per-rootfs lock and the endpoint.
 function Stop-Core {
     & $exe --port $Port --shutdown 2>$null | Out-Null
     Start-Sleep -Milliseconds 500
-    if ($core -and -not $core.HasExited) {
-        if (-not $core.WaitForExit(3000)) { try { $core.Kill() } catch { } }
+    if ($script:core -and -not $script:core.HasExited) {
+        if (-not $script:core.WaitForExit(3000)) { try { $script:core.Kill() } catch { } }
     }
+    $script:core = $null
 }
 
-$sw = [Diagnostics.Stopwatch]::StartNew()
-$err = $null
+# --- one core per scenario --------------------------------------------------
+#
+# Sequential, and that is forced rather than chosen: one port, and a rootfs that
+# one core at a time owns. The batch form used to be a separate driver that ran
+# this file once per scenario in a child process and killed leftovers between
+# runs from the outside; doing it here means the cleanup above is the only thing
+# between two scenarios, which is one fewer place for a stale core to hide.
+#
+# The logs are keyed by scenario because Start-Process -Redirect* truncates: one
+# file for the whole run would leave the ninth scenario's log standing as the
+# evidence for whichever one failed first.
+$failedScenarios = @()
+$swAll = [Diagnostics.Stopwatch]::StartNew()
+# $sw only exists once a core came up; the single-scenario summary below must not
+# read a stopwatch the not-up path skipped creating.
+$lastScenarioMs = 0
 
-try {
-switch ($Scenario) {
+foreach ($sc in $run) {
+    $pass0 = $script:pass
+    $fail0 = $script:fail
+
+    Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($exe)) -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $exe } | Stop-Process -Force -ErrorAction SilentlyContinue
+    & $exe --port $Port --shutdown 2>$null | Out-Null
+    Start-Sleep -Milliseconds 300
+
+    $coreLog = Join-Path ([IO.Path]::GetTempPath()) "jobctl_core_${Port}_$sc.log"
+    $coreErr = Join-Path ([IO.Path]::GetTempPath()) "jobctl_core_${Port}_$sc.err"
+    $script:core = Start-Process -FilePath $exe -ArgumentList '--serve', '--port', "$Port" `
+        -NoNewWindow -PassThru -RedirectStandardOutput $coreLog -RedirectStandardError $coreErr
+
+    $up = Wait-AshUp -Exe $exe -Port $Port -Process $script:core
+    if (-not $up) {
+        try { $script:core.Kill() } catch { }
+        "core did not come up (port $Port, scenario $sc); log:"
+        Get-Content $coreLog, $coreErr -ErrorAction SilentlyContinue
+        $failedScenarios += $sc
+        $script:fail++
+        $lastScenarioMs = $swAll.ElapsedMilliseconds
+        Stop-Core
+        continue
+    }
+
+    # The one session for this scenario. The frame makes the server start the
+    # shell immediately (rather than after its own grace delay). Opened now that
+    # the endpoint is live, so Connect-AshSession has something to talk to.
+    $sess = New-AshSession -Exe $exe -Port $Port -Frame 'R24;80'
+
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $err = $null
+
+    try {
+switch ($sc) {
     'sigint' {
         Reset-Steps
         Step 0 "sleep 30`n"
@@ -299,33 +353,59 @@ switch ($Scenario) {
         $out = Invoke-Session
         Check ($out -match 'AFTER-WAIT-INT') "^C cuts wait short while the job keeps running"
     }
-    default { throw "unknown scenario $Scenario" }
+    default { throw "unknown scenario $sc (known: $script:JobctlScenarios, all)" }
 }
-} catch {
-    $err = $_
-    $script:fail++
-    "[FAIL] scenario threw: $err"
-} finally {
-    Stop-Core
+    } catch {
+        $err = $_
+        $script:fail++
+        "[FAIL] scenario threw: $err"
+    } finally {
+        # Close the socket before the core goes: leaving it to the finaliser
+        # would keep a handle per scenario, and the loop is the only place that
+        # ever accumulates them.
+        if ($sess) { try { $sess.Stream.Dispose(); $sess.Socket.Close() } catch { } }
+        $sess = $null
+        Stop-Core
+    }
+
+    $sw.Stop()
+    $lastScenarioMs = $sw.ElapsedMilliseconds
+    if ($ShowRate) {
+        Show-SessionRate $sess
+    }
+
+    # A per-scenario verdict, because the counters are cumulative: without this
+    # line a failure in the third scenario reads as "3 of 40" with nothing saying
+    # which three.
+    $scenarioFails = $script:fail - $fail0
+    if ($scenarioFails -eq 0) {
+        if ($run.Count -gt 1) { "  {0,-12} PASS ({1} check(s), $($sw.ElapsedMilliseconds)ms)" -f $sc, ($script:pass - $pass0) }
+    } else {
+        $failedScenarios += $sc
+        "  {0,-12} FAIL ({1} of {2} check(s))" -f $sc, $scenarioFails, (($script:pass - $pass0) + $scenarioFails)
+        "--- session output ($sc) ---"
+        $script:lastOut
+        "--- newline offsets ($((Get-NewlineOffsets $script:lastOut).Count)) ---"
+        (Get-NewlineOffsets $script:lastOut) -join ','
+        "--- core log ($sc) ---"
+        Get-Content $coreLog, $coreErr -ErrorAction SilentlyContinue
+    }
+}
+$swAll.Stop()
+
+if ($run.Count -gt 1) {
+    "=== jobctl $mode : $($run.Count - $failedScenarios.Count)/$($run.Count) scenarios passed ==="
+    if ($failedScenarios.Count) { "failed: $($failedScenarios -join ', ')" }
+    exit ($failedScenarios.Count -eq 0 ? 0 : 1)
 }
 
-$sw.Stop()
-"elapsed_ms=$($sw.ElapsedMilliseconds)"
-
-if ($ShowRate) {
-    Show-SessionRate $sess
-}
-
+# One scenario: the verdict and exit code this file has always produced. The
+# failure evidence - session output, newline offsets, core log - is printed
+# above, in the loop, once per failing scenario, so it is not repeated here.
+"elapsed_ms=$lastScenarioMs"
 if ($script:fail -eq 0) {
     "=== PASS: jobctl $Scenario ($($script:pass) check(s)) ==="
     exit 0
-} else {
-    "--- session output ---"
-    $script:lastOut
-    "--- newline offsets ($((Get-NewlineOffsets $script:lastOut).Count)) ---"
-    (Get-NewlineOffsets $script:lastOut) -join ','
-    "--- core log ---"
-    Get-Content $coreLog, $coreErr -ErrorAction SilentlyContinue
-    "=== FAIL: jobctl $Scenario ($($script:fail) of $($script:pass + $script:fail) check(s)) ==="
-    exit 1
 }
+"=== FAIL: jobctl $Scenario ($($script:fail) of $($script:pass + $script:fail) check(s)) ==="
+exit 1
