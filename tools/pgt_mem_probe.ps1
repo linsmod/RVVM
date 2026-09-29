@@ -74,19 +74,25 @@ function Test-KidCommand([string]$cmd) {
     return $hits
 }
 
-function Test-ArenaMultiple([double]$slopeBytes, [int64]$arena) {
+function Test-ArenaMultiple([double]$slopeBytes, [int64]$arena, [int]$MinMultiple = 2) {
     # A slope that is a near-integer multiple of the arena is the signature of
     # having sampled a transient: one extra machine alive at the peak reads
     # exactly like one extra child's worth of cost.
     #
     # This is the check that would have caught 1,058.8 MB per child on the day it
     # was reported. 1058.8 / 536.9 = 1.972, which is 2 within 3%, and 2 x one
-    # perfectly reasonable number is precisely why it looked credible. Multiples of
-    # 1 are fine - that is one arena per child, which is what the code does.
+    # perfectly reasonable number is precisely why it looked credible.
+    #
+    # The default threshold is 2 because 1 x arena per child is the shape the code
+    # has today, and flagging the status quo on every run trains people to ignore
+    # the warning. That reasoning is specific to commit charge, though, and
+    # $MinMultiple exists because it does not transfer: residency has no
+    # legitimate steady state anywhere near one arena per child, so a caller
+    # regressing the resident metric passes 1 and treats it as the failure it is.
     if ($arena -le 0) { return 0 }
     $ratio = $slopeBytes / $arena
     $k = [math]::Round($ratio)
-    if ($k -ge 2 -and [math]::Abs($ratio - $k) -lt ($k * 0.05)) { return [int]$k }
+    if ($k -ge $MinMultiple -and [math]::Abs($ratio - $k) -lt ($k * 0.05)) { return [int]$k }
     return 0
 }
 
@@ -117,6 +123,23 @@ if ($SelfTest) {
         $expect = if ($mb -eq 529.4 -or $mb -eq 0.08) { 0 } else { $true }
         $ok = if ($expect) { $k -ge 2 } else { $k -eq 0 }
         Write-Host "  $(if($ok){'ok     '}else{'WRONG   '}) slope $mb MB -> multiple $k"
+        if (-not $ok) { $bad++ }
+    }
+
+    # The resident metric uses a different threshold, and the two cases below are
+    # the whole reason. 529.4 MB of commit per child is today's status quo and
+    # must not be flagged; 529.4 MB *resident* per child is a regression and must
+    # be. Same number, opposite verdicts, so the threshold cannot be a property of
+    # the slope alone.
+    Write-Host ''
+    Write-Host 'CHECK 2b: the resident threshold differs from the commit threshold'
+    foreach ($mb in @(529.4, 3.5, 1058.8)) {
+        $k = Test-ArenaMultiple ($mb * 1MB) $arena 1
+        # 1 arena resident per child is never a legitimate steady state, so it
+        # fires at 1. 3.5 MB is 151x below the arena and is what the real
+        # measurement gives, so it stays quiet. 1058.8 still fires, as a transient.
+        $ok = if ($mb -eq 3.5) { $k -eq 0 } else { $k -ge 1 }
+        Write-Host "  $(if($ok){'ok     '}else{'WRONG   '}) resident slope $mb MB -> multiple $k"
         if (-not $ok) { $bad++ }
     }
 
@@ -246,15 +269,27 @@ if ($Series) {
     $badCount = Show-Checks $rows
 
     Write-Host ''
-    Write-Host '  interval        per-child Private   per-child VSZ'
+    # WorkingSet64 gets a slope of its own for the same reason Private does, and
+    # for a sharper reason: the three metrics answer different questions, and
+    # only one of them is the one "how much memory does a child cost" usually
+    # means. Private is commit charged, VSZ is address space reserved, WS is
+    # physical pages resident. Measure-Run has been collecting WS all along and
+    # nothing ever regressed it, so every per-child number quoted so far - the
+    # 529.4 MB figure included - is a statement about commit, never about
+    # residency. A page-table change moves all three differently, and a
+    # conclusion drawn from one of them does not carry to the other two.
+    Write-Host '  interval        per-child Private   per-child VSZ   per-child WS'
     $lastSlope = 0.0
+    $lastWs = 0.0
     for ($i = 1; $i -lt $rows.Count; $i++) {
         $dn = $rows[$i].N - $rows[$i - 1].N
         $dp = ($rows[$i].Private - $rows[$i - 1].Private) / 1MB / $dn
         $dv = ($rows[$i].VSZ - $rows[$i - 1].VSZ) / 1MB / $dn
+        $dw = ($rows[$i].WS - $rows[$i - 1].WS) / 1MB / $dn
         $lastSlope = $dp
-        Write-Host ("  {0,2} -> {1,-3} {2,14:N1} MB   {3,13:N1} MB" -f `
-                    $rows[$i - 1].N, $rows[$i].N, $dp, $dv)
+        $lastWs = $dw
+        Write-Host ("  {0,2} -> {1,-3} {2,14:N1} MB   {3,13:N1} MB   {4,11:N1} MB" -f `
+                    $rows[$i - 1].N, $rows[$i].N, $dp, $dv, $dw)
     }
 
     $k = Test-ArenaMultiple ($lastSlope * 1MB) $ArenaBytes
@@ -267,15 +302,36 @@ if ($Series) {
         Write-Host "           $kid"
     }
 
+    # The Private warning above is about a sampling artifact. This one is about
+    # the thing the whole exercise is for, and it is a separate check because
+    # the two metrics have never moved together: today a child charges 529.4 MB
+    # of commit and holds 3.5 MB resident, a ratio of ~150:1 that comes straight
+    # from VirtualAlloc(MEM_COMMIT) accounting rather than from touched pages.
+    # Any future change can move either one without moving the other, so a gate
+    # that only watches commit is satisfied by work that leaves the observable
+    # cost exactly where it was.
+    $kw = Test-ArenaMultiple ($lastWs * 1MB) $ArenaBytes 1
+    if ($kw -ge 2) {
+        Write-Host ''
+        Write-Host "WARNING: the per-child WS slope is ~$($lastWs.ToString('N1')) MB, which is ${kw}x the"
+        Write-Host "         arena. WS is physical residency: a child really is holding that"
+        Write-Host '         much. This is the number that says whether the cost went down,'
+        Write-Host '         and unlike the Private slope it cannot be an accounting artifact.'
+    }
+
     $first = $rows[0]
     Write-Host ''
-    Write-Host ("  intercept (n={0}): Private={1:N1} MB  VSZ={2:N1} MB" -f `
-                $first.N, ($first.Private / 1MB), ($first.VSZ / 1MB))
+    Write-Host ("  per-child slope: Private={0:N1} MB (commit)   WS={1:N1} MB (resident)" -f `
+                $lastSlope, $lastWs)
+    Write-Host ("  intercept (n={0}): Private={1:N1} MB  VSZ={2:N1} MB  WS={3:N1} MB" -f `
+                $first.N, ($first.Private / 1MB), ($first.VSZ / 1MB), ($first.WS / 1MB))
     Write-Host "  That is the host plus $($first.Procs) machine(s) - not the base plus the"
     Write-Host "  first machine. With the scaffolding fork removed, n=0 is one machine and"
-    Write-Host "  nothing else, and the whole curve is Private = host + arena * machines:"
-    Write-Host "  the machine count above is read from the guest, not inferred from Private."
-    if ($badCount -or $k -ge 2) { exit 2 }
+    Write-Host "  nothing else. The machine count above is read from the guest, not inferred"
+    Write-Host "  from Private. Read the Private and WS slopes as two separate facts: the"
+    Write-Host "  first is commit charged and scales with the reservation, the second is"
+    Write-Host "  resident and scales with what the guest touched."
+    if ($badCount -or $k -ge 2 -or $kw -ge 2) { exit 2 }
     exit 0
 }
 
