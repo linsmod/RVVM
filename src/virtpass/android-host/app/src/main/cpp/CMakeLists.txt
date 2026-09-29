@@ -111,6 +111,7 @@ add_library(rvvm_core STATIC
 
     # Utils
     ${RVVM_SRC}/util/elf_load.c
+    ${RVVM_SRC}/util/cow_pgt.c
     ${RVVM_SRC}/util/vma_ops.c
     ${RVVM_SRC}/util/blk_io.c
     ${RVVM_SRC}/util/utils.c
