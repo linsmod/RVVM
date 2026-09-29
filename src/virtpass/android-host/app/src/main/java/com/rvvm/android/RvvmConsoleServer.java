@@ -11,6 +11,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 
 /**
  * A scripted view of the guest console.
@@ -167,6 +168,51 @@ final class RvvmConsoleServer {
     /** One attached console. -1 means "whichever is in the foreground". */
     private int guestId = -1;
 
+    /**
+     * How each run ended, by guest id.
+     *
+     * <p>A batch guest's result <em>is</em> its exit status - {@code test_busybox
+     * -c ...} exists to hand a command line to busybox and exit with what it
+     * returned - and without this the console could report what a guest printed
+     * but not whether it worked. A driver that cannot read it passes a guest
+     * that failed, which is the one mistake a harness must not make.</p>
+     */
+    private final HashMap<Integer, Integer> exits = new HashMap<>();
+
+    /**
+     * The most recent exit seen, whichever run it was.
+     *
+     * <p>Needed because exits are keyed by the run's own id while a client that
+     * never attached to anything addresses the foreground run as -1. Without a
+     * fallback the field would read "no status" for exactly the common case -
+     * a driver that launched a guest and let the channel pick it up - which
+     * looks the same as a run that never exited.</p>
+     */
+    private volatile int lastExitId = Integer.MIN_VALUE;
+    private volatile int lastExitCode = -1;
+
+    /** Record a run's exit status. Called from the guest thread that ends it. */
+    void recordExit(int id, int code) {
+        synchronized (exits) {
+            exits.put(id, code);
+            lastExitId = id;
+            lastExitCode = code;
+        }
+    }
+
+    private String exitField() {
+        synchronized (exits) {
+            Integer code = exits.get(guestId);
+            if (code != null) {
+                return " exit=" + code + " exit_of=" + guestId;
+            }
+            if (lastExitId != Integer.MIN_VALUE) {
+                return " exit=" + lastExitCode + " exit_of=" + lastExitId;
+            }
+        }
+        return "";
+    }
+
     private void serve(Socket socket) {
         try {
             socket.setTcpNoDelay(true);
@@ -266,13 +312,9 @@ final class RvvmConsoleServer {
                 ok(out, "lines=" + lines);
                 return true;
             }
-            case "status": {
-                ok(out, "guest=" + guestId
-                        + " running=" + (RvvmNative.nativeIsGuestRunning(guestId) ? 1 : 0)
-                        + " parked=" + (RvvmNative.nativeIsGuestParked(guestId) ? 1 : 0)
-                        + " screen=" + (RvvmNative.nativeTtyScreen(guestId) != null ? 1 : 0));
+            case "status":
+                status(out);
                 return true;
-            }
             case "ping":
                 ok(out, "pong");
                 return true;
@@ -286,6 +328,29 @@ final class RvvmConsoleServer {
     }
 
     /**
+ * What the attached guest is doing, as one header line.
+ *
+ * <p>Every field is a cheap int read on purpose. This is the command a driver
+ * polls, several times a second for the life of a connection, and the screen
+ * flag in particular used to be answered by building the whole grid into a
+ * string just to test it for null - the answer to "is there a console" costing
+ * a console.</p>
+ *
+ * <p>{@code serial} is here so a poller can tell a guest that is running from
+ * one that has already run: a batch guest (`busybox sh -c ...`) finishes in
+ * milliseconds, and "not running" on its own is also what a run that has not
+ * started yet looks like. A screen that moved is the evidence that it began.</p>
+ */
+    private void status(OutputStream out) throws IOException {
+        ok(out, "guest=" + guestId
+                + " running=" + (RvvmNative.nativeIsGuestRunning(guestId) ? 1 : 0)
+                + " parked=" + (RvvmNative.nativeIsGuestParked(guestId) ? 1 : 0)
+                + " screen=" + (RvvmNative.nativeTtyHasScreen(guestId) ? 1 : 0)
+                + " serial=" + RvvmNative.nativeTtySerial(guestId)
+                + exitField());
+    }
+
+    /**
      * The attached console as text. A guest with no session yet - or an id that
      * was never in the run table - answers with the fact rather than with
      * somebody else's screen: nativeTtyScreen() resolves an explicit id to that
@@ -294,8 +359,7 @@ final class RvvmConsoleServer {
     private void screen(OutputStream out) throws IOException {
         String text = RvvmNative.nativeTtyScreen(guestId);
         if (text == null) {
-            ok(out, "guest=" + guestId + " screen=none running="
-                    + (RvvmNative.nativeIsGuestRunning(guestId) ? 1 : 0));
+            status(out);
             return;
         }
         int nl = text.indexOf('\n');

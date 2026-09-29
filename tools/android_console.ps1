@@ -22,7 +22,10 @@
             --es guest_app_name <App> --ez console true
 
 .PARAMETER Argv
-    Guest argv, passed as `--esa argv`. Element 0 is the guest's own argv[1].
+    Guest argv. One string is split on `|` (`-Argv '-c|exit 7'`); an array is
+    taken as-is. The string form is the one `pwsh -File` can deliver - that
+    binder reads a token starting with a single dash as a parameter name, so
+    the array form cannot carry `sh -c` at all.
 
 .PARAMETER Command
     Text to type, Enter appended unless -NoEnter. Converted to the hex the
@@ -191,6 +194,54 @@ function Get-AdbTargetArgs {
     return @()
 }
 
+function Resolve-GuestArgv {
+    <#
+      The guest argv, from whatever shape the caller managed to pass.
+
+      One string containing '|' is split on it; anything else is taken as-is.
+
+      This exists because of how `pwsh -File` binds arguments. The documented
+      invocation is `pwsh ./tools/android_console.ps1 ...`, and that binder
+      treats a token starting with a single dash as a *parameter name* - so
+      `-Argv -c "exit 7"`, which is exactly what `busybox sh -c` needs, dies
+      with "Missing an argument for parameter 'Argv'" before the script runs.
+      Passing one string sidesteps the binder entirely, and '|' is a separator
+      rare enough in a shell command line to be worth the rule.
+
+      An array still works, for a dot-sourcing caller who never went near the
+      binder.
+    #>
+    param($Argv)
+    if ($null -eq $Argv) { return @() }
+    $arr = @($Argv)
+    if ($arr.Count -eq 1 -and $arr[0].Contains('|')) {
+        return @($arr[0] -split '\|')
+    }
+    return $arr
+}
+
+function ConvertTo-ArgvBlob {
+    <#
+      Guest argv as one base64 string: the arguments joined by NUL, then
+      base64. This is the whole reason the driver does not use `am start
+      --esa argv a b c`.
+
+      `--esa` is a multi-value option, and that is where shells disagree with
+      each other. On a ColorOS build `am start --esa argv a b c` puts `[a]` in
+      the intent, and `--esa argv -c "ls"` throws `Argument expected after
+      "-c"` out of Intent.parseCommandArgs, because a token starting with one
+      dash reads as the next option. Stock AOSP takes the whole run. A guest
+      argument that silently arrives as `[-c]` is worse than one that never
+      arrives, so the driver sends one extra that no shell will reinterpret.
+
+      NUL rather than a space as the joiner, so an argument may contain either.
+    #>
+    param([string[]]$Argv)
+    if (-not $Argv -or $Argv.Count -eq 0) { return '' }
+    $joined = [string]::Join([char]0, $Argv)
+    return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($joined))
+}
+
 function Start-ConsoleGuest {
     <#
       Boot the app with the console already listening.
@@ -219,7 +270,7 @@ function Start-ConsoleGuest {
            '--ez', 'console', 'true',
            '--es', 'after_guest_exit', $AfterExit)
     if ($GuestArgv -and $GuestArgv.Count -gt 0) {
-        $a += @('--esa', 'argv') + $GuestArgv
+        $a += @('--es', 'argv_b64', (ConvertTo-ArgvBlob $GuestArgv))
     }
     $out = & $AdbPath @a 2>&1
     if ($LASTEXITCODE -ne 0) { throw "am start failed: $out" }
@@ -279,6 +330,14 @@ function New-ConsoleSession {
             $pong = Invoke-Console $s -Command 'ping' -TimeoutMs 2000
             if ($pong.Ok -and $pong.Fields.Count -ge 0) {
                 if ($Guest -ge 0) { [void](Invoke-Console $s -Command "attach $Guest") }
+                # The screen as it stands right now. Its serial is the baseline
+                # for "has the guest said anything yet", which is the only way to
+                # tell a live guest from one that has already run and finished -
+                # a distinction a poll on `running` cannot make, because a batch
+                # guest is gone before anyone looks. `test_busybox -c` is that
+                # shape: it runs in milliseconds and exits with the status.
+                $s | Add-Member -NotePropertyName Initial `
+                                 -NotePropertyValue (Get-ConsoleScreen $s) -Force
                 return $s
             }
             $last = 'connected but not speaking the protocol: ' + $pong.Status
@@ -360,9 +419,15 @@ function Read-ConsoleResponse {
         elseif ($line.StartsWith('\\')) { $line = $line.Substring(1) }
         $rows.Add($line)
     }
-    $ok = $status.StartsWith('+ ')
+    # "+ " or "- " prefixes every status. A response that does not start with
+    # one is not a status - it is a desynchronised stream - and saying so beats
+    # throwing a substring range error at the caller.
+    if ($status.Length -lt 2 -or ($status[0] -ne '+' -and $status[0] -ne '-')) {
+        throw ("not a status line: '{0}'" -f $status)
+    }
+    $ok = $status[0] -eq '+'
+    $body = $status.Substring(2)
     $fields = @{}
-    $body = if ($ok) { $status.Substring(2) } else { $status.Substring(2) }
     foreach ($tok in ($body -split '\s+')) {
         if ($tok -match '^([A-Za-z_][A-Za-z_0-9]*)=(.*)$') { $fields[$Matches[1]] = $Matches[2] }
     }
@@ -376,15 +441,69 @@ function Read-ConsoleResponse {
     }
 }
 
-function Invoke-Console {
-    param($Session, [Parameter(Mandatory)][string]$Command, [int]$TimeoutMs = 5000)
-    $b = [Text.Encoding]::ASCII.GetBytes($Command + "`n")
-    $sent = 0
-    while ($sent -lt $b.Length) {
-        $sent += $Session.Sock.Send($b, $sent, $b.Length - $sent,
-                                    [System.Net.Sockets.SocketFlags]::None)
+function Drain-ConsoleResponse {
+    <#
+      Resynchronise to a response boundary: read and throw away lines until the
+      dot that ends one.
+
+      Needed because clearing the buffer does not undo a partial read - the
+      bytes of the abandoned response are still in the socket, still arriving.
+      Retrying into that stream reads the *tail* of the old answer as the head
+      of the new one, which is how a status line ends up being a payload row.
+      Bounded, because a peer that is not speaking this protocol at all must
+      not turn a retry into a hang.
+    #>
+    param($Session, [int]$TimeoutMs = 1000, [int]$MaxLines = 4000)
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    for ($i = 0; $i -lt $MaxLines; $i++) {
+        if ([DateTime]::UtcNow -ge $deadline) { return $false }
+        $line = Read-ConsoleLine $Session 200
+        if ($null -eq $line) { return $false }
+        if ($line -eq '.') { return $true }
     }
-    return Read-ConsoleResponse $Session $TimeoutMs
+    return $false
+}
+
+function Invoke-Console {
+    <#
+      Send one command, read one response.
+
+      -Retry is for idempotent commands only, and that restriction is the whole
+      reason it is a switch and not a default. `snap` and `status` ask a
+      question; sending one twice costs a round trip and changes nothing.
+      `in` types at a guest: sending it twice types the line twice, so a retry
+      that "fixes" a dropped connection would corrupt the very session it was
+      trying to protect.
+    #>
+    param(
+        $Session,
+        [Parameter(Mandatory)][string]$Command,
+        [int]$TimeoutMs = 5000,
+        [int]$Tries = 1
+    )
+    $last = $null
+    for ($try = 1; $try -le $Tries; $try++) {
+        try {
+            $b = [Text.Encoding]::ASCII.GetBytes($Command + "`n")
+            $sent = 0
+            while ($sent -lt $b.Length) {
+                $sent += $Session.Sock.Send($b, $sent, $b.Length - $sent,
+                                            [System.Net.Sockets.SocketFlags]::None)
+            }
+            return Read-ConsoleResponse $Session $TimeoutMs
+        } catch {
+            $last = $_
+            if ($try -lt $Tries) {
+                # Resynchronise rather than just clearing: the bytes of the
+                # abandoned response are still in the socket, still arriving,
+                # and reading the new command's answer on top of them would
+                # parse the old answer's tail as a status line.
+                [void](Drain-ConsoleResponse $Session)
+                Start-Sleep -Milliseconds (100 * $try)
+            }
+        }
+    }
+    throw $last
 }
 
 # ==================================================================
@@ -416,7 +535,7 @@ function Get-ConsoleScreen {
       there.
     #>
     param($Session, [int]$TimeoutMs = 5000)
-    $r = Invoke-Console $Session -Command 'snap' -TimeoutMs $TimeoutMs
+    $r = Invoke-Console $Session -Command 'snap' -TimeoutMs $TimeoutMs -Tries 3
     $Session | Add-Member -NotePropertyName Last -NotePropertyValue $r -Force
     return $r
 }
@@ -557,30 +676,27 @@ function Wait-ConsoleScreen {
 
 function Get-ConsoleStatus {
     <#
-      What the attached guest is doing. `status` is three plain int reads
+      What the attached guest is doing. `status` is a few plain int reads
       natively, so this is cheap enough to poll - and it is the only question
       about a guest that a screen cannot answer, because the answer is
       sometimes "there is no screen left".
+
+      Retried like `snap`, and for the same reason: a wait for a guest that is
+      not going to exit polls this for the whole timeout, which is the longest
+      a connection ever lives, and adb over WiFi will reset a connection that
+      idle that long.
     #>
     param($Session)
-    return Invoke-Console $Session -Command 'status'
+    return Invoke-Console $Session -Command 'status' -Tries 3
 }
 
-function Wait-ConsoleRunning {
+function Wait-ConsoleTypable {
     <#
-      The run up: a console exists and the guest in it is running.
+      The run is up AND still going - the condition for typing into it.
 
-      A launch does not boot the guest. The Activity starts it from
-      surfaceCreated, which the framework calls after the launch intent has
-      already returned - so a driver that types the moment it can connect is
-      typing into a run that has not started yet. The console refuses that
-      rather than guessing (typing into "the active run" would mean typing into
-      whichever guest is in the foreground, which is how a driver ends up
-      talking to the wrong one), so the wait belongs here.
-
-      Both conditions, because either alone is ambiguous: running without a
-      screen is a run whose session is gone, and a screen without a running
-      guest is one that has not started or has already finished.
+      Narrower than Wait-ConsoleLive on purpose: a batch guest that has already
+      run has nothing to type at, and asking it to hold a line open would be
+      asking for a shell that is not coming.
     #>
     param($Session, [int]$TimeoutMs = 30000, [int]$IntervalMs = 60)
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
@@ -594,9 +710,41 @@ function Wait-ConsoleRunning {
     return $false
 }
 
+function Wait-ConsoleLive {
+    <#
+      The run is up, or has already been.
+
+      Not "is running". A launch returns before the guest boots - the Activity
+      starts it from surfaceCreated - so a driver that types the moment it can
+      connect is typing into a run that has not started. But the opposite
+      assumption is just as wrong: `test_busybox -c "..."` runs in milliseconds
+      and exits, and a wait keyed on `running` would never see it at all, and
+      then report a successful command as a guest that failed to start.
+
+      So: a run is live when it is either running, or has already moved its
+      screen since this session attached. Output is the evidence that it
+      started, whether or not it is still going.
+    #>
+    param($Session, [int]$TimeoutMs = 30000, [int]$IntervalMs = 60)
+    $base = if ($Session.Initial -and $Session.Initial.Fields.ContainsKey('serial')) {
+        [int]$Session.Initial.Fields['serial']
+    } else { -1 }
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $r = Get-ConsoleStatus $Session
+        if ($r.Ok -and $r.Fields['screen'] -eq '1') {
+            if ($r.Fields['running'] -eq '1') { return $true }
+            $ser = if ($r.Fields.ContainsKey('serial')) { [int]$r.Fields['serial'] } else { $base }
+            if ($base -ge 0 -and $ser -ne $base) { return $true }
+        }
+        Start-Sleep -Milliseconds $IntervalMs
+    }
+    return $false
+}
+
 function Wait-ConsoleExit {
     <#
-      The run is over.
+      The run is over, and its status.
 
       The signal is "this run has a console and is not running" - not "is not
       running". A run that never started is also not running, and a wait keyed
@@ -604,10 +752,10 @@ function Wait-ConsoleExit {
       cleanly, which is the one distinction here that matters. The screen is the
       thing that says a run existed.
 
-      screen=none afterwards means the host tore the whole thing down, which is
-      also the end of the run - but only once a screen has been seen at all,
-      or a driver that connects to a host with no guest in it would be told a
-      run ended that never began.
+      The status is returned, not just a boolean. A batch guest's result is its
+      exit code (`test_busybox -c ...` is exactly that shape), so "it ended"
+      without "and it ended well" is half an answer - and a harness that cannot
+      tell passes a guest that failed.
     #>
     param($Session, [int]$TimeoutMs = 20000, [int]$IntervalMs = 60)
     $sawRun = $false
@@ -616,12 +764,22 @@ function Wait-ConsoleExit {
         $r = Get-ConsoleStatus $Session
         if ($r.Ok) {
             if ($r.Fields['screen'] -eq '1') { $sawRun = $true }
-            if ($sawRun -and $r.Fields['running'] -eq '0') { return $true }
-            if ($sawRun -and $r.Fields['screen'] -eq '0') { return $true }
+            if ($sawRun -and $r.Fields['running'] -eq '0') {
+                $code = if ($r.Fields.ContainsKey('exit')) { [int]$r.Fields['exit'] } else { -1 }
+                return [pscustomobject]@{ Exited = $true; Code = $code }
+            }
+            if ($sawRun -and $r.Fields['screen'] -eq '0') {
+                # The host tore the whole thing down, which is also the end of
+                # the run - but only once a screen has been seen at all, or a
+                # driver that connects to a host with no guest in it would be
+                # told a run ended that never began.
+                $code = if ($r.Fields.ContainsKey('exit')) { [int]$r.Fields['exit'] } else { -1 }
+                return [pscustomobject]@{ Exited = $true; Code = $code }
+            }
         }
         Start-Sleep -Milliseconds $IntervalMs
     }
-    return $false
+    return [pscustomobject]@{ Exited = $false; Code = -1 }
 }
 
 # ==================================================================
@@ -643,6 +801,26 @@ function Invoke-ConsoleSelfTest {
 
     Write-Host "encoding"
     Check 'text -> hex' ((ConvertTo-ConsoleHex (ConvertTo-KeyBytes 'ls')) -eq '6c730d')
+    # The argv blob is the one thing here that has to survive a shell, so it is
+    # worth pinning: NUL-joined so an argument may contain a space, base64 so no
+    # shell reinterprets it, and the exact form the Activity decodes.
+    Check 'argv blob round-trips' (
+        [Text.Encoding]::UTF8.GetString(
+            [Convert]::FromBase64String((ConvertTo-ArgvBlob @('-c', 'echo hi')))) -ceq
+        ("-c" + [char]0 + 'echo hi'))
+    Check 'argv blob survives a quote' (
+        [Text.Encoding]::UTF8.GetString(
+            [Convert]::FromBase64String((ConvertTo-ArgvBlob @('-c', 'echo "q"')))) -ceq
+        ("-c" + [char]0 + 'echo "q"'))
+    Check 'argv blob has no shell metachars' (
+        (ConvertTo-ArgvBlob @('-c', 'a b; rm -rf /')) -match '^[A-Za-z0-9+/=]*$')
+    # The shape `pwsh -File` can actually deliver: one string, split on '|'.
+    # A token starting with one dash is a parameter name to that binder, so
+    # `-Argv -c "exit 7"` never reaches the script at all.
+    $split = Resolve-GuestArgv '-c|exit 7'
+    Check 'argv string splits on bar'  ($split.Count -eq 2 -and $split[0] -ceq '-c' -and $split[1] -ceq 'exit 7')
+    Check 'argv array passes through'  ((Resolve-GuestArgv @('ls', '-l')).Count -eq 2)
+    Check 'empty argv is empty'        ((Resolve-GuestArgv $null).Count -eq 0)
     Check 'no Enter when asked' ((ConvertTo-ConsoleHex (ConvertTo-KeyBytes 'ls' -NoEnter)) -eq '6c73')
     Check 'CtrlC is one byte' ((ConvertTo-ConsoleHex (ConvertTo-KeyBytes '' -Key CtrlC)) -eq '03')
     Check 'Up is ESC [ A' ((ConvertTo-ConsoleHex (ConvertTo-KeyBytes '' -Key Up)) -eq '1b5b41')
@@ -827,7 +1005,7 @@ function Invoke-ConsoleDriver {
 
     if ($App -and -not $NoLaunch) {
         Write-Host "launch  $App" -ForegroundColor DarkGray
-        [void](Start-ConsoleGuest -AppId $App -GuestArgv $Argv -AdbPath $Adb `
+        [void](Start-ConsoleGuest -AppId $App -GuestArgv (Resolve-GuestArgv $Argv) -AdbPath $Adb `
                                     -Serial $Serial -AfterExit $AfterExit)
     }
 
@@ -836,12 +1014,17 @@ function Invoke-ConsoleDriver {
     $exitCode = 0
     try {
         # A launch returns before the guest boots, so typing straight away is a
-        # race the console would (rightly) refuse. Wait for the run instead.
-        if (-not (Wait-ConsoleRunning $s -TimeoutMs ($TimeoutSec * 1000))) {
-            Write-Warning "guest did not start within $TimeoutSec s"
+        # race the console would (rightly) refuse. A guest that is going to hold
+        # a line open has to be waited for; a batch guest must not be, or
+        # `busybox sh -c` finishing in milliseconds reads as a launch failure.
+        if ($Command -and -not (Wait-ConsoleTypable $s -TimeoutMs ($TimeoutSec * 1000))) {
+            Write-Warning "nothing to type at within $TimeoutSec s"
             $st = Get-ConsoleStatus $s
             Write-Warning "status: $($st.Body)"
             return 4
+        }
+        if (-not $Command) {
+            [void](Wait-ConsoleLive $s -TimeoutMs ([Math]::Min($TimeoutSec * 1000, 10000)))
         }
         if ($Screen) {
             $snap = Get-ConsoleScreen $s
@@ -871,11 +1054,18 @@ function Invoke-ConsoleDriver {
             }
         }
         if ($ExpectExit) {
-            if (Wait-ConsoleExit $s -TimeoutMs ($TimeoutSec * 1000)) {
-                Write-Host 'ok      guest exited' -ForegroundColor Green
-            } else {
+            $done = Wait-ConsoleExit $s -TimeoutMs ($TimeoutSec * 1000)
+            if (-not $done.Exited) {
                 Write-Host 'TIMEOUT guest still running' -ForegroundColor Red
                 $exitCode = 1
+            } elseif ($done.Code -eq 0) {
+                Write-Host 'ok      guest exited 0' -ForegroundColor Green
+            } else {
+                # A batch guest's result is its status. Reporting the timeout
+                # colour for a guest that exited 7 would make a failing command
+                # indistinguishable from a harness that lost the thread.
+                Write-Host "guest exited $($done.Code)" -ForegroundColor Red
+                $exitCode = $done.Code
             }
         }
     } finally {

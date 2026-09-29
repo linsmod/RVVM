@@ -89,8 +89,27 @@ public class GuestActivity extends Activity {
     /** Guest argv, as {@code am start ... --esa argv a b c}. Element 0 is the
      *  guest's own argv[1], exactly as MainActivity.EXTRA_GUEST_ARGS defines
      *  it: this Activity used to boot every guest with no arguments at all,
-     *  which made it unusable as a launch target for anything that takes one. */
+     *  which made it unusable as a launch target for anything that takes one.
+     *
+     *  <p>Prefer {@link #EXTRA_GUEST_ARGS_B64} where you can. {@code --esa} is
+     *  a multi-value option, and that is exactly where the OEM shells differ
+     *  from stock: on a ColorOS build {@code am start --esa argv a b c} puts
+     *  {@code [a]} in the intent, and {@code --esa argv -c "ls"} throws
+     *  {@code Argument expected after "-c"} from {@code parseCommandArgs},
+     *  because a token starting with a single dash is read as the next option.
+     *  Stock AOSP takes the whole run; neither behaviour is one a test can
+     *  rely on, and a guest argument that silently arrives as {@code [-c]} is
+     *  worse than one that never arrives.</p> */
     public static final String EXTRA_GUEST_ARGS = "argv";
+
+    /** Guest argv as one base64 string: {@code --es argv_b64 <blob>}, where
+     *  the blob is the arguments joined by NUL and base64'd.
+     *
+     *  <p>One extra, no spaces, nothing a shell will reinterpret - so it
+     *  survives the adb shell word split, the OEM {@code am} parser above, and
+     *  an argument that begins with a dash or contains a quote. Takes
+     *  precedence over {@link #EXTRA_GUEST_ARGS} when both are present.</p> */
+    public static final String EXTRA_GUEST_ARGS_B64 = "argv_b64";
 
     /** Turn the scripted console on for this process: {@code --ez console true},
      *  or {@code --ei console_port N}. See {@link RvvmHost#enableConsoleServer}. */
@@ -230,7 +249,7 @@ public class GuestActivity extends Activity {
         // Guest argv, when the launching Intent named any. Held for the run
         // rather than passed at start: the run starts from surfaceCreated(),
         // which can land after onCreate has returned.
-        guestArgs = intent.getStringArrayExtra(EXTRA_GUEST_ARGS);
+        guestArgs = decodeGuestArgs(intent);
 
         // Create the layout
         setContentView(R.layout.activity_guest);
@@ -368,6 +387,30 @@ public class GuestActivity extends Activity {
             Log.w(TAG, "Re-entry intent names a different app: " + incoming
                     + " (running " + appName + ")");
         }
+    }
+
+    /**
+ * The guest argv a launching Intent asked for, or null for none.
+ *
+ * <p>The base64 form wins over the array form, because the array form is a
+ * multi-value {@code am} option and multi-value options are where shells
+ * disagree (see {@link #EXTRA_GUEST_ARGS}). Both are still accepted: the array
+ * form is what MainActivity has always documented, and on stock AOSP it is the
+ * shorter thing to type.</p>
+ */
+    private static String[] decodeGuestArgs(Intent intent) {
+        String blob = intent.getStringExtra(EXTRA_GUEST_ARGS_B64);
+        if (blob != null && !blob.isEmpty()) {
+            try {
+                String joined = new String(android.util.Base64.decode(blob, 0),
+                        StandardCharsets.UTF_8);
+                return joined.isEmpty() ? new String[0] : joined.split("\0", -1);
+            } catch (IllegalArgumentException e) {
+                Log.w(TAG, "argv_b64 is not base64: " + e.getMessage());
+                return null;
+            }
+        }
+        return intent.getStringArrayExtra(EXTRA_GUEST_ARGS);
     }
 
     /**

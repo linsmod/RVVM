@@ -70,7 +70,7 @@ public final class RvvmHost extends Application {
                 RvvmNative.nativeSetPanelSize(panelWidth, panelHeight);
             }
             if (exitListener != null) {
-                RvvmNative.nativeSetExitCallback(exitListener);
+                RvvmNative.nativeSetExitCallback(wrapExit(exitListener));
             }
             if (consoleListener != null) {
                 RvvmNative.nativeSetConsoleListener(consoleListener);
@@ -200,8 +200,26 @@ public final class RvvmHost extends Application {
     public synchronized void setExitListener(RvvmNative.ExitListener listener) {
         exitListener = listener;
         if (initialized) {
-            RvvmNative.nativeSetExitCallback(listener);
+            // Wrapped, not replaced: the console needs the same event the
+            // Activity does, and only one listener is installed at a time. A
+            // batch guest's result is its exit status, so a driver that can
+            // read what it printed but not whether it worked would pass a guest
+            // that failed.
+            RvvmNative.nativeSetExitCallback(wrapExit(listener));
         }
+    }
+
+    /** The user's listener, with the console's record of the exit in front. */
+    private RvvmNative.ExitListener wrapExit(RvvmNative.ExitListener inner) {
+        return (id, code) -> {
+            RvvmConsoleServer cs = consoleServer;
+            if (cs != null) {
+                cs.recordExit(id, code);
+            }
+            if (inner != null) {
+                inner.onExit(id, code);
+            }
+        };
     }
 
     public synchronized void setConsoleListener(RvvmNative.ConsoleListener listener) {

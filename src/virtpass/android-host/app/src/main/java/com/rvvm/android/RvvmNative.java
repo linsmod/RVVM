@@ -326,6 +326,17 @@ public class RvvmNative {
     public static native String nativeTtyScreen(int guestId);
 
     /**
+     * Whether this guest has a console at all.
+     *
+     * <p>Not {@code nativeTtyScreen(id) != null}: that walks the whole grid and
+     * formats it into a string, which is the wrong cost for a question a poller
+     * asks several times a second.</p>
+     *
+     * @param guestId whose console to ask about, or -1 for the foreground one
+     */
+    public static native boolean nativeTtyHasScreen(int guestId);
+
+    /**
      * Bring a view parked in its scrollback home, the way typing does.
      *
      * <p>A client asking for "the screen" means the live screen. Without this

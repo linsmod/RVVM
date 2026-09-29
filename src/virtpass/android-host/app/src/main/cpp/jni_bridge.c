@@ -1044,6 +1044,19 @@ Java_com_rvvm_android_RvvmNative_nativeTtyScreen(JNIEnv* env, jobject thiz, jint
  * that it cannot overflow the int the position is kept in. */
 #define TTY_FOLLOW_PAST_END  (-1000000)
 
+/* Whether this guest has a console at all, without building the console.
+ *
+ * The obvious spelling of that question - nativeTtyScreen(id) != null - walks
+ * the whole grid and formats it into a string, which is the wrong cost for a
+ * question asked by a poller: this is what `status` runs on, several times a
+ * second, for the life of the connection. */
+JNIEXPORT jboolean JNICALL
+Java_com_rvvm_android_RvvmNative_nativeTtyHasScreen(JNIEnv* env, jobject thiz, jint guestId)
+{
+    (void)env; (void)thiz;
+    return android_tty_for_view(guestId) ? JNI_TRUE : JNI_FALSE;
+}
+
 /* Bring a view parked in the scrollback home. rvvm_tty_scroll() re-pins the
  * view when the drag passes the live bottom, so one call for more depth than
  * the session can hold is that clamp asked for directly. A client reading
