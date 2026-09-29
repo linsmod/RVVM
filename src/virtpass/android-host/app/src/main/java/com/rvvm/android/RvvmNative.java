@@ -305,6 +305,50 @@ public class RvvmNative {
     public static native int nativeTtySerial(int guestId);
 
     /**
+     * The console as text: one header line of key=value fields, then one line
+     * per row of the view's window.
+     *
+     * <p>This is the same grid {@link #nativeTtySnapshot(int[], int[])} packs,
+     * in the shape a pattern match wants rather than a renderer's: the header
+     * carries {@code rows}/{@code cols}/{@code scroll}/{@code scrollback}/
+     * {@code serial}/{@code cursor}, and the rows are UTF-8 with trailing
+     * blanks dropped and any control codepoint shown as '.' - so a line a
+     * client anchors on cannot be shortened or split by a byte the guest
+     * emitted.</p>
+     *
+     * <p>Cells and header come out of one locked pass, so the two cannot
+     * disagree by a frame, and the call keeps working after the guest is gone
+     * (which is exactly when its last screen is read back). Null when no
+     * session exists for {@code guestId}.</p>
+     *
+     * @param guestId whose console to read, or -1 for the foreground one
+     */
+    public static native String nativeTtyScreen(int guestId);
+
+    /**
+     * Bring a view parked in its scrollback home, the way typing does.
+     *
+     * <p>A client asking for "the screen" means the live screen. Without this
+     * a user who scrolled back in the console view to read something would
+     * silently decide what a script driving the same session sees.</p>
+     *
+     * @param guestId whose console view to pin, or -1 for the foreground one
+     */
+    public static native void nativeTtyFollow(int guestId);
+
+    /**
+     * A system property, or null when it is unset or empty.
+     *
+     * <p>The NDK has no public reader for these, and the console server's
+     * enable switch belongs beside the trace switch and the guest-capacity
+     * knob - which already read the same property - rather than in a second
+     * mechanism.</p>
+     *
+     * @param name property name
+     */
+    public static native String nativeGetSystemProperty(String name);
+
+    /**
      * Send host keyboard input to the guest's virtual TTY - the input half of
      * the console.
      *

@@ -912,6 +912,179 @@ Java_com_rvvm_android_RvvmNative_nativeTtyScrollBy(JNIEnv* env, jobject thiz, ji
     }
 }
 
+/* ============================================================
+ * The console as text, for a scripted client
+ * ============================================================
+ * nativeTtyScreen() hands the same grid nativeTtySnapshot() packs for the
+ * renderer back as one string: a header line of key=value fields, then one
+ * line per row. It exists so a client that cannot see the screen (a test
+ * driver, an editor over `adb forward`) has something to match a prompt
+ * against - the packed cells are colours and flags, which is what a renderer
+ * wants and a pattern match does not.
+ *
+ * The cells come from one rvvm_tty_snapshot() pass, so the text and the header
+ * cannot disagree by a frame. Nothing here keeps the buffer: the snapshot is
+ * malloc'd per call rather than shared, because a second caller now exists
+ * (a console server's reader thread alongside the UI's renderer) and a static
+ * would be a data race between them.
+ * ============================================================ */
+
+/* One code point as UTF-8. A control byte, an unpaired surrogate or anything
+ * out of range becomes '.', which keeps the result line- and column-true: a
+ * prompt a client matches on can never be shortened, split or hidden by a
+ * codepoint that moved something else on the terminal it came from. */
+static char* tty_utf8(char* dst, uint32_t cp)
+{
+    if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0) || cp > 0x10ffff ||
+        (cp >= 0xd800 && cp <= 0xdfff)) {
+        *dst++ = '.';
+        return dst;
+    }
+    if (cp < 0x80) {
+        *dst++ = (char)cp;
+    } else if (cp < 0x800) {
+        *dst++ = (char)(0xc0 | (cp >> 6));
+        *dst++ = (char)(0x80 | (cp & 0x3f));
+    } else if (cp < 0x10000) {
+        *dst++ = (char)(0xe0 | (cp >> 12));
+        *dst++ = (char)(0x80 | ((cp >> 6) & 0x3f));
+        *dst++ = (char)(0x80 | (cp & 0x3f));
+    } else {
+        *dst++ = (char)(0xf0 | (cp >> 18));
+        *dst++ = (char)(0x80 | ((cp >> 12) & 0x3f));
+        *dst++ = (char)(0x80 | ((cp >> 6) & 0x3f));
+        *dst++ = (char)(0x80 | (cp & 0x3f));
+    }
+    return dst;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_rvvm_android_RvvmNative_nativeTtyScreen(JNIEnv* env, jobject thiz, jint guestId)
+{
+    rvvm_tty_t* tty = android_tty_for_view(guestId);
+    jstring out;
+    rvvm_tty_cell_t* cells;
+    char* text;
+    int   max_cells = TTY_MAX_ROWS * TTY_COLS;
+    rvvm_tty_view_t view;
+    char* p;
+    size_t cap;
+
+    (void)thiz;
+    if (!tty) {
+        return NULL;
+    }
+
+    /* The snapshot sizes itself from the view, so one pass at the ceiling is
+     * enough: rows is clamped to TTY_MAX_ROWS and the column count is pinned
+     * to TTY_COLS by rvvm_tty_resize(). */
+    cells = malloc(sizeof(*cells) * (size_t)max_cells);
+    if (!cells) {
+        return NULL;
+    }
+    if (rvvm_tty_snapshot(tty, cells, max_cells, &view) <= 0) {
+        free(cells);
+        return NULL;
+    }
+
+    /* Four bytes per cell is the widest a codepoint gets (U+10FFFF), plus the
+     * newline and the slack a wide cell's gap column costs. */
+    cap = (size_t)view.rows * ((size_t)view.cols * 4 + 2) + 256;
+    text = malloc(cap);
+    if (!text) {
+        free(cells);
+        return NULL;
+    }
+
+    p = text + snprintf(text, 256,
+        "RVVM/1 rows=%d cols=%d scroll=%d scrollback=%d serial=%d cursor=%d,%d\n",
+        view.rows, view.cols, view.scroll, view.scrollback_lines, view.serial,
+        view.cursor_row, view.cursor_col);
+
+    for (int r = 0; r < view.rows; r++) {
+        const rvvm_tty_cell_t* row = cells + (size_t)r * view.cols;
+
+        /* Trailing blanks are dropped so a client's line-anchored pattern sees
+         * the line the guest drew, not 80 columns of padding - and the cursor
+         * cell is content, or a prompt with no trailing newline on it would
+         * trim away to nothing exactly when there is something to wait for. */
+        int last = -1;
+        for (int c = 0; c < view.cols; c++) {
+            uint32_t cp = (uint32_t)row[c].cp;
+            if (cp && cp != ' ' && !(row[c].flags & RVT_TTY_CURSOR)) {
+                last = c;
+            }
+        }
+        /* A wide cell's lead column is followed by the gap its continuation
+         * occupies, so the gap has to stay inside the trimmed line. */
+        if (last >= 0 && (row[last].flags & RVT_TTY_WIDE)) {
+            last++;
+        }
+
+        for (int c = 0; c <= last && c < view.cols; c++) {
+            uint32_t cp = (uint32_t)row[c].cp;
+            if (row[c].flags & RVT_TTY_WIDE) {
+                c++;   /* the continuation cell carries no codepoint */
+            }
+            p = tty_utf8(p, cp);
+        }
+        *p++ = '\n';
+    }
+    *p = '\0';
+
+    out = (*env)->NewStringUTF(env, text);
+    free(text);
+    free(cells);
+    return out;
+}
+
+/* A drag deeper than any scrollback can hold. The depth is the core's business
+ * (RVT_TTY_SB_LINES is private to rvvm_user.c) and asking for more than it
+ * clamps to is what clamps it, so this needs no idea how deep that is - only
+ * that it cannot overflow the int the position is kept in. */
+#define TTY_FOLLOW_PAST_END  (-1000000)
+
+/* Bring a view parked in the scrollback home. rvvm_tty_scroll() re-pins the
+ * view when the drag passes the live bottom, so one call for more depth than
+ * the session can hold is that clamp asked for directly. A client reading
+ * "the screen" means the live screen, and a user who scrolled back in the UI
+ * must not decide what a script sees. */
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeTtyFollow(JNIEnv* env, jobject thiz, jint guestId)
+{
+    rvvm_tty_t* tty = android_tty_for_view(guestId);
+    (void)env; (void)thiz;
+    if (tty) {
+        rvvm_tty_scroll(tty, TTY_FOLLOW_PAST_END);
+    }
+}
+
+/* A system property, or null when it is unset or empty. The NDK has no
+ * public reader for these, and this is the same __system_property_get() the
+ * trace switch and the guest-capacity knob already use - the console server's
+ * enable switch belongs beside them rather than in a second mechanism. */
+JNIEXPORT jstring JNICALL
+Java_com_rvvm_android_RvvmNative_nativeGetSystemProperty(JNIEnv* env, jobject thiz,
+                                                          jstring name)
+{
+    char value[PROP_VALUE_MAX];
+    const char* prop;
+    (void)thiz;
+
+    if (!name) {
+        return NULL;
+    }
+    prop = (*env)->GetStringUTFChars(env, name, NULL);
+    if (!prop) {
+        return NULL;
+    }
+    value[0] = '\0';
+    __system_property_get(prop, value);
+    (*env)->ReleaseStringUTFChars(env, name, prop);
+
+    return value[0] ? (*env)->NewStringUTF(env, value) : NULL;
+}
+
 /* Host keyboard -> guest console, the input half of the TTY.
  *
  * `bytes` is what a real terminal receives from its keyboard: UTF-8 text,

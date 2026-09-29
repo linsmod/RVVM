@@ -31,6 +31,7 @@ public final class RvvmHost extends Application {
     private RvvmNative.ExitListener exitListener;
     private RvvmNative.ConsoleListener consoleListener;
     private RvvmNative.FrameCallback frameCallback;
+    private RvvmConsoleServer consoleServer;
 
     public static RvvmHost getInstance() {
         if (instance == null) {
@@ -77,11 +78,50 @@ public final class RvvmHost extends Application {
             if (frameCallback != null) {
                 RvvmNative.nativeSetFrameCallback(frameCallback);
             }
+            // Off unless asked for. The property is the switch the trace gates
+            // and the guest-capacity knob already use, so there is one place to
+            // look when asking "why is this or that on"; an Activity that wants
+            // the console calls enableConsoleServer() itself, which is what an
+            // `am start` carrying EXTRA_CONSOLE does.
+            String want = RvvmNative.nativeGetSystemProperty(RvvmConsoleServer.PROP);
+            if (want != null) {
+                enableConsoleServer(parsePort(want));
+            }
             Log.i(TAG, "Native host acquired");
         } catch (RuntimeException e) {
             acquireCount = 0;
             initialized = false;
             throw e;
+        }
+    }
+
+    /**
+     * The scripted console, off unless a driver asked for it.
+     *
+     * <p>Loopback only and off by default: see {@link RvvmConsoleServer}. The
+     * port comes from {@code debug.rvvm.console} (its value, or the default when
+     * it is not a number), and an Activity can also turn it on for this process
+     * with an intent extra - which is the difference between a driver that has
+     * to `setprop` before every launch and one that does not.</p>
+     */
+    public synchronized void enableConsoleServer(int requestedPort) {
+        if (consoleServer == null) {
+            consoleServer = new RvvmConsoleServer();
+        }
+        consoleServer.start(requestedPort > 0 ? requestedPort : RvvmConsoleServer.DEFAULT_PORT);
+    }
+
+    /** Whether the scripted console is listening, and on what port (0 = no). */
+    public synchronized int consoleServerPort() {
+        return (consoleServer != null && consoleServer.isRunning()) ? consoleServer.port() : 0;
+    }
+
+    private static int parsePort(String value) {
+        try {
+            int port = Integer.parseInt(value.trim());
+            return (port > 0 && port <= 65535) ? port : RvvmConsoleServer.DEFAULT_PORT;
+        } catch (NumberFormatException e) {
+            return RvvmConsoleServer.DEFAULT_PORT;
         }
     }
 
@@ -97,6 +137,12 @@ public final class RvvmHost extends Application {
             return;
         }
         acquireCount = 0;
+        // The console deliberately outlives this. A guest that exits finishes
+        // its Activity, and the console is stopped exactly when a driver would
+        // most want to ask what happened - which is also why the run's tty
+        // session is retired rather than destroyed, so the last screen and the
+        // whole scrollback are still there to read. Loopback-only and off
+        // unless asked for, so what it costs to keep is a parked socket.
         RvvmNative.nativeSetConsoleListener(null);
         RvvmNative.nativeSetFrameCallback(null);
         RvvmNative.nativeSetExitCallback(null);

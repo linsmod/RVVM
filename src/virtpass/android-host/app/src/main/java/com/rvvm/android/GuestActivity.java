@@ -86,6 +86,17 @@ public class GuestActivity extends Activity {
     public static final String AFTER_GUEST_EXIT_FINISH = "finish";
     public static final String AFTER_GUEST_EXIT_STAY = "stay";
 
+    /** Guest argv, as {@code am start ... --esa argv a b c}. Element 0 is the
+     *  guest's own argv[1], exactly as MainActivity.EXTRA_GUEST_ARGS defines
+     *  it: this Activity used to boot every guest with no arguments at all,
+     *  which made it unusable as a launch target for anything that takes one. */
+    public static final String EXTRA_GUEST_ARGS = "argv";
+
+    /** Turn the scripted console on for this process: {@code --ez console true},
+     *  or {@code --ei console_port N}. See {@link RvvmHost#enableConsoleServer}. */
+    public static final String EXTRA_CONSOLE = "console";
+    public static final String EXTRA_CONSOLE_PORT = "console_port";
+
     private static final int APP_CMD_INIT_WINDOW = 1;
     private static final int APP_CMD_TERM_WINDOW = 2;
     private static final int APP_CMD_WINDOW_RESIZED = 3;
@@ -100,6 +111,8 @@ public class GuestActivity extends Activity {
 
     // intent paremeter
     private String afterGuestExit="finish";
+    /** argv a launching Intent asked for, or null for none. See EXTRA_GUEST_ARGS. */
+    private String[] guestArgs;
 
     // Guest state
     private int guestId = -1;
@@ -214,6 +227,11 @@ public class GuestActivity extends Activity {
             afterGuestExit = AFTER_GUEST_EXIT_FINISH;
         }
 
+        // Guest argv, when the launching Intent named any. Held for the run
+        // rather than passed at start: the run starts from surfaceCreated(),
+        // which can land after onCreate has returned.
+        guestArgs = intent.getStringArrayExtra(EXTRA_GUEST_ARGS);
+
         // Create the layout
         setContentView(R.layout.activity_guest);
 
@@ -246,12 +264,21 @@ public class GuestActivity extends Activity {
         RvvmHost host = RvvmHost.getInstance();
         host.acquire();
 
+        applyConsoleIntent(host, intent);
+
         // Get notified when this guest's run ends (fired on a vCPU thread)
         host.setExitListener((gid, code) -> {
             if (gid == guestId) {
                 runOnUiThread(() -> handleGuestExit(code));
             }
         });
+
+        // One line of guest output per call, for the run's log file. Without
+        // this the log file openLogFile() creates is opened, named and closed
+        // again having never been written to - the console renders its own
+        // VTerm screen, but the VTerm is a picture of the output, not the
+        // output, and a log of a run is how its result gets read back.
+        host.setConsoleListener((gid, line) -> handleGuestOutput(gid, line));
 
         // Pin the virtual panel before the guest observes a window geometry
         host.setPanelSize(PANEL_W, PANEL_H);
@@ -320,17 +347,46 @@ public class GuestActivity extends Activity {
      * Re-entry through the launcher: documentLaunchMode="intoExisting" brings
      * the existing task forward instead of starting a new guest run. The
      * suspended (or running) guest keeps its state; onResume() resumes it.
+     *
+     * <p>The console flag is honoured here too, and not only in onCreate:
+     * `am start` against a task that is already up lands in this method, so a
+     * driver whose Activity was left in the foreground by an earlier run would
+     * otherwise be told to type at a port nobody ever bound.</p>
      */
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        RvvmHost host = RvvmHost.getInstance();
+        if (host.isInitialized()) {
+            applyConsoleIntent(host, intent);
+        }
         String incoming = intent.getStringExtra(EXTRA_APP_NAME);
         if (incoming != null && !incoming.equals(appName)) {
             // intoExisting matches the intent action (the app name), so this
             // should not happen; keep the live guest over a silent swap.
             Log.w(TAG, "Re-entry intent names a different app: " + incoming
                     + " (running " + appName + ")");
+        }
+    }
+
+    /**
+     * Turn the scripted console on if this Intent asked for it.
+     *
+     * <p>Called from both onCreate and onNewIntent, because a launch either
+     * creates this Activity or brings the existing one forward, and a driver
+     * must not have to know which happened. The port has to be listening by
+     * the time the first command is typed, not whenever a later round trip
+     * gets around to noticing.</p>
+     */
+    private void applyConsoleIntent(RvvmHost host, Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        if (intent.getBooleanExtra(EXTRA_CONSOLE, false)
+                || intent.hasExtra(EXTRA_CONSOLE_PORT)) {
+            host.enableConsoleServer(intent.getIntExtra(EXTRA_CONSOLE_PORT, 0));
+            Log.i(TAG, "Scripted console on port " + host.consoleServerPort());
         }
     }
 
@@ -625,10 +681,12 @@ public class GuestActivity extends Activity {
         }
 
         // Actually run the ELF
-        boolean started = RvvmNative.nativeRunElf(guestId, elfPath, null);
+        boolean started = RvvmNative.nativeRunElf(guestId, elfPath, guestArgs);
         if (started) {
             isGuestStarted = true;
-            Log.i(TAG, "Guest started: " + appName + " (guestId=" + guestId + ")");
+            Log.i(TAG, "Guest started: " + appName + " (guestId=" + guestId
+                    + ", argv=" + (guestArgs == null ? "none" : java.util.Arrays.toString(guestArgs))
+                    + ")");
         } else {
             Log.e(TAG, "Failed to start guest: " + appName);
             Toast.makeText(this, "Failed to start guest", Toast.LENGTH_SHORT).show();
@@ -1269,6 +1327,31 @@ public class GuestActivity extends Activity {
                     Log.w(TAG, "Failed to close log file", e);
                 }
                 logWriter = null;
+            }
+        }
+    }
+
+    /**
+     * One line of guest output, appended to this run's log file. Fires on a
+     * guest thread, which is why the write takes the lock the file is opened
+     * and closed under.
+     *
+     * <p>Lines are what native hands over (one per newline, control bytes
+     * sanitized to '?'), so this is a transcript rather than a byte-exact
+     * capture - which is why a driver that needs the bytes reads the console
+     * itself over the scripted server instead.</p>
+     */
+    private void handleGuestOutput(int gid, String line) {
+        synchronized (logFileLock) {
+            if (logWriter != null) {
+                try {
+                    logWriter.write(line);
+                    logWriter.newLine();
+                    logWriter.flush();
+                } catch (IOException e) {
+                    Log.w(TAG, "Guest log write failed: " + e.getMessage());
+                    closeLogFile();
+                }
             }
         }
     }

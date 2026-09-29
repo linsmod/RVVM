@@ -38,10 +38,21 @@
              action (the app name) and brings it forward. documentLaunchMode
              is deliberately NOT used: its task lookup matches by affinity
              first, and every GuestActivity shares the default (package)
-             affinity - all guests would collapse into the first task. -->
+             affinity - all guests would collapse into the first task.
+
+             Exported for the same reason MainActivity is: `adb shell am start`
+             needs it to reach a run at all (the shell uid is refused on a
+             non-exported Activity, which makes the documented launch command
+             fail silently). EXTRA_APP_NAME / EXTRA_GUEST_ARGS / EXTRA_CONSOLE
+             are what it takes, so a host test is one am start and one adb
+             forward rather than driving the picker by hand and then reading
+             the screen off it. No intent-filter (it must not add a launcher
+             entry) and no permission: this is a development console. Launched
+             from the app it behaves exactly as before, because the picker
+             always passes EXTRA_APP_NAME itself. -->
         <activity
             android:name=".GuestActivity"
-            android:exported="false"
+            android:exported="true"
             android:screenOrientation="portrait"
             android:windowSoftInputMode="adjustNothing"
             android:configChanges="orientation|screenSize|keyboardHidden">
