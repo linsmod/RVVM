@@ -11489,6 +11489,107 @@ static void userland_sigrestore(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
     atomic_store_uint32(&ctx->sig_inflight, 0);
 }
 
+/*
+ * TABLE 1 - which syscall arguments the kernel fills.
+ *
+ * This table lives here, next to the switch it describes, on purpose. The
+ * classification it exists for cannot be done by reading the call sites: thirteen
+ * of them are textually identical,
+ *
+ *     void* buf = a2 ? to_ptr_sz(a1, a2) : NULL;   // read()  -> the kernel fills it
+ *     void* wbuf = a2 ? to_ptr_sz(a1, a2) : NULL;  // write() -> it is the source
+ *
+ * and a fourth differs only by a const (pwrite64). Whether one is a writer depends
+ * on which syscall's argument it is, and that is not in the code. So the mapping
+ * has to be derived from the kernel's calling convention, which means the ABI
+ * knowledge has to sit where the dispatch is - otherwise it drifts, and it drifts
+ * invisibly, because a checker reading a stale copy keeps reporting success.
+ *
+ * Format, so tools/axis_a_by_abi.ps1 can read it and a diff shows what changed:
+ * name, then a TAB, then the 0-based argument indices the kernel fills. An empty
+ * list means the syscall fills no buffer, which is most of them. A name ABSENT from
+ * the table is unclassified, not clean: the completeness direction is the other
+ * half of the check, and it is the half that finds a hole in this table rather than
+ * a mistake in the code.
+ *
+ * Derived from the Linux syscall ABI, not from scanning this file. That
+ * distinction is not pedantic: an earlier version of this table listed sendmmsg as
+ * filling its msghdr array, because a scan of the call sites cannot tell
+ * sendmsg(fd, msg*, flags) from sendmmsg(fd, msgvec*, vlen, flags) - and every
+ * field of a sendmmsg msghdr is an input.
+ *
+ * The names here are the ones the dispatch's own case labels carry, not the
+ * generic Linux spellings - it says statfs64 where the kernel header says
+ * statfs, pselect6_time32 where the header says pselect6, newuname where the
+ * header says uname. That is not cosmetic. An earlier version of this table used
+ * the header spellings, and the completeness check below immediately showed every
+ * dispatched syscall as unclassified, which in turn meant the soundness check was
+ * comparing against nothing and reporting success. A checker that cannot fail is
+ * worse than no checker, so the names have to be the dispatch's.
+ *
+ * Two entries are not a plain index list, and both are called out again where they
+ * are implemented:
+ *
+ *   ioctl       index 2, but only for the request codes that fill it - a second
+ *               closed set inside this one. See to_ptr_ioctl().
+ *   sendmsg     index 1 is a guest msghdr that is READ. The buffers that get
+ *   recvmsg     filled are the ones its name and control fields point at, and
+ *               those are translated in rvvm_msghdr_from_guest(). The msghdr
+ *               itself is never written back.
+ *
+ * Confirmed readers, listed so their empty entry is deliberate rather than an
+ * omission: write, pwrite64, setsockopt, sendmmsg, setgroups, shmctl, shmat (its
+ * second argument is a key value, not a buffer), shmdt, memfd_create, prctl, futex
+ * (its uaddr is read and compared, and the waiter list is host-side), and every
+ * timespec used as an input.
+ */
+static const char* const syscalls_filling_guest_memory[] = {
+    /* fills a buffer */
+    "read\t1", "pread64\t1", "readv\t1", "recvfrom\t1,4,5",
+    "recvmsg\t1", "sendmsg\t1", "epoll_pwait\t1", "ppoll_time32\t0",
+    "pselect6_time32\t0", "sendfile64\t2", "getdents64\t1", "readlinkat\t2",
+    "getcwd\t0", "clock_gettime\t1", "clock_getres\t1", "gettimeofday\t0,1",
+    "times\t0", "sysinfo\t0", "newuname\t0", "statfs64\t1", "fstatfs64\t1",
+    "newfstatat\t2", "newfstat\t1", "getrusage\t1", "getgroups\t1",
+    "sched_getaffinity\t2", "sched_getparam\t1", "setitimer\t2",
+    "rt_sigaction\t2", "rt_sigprocmask\t2", "rt_sigtimedwait_time32\t1",
+    "getsockopt\t3,4", "getsockname\t1,2", "getpeername\t1,2", "accept\t1,2",
+    "accept4\t1,2", "prlimit64\t3", "wait4\t1,3", "getrandom\t0", "statx\t4",
+    "ioctl\t2", "capget\t1", "pipe2\t0", "socketpair\t3",
+    "getresuid\t0,1,2", "getresgid\t0,1,2", "clone\t2,4",
+    /*
+     * Fills nothing - present so the check can tell "classified" from "absent".
+     * The ones that do touch guest pointers are named here with the reason,
+     * because "unclassified" in the check's output is only actionable if the
+     * reader knows which of the 90 it has to think about: the other ~70 have no
+     * to_ptr*() at all and are settled by construction.
+     *
+     *   epoll_ctl      a1 is the event being registered: a source
+     *   sendto         buf and dest_addr are both sources
+     *   bind           the sockaddr is a source
+     *   connect        the sockaddr is a source
+     *   shmat          the second argument is a key value, not a buffer
+     *   memfd_create   the name is a source
+     *   set_tid_address  returns the tid in a0, writes nothing
+     *   riscv_flush_icache  addr and len are values, not a buffer
+     *   mknodat, mkdirat, unlinkat, symlinkat, linkat, renameat2, fchmodat,
+     *   fchownat, faccessat, faccessat2, chdir, chroot, truncate64, mount,
+     *   umount2, openat   paths are sources
+     *   write, writev, pwrite64   the buffer is the source
+     *   nanosleep, clock_nanosleep   the timespec is an input
+     */
+    "getpid\t", "gettid\t", "sched_getscheduler\t", "setgroups\t",
+    "setsockopt\t", "sendmmsg\t", "shmctl\t", "shmdt\t", "fcntl64\t",
+    "capset\t", "prctl\t", "futex\t", "brk\t", "mremap\t", "riscv_hwprobe\t",
+    "epoll_ctl\t", "sendto\t", "bind\t", "connect\t", "shmat\t", "memfd_create\t",
+    "set_tid_address\t", "riscv_flush_icache\t", "mknodat\t", "mkdirat\t",
+    "unlinkat\t", "symlinkat\t", "linkat\t", "renameat2\t", "fchmodat\t",
+    "fchownat\t", "faccessat\t", "faccessat2\t", "chdir\t", "chroot\t",
+    "truncate64\t", "mount\t", "umount2\t", "openat\t", "write\t", "writev\t",
+    "pwrite64\t", "nanosleep\t", "clock_nanosleep\t",
+    NULL
+};
+
 static void* rvvm_user_thread_wrap(void* arg)
 {
     rvvm_user_thread_t* thread = arg;
@@ -12002,7 +12103,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 43: { // statfs64
                     struct statfs stfs = {0};
-                    struct uapi_statfs64* out = to_ptr_sz(a1, sizeof(*out));
+                    struct uapi_statfs64* out = to_ptr_sz_wr(a1, sizeof(*out));
                     rvvm_info("sys_statfs64(%s, %lx, %lx)", to_str(a0), a1, a2);
                     if (!out) {
                         a0 = -UAPI_EFAULT;
@@ -12014,7 +12115,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 44: { // fstatfs64
                     struct statfs stfs = {0};
-                    struct uapi_statfs64* out = to_ptr_sz(a1, sizeof(*out));
+                    struct uapi_statfs64* out = to_ptr_sz_wr(a1, sizeof(*out));
                     rvvm_info("sys_fstatfs64(%ld, %lx, %lx)", a0, a1, a2);
                     if (!out) {
                         a0 = -UAPI_EFAULT;
@@ -12257,7 +12358,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 59: { // pipe2
                     rvvm_info("sys_pipe2(%lx, %lx)", a0, a1);
-                    int* fds = to_ptr_sz(a0, sizeof(int) * 2);
+                    int* fds = to_ptr_sz_wr(a0, sizeof(int) * 2);
                     int flags = (int)a1;
                     a0 = fds ? errno_ret(pipe(fds)) : (rvvm_addr_t)-UAPI_EFAULT;
                     if ((int64_t)a0 >= 0 && fds) {
@@ -12672,7 +12773,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     struct stat st = {0};
                     const int   dirfd = (int)a0;   /* a0 holds the result below */
                     const char* path = to_str(a1);
-                    struct uapi_stat* out = to_ptr_sz(a2, sizeof(*out));
+                    struct uapi_stat* out = to_ptr_sz_wr(a2, sizeof(*out));
                     char abs[UAPI_PATH_MAX];
                     const char* asset = NULL;
                     int ret;
@@ -12783,7 +12884,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 80: { // newfstat
                     struct stat st = {0};
-                    struct uapi_stat* out = to_ptr_sz(a1, sizeof(*out));
+                    struct uapi_stat* out = to_ptr_sz_wr(a1, sizeof(*out));
                     const long fd = (long)a0;
                     rvvm_info("sys_newfstat(%ld, %lx)", a0, a1);
                     if (!out) {
@@ -12944,7 +13045,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                 {
                     struct itimerval newval = { 0 }, oldval = { 0 };
                     struct uapi_itimerval* gnew = to_ptr(a1);
-                    struct uapi_itimerval* gold = to_ptr(a2);
+                    struct uapi_itimerval* gold = to_ptr_wr(a2);
                     rvvm_info("sys_setitimer(%lx, %lx, %lx)", a0, a1, a2);
                     /* ITIMER_REAL is ours (see userland_setitimer_real). The
                      * CPU-time timers would need per-thread accounting this
@@ -13246,9 +13347,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 148: { // getresuid - semi stub
                     // Linux has no optional out-parameters here - all three must
                     // be writable, a NULL is EFAULT rather than "don't report it"
-                    int* ruid = to_ptr_sz(a0, sizeof(int));
-                    int* euid = to_ptr_sz(a1, sizeof(int));
-                    int* suid = to_ptr_sz(a2, sizeof(int));
+                    int* ruid = to_ptr_sz_wr(a0, sizeof(int));
+                    int* euid = to_ptr_sz_wr(a1, sizeof(int));
+                    int* suid = to_ptr_sz_wr(a2, sizeof(int));
                     if (!ruid || !euid || !suid) {
                         a0 = -UAPI_EFAULT;
                     } else {
@@ -13261,9 +13362,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 150: { // getresgid - semi stub
                     // Same as getresuid: every pointer is required
-                    int* rgid = to_ptr_sz(a0, sizeof(int));
-                    int* egid = to_ptr_sz(a1, sizeof(int));
-                    int* sgid = to_ptr_sz(a2, sizeof(int));
+                    int* rgid = to_ptr_sz_wr(a0, sizeof(int));
+                    int* egid = to_ptr_sz_wr(a1, sizeof(int));
+                    int* sgid = to_ptr_sz_wr(a2, sizeof(int));
                     if (!rgid || !egid || !sgid) {
                         a0 = -UAPI_EFAULT;
                     } else {
@@ -13449,7 +13550,7 @@ case 179: // sysinfo
                 case 199: { // socketpair
                     rvvm_info("sys_socketpair(%lx, %lx, %lx, %lx)", a0, a1, a2, a3);
                     int type = (int)a1;
-                    int* pair = to_ptr_sz(a3, sizeof(int) * 2);
+                    int* pair = to_ptr_sz_wr(a3, sizeof(int) * 2);
                     a0 = errno_ret(socketpair(a0, a1 & ~UAPI_SOCK_TYPE_MASK, a2, pair));
                     if ((int64_t)a0 >= 0 && pair) {
                         bool cloexec = (type & UAPI_SOCK_CLOEXEC) != 0;
@@ -13711,7 +13812,7 @@ case 179: // sysinfo
                         a0 = -UAPI_EAGAIN;
                         break;
                     }
-                    a0 = rvvm_sys_clone(thread, cpu, a0, a1, to_ptr(a2), a3, to_ptr(a4));
+                    a0 = rvvm_sys_clone(thread, cpu, a0, a1, to_ptr_wr(a2), a3, to_ptr_wr(a4));
                     break;
                 case 221: { // execve
                     /* Replace this process's image in place - see
