@@ -62,7 +62,18 @@
 void ash_install_termination_handler(void);
 
 /* Implemented in ash_client.c */
-int ash_serve(int port, int idle_s, const char* dlog);
+
+/*
+ * ash_serve(): the core.
+ *
+ * @cmdline is the run's boot arguments (`root= init= loglevel= debug`), or NULL.
+ * It is applied here rather than by the caller because two of its arguments are
+ * this function's to apply and not the caller's to: init= names the core program,
+ * which is argv[0] and is decided below, and loglevel=/debug answer for this
+ * process's logging, which is set below and would be undone by a caller that set
+ * it earlier. root= is passed on to the machine.
+ */
+int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline);
 int ash_client(int port, const char* one_cmd, bool autostart);
 int ash_list(void);
 int ash_shutdown(int port);

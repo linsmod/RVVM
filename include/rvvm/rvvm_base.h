@@ -112,6 +112,21 @@ typedef unsigned long long __uint64_t;
 #define RVVM_ABI_VERSION -1
 
 /**
+ * The size of a machine's command line, NUL-terminated, so it fits in one.
+ *
+ * Linux calls this COMMAND_LINE_SIZE and puts it at 2048 on most arches; the
+ * same number is used here for the same reason - a set of boot arguments that
+ * cannot be written down in full is a boot whose behaviour cannot be reported
+ * afterwards, which is worse than one that was refused.
+ *
+ * Public because a host keeps its own copy of a command line before the machine
+ * it is for exists (the win32 bridge and the Android host both do), and that
+ * copy is sized by this number so it cannot be longer than the field it is
+ * eventually handed to.
+ */
+#define RVVM_CMDLINE_MAX 2048
+
+/**
  * @defgroup rvvm_types Base types and definitions
  * @addtogroup rvvm_types
  * @{

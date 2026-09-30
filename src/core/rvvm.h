@@ -315,6 +315,14 @@ const void* rvvm_ram_const_ptr_range(const rvvm_ram_t* mem, size_t offset, size_
 #define USERLAND_MEM_SIZE 0x20000000UL // 512 MiB
 #endif
 
+/*
+ * The machine's command line field is sized by RVVM_CMDLINE_MAX, which lives in
+ * the public header (rvvm/rvvm_base.h) rather than here: a host holds its own
+ * copy of the command line before the machine exists, and that copy has to be
+ * bounded by the same number the field is or the two could disagree about how
+ * much of it there is.
+ */
+
 #define USERLAND_MEM_BASE 0x1000UL
 
 // Main stack, carved off the top of the space.
@@ -464,6 +472,36 @@ struct randomize_layout rvvm_machine_t {
     gdb_server_t* gdbstub;
 
     rvvm_addr_t opts[RVVM_OPTS_ARR_SIZE];
+
+    /*
+     * The command line this machine was booted with, and the only copy of it.
+     *
+     * It used to exist only as the device tree's /chosen/bootargs, which made
+     * it a property of a Linux guest and nothing else: rvvm_user.c never looks
+     * at the device tree at all (it reaches it only through elf_load.h), and
+     * /proc/cmdline answered "\n" whatever had been set. So on a userland guest
+     * - which is every guest in virtpass, there being no kernel - a command
+     * line could be set and then not be observed by anything, including the
+     * program it was set for.
+     *
+     * Two things now read it, and they cannot disagree: rvvm_set_cmdline()
+     * writes this field and /chosen/bootargs from the same string, and
+     * /proc/cmdline (rvvm_user.c) reports this field verbatim. A kernel guest
+     * still finds its arguments where it expects them, and a userland guest can
+     * finally read its own boot arguments back.
+     *
+     * The field is per machine rather than per userland context because it is
+     * per machine: two children forked out of one run are the same machine and
+     * must not see two different command lines. It is on the machine struct -
+     * which rvvm.c owns and rvvm_user.c reaches only as an opaque handle
+     * everywhere except through elf_load.h - precisely so that neither module
+     * has to know how the other stores it.
+     *
+     * Empty means "nothing was set", and that is a real state rather than an
+     * absent one: /proc/cmdline then answers "\n", which is what a Linux
+     * /proc/cmdline with no boot arguments answers.
+     */
+    char cmdline[RVVM_CMDLINE_MAX];
 
     // Opaque per-mode state owned by whoever created the machine, e.g. the
     // userland context (rvvm_userland_t) of a userland machine. The core never

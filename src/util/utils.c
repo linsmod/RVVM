@@ -782,6 +782,153 @@ void rvvm_set_loglevel(int loglevel)
     rvvm_loglevel = loglevel;
 }
 
+/*
+ * One token of a command line, and where its value starts.
+ *
+ * Held as offsets into the caller's string rather than as pointers into a copy:
+ * a command line is scanned several times (once for root=, once for the log
+ * level, once per question a host asks) and copying it per question is how a
+ * parser ends up disagreeing with itself.
+ */
+typedef struct {
+    const char* key;
+    size_t      key_len;
+    const char* value;    /* "" for a bare flag, never NULL */
+    bool        has_value;
+} cmdline_token_t;
+
+/*
+ * The token @key names in @cmdline, or NULL.
+ *
+ * @key is matched whole and only up to its own length, so looking up "root"
+ * does not answer for "rootflags" - the failure a substring match has, and a
+ * silent one: a machine booted `rootflags=discard` would otherwise take its
+ * root from a flag about something else.
+ *
+ * Empty keys are refused. Linux has no use for `=value`, and accepting one would
+ * mean every malformed command line answers to the same key, which is a worse
+ * answer than none.
+ */
+static const cmdline_token_t* cmdline_find(const char* cmdline, const char* key)
+{
+    cmdline_token_t tok;
+    size_t         key_len;
+    size_t         i = 0;
+
+    if (!cmdline || !key || !key[0]) {
+        return NULL;
+    }
+    key_len = strlen(key);
+
+    while (cmdline[i]) {
+        /* A token runs to the next space or tab, which are the two separators
+         * every boot argument format in practice uses. A newline is not one,
+         * because /proc/cmdline is read by programs that split it themselves
+         * and this side has no reason to be the stricter of the two. */
+        size_t start = i;
+        size_t eq;
+        while (cmdline[i] && cmdline[i] != ' ' && cmdline[i] != '\t') {
+            i++;
+        }
+        tok.key       = cmdline + start;
+        tok.key_len   = i - start;
+        tok.value     = cmdline + i;
+        tok.has_value = false;
+
+        eq = start;
+        while (eq < i && cmdline[eq] != '=') {
+            eq++;
+        }
+        /* An '=' inside the value rather than the one that introduces it:
+         * `init=/sbin/a=b` is a path that happens to contain '='. Only the
+         * first one at or before the token's end can start the value. */
+        if (eq > start) {
+            tok.has_value = (eq < i);
+            if (tok.has_value) {
+                tok.value    = cmdline + eq + 1;
+                tok.key_len  = eq - start;
+            }
+            if (tok.key_len == key_len && !strncmp(tok.key, key, key_len)) {
+                return &tok;
+            }
+        }
+
+        while (cmdline[i] == ' ' || cmdline[i] == '\t') {
+            i++;
+        }
+    }
+    return NULL;
+}
+
+const char* rvvm_cmdline_get(const char* cmdline, const char* key)
+{
+    const cmdline_token_t* tok = cmdline_find(cmdline, key);
+    /* NULL for a bare flag rather than "": `debug` has no value, and a caller
+     * handed "" could not tell it from `debug=`. Ask rvvm_cmdline_has() for the
+     * flag case. */
+    return (tok && tok->has_value) ? tok->value : NULL;
+}
+
+bool rvvm_cmdline_has(const char* cmdline, const char* key)
+{
+    return cmdline_find(cmdline, key) != NULL;
+}
+
+void rvvm_apply_cmdline_logging(const char* cmdline)
+{
+    static const struct {
+        const char* name;
+        int         level;
+    } words[] = {
+        { "none",  LOG_NONE  },
+        { "error", LOG_ERROR },
+        { "warn",  LOG_WARN  },
+        { "info",  LOG_INFO  },
+        { "debug", LOG_DEBUG },
+    };
+    const char* val;
+    size_t      i;
+
+    if (!cmdline || !cmdline[0]) {
+        return;
+    }
+
+    /* debug first, and as its own case, because it is both a word and a flag.
+     * `loglevel=debug` and a bare `debug` are the same request, and a bare
+     * `debug` is the spelling people actually type. */
+    if (rvvm_cmdline_has(cmdline, "debug")) {
+        rvvm_set_loglevel(LOG_DEBUG);
+    }
+
+    val = rvvm_cmdline_get(cmdline, "loglevel");
+    if (!val || !val[0]) {
+        return;
+    }
+
+    /* A word before a number, because `loglevel=info` is what a person writes
+     * and strtol alone reads it as 0 and answers LOG_NONE - silently muting a
+     * host that asked to be louder, which is the direction that hides a bug
+     * rather than showing one. */
+    for (i = 0; i < sizeof(words) / sizeof(words[0]); ++i) {
+        if (!strcmp(val, words[i].name)) {
+            rvvm_set_loglevel(words[i].level);
+            return;
+        }
+    }
+
+    /* A number, which is what the kernel's loglevel= is. 0..4 land on the same
+     * LOG_* values, the mapping being the identity because the two scales were
+     * numbered alike on purpose. Out of range is refused rather than clamped,
+     * so `loglevel=9` says nothing and leaves the level the host chose. */
+    if (val[0] >= '0' && val[0] <= '9') {
+        char* end = NULL;
+        long  n   = strtol(val, &end, 10);
+        if (end && !*end && n >= LOG_NONE && n <= LOG_DEBUG) {
+            rvvm_set_loglevel((int)n);
+        }
+    }
+}
+
 static bool log_has_colors(void)
 {
     // TERM is set on any POSIX, WT_SESSION is set by Windows Terminal

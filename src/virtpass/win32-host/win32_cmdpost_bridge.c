@@ -209,6 +209,20 @@ static char** g_guest_argv   = NULL;
  * the rvvm_user_linux_ex() error code if the guest never started. */
 static int    g_guest_rc     = -1;
 
+/*
+ * Boot arguments for the next machine, held here rather than passed to
+ * win32_host_start_guest() because a command line is a property of the machine
+ * and the machine does not exist until that call makes it - the same reason the
+ * Android host keeps its own pending flag (see jni_bridge.c's g_core_pending).
+ *
+ * A copy, not the caller's pointer: the argv this came from belongs to whoever
+ * called ash_main, and a core that outlives its command line would otherwise
+ * boot a run from a freed string. NULL means "no arguments", which is a real
+ * answer and not the same as "not set yet": a host that set nothing gets
+ * /proc/cmdline empty, and a host that set an empty string gets the same thing.
+ */
+static char g_guest_cmdline[RVVM_CMDLINE_MAX];
+
 /* Host-side suspend/resume guards. The machine handle only exists while a guest
  * is booted, so every host control call goes through these instead of testing
  * g_guest_machine at each call site. */
@@ -1165,6 +1179,21 @@ static bool g_no_stdin_pump = false;
 void win32_host_no_stdin(void)
 {
     g_no_stdin_pump = true;
+}
+
+void win32_host_set_cmdline(const char* str)
+{
+    if (!str) {
+        g_guest_cmdline[0] = '\0';
+        return;
+    }
+    /* Truncated rather than refused, and the truncation is visible: the copy is
+     * bounded by the same RVVM_CMDLINE_MAX the machine's own field is, so a long
+     * command line cannot become a long string that does not fit anywhere else.
+     * The line printed at boot is the truncated one, which is what the guest
+     * will read from /proc/cmdline - so what is logged is what happened. */
+    strncpy(g_guest_cmdline, str, sizeof(g_guest_cmdline) - 1);
+    g_guest_cmdline[sizeof(g_guest_cmdline) - 1] = '\0';
 }
 
 /* Start the pump once per process, if there is a stdin to read at all. */
@@ -3112,7 +3141,6 @@ bool win32_host_start_guest(int argc, char** argv)
     int i;
 
     if (g_guest_thread) return false;
-
     /* Reinstall the callbacks for this guest. The previous guest's exit no
      * longer clears them (cmdpost_end_run() ends the run, not the bridge), so
      * this is an idempotent belt rather than what keeps a relaunched guest
@@ -3151,6 +3179,20 @@ bool win32_host_start_guest(int argc, char** argv)
         have_app = vp_bundle_app_id_from_guest_path(argc > 0 ? argv[0] : NULL,
                                                     app_id, sizeof(app_id));
         win32_guest_rootfs_mount(g_guest_machine, have_app ? app_id : NULL);
+
+        /* Boot arguments, after the bundle mount and not before, so that a
+         * `root=` on the command line overrides the rootfs the image installed
+         * rather than being overwritten by it. That is the order a boot wants:
+         * what the release provides, then what this run asked for.
+         *
+         * Only root= has a consequence here. init= is read by the caller
+         * (ash_serve) because it names the program and this function is handed
+         * argv, not a choice; loglevel= and debug are the process's, applied by
+         * the caller before any of this runs. */
+        if (g_guest_cmdline[0]) {
+            rvvm_user_set_cmdline(g_guest_machine, g_guest_cmdline);
+            winhost_log("machine booted with cmdline: %s", g_guest_cmdline);
+        }
     }
 
     /* Route guest fd 1/2 through the console session so CR / ANSI escapes

@@ -130,6 +130,10 @@ public class GuestActivity extends Activity {
     public static final String EXTRA_CONSOLE = "console";
     public static final String EXTRA_CONSOLE_PORT = "console_port";
 
+    /** Linux-style boot arguments for this run's machine: {@code --es cmdline
+     *  "root=... init=... debug"}. See {@link RvvmNative#nativeSetCmdline}. */
+    public static final String EXTRA_CMDLINE = "cmdline";
+
     private static final int APP_CMD_INIT_WINDOW = 1;
     private static final int APP_CMD_TERM_WINDOW = 2;
     private static final int APP_CMD_WINDOW_RESIZED = 3;
@@ -146,6 +150,9 @@ public class GuestActivity extends Activity {
     private String afterGuestExit="finish";
     /** argv a launching Intent asked for, or null for none. See EXTRA_GUEST_ARGS. */
     private String[] guestArgs;
+    /** Boot arguments a launching Intent asked for, or null for none. See
+     *  EXTRA_CMDLINE. */
+    private String bootArgs;
 
     // Guest state
     private int guestId = -1;
@@ -264,6 +271,12 @@ public class GuestActivity extends Activity {
         // rather than passed at start: the run starts from surfaceCreated(),
         // which can land after onCreate has returned.
         guestArgs = decodeGuestArgs(intent);
+
+        // Boot arguments, for the same reason and read here rather than at the
+        // start: nativeSetCmdline() has to be called immediately before the run,
+        // and a string read at onCreate is not the same string by the time
+        // surfaceCreated() runs if the Activity was reused for a second Intent.
+        bootArgs = intent.getStringExtra(EXTRA_CMDLINE);
 
         // Create the layout
         setContentView(R.layout.activity_guest);
@@ -438,6 +451,51 @@ public class GuestActivity extends Activity {
             }
         }
         return intent.getStringArrayExtra(EXTRA_GUEST_ARGS);
+    }
+
+    /**
+     * The value of {@code key} in a Linux-style boot argument string, or null.
+     *
+     * <p>The same rules the native scanner uses ({@code rvvm_cmdline_get} in
+     * utils.c), because a command line with two spellings is worse than one with
+     * none: tokens split on spaces and tabs, the value starts at the token's
+     * <em>first</em> {@code =} so a value may contain one, and the key is matched
+     * whole so {@code root} never answers for {@code rootflags}.</p>
+     *
+     * <p>Duplicated rather than asked of native, and that is a real cost: the
+     * string is in the Intent and the answer is needed before the run exists, so
+     * there is no machine to ask about yet. It is thirty lines against a JNI
+     * round trip, and the two are pinned to the same rules by the comment above -
+     * if the native scanner's rules change, this has to change with them.</p>
+     *
+     * <p>Null for a bare flag ({@code debug}) rather than "", so a caller can tell
+     * "not mentioned" from "mentioned with an empty value".</p>
+     */
+    private static String cmdlineArg(String cmdline, String key) {
+        if (cmdline == null || key == null || key.isEmpty()) {
+            return null;
+        }
+        int i = 0;
+        while (i < cmdline.length()) {
+            int start = i;
+            while (i < cmdline.length() && cmdline.charAt(i) != ' '
+                   && cmdline.charAt(i) != '\t') {
+                i++;
+            }
+            int eq = cmdline.indexOf('=', start);
+            // An '=' at or past the token's end belongs to a later token.
+            if (eq > start && eq < i) {
+                if (eq - start == key.length()
+                    && cmdline.regionMatches(start, key, 0, key.length())) {
+                    return cmdline.substring(eq + 1, i);
+                }
+            }
+            while (i < cmdline.length()
+                   && (cmdline.charAt(i) == ' ' || cmdline.charAt(i) == '\t')) {
+                i++;
+            }
+        }
+        return null;
     }
 
     /**
@@ -748,10 +806,41 @@ public class GuestActivity extends Activity {
         // opens it as its first act, which is why this cannot be a value handed
         // in from Java: there is nothing to hand in yet.
         String[] args = guestArgs;
+        String elf = elfPath;
         if (isCore()) {
             RvvmNative.nativeArmCore();
             args = new String[] { "--shell", RvvmHost.getInstance().getSessionShell() };
             Log.i(TAG, "core starting: idle " + args[0] + " " + args[1]);
+        }
+
+        // init= names the program, and is acted on here rather than natively
+        // because this is where elf_path, argv and a core's --control are
+        // decided: a side that overrode them would boot a program nobody
+        // assembled. What comes with the default is idle's own signature, so
+        // init= replaces the program rather than the way it is called - which
+        // means a command line naming a program with a different signature gets
+        // that program's usage and exits, exactly as booting it directly would.
+        //
+        // Refused for a core rather than honoured, because a core's program is
+        // what makes it a core: idle is the run root that outlives every client,
+        // and a vpsessiond booted as one would take the machine down with it the
+        // moment it exited, which is the exact failure idle exists to prevent.
+        if (bootArgs != null && !bootArgs.isEmpty()) {
+            String initArg = cmdlineArg(bootArgs, "init");
+            if (initArg != null && !initArg.isEmpty()) {
+                if (isCore()) {
+                    Log.e(TAG, "ignoring init=" + initArg + ": a core's run root is idle"
+                             + " (/sbin/idle), and it has to outlive its clients");
+                } else {
+                    elf = initArg;
+                    Log.i(TAG, "init= chose the run root: " + elf);
+                }
+            }
+            // Immediately before nativeRunElf, and for the same reason as
+            // nativeArmCore above: the machine these describe does not exist
+            // until that call creates it, and root= has to land after this run's
+            // bundle mount - which is inside nativeRunElf too.
+            RvvmNative.nativeSetCmdline(bootArgs);
         }
 
         // Re-deliver the lifecycle state a freshly started guest expects to see
@@ -764,7 +853,7 @@ public class GuestActivity extends Activity {
         }
 
         // Actually run the ELF
-        boolean started = RvvmNative.nativeRunElf(guestId, elfPath, args);
+        boolean started = RvvmNative.nativeRunElf(guestId, elf, args);
         if (started && isCore()) {
             String ctl = RvvmNative.nativeCoreControlPty(guestId);
             if (ctl == null) {

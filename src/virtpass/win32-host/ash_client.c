@@ -526,9 +526,10 @@ void ash_install_termination_handler(void)
     }
 }
 
-int ash_serve(int port, int idle_s, const char* dlog)
+int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline)
 {
     const char* shell = ash_default_core_shell();
+    const char* init_arg;
     char        port_buf[16];
     char        idle_buf[16];
     char*       guest[5];
@@ -554,6 +555,26 @@ int ash_serve(int port, int idle_s, const char* dlog)
      * for the image to be found: the bundle is located by the executable's own
      * directory, never the cwd. */
 
+    /* `init=` names the core program, and is applied here rather than deeper in
+     * the bridge because this is where the program's own arguments are decided:
+     * the host bridge is handed argv and has no business choosing what argv[0]
+     * is. What comes with the default is the session server's own signature,
+     * which is why init= overrides the program and not the way it is called - a
+     * `rvvm_ash --serve --cmdline "init=/data/app/test_std/bin/test_std"`
+     * therefore gets that program's usage and exits, which is what booting it
+     * directly would do.
+     *
+     * Used verbatim as a guest path, like the default, and resolved inside the
+     * run rather than here: the host does not know this run's rootfs (root= may
+     * have just changed it) and a check against the wrong tree would refuse a
+     * program that is there. An init= naming nothing is loud rather than
+     * silent - the ELF load fails, the guest leaves, and the line below says the
+     * core stopped with its status. */
+    init_arg = cmdline ? rvvm_cmdline_get(cmdline, "init") : NULL;
+    if (init_arg && init_arg[0]) {
+        shell = init_arg;
+    }
+
     snprintf(port_buf, sizeof(port_buf), "%d", port);
     snprintf(idle_buf, sizeof(idle_buf), "%d", idle_s > 0 ? idle_s : 0);
     /* argv[3]: the daemon's log, as a guest path, only when one was asked for.
@@ -573,8 +594,24 @@ int ash_serve(int port, int idle_s, const char* dlog)
     guest[4] = NULL;
 
     /* Same switch as rvvm_winhost (win32_main.c): RVVM_VERBOSE=1 lifts the log
-     * to LOG_INFO so the per-syscall lines (sys_openat etc.) reach stderr. */
+     * to LOG_INFO so the per-syscall lines (sys_openat etc.) reach stderr.
+     *
+     * Applied here rather than in ash_main.c, and immediately after this line,
+     * because this line is a default that would otherwise overwrite it: a
+     * --cmdline asking for loglevel=debug on a run with RVVM_VERBOSE unset has
+     * to end up loud, and the ordering that gets that right is the whole reason
+     * the two are adjacent. ash_main.c parses --cmdline and passes it down; it
+     * does not decide the level. */
     rvvm_set_loglevel(getenv("RVVM_VERBOSE") ? LOG_INFO : LOG_WARN);
+    if (cmdline) {
+        rvvm_apply_cmdline_logging(cmdline);
+    }
+
+    /* Before the guest starts, because the machine does not exist until it does.
+     * root= is applied inside win32_host_start_guest(), after the bundle mount,
+     * so that a command line overrides the image rather than the other way
+     * round. */
+    win32_host_set_cmdline(cmdline);
 
     /* The guest's permission bits outlive this process: the host filesystem
      * has nowhere to put them, so they go to a file beside the rootfs. */

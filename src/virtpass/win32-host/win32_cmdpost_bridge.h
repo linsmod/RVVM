@@ -88,6 +88,22 @@ bool win32_host_init_console(int virt_w, int virt_h, int virt_ppi);
 void win32_host_no_stdin(void);
 
 /*
+ * Boot the next guest's machine with these Linux-style boot arguments
+ * (`root=... init=... loglevel=... debug`), applied in
+ * win32_host_start_guest(). NULL clears them.
+ *
+ * Call before win32_host_start_guest(), which is the only place a machine
+ * exists to be given them. A call after the guest has started has no effect on
+ * the running one - the arguments are read when the machine is built, as they
+ * are on a real boot, and a run cannot be re-parameterised in place.
+ *
+ * `init=` is NOT applied here: this function is handed argv, so the program has
+ * already been chosen by whoever called it, and overriding it here would be a
+ * choice made behind the caller's back. Read `init=` before calling.
+ */
+void win32_host_set_cmdline(const char* str);
+
+/*
  * Block until the guest exits and return its exit code. The console host's
  * equivalent of win32_host_message_loop(): with the guest, the stdin pump and
  * the console geometry poller all on threads of their own, there is no message

@@ -412,6 +412,35 @@ public class RvvmNative {
     public static native String nativeCoreControlPty(int guestId);
 
     /**
+     * Boot the next run's machine with these Linux-style boot arguments.
+     *
+     * <p>Call immediately before {@link #nativeRunElf}, for the same reason
+     * {@link #nativeArmCore} is a separate call: a command line is a property of
+     * the machine, and the machine is created by the run's start.</p>
+     *
+     * <p>Understood here:</p>
+     * <ul>
+     *   <li>{@code root=<host-path>} - where the guest's absolute paths resolve.
+     *       Applied <em>after</em> the APK's bundle mount, so it overrides the
+     *       rootfs the bundle installed rather than the other way round.</li>
+     *   <li>{@code loglevel=<none|error|warn|info|debug>} or the kernel's
+     *       {@code 0..4}, and a bare {@code debug} - this process's logging.
+     *       Applied at once, so the level covers the run's first log lines.</li>
+     *   <li>{@code init=<guest-path>} - read by the caller, not applied here.
+     *       Which program boots is the launcher's to decide: this side is handed
+     *       {@code elf_path}, the argv, and a core's {@code --control}, and
+     *       overriding them here would boot a program nobody assembled.</li>
+     * </ul>
+     *
+     * <p>Arguments nothing here recognises are kept, not rejected - a command
+     * line is not a schema, and the unknown ones may be for the guest program.
+     * Whatever is passed is what the guest reads back from {@code /proc/cmdline}.</p>
+     *
+     * @param cmdline the arguments, or null/empty for a run with none.
+     */
+    public static native void nativeSetCmdline(String cmdline);
+
+    /**
      * A session's terminal, by its path, already sized.
      *
      * <p>Sized here rather than at spawn time, because the shell's first prompt is

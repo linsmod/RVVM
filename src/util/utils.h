@@ -342,6 +342,38 @@ PUBLIC uint64_t    rvvm_getarg_size(const char* arg);
 
 PUBLIC void rvvm_set_loglevel(int loglevel);
 
+/*
+ * Reading a command line: one scanner, for everyone who has one.
+ *
+ * A machine's command line is asked about from three layers - the core applying
+ * root=, the logger reading loglevel=, and each host reading init= - and the
+ * answers have to agree. They agree because there is one scanner here rather
+ * than three, and it takes a plain string so no layer has to own the machine to
+ * ask a question about it.
+ *
+ * Tokens are separated by spaces and tabs. `key=value` splits at the *first* '='
+ * in the token, so a value may contain one; `key` alone is a flag. Unknown
+ * arguments are simply not found: a command line is not a schema, and refusing
+ * one because it names something this build has never heard of would make the
+ * string unusable for the guest program it was written for.
+ */
+PUBLIC const char* rvvm_cmdline_get(const char* cmdline, const char* key);
+PUBLIC bool        rvvm_cmdline_has(const char* cmdline, const char* key);
+
+/* Apply the logging arguments of @cmdline - `debug` (bare) and `loglevel=`,
+ * which takes either a name (none/error/warn/info/debug) or the kernel's 0..4.
+ *
+ * Both are read from the command line rather than from a host flag because the
+ * answer they give is global (rvvm_set_loglevel is process-wide) and a host that
+ * wanted it per machine could not honour that. So the argument is spelled once
+ * and applies to the process, which is the same bargain the -v flag makes.
+ *
+ * Applied, not validated: an unreadable loglevel= leaves the level the host
+ * already chose, because a typo in a verbosity argument should not change how
+ * much of the run is reported - and should not stop the run either.
+ */
+PUBLIC void rvvm_apply_cmdline_logging(const char* cmdline);
+
 #if GNU_ATTRIBUTE(__format__)
 #define PRINT_FORMAT     __attribute__((__format__(printf, 1, 2)))
 #define PRINT_FORMAT_ARG2 __attribute__((__format__(printf, 2, 3)))

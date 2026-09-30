@@ -46,7 +46,7 @@ static void print_usage(const char* self)
     fprintf(stderr,
             "usage: %s [--serve [--idle S] [--dlog <guest-path>]] [--list]\n"
             "          [--shutdown] [--no-autostart]\n"
-            "          [--port N] [-c <command>] [--sock-path]\n"
+            "          [--cmdline <linux-args>] [--port N] [-c <command>] [--sock-path]\n"
             "\n"
             "  %s                  connect to the run's core (start one if none);"
             " a new session\n"
@@ -59,8 +59,18 @@ static void print_usage(const char* self)
             "Options: --port N (default %d, RVVM_ASH_PORT) is the core's logical id\n"
             "and names its endpoint; --serve --idle S stops a core after S seconds\n"
             "with no session (0 = never). --serve --dlog <path> puts the session\n"
-            "server's log at that guest path instead of the run's /tmp. The core\n"
-            "program is /sbin/vpsessiond, from the bundle.\n"
+            "server's log at that guest path instead of the run's /tmp.\n"
+            "\n"
+            "--cmdline <args> boots the core's machine with those Linux-style boot\n"
+            "arguments, and is the only way to change what the run is made of:\n"
+            "  init=<guest-path>  the core program, instead of /sbin/vpsessiond\n"
+            "  root=<host-path>   the run's filesystem prefix, instead of the bundle\n"
+            "  loglevel=<name|n>  none/error/warn/info/debug, or the kernel's 0..4\n"
+            "  debug              the same as loglevel=debug\n"
+            "Whatever is passed is also what the guest reads back from\n"
+            "/proc/cmdline, so a program in the run can see how it was started.\n"
+            "Arguments this build does not know are kept, not refused - they may be\n"
+            "for the guest program rather than for the host.\n"
             "\n"
             "--no-autostart: fail instead of starting a core when none is listening.\n"
             "A client that starts one by itself is convenient and wrong for a test:\n"
@@ -72,7 +82,7 @@ static void print_usage(const char* self)
             "stdout, which is the guest's console transcript. RVVM_LOG_FILE=<path>\n"
             "appends them to a file instead, and RVVM_LOG_RING_DUMP=<path> writes the\n"
             "log ring - the last 128 KiB of the run, kept in static storage - at exit.\n",
-            self, self, self, self, self, self, self, ASH_PORT_DEFAULT);
+            self, self, self, self, self, self, self, self, ASH_PORT_DEFAULT);
 }
 
 int main(int argc, char** argv)
@@ -86,6 +96,7 @@ int main(int argc, char** argv)
     bool        autostart = true;
     const char* one_cmd  = NULL;
     const char* dlog     = NULL;
+    const char* cmdline  = NULL;
     int         idle     = 0;
     int         port     = ash_port();
     int         i        = 1;
@@ -116,6 +127,10 @@ int main(int argc, char** argv)
             idle = atoi(argv[++i]);
         } else if (!strncmp(a, "--idle=", 7)) {
             idle = atoi(a + 7);
+        } else if (!strcmp(a, "--cmdline") && i + 1 < argc) {
+            cmdline = argv[++i];
+        } else if (!strncmp(a, "--cmdline=", 10)) {
+            cmdline = a + 10;
         } else if (!strcmp(a, "--port") && i + 1 < argc) {
             port = atoi(argv[++i]);
         } else if (!strncmp(a, "--port=", 7)) {
@@ -144,18 +159,42 @@ int main(int argc, char** argv)
         /* The same switch the client path honours (see ash_client.c): without
          * it a core stays at LOG_WARN, so the per-syscall lines a session's
          * trouble has to be read from never reach this console - and the core is
-         * exactly where they are needed. */
+         * exactly where they are needed. ash_serve() re-applies it and then
+         * applies any loglevel=/debug from --cmdline on top, which has to be
+         * the later of the two or a run asked to be loud would not be. */
         rvvm_set_loglevel(getenv("RVVM_VERBOSE") ? LOG_INFO : LOG_WARN);
-        return ash_serve(port, idle, dlog);
+        return ash_serve(port, idle, dlog, cmdline);
     }
 
-    /* Client mode. `-c <command>` asks the core for a one-shot session. */
+    /* Client mode. `-c <command>` asks the core for a new session. */
     if (i < argc && !strcmp(argv[i], "-c") && i + 1 < argc) {
         one_cmd = argv[i + 1];
     } else if (i < argc) {
         fprintf(stderr, "%s: unexpected argument '%s'\n", argv[0], argv[i]);
         print_usage(argv[0]);
         return 1;
+    }
+
+    /* A client boots nothing, so init= and root= have nothing to act on here.
+     * Saying so beats taking them and ignoring them: a `--cmdline` that looked
+     * like it worked and left the core running last time's rootfs is exactly
+     * the kind of silent mismatch a boot argument is supposed to rule out. The
+     * logging arguments are still honoured, because they are about this process
+     * and not about the core. */
+    if (cmdline) {
+        const char* init_arg = rvvm_cmdline_get(cmdline, "init");
+        const char* root_arg = rvvm_cmdline_get(cmdline, "root");
+        if ((init_arg && init_arg[0]) || (root_arg && root_arg[0])) {
+            fprintf(stderr,
+                    "%s: init= and root= describe the machine, and a client "
+                    "starts none.\n"
+                    "    They belong to --serve, which is what boots the run:\n"
+                    "        %s --serve --cmdline \"%s%s\"\n",
+                    argv[0], argv[0], init_arg ? "init=" : "",
+                    init_arg ? init_arg : root_arg);
+            return 2;
+        }
+        rvvm_apply_cmdline_logging(cmdline);
     }
     return ash_client(port, one_cmd, autostart);
 }

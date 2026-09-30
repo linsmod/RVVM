@@ -595,18 +595,55 @@ PUBLIC rvvm_machine_t* rvvm_create_machine(size_t mem_size, size_t hart_count, c
 
 PUBLIC void rvvm_set_cmdline(rvvm_machine_t* machine, const char* str)
 {
+    if (machine && str) {
+        /*
+         * The store, and the reason this function is not a no-op on a userland
+         * machine. The device tree below is only half the audience: it is how a
+         * Linux kernel is told, and there is no kernel in a virtpass guest, so
+         * before this the whole function compiled away to UNUSED(machine) for
+         * every guest that could actually read /proc/cmdline - which is to say
+         * for all of them, since the Android host does not even build with
+         * USE_FDT. Truncation is silent and total, the way a fixed buffer is:
+         * the field holds the beginning of what was asked for.
+         */
+        strncpy(machine->cmdline, str, RVVM_CMDLINE_MAX - 1);
+        machine->cmdline[RVVM_CMDLINE_MAX - 1] = '\0';
+    }
 #if defined(USE_FDT)
     if (machine) {
         struct fdt_node* chosen = fdt_node_find(machine->fdt, "chosen");
         fdt_node_add_prop_str(chosen, "bootargs", str);
     }
+#else
+    UNUSED(str);
 #endif
     UNUSED(machine);
-    UNUSED(str);
 }
 
 PUBLIC void rvvm_append_cmdline(rvvm_machine_t* machine, const char* str)
 {
+    if (machine && str) {
+        /*
+         * Appended to the field, and to the device tree, from one place. Merging
+         * into the field rather than re-deriving it keeps the two in step: a
+         * caller that appended twice gets the same string from /proc/cmdline as
+         * a kernel would have found in bootargs, and a caller that appended
+         * after a kernel guest had already read the tree is the only case where
+         * they can differ, which is the same case Linux has.
+         */
+        size_t have = strlen(machine->cmdline);
+        if (have + 1 < RVVM_CMDLINE_MAX) {
+            /* A separator only between two arguments. Appending to an empty
+             * command line must not leave a leading space: /proc/cmdline is read
+             * by people, and by `cat /proc/cmdline` in a test that compares it. */
+            if (have) {
+                machine->cmdline[have++] = ' ';
+                machine->cmdline[have] = '\0';
+            }
+            strncat(machine->cmdline, str, RVVM_CMDLINE_MAX - 1 - have);
+            machine->cmdline[RVVM_CMDLINE_MAX - 1] = '\0';
+        }
+    }
 #if defined(USE_FDT)
     if (machine) {
         struct fdt_node* chosen = fdt_node_find(machine->fdt, "chosen");
@@ -619,9 +656,10 @@ PUBLIC void rvvm_append_cmdline(rvvm_machine_t* machine, const char* str)
         free(tmp);
         free(new);
     }
+#else
+    UNUSED(str);
 #endif
     UNUSED(machine);
-    UNUSED(str);
 }
 
 PUBLIC bool rvvm_load_firmware(rvvm_machine_t* machine, const char* path)

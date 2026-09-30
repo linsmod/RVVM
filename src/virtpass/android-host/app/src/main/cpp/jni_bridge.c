@@ -182,6 +182,19 @@ static struct android_run* g_active_run = NULL;
  * the machine appears. */
 static int g_core_pending = 0;
 
+/* The next run's boot arguments, from nativeSetCmdline(). Held here for the same
+ * reason as g_core_pending: a command line is a property of the machine, and the
+ * machine does not exist until nativeRunElf creates it - and root= has to land
+ * after that run's bundle mount, which is also inside nativeRunElf and nowhere
+ * else.
+ *
+ * Process-global for the same duration g_core_pending is, and for the same
+ * reason: the UI thread sets one up and starts one run, so there is exactly one
+ * "next run" to be talking about. It is consumed by the run it starts, so a
+ * nativeRunElf that was never preceded by a nativeSetCmdline() gets an empty
+ * command line rather than the last run's. */
+static char g_pending_cmdline[RVVM_CMDLINE_MAX];
+
 /* Guards the run's display geometry and the window. Held for short reads/writes
  * only, never across an ANativeWindow_lock()/unlockAndPost() pair. */
 static pthread_mutex_t g_surf_cs = PTHREAD_MUTEX_INITIALIZER;
@@ -1272,6 +1285,55 @@ Java_com_rvvm_android_RvvmNative_nativeConsoleStop(JNIEnv* env, jobject thiz)
  * text rather than a socket, because these two ends already have a protocol and
  * this is not meant to be a second one.
  */
+
+/* Boot arguments for the next run, in Linux's spelling:
+ *
+ *     nativeSetCmdline("root=/data/local/tmp/rootfs init=/sbin/idle debug")
+ *
+ * root= names the directory the guest's absolute paths resolve against, and
+ * overrides the rootfs the APK's bundle installed. init= names the program to
+ * boot; see the note below on why this side does not act on it. loglevel= (a name
+ * or the kernel's 0..4) and a bare debug set this process's logging, and are
+ * applied here because that is a process-wide answer and the level has to be set
+ * before the run's own output starts.
+ *
+ * Call immediately before nativeRunElf, for the same reason nativeArmCore is:
+ * the machine these describe does not exist until nativeRunElf makes it.
+ *
+ * init= is deliberately NOT applied. It names the first program, and on this host
+ * that is a question about what the launcher installed and what Java asked to
+ * run - elf_path, argv, and the --control argument a core needs are all decided
+ * there. Overriding them from here would boot a program whose arguments nobody
+ * assembled. GuestActivity reads init= and uses it to choose the program; this
+ * keeps the string so /proc/cmdline in the guest can see what it was.
+ */
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeSetCmdline(JNIEnv* env, jobject thiz,
+                                                   jstring cmdline)
+{
+    const char* str = NULL;
+    (void)thiz;
+
+    if (cmdline) {
+        str = (*env)->GetStringUTFChars(env, cmdline, NULL);
+    }
+    if (!str) {
+        g_pending_cmdline[0] = '\0';
+    } else {
+        /* Truncated, not refused: the copy is bounded by the same
+         * RVVM_CMDLINE_MAX the machine's field is, and what is logged at boot is
+         * what the guest will read back from /proc/cmdline. */
+        strncpy(g_pending_cmdline, str, sizeof(g_pending_cmdline) - 1);
+        g_pending_cmdline[sizeof(g_pending_cmdline) - 1] = '\0';
+        (*env)->ReleaseStringUTFChars(env, cmdline, str);
+    }
+    /* Logging is the process's and is applied now, not at boot: a level set
+     * after the run's first log lines have already been filtered is a level that
+     * silently applies to the part of the run nobody was watching. */
+    if (g_pending_cmdline[0]) {
+        rvvm_apply_cmdline_logging(g_pending_cmdline);
+    }
+}
 
 /* Say that the next run to start is a core, so its start makes a control
  * terminal. Asked for from Java immediately before nativeRunElf, because the
@@ -3270,6 +3332,22 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
         rvvm_user_set_assets(run->machine, vp_bundle_assets(), run->assets_root);
     } else {
         rvvm_user_set_assets(run->machine, &android_asset_ops, NULL);
+    }
+
+    /* Boot arguments, after the bundle mount and not before, so a `root=` on the
+     * command line overrides the rootfs the APK installed rather than being
+     * overwritten by it: what the image provides, then what this run asked for.
+     *
+     * Applied per run and not process-globally, because the run is what has a
+     * machine: two runs can be started with different arguments and are separate
+     * machines, which is the same reasoning as the per-run assets root above.
+     * The pending copy is consumed here so a second nativeRunElf without its own
+     * nativeSetCmdline() does not inherit the previous run's arguments - a stale
+     * command line on a new run is a bug report nobody can reproduce. */
+    if (g_pending_cmdline[0]) {
+        rvvm_user_set_cmdline(run->machine, g_pending_cmdline);
+        LOGI("Guest %d booted with cmdline: %s", run->id, g_pending_cmdline);
+        g_pending_cmdline[0] = '\0';
     }
 
     /* This run's own console session: opened fresh (the previous run's frozen
