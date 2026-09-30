@@ -4206,8 +4206,11 @@ static bool path_has_prefix(const char* path, const char* prefix)
  * namespace they belong to. */
 static bool guest_path_absolutize(char* out, size_t size, const char* path);
 
-/* The mount whose path covers @path, longest match first, or NULL. Caller holds
- * the namespace lock. See rvvm_mount_ns_t for why the table is not per context. */
+/* The mount whose path covers @path, longest match first, or NULL, for the
+ * callers that ask whether @path is a mount point - mount(2), umount2(2) - and
+ * NOT for path resolution, which wants rvvm_mount_covering() below (the "/" row
+ * is deliberately not a match here). Caller holds the namespace lock. See
+ * rvvm_mount_ns_t for why the table is not per context. */
 static const rvvm_mount_t* rvvm_mount_find(const struct rvvm_mount_ns* ns, const char* path)
 {
     const rvvm_mount_t* best = NULL;
@@ -4237,9 +4240,83 @@ static const rvvm_mount_t* rvvm_mount_find(const struct rvvm_mount_ns* ns, const
     return best;
 }
 
-/* Whether a guest path skips the hostfs prefix.
+/* The mount row that covers @path as a *namespace* question: longest match
+ * first, with the run's own root ("/") as the fallback for anything the table
+ * does not otherwise cover. Caller holds the namespace lock.
  *
- * The rule is the one the array implemented, unchanged: a mounted path does not
+ * Not the same question as rvvm_mount_find() above, and the difference is why
+ * both exist:
+ *
+ *   rvvm_mount_find()      "is @path itself a mount point (or under one)" -
+ *                          mount(2)/umount2(2) ask this, and "/" must NOT count
+ *                          there, because every path is under it and finding it
+ *                          would make every mount(2) an EBUSY.
+ *   rvvm_mount_covering()  "who answers @path" - path resolution asks this, and
+ *                          "/" is exactly the answer for a path nothing else
+ *                          covers.
+ *
+ * The "/" row is matched by hand rather than through path_has_prefix(): that
+ * helper requires a component boundary after the prefix, and "/foo" has none
+ * after the bare "/". The root row covers every absolute path, not the paths
+ * that start with a "/" component. */
+static const rvvm_mount_t* rvvm_mount_covering(const struct rvvm_mount_ns* ns, const char* path)
+{
+    const rvvm_mount_t* best = NULL;
+    size_t               best_len = 0;
+    unsigned             i;
+
+    if (!ns || !path) {
+        return NULL;
+    }
+    for (i = 0; i < ns->count; ++i) {
+        const rvvm_mount_t* m = &ns->mounts[i];
+        size_t               len;
+        bool                 hit;
+        if (m->path[0] == '/' && m->path[1] == '\0') {
+            len = 1;
+            hit = (path[0] == '/');
+        } else {
+            len = rvvm_strlen(m->path);
+            hit = path_has_prefix(path, m->path);
+        }
+        if (!hit || len <= best_len) {
+            continue;
+        }
+        best     = m;
+        best_len = len;
+    }
+    return best;
+}
+
+/* Who answers a guest-absolute path, and the row that says so. @mount is NULL and
+ * @provider ROOTFS when nothing but the run's own root covers it - reported that
+ * way rather than as the "/" row, so no caller mistakes the root row for a
+ * provider with storage of its own. That stops being a distinction the day "/"
+ * is served by a real mount (the empty MEMFS root is the next change), and this
+ * struct is where that change lands: the answer becomes a provider rather than a
+ * boolean. */
+typedef struct {
+    const rvvm_mount_t*   mount;
+    rvvm_mount_provider_t provider;
+} rvvm_path_owner_t;
+
+/* Caller holds the namespace lock. */
+static rvvm_path_owner_t rvvm_path_owner(const struct rvvm_mount_ns* ns, const char* path)
+{
+    rvvm_path_owner_t owner;
+
+    owner.mount    = rvvm_mount_covering(ns, path);
+    owner.provider = owner.mount ? owner.mount->provider : RVVM_MOUNT_ROOTFS;
+    if (owner.provider == RVVM_MOUNT_ROOTFS) {
+        owner.mount = NULL;
+    }
+    return owner;
+}
+
+/* Whether a guest path skips the hostfs prefix - i.e. is answered by a mount of
+ * its own rather than by the run's rootfs.
+ *
+ * The rule is the one the array implemented, unchanged: a covered path does not
  * get the prefix, UNLESS the run's own rootfs has that directory - a minirootfs
  * ships /dev and /tmp as empty directories, and sending an access to the host's
  * root, where they do not exist, would lose a directory the guest can see in its
@@ -4247,30 +4324,38 @@ static const rvvm_mount_t* rvvm_mount_find(const struct rvvm_mount_ns* ns, const
  * because a name that does not exist yet has no entry of its own and asking about
  * it would send that very open() to the host.
  *
+ * Where the covering row comes from is now rvvm_path_owner() rather than a
+ * longest-match of its own; what is decided is unchanged. A path only the root
+ * covers has provider ROOTFS and does not bypass, which is the answer the old
+ * "no covering row" gave.
+ *
  * prefix == NULL means the guest's paths ARE the host's paths, so everything
  * bypasses. That is the one answer here that is not derived from the table, and
  * it is what the next change removes.
  */
 static bool path_bypass(const char* path)
 {
-    const rvvm_mount_t* m;
-    const char*         prefix = uctx()->prefix_path;
-    bool                bypassed;
+    rvvm_path_owner_t owner;
+    bool              bypassed;
 
-    if (prefix == NULL) {
+    if (uctx()->prefix_path == NULL) {
         return true;
     }
     if (!path) {
         return false;
     }
     spin_lock(&uctx()->mountns->lock);
-    m        = rvvm_mount_find(uctx()->mountns, path);
-    /* Decided under the lock because it is half table and half shadow, and the
-     * shadow can be replaced under it by another thread. */
-    bypassed = (uctx()->shadow == NULL ||
-                vp_shadow_view_lookup(&uctx()->shadow_view, m ? m->path : path) == NULL);
+    owner = rvvm_path_owner(uctx()->mountns, path);
+    if (owner.provider == RVVM_MOUNT_ROOTFS) {
+        bypassed = false;
+    } else {
+        /* Decided under the lock because it is half table and half shadow, and
+         * the shadow can be replaced under it by another thread. */
+        bypassed = (uctx()->shadow == NULL ||
+                    vp_shadow_view_lookup(&uctx()->shadow_view, owner.mount->path) == NULL);
+    }
     spin_unlock(&uctx()->mountns->lock);
-    return m ? bypassed : false;
+    return bypassed;
 }
 
 /* mount(2) and umount2(2) against the table.
