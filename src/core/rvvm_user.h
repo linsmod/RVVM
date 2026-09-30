@@ -326,13 +326,100 @@ void rvvm_session_pty_free(rvvm_host_pty_t* pty);
 // Passing NULL is how a host asks for passthrough. The direction of the mount
 // is always the host's, per machine: there is no environment override.
 //
-// The string is copied and may be freed by the caller. Must be called before
-// rvvm_user_linux_ex().
+// A relative @prefix is resolved against the working directory HERE, once, and
+// the stored string is always absolute. That is not tidiness: three consumers
+// downstream need an absolute string and cannot arrange it themselves -
+// rvvm_user_linux_ex() chdir()s into the prefix (which moves the cwd a relative
+// one would then resolve against), path_wrapped() compares a getcwd() result
+// against the prefix as a literal, and map_abs_path_ex() hands the concatenation
+// to host syscalls that resolve it against whatever the cwd is by then.
+//
+// NOT a boot argument, and not reachable from one. The prefix is a host path and
+// the command line is guest-facing: the rootfs sits under the APK's private
+// directory on Android and under the release tree on win32, so a command line
+// carrying a prefix would mean a different run on each. The command line's
+// spelling of "where the guest's / is" is root=, and it is currently only
+// recorded - see rvvm_user_set_cmdline().
 void rvvm_user_set_prefix(rvvm_machine_t* machine, const char* prefix);
 
-// Read back the prefix in effect (NULL when host paths pass through). The
-// pointer is owned by the machine.
+// Read back the prefix in effect, always absolute when non-NULL (NULL when host
+// paths pass through). The pointer is owned by the machine.
 const char* rvvm_user_get_prefix(rvvm_machine_t* machine);
+
+// --- The machine's command line ---
+//
+// rvvm_set_cmdline() (rvvm.h) records a command line; this records the same
+// string for a userland machine and is the entry point a host uses, because it
+// is the one that also reaches the userland halves (below).
+//
+// What is applied, and why so little:
+//
+//   root=<path>   NOT applied, and this is a real gap rather than an oversight.
+//                 It is the guest's spelling of "where / is", so applying it is
+//                 what a caller would expect - but the guest's filesystem is
+//                 answered from two places and only one of them is a host path.
+//                 The archive index (vp_shadow, via vp_shadow_lookup) answers
+//                 stat(), getdents64() and every symlink for any name in the
+//                 rootfs, and it knows nothing about a sub-root. Applying root=
+//                 to the host-path branch alone (map_abs_path_ex) was tried and
+//                 measured: with any real bundle present, `root=/sbin` still
+//                 resolved /etc/resolv.conf, because the answer came from the
+//                 index and never reached the prefix.
+//
+//                 A chroot needs three things that do not exist yet, and none
+//                 is a flag: re-rooted lookups at every vp_shadow_lookup() call
+//                 site, enumeration filtering so getdents64() cannot list what
+//                 is above the root, and symlink targets resolved inside it
+//                 (shadow_follow_path / shadow_resolve_parent /
+//                 shadow_link_target). /proc/self/root and /proc/<pid>/root have
+//                 to report the new root too. That is a mount table - see
+//                 path_bypass() for the list it would replace - and it is
+//                 larger than this argument.
+//
+//                 So the argument is kept, stored, and readable with
+//                 rvvm_user_cmdline_arg(machine, "root"). Kept rather than
+//                 refused so that a command line written for a machine with
+//                 mounts is still accepted and visible to the guest, and so the
+//                 day the mount table lands this becomes a one-line change
+//                 rather than a new spelling. Refusing it would also be worse:
+//                 the run would then fail on an argument whose meaning is
+//                 perfectly clear, which is the opposite of what a boot argument
+//                 is for.
+//
+//   init=<path>   NOT applied, and cannot be. It names the first program, and
+//                 only a host knows what programs exist - on win32 that is
+//                 /sbin/vpsessiond from the system layer, on Android it is
+//                 whichever app the run was started with. The core has no way to
+//                 be right about it and a wrong answer is a machine that boots
+//                 something nobody asked for. Each host reads it itself
+//                 (ash_serve, GuestActivity).
+//
+//   loglevel=, debug
+//                 NOT applied here either, and deliberately: rvvm_set_loglevel()
+//                 is process-wide, not per machine, so an argument that changed
+//                 it would be describing the host rather than the machine. It is
+//                 applied by rvvm_apply_cmdline_logging() (utils.h), which the
+//                 hosts call before the run starts.
+//
+// Anything else is kept and not rejected: a kernel ignores what it does not know,
+// and a guest program may not. Call this after the host has installed its prefix
+// (a bundle, an extracted rootfs).
+void rvvm_user_set_cmdline(rvvm_machine_t* machine, const char* str);
+
+// The command line in effect, as /proc/cmdline reports it: never NULL, and "" for
+// a machine that was booted without one. Owned by the machine.
+const char* rvvm_user_get_cmdline(rvvm_machine_t* machine);
+
+// The value of <key> in the machine's command line, or NULL when it is absent or
+// has no value. `key` is the text before the first '=' and is matched whole, so
+// "root" never answers for "rootflags". The pointer is into the machine's
+// command line and is invalidated by the next rvvm_user_set_cmdline().
+const char* rvvm_user_cmdline_arg(rvvm_machine_t* machine, const char* key);
+
+// Whether <key> appears in the machine's command line at all, with or without a
+// value - which is the whole test for a bare flag like `debug`, where the
+// question is its presence and never its argument.
+bool rvvm_user_cmdline_has(rvvm_machine_t* machine, const char* key);
 
 // --- Bundled assets (the /assets directory) ---
 //

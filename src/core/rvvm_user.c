@@ -3621,22 +3621,123 @@ PUBLIC void rvvm_user_set_exit_callback(rvvm_machine_t* machine, rvvm_user_exit_
     if (ctx) ctx->exit_callback = callback;
 }
 
+/*
+ * Whether @path is already a host-absolute path.
+ *
+ * Both spellings, because the hosts are not one platform: a POSIX build wants a
+ * leading '/', and a Windows build has to recognise "C:\dir" and the UNC form
+ * "\\server\share" as well - a prefix starting with a drive letter is absolute
+ * there and looks relative to a check that only looks for '/'.
+ *
+ * MinGW's CRT accepts '/'-separated absolute paths, so a leading '/' counts on
+ * Windows too. That is the one place the two platforms are deliberately not
+ * treated differently: the alternative is rejecting a path the host's own
+ * syscalls would have accepted, which buys nothing.
+ */
+static bool host_path_is_absolute(const char* path)
+{
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (path[0] == '/' || path[0] == '\\') {
+        return true;
+    }
+    /* "C:" alone is the drive's current directory, not an absolute path, so it
+     * needs the separator after it to count. */
+    return path[1] == ':' && (path[2] == '/' || path[2] == '\\');
+}
+
+/*
+ * @path as a host-absolute path, or NULL when it cannot be made one.
+ *
+ * A relative path is joined onto the current working directory rather than
+ * refused, because the callers are hosts naming a directory they can see, and
+ * "runtime/rootfs" is a thing a person types. It is resolved HERE, once, at the
+ * point a host hands over a prefix - and that is the whole reason this is not
+ * done in map_abs_path_ex() or wherever the path is finally used:
+ *
+ *   - rvvm_user_linux_ex() chdir()s into the prefix, which moves the cwd; a
+ *     prefix still relative afterwards would resolve against the directory it
+ *     just entered, so "./rootfs/etc/x" would become "<rootfs>/rootfs/etc/x".
+ *   - path_wrapped() compares a getcwd() result against the prefix as a literal
+ *     string, so a relative prefix can never match and the "already wrapped,
+ *     don't chdir again" test never passes.
+ *   - the prefix is concatenated onto guest paths and handed to host syscalls,
+ *     which resolve a relative result against whatever the cwd is by then.
+ *
+ * All three want an absolute string, and all three are downstream of the setter.
+ * Making the invariant "a stored prefix is absolute" hold at the one place a
+ * host sets it is what keeps three consumers from each having to know it.
+ *
+ * NULL when getcwd() fails: a prefix that cannot be resolved must not be stored,
+ * because storing it would put back exactly the bug this removes.
+ */
+static const char* host_path_absolute(char* buffer, size_t size, const char* path)
+{
+    char    cwd[UAPI_PATH_MAX];
+    size_t  at = 0;
+
+    if (!path || !path[0]) {
+        return NULL;
+    }
+    if (host_path_is_absolute(path)) {
+        return path;
+    }
+    if (!getcwd(cwd, sizeof(cwd))) {
+        return NULL;
+    }
+    at = rvvm_strlcpy(buffer, cwd, size);
+    if (at >= size) {
+        return NULL;
+    }
+    /* One separator, and only when there is not already one: the cwd can end in
+     * a separator on Windows ("C:\") and a doubled one is harmless there but is
+     * a different string to the hostfs path a test compares against. */
+    if (at > 0 && buffer[at - 1] != '/' && buffer[at - 1] != '\\') {
+        if (at + 1 >= size) {
+            return NULL;
+        }
+        buffer[at++] = '/';
+        buffer[at]   = '\0';
+    }
+    rvvm_strlcpy(buffer + at, path, size - at);
+    return buffer;
+}
+
 PUBLIC void rvvm_user_set_prefix(rvvm_machine_t* machine, const char* prefix)
 {
     rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    char             absolute[UAPI_PATH_MAX];
+    const char*      resolved;
+
     if (!ctx) {
         return;
     }
     safe_free(ctx->prefix_owned);
     ctx->prefix_owned = NULL;
-    if (prefix && prefix[0]) {
-        size_t len = strlen(prefix) + 1;
-        char* copy = safe_malloc(len);
-        memcpy(copy, prefix, len);
+    ctx->prefix_path  = NULL;
+    if (!prefix || !prefix[0]) {
+        return;
+    }
+    /* Resolved here rather than by each host: this setter is where a host hands
+     * over a real rootfs, so it is the host boundary. See host_path_absolute()
+     * for what breaks downstream if the stored string is relative. */
+    resolved = host_path_absolute(absolute, sizeof(absolute), prefix);
+    if (!resolved) {
+        rvvm_warn("prefix %s is relative and the working directory could not be "
+                  "read; the guest's paths pass through unchanged", prefix);
+        return;
+    }
+    {
+        /* From `resolved`, not from `absolute`: the helper returns the caller's
+         * own pointer when the path was already absolute, having written nothing
+         * to the buffer - so reading the buffer there would hand back whatever
+         * was on the stack. */
+        size_t len = strlen(resolved) + 1;
+        char*  copy = safe_malloc(len);
+        memcpy(copy, resolved, len);
         ctx->prefix_owned = copy;
-        ctx->prefix_path = copy;
-    } else {
-        ctx->prefix_path = NULL;
+        ctx->prefix_path  = copy;
     }
 }
 
@@ -3645,6 +3746,40 @@ PUBLIC const char* rvvm_user_get_prefix(rvvm_machine_t* machine)
     rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
     return ctx ? ctx->prefix_path : NULL;
 }
+
+/*
+ * The command line's arguments are scanned by rvvm_cmdline_get()/
+ * rvvm_cmdline_has() in utils.c. They are not re-implemented here: the core, the
+ * logger and both hosts all ask questions of one string, and three scanners over
+ * it is three answers to disagree.
+ */
+
+PUBLIC void rvvm_user_set_cmdline(rvvm_machine_t* machine, const char* str)
+{
+    if (!machine) {
+        return;
+    }
+    /* rvvm_set_cmdline() rather than a private store: the device tree copy and
+     * /proc/cmdline have to come from the same call, or a kernel guest and a
+     * userland guest on this machine disagree about what it was booted with. */
+    rvvm_set_cmdline(machine, str ? str : "");
+}
+
+PUBLIC const char* rvvm_user_get_cmdline(rvvm_machine_t* machine)
+{
+    return machine ? machine->cmdline : "";
+}
+
+PUBLIC const char* rvvm_user_cmdline_arg(rvvm_machine_t* machine, const char* key)
+{
+    return machine ? rvvm_cmdline_get(machine->cmdline, key) : NULL;
+}
+
+PUBLIC bool rvvm_user_cmdline_has(rvvm_machine_t* machine, const char* key)
+{
+    return machine && rvvm_cmdline_has(machine->cmdline, key);
+}
+
 
 PUBLIC void rvvm_user_set_assets(rvvm_machine_t* machine, const rvvm_asset_ops_t* ops, void* userdata)
 {
@@ -3761,8 +3896,48 @@ static void proc_symbolize(const char* label, const char* elf, const rvvm_addr_t
     proc_pclose(pipe);
 }
 
+/*
+ * The hostfs base a fresh context starts with, when nobody named another.
+ *
+ * It used to be "/home/lekkit/stuff/userland/debian" - one developer's home
+ * directory, hardcoded, on every build of every platform. It was a directory
+ * that exists on exactly one machine on earth, so every other build inherited a
+ * prefix pointing at nothing and said so on stderr before it did anything else:
+ *
+ *     ERROR: Failed to chdir to userland prefix /home/lekkit/stuff/userland/debian
+ *
+ * That line is worse than noise. It arrives before the guest's first
+ * instruction, on every run, including the many that go on to work - because
+ * rvvm_user_linux_ex() installs a rootfs over it (see rvvm_user_set_prefix in
+ * the win32 bridge and jni_bridge.c) and the run is fine. So the one diagnostic a
+ * user sees first is a developer's path failing, and the habit it trains is to
+ * ignore stderr.
+ *
+ * "./runtime/rootfs" is the directory the release tree already uses: that is
+ * where vp_bundle_mount() and win32_guest_rootfs_mount() materialize the rootfs
+ * (see vp_rootfs.h's VP_BUNDLE_DIR and the "runtime/rootfs" in jni_bridge.c), so
+ * the default now points at where the rootfs actually is rather than at a
+ * memory of someone's desktop. A host that installs its own still overwrites it,
+ * which is why this is only ever a starting point - see ctx->prefix_path.
+ *
+ * NULL would be the honest "no namespace" answer, and it is what the riscv build
+ * already uses. It is not the default here because a passthrough context has no
+ * prefix to chdir into at all, and the run is then silently unsandboxed - see
+ * path_bypass() for why that is a decision rather than a fallback.
+ *
+ * Relative, which is worth being straight about: rvvm_user_linux_ex() chdir()s
+ * into this (line ~16697), so the default resolves against the cwd the binary was
+ * started in. Every host that installs a rootfs overwrites it with an absolute
+ * path first - win32_cmdpost_bridge.c and jni_bridge.c both call
+ * rvvm_user_set_prefix() with the real location, and the win32 side goes out of
+ * its way to locate the bundle by the executable's own directory rather than the
+ * cwd. So this default only decides a bare `rvvm_user <elf>` from a release
+ * directory, which is the one case where "next to the binary" is what the caller
+ * meant anyway. An absolute default was the other option and was worse: it would
+ * have to name a build machine's layout to be right anywhere.
+ */
 #ifndef __riscv
-#define USERLAND_DEFAULT_PREFIX "/home/lekkit/stuff/userland/debian"
+#define USERLAND_DEFAULT_PREFIX "./runtime/rootfs"
 #else
 #define USERLAND_DEFAULT_PREFIX NULL
 #endif
@@ -11729,8 +11904,33 @@ static size_t userland_proc_gen_filesystems(char* buf, size_t size)
         "\text4\n");
 }
 
+/*
+ * /proc/cmdline: the command line the machine was booted with.
+ *
+ * This used to answer "\n" unconditionally, which was true of nothing: not of a
+ * machine rvvm_set_cmdline() had been called on, and not of a Linux guest either,
+ * whose arguments live in /chosen/bootargs rather than here. It answered a
+ * constant, so a program reading it learned that the machine it is running on
+ * has no remembered boot arguments - which for a guest that was booted with some
+ * is a lie, and a quiet one.
+ *
+ * The string is machine->cmdline, which rvvm_set_cmdline() and
+ * rvvm_append_cmdline() fill from the same place they write /chosen/bootargs
+ * from. So the kernel that reads bootargs and the userspace that reads this are
+ * looking at one set of arguments, and neither can be right about the other
+ * being wrong.
+ *
+ * Answered without the trailing newline a real /proc/cmdline does not have -
+ * that is what a `cat` of the real file looks like, and a reader that trims one
+ * newline should not have to know which file it was reading. The empty machine
+ * gets "\n" and nothing else, which is what an argument-less boot looks like.
+ */
 static size_t userland_proc_gen_root_cmdline(char* buf, size_t size)
 {
+    rvvm_machine_t* machine = cur_machine();
+    if (machine && machine->cmdline[0]) {
+        return userland_proc_appendf(buf, size, 0, "%s\n", machine->cmdline);
+    }
     return userland_proc_appendf(buf, size, 0, "\n");
 }
 
@@ -16104,7 +16304,6 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
     /* The console is already open on 0/1/2 before the guest runs a single
      * instruction, so the table starts out knowing those numbers are taken. */
     userland_fd_table_init(ctx);
-    ctx->prefix_path  = USERLAND_DEFAULT_PREFIX;
     ctx->fake_root    = USERLAND_DEFAULT_FAKE_ROOT;
     /* Guests run as root until they say otherwise, which is what makes the
      * rootfs writable out of the box; the first setuid/setgid is what makes
@@ -16125,6 +16324,20 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
     // answer in user_tty_ioctl(): canonical, echoing, line editing.
     ctx->tty_lflag    = TTY_LFLAG_DEFAULT;
     machine->userdata = ctx;
+
+    /* The default prefix, through the setter and here rather than among the field
+     * initialisations above: the setter resolves a relative path against the
+     * working directory, and it finds the context through machine->userdata,
+     * which only exists from the line above. Called earlier it would have found
+     * no context, returned without complaint, and left the guest with no prefix
+     * at all - a default that is silently absent is worse than a wrong one,
+     * because nothing says so.
+     *
+     * Worth the extra line: rvvm_user_set_prefix() resolves because the chdir()
+     * in rvvm_user_linux_ex() and the literal compare in path_wrapped() both
+     * need an absolute string, and neither can tell that this one was assigned
+     * without ever going through it. */
+    rvvm_user_set_prefix(machine, USERLAND_DEFAULT_PREFIX);
     return machine;
 }
 
