@@ -204,6 +204,57 @@ Check ($r -notmatch '(?m)\bd2\b') "the directory is gone"
 $r = Client 'ln /mnt/big /tmp/hop'
 Check ($r -match 'cross-device') "a hard link across a mount is EXDEV ('$($r.Trim())')"
 
+# --- read-only, which a tmpfs now has somewhere to keep ----------------------
+$rc = ClientRc 'mount -t tmpfs -o ro tmpfs /rdonly'
+Check ($rc -eq 0) "mount a tmpfs with -o ro (rc $rc)"
+$r = Client 'grep " /rdonly " /proc/mounts'
+Check ($r -match 'tmpfs ro,') "/proc/mounts reports it read-only ('$($r.Trim())')"
+$r = Client 'touch /rdonly/f'
+Check ($r -match 'Read-only file system') "a create on it is EROFS"
+$rc = ClientRc 'umount /rdonly'
+Check ($rc -eq 0) "unmount it (rc $rc)"
+
+# A remount is how a guest turns a mount read-only, and it used to be answered
+# with a success that changed nothing at all.
+$rc = ClientRc 'mount -t tmpfs tmpfs /rm'
+Check ($rc -eq 0) "mount a writable tmpfs (rc $rc)"
+$rc = ClientRc 'touch /rm/f'
+Check ($rc -eq 0) "a create on it works (rc $rc)"
+# touch(1) asks utimensat() first and only creates when that says ENOENT, so a
+# utimensat that answered success unconditionally left touch reporting success
+# with no file behind it. The file's existence is the assertion that catches it.
+$r = Client 'ls /rm'
+Check ($r -match '(?m)^f\r?$') "and the file is really there"
+$rc = ClientRc 'mount -o remount,ro /rm'
+Check ($rc -eq 0) "remount it read-only (rc $rc)"
+$r = Client 'grep " /rm " /proc/mounts'
+Check ($r -match 'tmpfs ro,') "and /proc/mounts agrees ('$($r.Trim())')"
+$r = Client 'touch /rm/g'
+Check ($r -match 'Read-only file system') "the next create is EROFS"
+$rc = ClientRc 'mount -o remount,rw /rm'
+Check ($rc -eq 0) "remount it writable again (rc $rc)"
+$rc = ClientRc 'touch /rm/g'
+Check ($rc -eq 0) "and a create works again (rc $rc)"
+$rc = ClientRc 'umount /rm'
+Check ($rc -eq 0) "unmount it (rc $rc)"
+
+# size= is a budget on the bytes, so a write past it is ENOSPC rather than a
+# short write or a file that quietly stops growing.
+$rc = ClientRc 'mount -t tmpfs -o size=8k tmpfs /small'
+Check ($rc -eq 0) "mount a tmpfs with size=8k (rc $rc)"
+$r = Client 'grep " /small " /proc/mounts'
+Check ($r -match 'size=8k') "/proc/mounts reports the size ('$($r.Trim())')"
+$rc = ClientRc 'dd if=/dev/zero of=/small/f bs=1024 count=8 2>/dev/null'
+Check ($rc -eq 0) "fill it exactly (rc $rc)"
+$r = Client 'dd if=/dev/zero of=/small/g bs=1024 count=9 2>&1'
+Check ($r -match 'No space left') "a write past it is ENOSPC"
+$r = Client 'stat -c %s /small/f'
+Check ($r.Trim() -eq '8192') "and the bytes that fit are still there ('$($r.Trim())')"
+$r = Client 'echo x > /small/h'
+Check ($r -match 'No space left') "a second file has no room either: the budget is the mount's"
+$rc = ClientRc 'umount /small'
+Check ($rc -eq 0) "unmount it (rc $rc)"
+
 # --- private, and it dies with the mount ------------------------------------
 $r = Client 'ls /mnt'
 Check ($r -match '(?m)\bf\b') "the file is there before the unmount"

@@ -1278,7 +1278,28 @@ void rvvm_memfs_free(rvvm_memfs_t* fs)
     free(fs);
 }
 
-bool     rvvm_memfs_read_only(const rvvm_memfs_t* fs)   { return fs ? fs->read_only : false; }
+bool rvvm_memfs_read_only(rvvm_memfs_t* fs)
+{
+    bool ro;
+    if (!fs) {
+        return false;
+    }
+    rvvm_lock(&fs->lock);
+    ro = fs->read_only;
+    rvvm_unlock(&fs->lock);
+    return ro;
+}
+
+void rvvm_memfs_set_read_only(rvvm_memfs_t* fs, bool read_only)
+{
+    if (!fs) {
+        return;
+    }
+    rvvm_lock(&fs->lock);
+    fs->read_only = read_only;
+    rvvm_unlock(&fs->lock);
+}
+
 uint64_t rvvm_memfs_size_limit(const rvvm_memfs_t* fs) { return fs ? fs->size_limit : 0; }
 
 uint64_t rvvm_memfs_used(rvvm_memfs_t* fs)
@@ -1952,6 +1973,31 @@ rvvm_memfs_result_t rvvm_memfs_truncate(rvvm_memfs_t* fs, const char* path, uint
     }
     if (rc == RVVM_MEMFS_OK) {
         rc = memfs_truncate_inode_locked(fs, memfs_inode_of(fs, idx), size);
+    }
+    rvvm_unlock(&fs->lock);
+    return rc;
+}
+
+rvvm_memfs_result_t rvvm_memfs_touch(rvvm_memfs_t* fs, const char* path)
+{
+    rvvm_memfs_result_t rc;
+    uint32_t            idx;
+
+    if (!fs) {
+        return RVVM_MEMFS_ENOENT;
+    }
+    rvvm_lock(&fs->lock);
+    if (fs->read_only) {
+        rvvm_unlock(&fs->lock);
+        return RVVM_MEMFS_EROFS;
+    }
+    /* Follows, and through the same resolver the lookups use: a touch of a
+     * symlink stamps what it points at, which is what utimensat() without
+     * AT_SYMLINK_NOFOLLOW does, and a dangling link is ENOENT rather than a
+     * success on a name whose target is not there. */
+    rc = memfs_resolve_locked(fs, path, true, &idx);
+    if (rc == RVVM_MEMFS_OK) {
+        memfs_inode_of(fs, idx)->mtime = memfs_now();
     }
     rvvm_unlock(&fs->lock);
     return rc;

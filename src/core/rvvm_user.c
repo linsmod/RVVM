@@ -4412,6 +4412,136 @@ static bool path_bypass(const char* path)
     return bypassed;
 }
 
+/* Parse a tmpfs `size=` value: a byte count, or one of the usual k/m/g suffixes,
+ * which is what mount(8) and an fstab line both write. Linux additionally accepts
+ * a percentage of RAM, and that is deliberately not read here: this filesystem's
+ * size is a count of bytes it hands out, so a share of a machine's memory would
+ * be a number with nothing to answer it - and reading "50%" as 50 bytes would be
+ * far worse than refusing it. Returns false when the text is not a size. */
+static bool memfs_parse_size(const char* text, uint64_t* out)
+{
+    uint64_t    value = 0;
+    const char* p     = text;
+
+    if (!p || !*p) {
+        return false;
+    }
+    while (*p >= '0' && *p <= '9') {
+        /* Refused rather than wrapped: a count that stops fitting is not a limit
+         * anything will reach, and a wrapped one would be a small limit that looks
+         * real. The bound is 62 bits because the suffix still multiplies. */
+        if (value > (((uint64_t)1 << 62) / 10)) {
+            return false;
+        }
+        value = value * 10 + (uint64_t)(*p - '0');
+        p++;
+    }
+    if (p == text) {
+        return false; /* no digits at all */
+    }
+    if (*p) {
+        uint64_t mul;
+        switch (*p) {
+            case 'k': case 'K': mul = 1024ULL; break;
+            case 'm': case 'M': mul = 1024ULL * 1024ULL; break;
+            case 'g': case 'G': mul = 1024ULL * 1024ULL * 1024ULL; break;
+            default: return false; /* a suffix this does not know */
+        }
+        p++;
+        if (*p) {
+            return false; /* trailing rubbish after the suffix */
+        }
+        if (value && mul > (((uint64_t)1 << 62) / value)) {
+            return false;
+        }
+        value *= mul;
+    }
+    *out = value;
+    return true;
+}
+
+/* The two fields of a tmpfs's mount data this core acts on: `size=`, and `ro`.
+ * The data is a comma-separated list.
+ *
+ * `ro` is read from here as well as from the flags because mount(8) does not
+ * always put it in the flags: for a filesystem whose name it does not recognise
+ * it passes the whole option list through instead, which is exactly how
+ * `mount -t tmpfs -o ro ...` arrives. Both spellings are honoured and either one
+ * asking for ro is enough, since a caller that wrote it twice did not mean rw.
+ * `rw` needs no arm: writable is what a mount is unless something says otherwise.
+ *
+ * Fields that are not modelled are ignored rather than refused. mount(8) adds
+ * mode=, uid= and friends on its own initiative, and failing a mount over an
+ * option that would not have changed the answer stops a routine boot for nothing.
+ * A size= that is present and unreadable is EINVAL, which is the one case where
+ * ignoring it would leave the guest with a limit it did not ask for. Returns 0
+ * with @have_size false when there is no size= at all. */
+static rvvm_addr_t memfs_mount_options(const char* data, uint64_t* size_out,
+                                       bool* have_size, bool* read_only_out)
+{
+    const char* p = data;
+
+    *have_size = false;
+    while (p && *p) {
+        const char* comma = strchr(p, ',');
+        size_t      len   = comma ? (size_t)(comma - p) : strlen(p);
+
+        if (len > 5 && !strncmp(p, "size=", 5)) {
+            char num[32];
+            if (len - 5 >= sizeof(num)) {
+                return -UAPI_EINVAL;
+            }
+            memcpy(num, p + 5, len - 5);
+            num[len - 5] = '\0';
+            if (!memfs_parse_size(num, size_out)) {
+                return -UAPI_EINVAL;
+            }
+            *have_size = true;
+        } else if (len == 2 && !strncmp(p, "ro", 2)) {
+            *read_only_out = true;
+        }
+        if (!comma) {
+            break;
+        }
+        p = comma + 1;
+    }
+    return 0;
+}
+
+/* The row mounted at exactly @abs, or NULL. Deliberately not rvvm_mount_find():
+ * that answers "which mount covers this path" with the longest prefix, which is
+ * the right question for resolving a path and the wrong one for anything that
+ * asks about a mount point itself - a remount of /mnt/sub must not find /mnt and
+ * turn that read-only instead. Caller holds the namespace lock. */
+static rvvm_mount_t* mount_row_exact(struct rvvm_mount_ns* ns, const char* abs)
+{
+    unsigned i;
+
+    for (i = 0; i < ns->count; ++i) {
+        if (!strcmp(ns->mounts[i].path, abs)) {
+            return &ns->mounts[i];
+        }
+    }
+    return NULL;
+}
+
+/* The options string a tmpfs row reports, which is what /proc/mounts hands the
+ * guest. Written from the storage rather than from the request, so the flag and
+ * the size a guest reads there are the ones it is really under: a row that said
+ * rw over storage that refuses every write is the kind of lie this whole table
+ * exists to stop telling. */
+static void mount_row_tmpfs_options(rvvm_mount_t* m, bool read_only)
+{
+    uint64_t limit = rvvm_memfs_size_limit(m->memfs);
+
+    if (limit) {
+        snprintf(m->options, sizeof(m->options), "%s,relatime,size=%lluk",
+                 read_only ? "ro" : "rw", (unsigned long long)(limit / 1024));
+    } else {
+        snprintf(m->options, sizeof(m->options), "%s,relatime", read_only ? "ro" : "rw");
+    }
+}
+
 /* mount(2) and umount2(2) against the table.
  *
  * These used to be answered without consulting anything: mount(2) returned
@@ -4425,31 +4555,38 @@ static bool path_bypass(const char* path)
  *   devpts      RVVM_MOUNT_CORE.   The same, and it is a real capability that
  *                                  was never expressed: /dev/pts holds the
  *                                  rvvm_session_pty_* pairs.
- *   tmpfs       RVVM_MOUNT_HOSTFS. The host's own directory, reached directly.
+ *   tmpfs       RVVM_MOUNT_MEMFS.  A memory filesystem the mount owns.
  *   sysfs       RVVM_MOUNT_HOSTFS. As today.
  *
  * Anything else is ENOSYS - which is what it already was, and is now for a reason
  * a caller can act on rather than by accident.
  *
- * A tmpfs's `data=` is not honoured, and that is the sharp edge. mount() has no
- * way to say where a tmpfs should live on the host, so a new tmpfs mount point
- * answers with the host's directory of the same name: /mnt answers /mnt. A
- * caller who wanted a private directory asked for something this cannot express.
- * It is accepted rather than refused, and the property is written on the entry
- * rather than left to be discovered: refusing would fail every guest that mounts
- * a tmpfs as a matter of routine. What is refused is what would be a lie -
- * MS_RDONLY, MS_NODEV and friends, because nothing here enforces them.
+ * A tmpfs is the one filesystem here whose bytes the core has: private to the
+ * run, dying with the mount, and the only place a size= or a read-only flag has
+ * anything behind it. So `data=size=64k` bounds what a guest can store and
+ * MS_RDONLY makes every write fail, and both are enforced by the storage rather
+ * than recorded on the row - /proc/mounts then reports what is really there,
+ * including on a remount, because the string is written from the storage.
+ *
+ * What is still refused is what would be a lie: MS_NODEV, MS_NOSUID and MS_NOEXEC
+ * have nothing behind them for any filesystem here, and MS_RDONLY has nothing
+ * behind it for a proc or sysfs row either, since those are served by code that
+ * does not implement the check.
  */
 static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
-                                   const char* fstype, unsigned long flags)
+                                   const char* fstype, unsigned long flags,
+                                   const char* data)
 {
     rvvm_userland_t*      ctx = uctx();
     rvvm_mount_provider_t provider;
-    rvvm_memfs_t*         memfs = NULL;
+    rvvm_memfs_t*         memfs      = NULL;
+    uint64_t              size_limit = 0;
+    bool                  have_size  = false;
+    bool                  read_only  = false;
     char                  abs[UAPI_PATH_MAX];
     unsigned              i;
 
-    if (!target || !fstype) {
+    if (!target) {
         return -UAPI_EFAULT;
     }
     if (!guest_path_absolutize(abs, sizeof(abs), target)) {
@@ -4460,6 +4597,52 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
      * is EINVAL rather than an ENOSYS that names the wrong problem. */
     if (abs[0] == '/' && abs[1] == '\0') {
         return -UAPI_EINVAL;
+    }
+
+    /* A flag with nothing behind it is worse than a refusal: a guest that mounts
+     * /tmp nodev and then writes to it has been told it cannot. Nothing here
+     * enforces nodev, nosuid or noexec for any filesystem, so those are refused -
+     * checked before the remount below, so the answer does not depend on which row
+     * is involved. */
+    if (flags & (UAPI_MS_NOSUID | UAPI_MS_NODEV | UAPI_MS_NOEXEC)) {
+        return -UAPI_EINVAL;
+    }
+
+    /* MS_REMOUNT asks about a mount that is already there, and init and mount(8)
+     * pass it routinely. A remount may also leave the filesystem out entirely -
+     * mount(8) does - so it is answered before the fstype is looked at: the row
+     * already knows what it is. */
+    if (flags & UAPI_MS_REMOUNT) {
+        int           rc;
+        spin_lock(&ctx->mountns->lock);
+        {
+            rvvm_mount_t* m = mount_row_exact(ctx->mountns, abs);
+            rc = 0;
+            if (!m) {
+                /* Not a mount point, so there is nothing to remount. Linux
+                 * answers EINVAL here as well. */
+                rc = -UAPI_EINVAL;
+            } else if (m->provider == RVVM_MOUNT_MEMFS && m->memfs) {
+                bool ro = (flags & UAPI_MS_RDONLY) != 0;
+                /* A remount is how a guest turns a mount read-only or writable
+                 * again - mount -o remount,ro is the ordinary way - and until now
+                 * it was answered with a success that changed nothing. It sets the
+                 * storage's flag and rewrites the row's options from it, so what
+                 * /proc/mounts says and what the storage does stay one thing. A
+                 * remount of anything else still changes nothing, and that is
+                 * honest: those rows have no writable state to turn off. */
+                rvvm_memfs_set_read_only(m->memfs, ro);
+                mount_row_tmpfs_options(m, ro);
+            }
+        }
+        spin_unlock(&ctx->mountns->lock);
+        return rc;
+    }
+
+    /* From here on it is a new mount, and one without a filesystem is a mount this
+     * core cannot create. */
+    if (!fstype) {
+        return -UAPI_EFAULT;
     }
 
     if (!strcmp(fstype, "proc")) {
@@ -4482,11 +4665,30 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
 
     /* A flag with nothing behind it is worse than a refusal: a guest that mounts
      * /tmp nodev and then writes to it has been told it cannot. Nothing here
-     * enforces nodev or noexec, so nothing here accepts them - and MS_RDONLY
-     * stays refused until the tmpfs below is actually served, so that a mount
-     * this call accepts is a mount the run can honour. */
-    if (flags & (UAPI_MS_RDONLY | UAPI_MS_NOSUID | UAPI_MS_NODEV | UAPI_MS_NOEXEC)) {
+     * enforces nodev, nosuid or noexec for any filesystem, so those are refused. */
+    if (flags & (UAPI_MS_NOSUID | UAPI_MS_NODEV | UAPI_MS_NOEXEC)) {
         return -UAPI_EINVAL;
+    }
+    /* MS_RDONLY is the one of them a tmpfs can honour, because a tmpfs is served
+     * by storage that owns the check. For anything else it stays refused: a proc
+     * or sysfs row served by code that never looks at the flag would be a mount
+     * point that says ro while writing still works. */
+    if ((flags & UAPI_MS_RDONLY) && provider != RVVM_MOUNT_MEMFS) {
+        return -UAPI_EINVAL;
+    }
+    read_only = (flags & UAPI_MS_RDONLY) != 0;
+    if (provider == RVVM_MOUNT_MEMFS) {
+        bool data_ro = false;
+        if (memfs_mount_options(data, &size_limit, &have_size, &data_ro)) {
+            /* An unreadable size=, which is the one field that changes the answer:
+             * mounting anyway would give the guest a limit it did not ask for, or
+             * none where it asked for one. @have_size is not consulted - absent
+             * means no limit, which is what zero already says. */
+            return -UAPI_EINVAL;
+        }
+        /* A `ro` in the data counts as much as the flag: mount(8) puts it there for
+         * a filesystem it does not know by name, which this one is. */
+        read_only = read_only || data_ro;
     }
 
     /* A tmpfs gets storage of its own, built before the row exists and outside
@@ -4495,22 +4697,13 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
      * allocator. Every early return below hands it back (freeing NULL is a
      * no-op for the mounts that have none). */
     if (provider == RVVM_MOUNT_MEMFS) {
-        memfs = rvvm_memfs_create(false, 0);
+        memfs = rvvm_memfs_create((flags & UAPI_MS_RDONLY) != 0, size_limit);
         if (!memfs) {
             return -UAPI_ENOMEM;
         }
     }
 
-    /* MS_REMOUNT asks about a mount that is already there, and init and mount(8)
-     * pass it routinely. Refusing those is how a boot stops for no stated
-     * reason. */
     spin_lock(&ctx->mountns->lock);
-    if (flags & UAPI_MS_REMOUNT) {
-        int mounted = rvvm_mount_find(ctx->mountns, abs) != NULL;
-        spin_unlock(&ctx->mountns->lock);
-        rvvm_memfs_free(memfs);
-        return mounted ? 0 : -UAPI_EINVAL;
-    }
     /* Mounting over something already mounted needs a tree rather than a
      * longest-match list, and a stack is the wrong shape to answer "what covers
      * here" with anyway. Linux says EBUSY. */
@@ -4552,9 +4745,15 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
         memset(m, 0, sizeof(*m));
         rvvm_strlcpy(m->path, abs, sizeof(m->path));
         rvvm_strlcpy(m->fstype, fstype, sizeof(m->fstype));
-        rvvm_strlcpy(m->options, "rw,relatime", sizeof(m->options));
         m->provider = provider;
         m->memfs    = memfs;
+        if (provider == RVVM_MOUNT_MEMFS) {
+            /* From the storage that was just built, so the row reports the flag
+             * and the size the mount is really under. */
+            mount_row_tmpfs_options(m, read_only);
+        } else {
+            rvvm_strlcpy(m->options, "rw,relatime", sizeof(m->options));
+        }
         ctx->mountns->count++;
     }
     spin_unlock(&ctx->mountns->lock);
@@ -14609,9 +14808,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 40: { // mount
                     const char* fstype = to_str(a2);
-                    rvvm_info("sys_mount(%s, %s, %s)", to_str(a0), to_str(a1), fstype);
-                    a0 = (rvvm_addr_t)(int64_t)rvvm_user_mount(to_str(a0), to_str(a1),
-                                                               fstype, (unsigned long)a3);
+                    rvvm_info("sys_mount(%s, %s, %s, %lx, %s)", to_str(a0), to_str(a1), fstype,
+                              a3, to_str(a4) ? to_str(a4) : "(none)");
+                    a0 = (rvvm_addr_t)(int64_t)rvvm_user_mount(to_str(a0), to_str(a1), fstype,
+                                                               (unsigned long)a3, to_str(a4));
                     break;
                 }
                 case 43: { // statfs64
@@ -15741,9 +15941,44 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 83: // fdatasync
                     a0 = errno_ret(fsync(userland_fd_host(uctx(), (int)a0)));
                     break;
-                case 88: // utimensat - ignore
+                case 88: { // utimensat
+                    /* No longer "ignore", because an unconditional success here is
+                     * a lie the caller acts on: touch(1) calls utimensat() first
+                     * and creates the file only when it answers ENOENT, so a stub
+                     * that always succeeded left touch reporting success with
+                     * nothing behind it - and every build system that tests a
+                     * timestamp believed it. The question this really has to answer
+                     * is whether the name is there. */
+                    const char* ut_path = to_str(a1);
+                    char        ut_abs[UAPI_PATH_MAX];
+                    if (ut_path && (ut_path[0] == '/' || (int)a0 == UAPI_AT_FDCWD) &&
+                        guest_path_absolutize(ut_abs, sizeof(ut_abs), ut_path)) {
+                        rvvm_memfs_t* ut_fs = NULL;
+                        char          ut_rel[RVVM_MEMFS_PATH_MAX];
+                        if (memfs_mount_for(&ut_fs, ut_rel, sizeof(ut_rel), ut_abs)) {
+                            /* A tmpfs keeps one time per inode, so a touch there is
+                             * ENOENT for a name that is not present - which is what
+                             * sends touch on to create it - and a fresh mtime for one
+                             * that is. */
+                            a0 = -(rvvm_addr_t)memfs_errno(rvvm_memfs_touch(ut_fs, ut_rel));
+                            rvvm_memfs_free(ut_fs);
+                            break;
+                        }
+                        /* A host file keeps its own timestamps, and there is no shim
+                         * here that sets one on Windows. So this answers the part
+                         * that decides what happens next - is the name there - and a
+                         * file that is there keeps the time the host gave it. */
+                        {
+                            struct stat ut_probe;
+                            if (stat(wrap_guest_path(path_buf, (int)a0, ut_path), &ut_probe)) {
+                                a0 = errno_ret(-1);
+                                break;
+                            }
+                        }
+                    }
                     a0 = 0;
                     break;
+                }
                 case 90: // capget - stub
                     if (a1) {
                         struct uapi_cap_data_struct* cap = to_ptr_wr(a1);

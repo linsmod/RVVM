@@ -143,15 +143,27 @@ void          rvvm_memfs_free(rvvm_memfs_t* fs);
 
 /* The mount's own properties, for a mount table row to report.
  *
- * read_only and size_limit are const and lock-free because nothing changes them
- * after rvvm_memfs_create(): a read-only mount cannot be made writable and a
- * size= cannot be changed, so there is no state here for a lock to guard. used
- * and count are not, and take a non-const pointer for the ordinary reason that
- * taking a lock writes to it. */
-bool     rvvm_memfs_read_only(const rvvm_memfs_t* fs);
+ * size_limit is const and lock-free because rvvm_memfs_create() is the only thing
+ * that sets it: a size= is fixed for the life of the mount, so there is no state
+ * here for a lock to guard. read_only is not const - a remount can turn it on and
+ * off - so it is read under the lock like any other mutable field, and reached
+ * through rvvm_memfs_set_read_only() rather than written. used and count take a
+ * non-const pointer for the ordinary reason that taking a lock writes to it. */
+bool     rvvm_memfs_read_only(rvvm_memfs_t* fs);
 uint64_t rvvm_memfs_size_limit(const rvvm_memfs_t* fs);
 uint64_t rvvm_memfs_used(rvvm_memfs_t* fs);
 uint32_t rvvm_memfs_count(rvvm_memfs_t* fs);
+
+/* Turn the whole mount read-only, or writable again. This is what MS_REMOUNT
+ * with and without MS_RDONLY asks mount(2) for, and it is the one property of a
+ * memfs that changes after creation.
+ *
+ * It does not walk the tree and stamp anything: the flag is consulted by every
+ * mutating operation, so turning it on makes the next write fail and turning it
+ * off makes it succeed, with no state to get out of step. A write that is already
+ * in flight is not interrupted - it took the lock before the change and finishes
+ * under the flag it started with, which is the same race Linux has. */
+void rvvm_memfs_set_read_only(rvvm_memfs_t* fs, bool read_only);
 
 /* --- lookups ------------------------------------------------------------ */
 
@@ -215,6 +227,21 @@ rvvm_memfs_result_t rvvm_memfs_readlink(rvvm_memfs_t* fs, const char* path,
 rvvm_memfs_result_t rvvm_memfs_truncate(rvvm_memfs_t* fs, const char* path, uint64_t size);
 
 rvvm_memfs_result_t rvvm_memfs_chmod(rvvm_memfs_t* fs, const char* path, uint32_t mode);
+
+/* Give an existing name a fresh mtime, which is what touch(1) asks for.
+ *
+ * There is one time per inode and no way to hand it a specific one from outside -
+ * the module has a single clock (memfs_now()) - so this is "mark it as just
+ * written" rather than a general utimes, and the atime half of a utimensat() is
+ * not kept at all because nothing here reads it back.
+ *
+ * Its most important answer is the negative one: ENOENT for a name that is not
+ * there. A caller that is told a touch succeeded but finds no file has been lied
+ * to, and touch(1) itself asks this before it creates anything - busybox's touch
+ * calls utimensat() first and only falls back to open(O_CREAT) when that says the
+ * name is missing. It follows symlinks, like utimensat() without
+ * AT_SYMLINK_NOFOLLOW, and answers EROFS on a read-only mount. */
+rvvm_memfs_result_t rvvm_memfs_touch(rvvm_memfs_t* fs, const char* path);
 
 /* --- reading and writing ------------------------------------------------ */
 
