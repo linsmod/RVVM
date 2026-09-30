@@ -53,12 +53,16 @@ working directory; the setter does that, not this file.
 static void print_usage(const char* self)
 {
     fprintf(stderr,
-            "usage: %s [-prefix <dir>] [-cmdline <args>] [-append <args>]"
-            " [guest_elf [args...]]\n"
+            "usage: %s [-prefix <dir>] [-no-rootfs] [-cmdline <args>]"
+            " [-append <args>] [guest_elf [args...]]\n"
             "\n"
             "With no guest_elf, boots %s in the default prefix"
             " (./runtime/rootfs).\n"
             "\n"
+            "  -no-rootfs       no hostfs base at all: the guest's / is an empty\n"
+            "                  memory filesystem, which dies with the run. For a\n"
+            "                  program that needs no files, and for one that only\n"
+            "                  wants somewhere to write.\n"
             "  -prefix <dir>    the hostfs base: where the guest's / lives.\n"
             "                  A HOST path and NOT a boot argument - it would\n"
             "                  mean a different run on every machine, since the\n"
@@ -103,6 +107,7 @@ int main(int argc, char** argv, char** envp)
     const char*     prefix  = NULL;
     const char*     cmdline = NULL;
     const char*     append  = NULL;
+    bool            no_rootfs = false;
     int             guest_argc;
     char**          guest_argv;
     /* Hoisted out of the default-program branch below so the debug line can see
@@ -148,6 +153,15 @@ int main(int argc, char** argv, char** envp)
             prefix = argv[i] + 8;
         } else if (!strncmp(argv[i], "--prefix=", 9)) {
             prefix = argv[i] + 9;
+        } else if (!strcmp(argv[i], "-no-rootfs") || !strcmp(argv[i], "--no-rootfs")) {
+            /* An explicit ask for the run with no rootfs at all, which used to be
+             * unexpressible from here: the default prefix is compiled in, and the
+             * only way past it was a caller of the library that never set one. What
+             * it produces is not a passthrough run - the guest's "/" is an empty
+             * memory filesystem that dies with the run, which is what a program
+             * that needs no files can be run against and what a program that wants
+             * somewhere to write can use. See userland_root_backing_sync(). */
+            no_rootfs = true;
         } else if (!strcmp(argv[i], "-cmdline") || !strcmp(argv[i], "--cmdline")) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "%s: %s needs an argument\n", argv[0], argv[i]);
@@ -183,12 +197,15 @@ int main(int argc, char** argv, char** envp)
          *
          * Nothing to do here: control falls through to the defaults. -h is
          * handled in the option loop above, which cannot run in this case. */
-    } else if (i >= argc && !(cmdline || append)) {
+    } else if (i >= argc && !(cmdline || append || no_rootfs)) {
         /* Options given, no ELF, and nothing that could name one: that IS a
          * mistake, and saying so beats quietly booting a shell the caller did not
          * ask for. With -cmdline/-append it is not a mistake, because init= in
          * there is the program (see the precedence below) - so this has to
-         * look at what those were set to rather than only at i. */
+         * look at what those were set to rather than only at i. -no-rootfs counts
+         * for the same reason: it changes where the guest's / is and nothing about
+         * which program runs, so asking for a run with no rootfs and the default
+         * program is a complete request. */
         fprintf(stderr, "%s: options given but no guest program\n\n", argv[0]);
         print_usage(argv[0]);
         return 1;
@@ -202,7 +219,14 @@ int main(int argc, char** argv, char** envp)
     /* Before the image is opened: both of these have to be in effect before the
      * first path the guest resolves, and rvvm_user_linux_ex() loads the ELF
      * immediately after this. */
-    if (prefix) {
+    if (no_rootfs) {
+        /* After the default prefix was applied by rvvm_user_create(), so this is an
+         * override rather than an absence - and it moves the root row with it,
+         * which is the whole of what "no rootfs" now means. */
+        rvvm_user_set_prefix(machine, NULL);
+        fprintf(stderr, "rvvm_user: prefix: none; the guest's / is an empty "
+                        "filesystem\n");
+    } else if (prefix) {
         rvvm_user_set_prefix(machine, prefix);
         /* Echoed resolved, because that is the string every guest path is built
          * from, and "it found my directory" is worth seeing before the guest runs
@@ -276,9 +300,12 @@ int main(int argc, char** argv, char** envp)
      * above from three sources, and "which shell did that actually start" is not
      * a question the output can always answer. */
     fprintf(stderr, "rvvm_user: boot %s\n", guest_argv[0]);
+    /* "no prefix" is not "passthrough" any more: it is an empty memory filesystem
+     * for the guest's /, and saying passthrough here would name the one thing it
+     * is not. */
     fprintf(stderr, "rvvm_user: prefix %s\n",
             rvvm_user_get_prefix(machine) ? rvvm_user_get_prefix(machine)
-                                          : "(passthrough)");
+                                          : "(none; the guest's / is memory)");
     fprintf(stderr, "rvvm_user: guest root %s\n",
             rvvm_user_get_guest_root(machine) ? rvvm_user_get_guest_root(machine)
                                               : "(none)");

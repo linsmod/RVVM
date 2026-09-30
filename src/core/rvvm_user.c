@@ -1691,9 +1691,18 @@ typedef struct {
  *                      tmpfs mount becomes - a host directory would outlive the
  *                      run and could not be bounded, which is the one thing a
  *                      tmpfs promises not to be.
- *   RVVM_MOUNT_ROOTFS  the run's own root - the hostfs prefix. The entry exists
- *                      for /proc/mounts and is not a match target for mount(2);
- *                      see rvvm_mount_find() and rvvm_mount_covering().
+ *   RVVM_MOUNT_ROOTFS  nothing answers. What rvvm_path_owner() reports for a path
+ *                      no row covers, which is only reachable when there is no
+ *                      namespace to ask - it is not a row, and the run's own root
+ *                      is one now.
+ *
+ * The root row is /, and it is built at run time rather than copied from a
+ * constant because where its bytes are is decided then: RVVM_MOUNT_HOSTFS with the
+ * prefix directory when the host named one, RVVM_MOUNT_MEMFS with an empty
+ * filesystem when it did not. That second case is what "this run has no rootfs"
+ * means - a mount at "/" that is empty, not a namespace that switches translation
+ * off - and it is what lets the root be one more row with one more provider. See
+ * mount_row_is_root(), rvvm_user_set_prefix() and userland_root_backing_sync().
  *
  * The table is per context and seeded from a constant, and mount(2)/umount2(2)
  * edit it. /proc/mounts is generated from it rather than shipped as a string in
@@ -1746,12 +1755,14 @@ typedef struct rvvm_mount_ns {
     rvvm_mount_t  mounts[RVVM_MOUNT_MAX];
 } rvvm_mount_ns_t;
 
-static struct rvvm_mount_ns* userland_mountns_new(void)
+static struct rvvm_mount_ns* userland_mountns_new(const char* root_host_dir)
 {
     /* SPINLOCK_INIT is a brace initializer, so the whole struct goes down in one
-     * shot rather than field by field - and the defaults come with it. */
+     * shot rather than field by field - and these come with it. Every row but the
+     * root is a constant: /dev and /proc the core synthesizes, /sys and /tmp are
+     * the host's own trees at the same path, and none of them depends on where
+     * this run's root lives. */
     static const rvvm_mount_t defaults[] = {
-        { "/",        "auto",    "rw,relatime",                             RVVM_MOUNT_ROOTFS },
         { "/dev",     "devtmpfs", "rw,nosuid,size=65536k,mode=755",         RVVM_MOUNT_CORE   },
         { "/sys",     "sysfs",   "rw,nosuid,nodev,noexec,relatime",        RVVM_MOUNT_HOSTFS },
         { "/proc",    "proc",    "rw,nosuid,nodev,noexec,relatime",        RVVM_MOUNT_CORE   },
@@ -1763,9 +1774,35 @@ static struct rvvm_mount_ns* userland_mountns_new(void)
     *ns = (struct rvvm_mount_ns){
         .lock  = SPINLOCK_INIT,
         .refs  = 1,
-        .count = STATIC_ARRAY_SIZE(defaults),
+        .count = STATIC_ARRAY_SIZE(defaults) + 1,
     };
-    memcpy(ns->mounts, defaults, sizeof(defaults));
+    /* The root is built rather than copied, because it is the one row whose
+     * backing is decided at run time: the prefix directory when the host named
+     * one, an empty memory filesystem when it did not. That second case is what
+     * "this run has no rootfs" means now - not a namespace that switches
+     * translation off, but a mount at "/" with nothing in it yet, so a program
+     * that needs no files at all can run against nothing and a program that wants
+     * somewhere to write has a filesystem that dies with the run. */
+    rvvm_strlcpy(ns->mounts[0].path, "/", sizeof(ns->mounts[0].path));
+    if (root_host_dir) {
+        rvvm_strlcpy(ns->mounts[0].fstype, "rootfs", sizeof(ns->mounts[0].fstype));
+        rvvm_strlcpy(ns->mounts[0].options, "rw,relatime", sizeof(ns->mounts[0].options));
+        ns->mounts[0].provider = RVVM_MOUNT_HOSTFS;
+    } else {
+        rvvm_strlcpy(ns->mounts[0].fstype, "tmpfs", sizeof(ns->mounts[0].fstype));
+        rvvm_strlcpy(ns->mounts[0].options, "rw,relatime", sizeof(ns->mounts[0].options));
+        ns->mounts[0].provider = RVVM_MOUNT_MEMFS;
+        ns->mounts[0].memfs    = rvvm_memfs_create(false, 0);
+        if (!ns->mounts[0].memfs) {
+            /* Nearly unreachable - safe_new_obj() above would already have aborted
+             * on a machine this short of memory - and a namespace whose root has no
+             * storage is still better than no namespace at all: the row answers
+             * nothing, which is what an empty root answers, and the guest is told
+             * rather than left to work it out. */
+            rvvm_warn("no memory for the root filesystem; this run has no / to speak of");
+        }
+    }
+    memcpy(ns->mounts + 1, defaults, sizeof(defaults));
     return ns;
 }
 
@@ -1785,6 +1822,48 @@ static void mount_row_release(rvvm_mount_t* m)
         rvvm_memfs_free(m->memfs);
         m->memfs = NULL;
     }
+}
+
+/* Whether @m is the run's own root row. By path rather than by provider, because
+ * that is what actually distinguishes it: /sys and /tmp are RVVM_MOUNT_HOSTFS too,
+ * but the root is the row the prefix belongs to - the one whose host directory is
+ * the rootfs, the one mount(2) may not replace and umount2(2) may not remove. */
+static bool mount_row_is_root(const rvvm_mount_t* m)
+{
+    return m && m->path[0] == '/' && m->path[1] == '\0';
+}
+
+/* Point the root row at @host_backed: the prefix directory when true, an empty
+ * memory filesystem when false. Returns the storage it displaced, which may be
+ * NULL, and sets @placed false when the table has no root row - in which case
+ * @fresh is untouched and still the caller's to free.
+ *
+ * Takes @fresh rather than allocating it: this runs under the namespace lock, and
+ * an allocator there would sit in front of every other thread's lookup. */
+static rvvm_memfs_t* mount_root_set_backing(struct rvvm_mount_ns* ns, bool host_backed,
+                                            rvvm_memfs_t* fresh, bool* placed)
+{
+    unsigned i;
+
+    for (i = 0; i < ns->count; ++i) {
+        rvvm_mount_t* m = &ns->mounts[i];
+        rvvm_memfs_t* old;
+        if (!mount_row_is_root(m)) {
+            continue;
+        }
+        old         = m->memfs;
+        m->memfs    = fresh;
+        m->provider = host_backed ? RVVM_MOUNT_HOSTFS : RVVM_MOUNT_MEMFS;
+        /* The type is what /proc/mounts reports as the filesystem, and the two
+         * cases are not the same one: a root backed by a host directory is a
+         * rootfs, a root backed by memory is a tmpfs. */
+        rvvm_strlcpy(m->fstype, host_backed ? "rootfs" : "tmpfs", sizeof(m->fstype));
+        rvvm_strlcpy(m->options, "rw,relatime", sizeof(m->options));
+        *placed = true;
+        return old;
+    }
+    *placed = false;
+    return NULL;
 }
 
 static void userland_mountns_unref(struct rvvm_mount_ns* ns)
@@ -3892,6 +3971,45 @@ static const char* host_path_absolute(char* buffer, size_t size, const char* pat
     return buffer;
 }
 
+/* Make the root row agree with where the run's "/" actually lives: the prefix
+ * directory when there is one, an empty memory filesystem when there is not.
+ *
+ * Called from rvvm_user_set_prefix() and from the namespace's own creation, which
+ * are the two moments the answer can change - a host is free to name a rootfs
+ * after the context exists (vp_bundle_mount does, and win32_cmdpost_bridge.c and
+ * jni_bridge.c both do), so the machine has to be right whether that happened
+ * before the table was built or after. */
+static void userland_root_backing_sync(rvvm_userland_t* ctx)
+{
+    rvvm_memfs_t* fresh  = NULL;
+    rvvm_memfs_t* old;
+    bool          placed = false;
+
+    if (!ctx || !ctx->mountns) {
+        /* Nothing to point yet: the namespace is built from the same answer when
+         * it appears. */
+        return;
+    }
+    if (!ctx->prefix_path) {
+        /* Built outside the lock: allocating under the namespace lock would put an
+         * allocator in front of every other thread's lookup. */
+        fresh = rvvm_memfs_create(false, 0);
+        if (!fresh) {
+            rvvm_warn("no memory for the root filesystem; the guest keeps the empty "
+                      "root it had");
+            return;
+        }
+    }
+    spin_lock(&ctx->mountns->lock);
+    old = mount_root_set_backing(ctx->mountns, ctx->prefix_path != NULL, fresh, &placed);
+    spin_unlock(&ctx->mountns->lock);
+    rvvm_memfs_free(old);       /* freeing NULL is a no-op, and so is freeing a
+                                 * storage the row never took */
+    if (!placed) {
+        rvvm_memfs_free(fresh);
+    }
+}
+
 PUBLIC void rvvm_user_set_prefix(rvvm_machine_t* machine, const char* prefix)
 {
     rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
@@ -3904,29 +4022,30 @@ PUBLIC void rvvm_user_set_prefix(rvvm_machine_t* machine, const char* prefix)
     safe_free(ctx->prefix_owned);
     ctx->prefix_owned = NULL;
     ctx->prefix_path  = NULL;
-    if (!prefix || !prefix[0]) {
-        return;
+    if (prefix && prefix[0]) {
+        /* Resolved here rather than by each host: this setter is where a host
+         * hands over a real rootfs, so it is the host boundary. See
+         * host_path_absolute() for what breaks downstream if the stored string is
+         * relative. */
+        resolved = host_path_absolute(absolute, sizeof(absolute), prefix);
+        if (!resolved) {
+            rvvm_warn("prefix %s is relative and the working directory could not be "
+                      "read; the guest's root becomes an empty filesystem", prefix);
+        } else {
+            /* From `resolved`, not from `absolute`: the helper returns the
+             * caller's own pointer when the path was already absolute, having
+             * written nothing to the buffer - so reading the buffer there would
+             * hand back whatever was on the stack. */
+            size_t len = strlen(resolved) + 1;
+            char*  copy = safe_malloc(len);
+            memcpy(copy, resolved, len);
+            ctx->prefix_owned = copy;
+            ctx->prefix_path  = copy;
+        }
     }
-    /* Resolved here rather than by each host: this setter is where a host hands
-     * over a real rootfs, so it is the host boundary. See host_path_absolute()
-     * for what breaks downstream if the stored string is relative. */
-    resolved = host_path_absolute(absolute, sizeof(absolute), prefix);
-    if (!resolved) {
-        rvvm_warn("prefix %s is relative and the working directory could not be "
-                  "read; the guest's paths pass through unchanged", prefix);
-        return;
-    }
-    {
-        /* From `resolved`, not from `absolute`: the helper returns the caller's
-         * own pointer when the path was already absolute, having written nothing
-         * to the buffer - so reading the buffer there would hand back whatever
-         * was on the stack. */
-        size_t len = strlen(resolved) + 1;
-        char*  copy = safe_malloc(len);
-        memcpy(copy, resolved, len);
-        ctx->prefix_owned = copy;
-        ctx->prefix_path  = copy;
-    }
+    /* The other half of what a prefix means: it is the root row's host directory,
+     * so naming one - or naming none - moves where "/" is. */
+    userland_root_backing_sync(ctx);
 }
 
 PUBLIC const char* rvvm_user_get_prefix(rvvm_machine_t* machine)
@@ -4034,11 +4153,12 @@ PUBLIC void rvvm_user_set_shadow(rvvm_machine_t* machine, vp_shadow_t* shadow)
  * build. An unusable root= is worse than none - it would chroot the run into
  * somewhere empty and every failure afterwards would be about the wrong thing.
  *
- * Only takes effect when there is a prefix, because that is the only case where
- * the guest's namespace is a namespace. With prefix == NULL the guest's paths
- * ARE host paths (see path_bypass()), and chrooting them would move /foo while
- * /proc, /dev and /sys stayed put - half a chroot, which is worse than none
- * because it looks like a sandbox.
+ * Only takes effect when the root is a host directory, because that is the only
+ * case where there is something for it to be relative to. With no prefix the root
+ * is an empty memory filesystem (see userland_root_backing_sync()), which has no
+ * directory to name a part of - so a root= is refused rather than quietly ignored,
+ * since an empty root that is not the one asked for is worse than a refusal: every
+ * failure afterwards would be about the wrong directory.
  */
 PUBLIC void rvvm_user_set_guest_root(rvvm_machine_t* machine, const char* root)
 {
@@ -4210,10 +4330,12 @@ static void proc_symbolize(const char* label, const char* elf, const rvvm_addr_t
  * memory of someone's desktop. A host that installs its own still overwrites it,
  * which is why this is only ever a starting point - see ctx->prefix_path.
  *
- * NULL would be the honest "no namespace" answer, and it is what the riscv build
- * already uses. It is not the default here because a passthrough context has no
- * prefix to chdir into at all, and the run is then silently unsandboxed - see
- * path_bypass() for why that is a decision rather than a fallback.
+ * NULL is the answer for a run with no rootfs at all, and it is what the riscv
+ * build already uses: the guest's / is then an empty memory filesystem rather
+ * than a window onto the host (see userland_root_backing_sync()). It is still not
+ * the default here, because the default is meant to point at where the rootfs
+ * really is - and a run that wants no rootfs can now ask for one, which it could
+ * not before: -no-rootfs in the runner, or simply never calling the setter.
  *
  * Relative, which is worth being straight about: rvvm_user_linux_ex() chdir()s
  * into this (line ~16697), so the default resolves against the cwd the binary was
@@ -4378,37 +4500,50 @@ static rvvm_path_owner_t rvvm_path_owner(const struct rvvm_mount_ns* ns, const c
  * because a name that does not exist yet has no entry of its own and asking about
  * it would send that very open() to the host.
  *
- * Where the covering row comes from is now rvvm_path_owner() rather than a
- * longest-match of its own; what is decided is unchanged. A path only the root
- * covers has provider ROOTFS and does not bypass, which is the answer the old
- * "no covering row" gave.
- *
- * prefix == NULL means the guest's paths ARE the host's paths, so everything
- * bypasses. That is the one answer here that is not derived from the table, and
- * it is what the next change removes.
+ * Every answer here now comes from the table, including the one that used to be
+ * read off the prefix: prefix == NULL no longer means "the guest's paths are the
+ * host's paths". It means the root row is memory-backed, and a memory-backed root
+ * has no host directory for a prefix to be put in front of, so its paths do not
+ * bypass - they simply have no host form at all, which is what the callers of
+ * memfs_mount_for() are for.
  */
 static bool path_bypass(const char* path)
 {
+    rvvm_userland_t*  ctx = uctx();
     rvvm_path_owner_t owner;
     bool              bypassed;
 
-    if (uctx()->prefix_path == NULL) {
-        return true;
-    }
     if (!path) {
         return false;
     }
-    spin_lock(&uctx()->mountns->lock);
-    owner = rvvm_path_owner(uctx()->mountns, path);
-    if (owner.provider == RVVM_MOUNT_ROOTFS) {
+    /* Under the lock because it is half table and half shadow, and the shadow can
+     * be replaced under it by another thread. */
+    spin_lock(&ctx->mountns->lock);
+    owner = rvvm_path_owner(ctx->mountns, path);
+    if (!owner.mount) {
+        /* No row answers at all, which only happens before the namespace exists.
+         * The prefix is then the only thing left, and a path under it is not
+         * bypassed. */
+        bypassed = (ctx->prefix_path == NULL);
+    } else if (mount_row_is_root(owner.mount)) {
+        /* The run's own root. Host-backed it takes the prefix - that is what the
+         * prefix is; memory-backed there is no host directory to put in front of
+         * anything, so the path skips the mapping and the syscall layer answers it
+         * out of the storage. */
+        bypassed = (owner.provider != RVVM_MOUNT_HOSTFS);
+    } else if (ctx->shadow &&
+               vp_shadow_view_lookup(&ctx->shadow_view, owner.mount->path) != NULL) {
+        /* A mount the rootfs also ships as a real directory - a minirootfs has
+         * /dev and /tmp as empty ones - so the host directory wins and the prefix
+         * goes on after all. */
         bypassed = false;
     } else {
-        /* Decided under the lock because it is half table and half shadow, and
-         * the shadow can be replaced under it by another thread. */
-        bypassed = (uctx()->shadow == NULL ||
-                    vp_shadow_view_lookup(&uctx()->shadow_view, owner.mount->path) == NULL);
+        /* A core subtree, a memory filesystem, or one of the host's own trees:
+         * served by the row itself, and prefixing it would aim at a directory
+         * nobody made. */
+        bypassed = true;
     }
-    spin_unlock(&uctx()->mountns->lock);
+    spin_unlock(&ctx->mountns->lock);
     return bypassed;
 }
 
@@ -5104,11 +5239,14 @@ static bool userland_proc_parse(const char* abs, uint32_t self_pid, rvvm_proc_pa
 static const char* map_abs_path_ex(char* buffer, const char* path, bool follow_final)
 {
     const char* prefix = uctx()->prefix_path;
-    if (prefix && path) {
-        if (path_bypass(path)) {
-            return path;
-        }
-
+    /* Whether the prefix applies is now the table's answer rather than this
+     * function's own reading of `prefix != NULL`, and the two are not the same
+     * question any more: a run with no prefix has a memory root, and every path
+     * under it bypasses. The prefix itself still means exactly what it did - the
+     * root row's host directory - so a path that does take it is mapped the way it
+     * always was. `prefix` is still consulted, for the one case the table and the
+     * context could disagree about. */
+    if (prefix && path && path[0] == '/' && !path_bypass(path)) {
         if (rvvm_strfind(path, "/") == path) {
             char followed[UAPI_PATH_MAX];
             size_t prefix_len;
@@ -5138,11 +5276,11 @@ static const char* map_abs_path_ex(char* buffer, const char* path, bool follow_f
              * be assumed to be - a view could be given a root the host half has
              * never heard of, and the other way round.
              *
-             * Not applied to a path_bypass() name: /proc, /dev and /sys are
+             * Not applied to a path that bypasses: /proc, /dev and /sys are
              * resolved before this point (the check is above), and prefixing them
              * would produce <prefix>/data/app/foo/proc, which is a directory
-             * nobody made. Replacing that list with real mounts is the remaining
-             * half of this work - see path_bypass(). */
+             * nobody made. That is now the table's answer for each of them rather
+             * than a list in this function. */
             if (uctx()->guest_root_path) {
                 size_t root_len = rvvm_strlcpy(buffer + prefix_len,
                                                uctx()->guest_root_path,
@@ -13353,8 +13491,11 @@ static size_t userland_proc_gen_mounts(char* buf, size_t size)
         spin_lock(&ctx->mountns->lock);
         for (i = 0; i < ctx->mountns->count; ++i) {
             const rvvm_mount_t* m = &ctx->mountns->mounts[i];
+            /* The root is named /dev/root and its type is what it is really backed
+             * by - rootfs for a host directory, tmpfs for memory - so a guest that
+             * reads this can tell a run with a rootfs from one without. */
             int n = snprintf(line, sizeof(line), "%s %s %s %s 0 0\n",
-                             m->provider == RVVM_MOUNT_ROOTFS ? "/dev/root" : m->fstype,
+                             mount_row_is_root(m) ? "/dev/root" : m->fstype,
                              m->path, m->fstype, m->options);
             if (n > 0) {
                 size_t room = (len < size) ? (size - len) : 0;
@@ -18147,8 +18288,11 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
      * same as not having called it, and it exists so there is exactly one place
      * that decides what the view is. */
     vp_shadow_view_init(&ctx->shadow_view, NULL, NULL);
-    /* The run's mount namespace, before anything can ask about one. */
-    ctx->mountns = userland_mountns_new();
+    /* The run's mount namespace, before anything can ask about one. Built from the
+     * prefix that was just stored, so the root row starts out agreeing with it:
+     * host-backed when the default prefix resolved, an empty memory filesystem when
+     * it did not (which is the riscv build, where there is no default). */
+    ctx->mountns = userland_mountns_new(ctx->prefix_path);
     return machine;
 }
 
@@ -18443,9 +18587,11 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
     userland_fd_table_free(ctx);
     userland_fd_table_init(ctx);
 
-    /* Path prefix: what the host set with rvvm_user_set_prefix() (NULL = host
-     * paths pass through unchanged). There is no environment override - the
-     * rootfs is the host's to name per machine, not a process-wide env. */
+    /* Path prefix: what the host set with rvvm_user_set_prefix(), which is also
+     * where the root row's backing lives - a host directory when there is one, an
+     * empty memory filesystem when there is not (see
+     * userland_root_backing_sync()). There is no environment override - the rootfs
+     * is the host's to name per machine, not a process-wide env. */
 
     /* The guest starts at its own root. The host process's cwd is not it, and
      * resolving relative guest paths against that host cwd only looked right
