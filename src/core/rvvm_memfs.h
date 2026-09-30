@@ -225,6 +225,41 @@ rvvm_memfs_result_t rvvm_memfs_read(rvvm_memfs_t* fs, const char* path,
 rvvm_memfs_result_t rvvm_memfs_write(rvvm_memfs_t* fs, const char* path,
                                      uint64_t off, const void* buf, size_t count, size_t* done);
 
+/* --- open handles (a descriptor names an inode, not a name) ------------- */
+
+/* Take a reference on @ino so that removing its last name does not take it away
+ * while a descriptor is still reading it - Linux's rule for a file unlinked
+ * while open. Every open of a descriptor pins once and every close unpins once;
+ * the inode is freed when its last name AND its last pin are both gone. A caller
+ * that pins must unpin exactly once, or the inode is a leak the consistency
+ * check reports.
+ *
+ * The index to pin is the @index rvvm_memfs_info_t reports, which is also the
+ * number every hard link to the file reports - and that is what lets a
+ * descriptor survive a rename or an unlink of the name it was opened through. */
+rvvm_memfs_result_t rvvm_memfs_pin(rvvm_memfs_t* fs, uint32_t ino);
+void                rvvm_memfs_unpin(rvvm_memfs_t* fs, uint32_t ino);
+
+/* The same read, write and truncate the path-keyed calls above do, named by the
+ * inode a descriptor already resolved. A descriptor is an inode, so a rename or
+ * an unlink between two calls must not change what it answers. */
+rvvm_memfs_result_t rvvm_memfs_read_at(rvvm_memfs_t* fs, uint32_t ino,
+                                       uint64_t off, void* buf, size_t count, size_t* done);
+rvvm_memfs_result_t rvvm_memfs_write_at(rvvm_memfs_t* fs, uint32_t ino,
+                                        uint64_t off, const void* buf, size_t count, size_t* done);
+rvvm_memfs_result_t rvvm_memfs_truncate_ino(rvvm_memfs_t* fs, uint32_t ino, uint64_t size);
+
+/* What fstat() reports for a descriptor. @out->path is left empty on purpose: an
+ * inode reached by number has no one name. */
+rvvm_memfs_result_t rvvm_memfs_stat_ino(rvvm_memfs_t* fs, uint32_t ino, rvvm_memfs_info_t* out);
+
+/* The listing of a directory named by inode, for a readdir descriptor. Same
+ * contract as rvvm_memfs_getdents(): one entry per call, @pos the caller's
+ * cursor, RVVM_MEMFS_EOF at the end. */
+rvvm_memfs_result_t rvvm_memfs_getdents_ino(rvvm_memfs_t* fs, uint32_t ino,
+                                            uint32_t* pos, char* out_name, size_t size,
+                                            uint8_t* out_kind, uint64_t* out_ino);
+
 /* --- listing ------------------------------------------------------------ */
 
 /* One entry per call, so the guest's readdir loop drives it and nothing has to

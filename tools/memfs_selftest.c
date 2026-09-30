@@ -233,6 +233,61 @@ int main(void)
         ck(info.nlink == 2, "rmdir took the link back");
     }
 
+    stage("handles");
+    /* --- a descriptor names an inode, so rename/unlink do not move it --- */
+    {
+        uint32_t ino_idx;
+        uint32_t dino;
+        uint32_t pos2;
+
+        ck_rc(rvvm_memfs_create_file(fs, "/hnd", 0644), RVVM_MEMFS_OK, "create /hnd");
+        ck_rc(rvvm_memfs_write(fs, "/hnd", 0, "abcdef", 6, &done), RVVM_MEMFS_OK, "fill /hnd");
+        ck_rc(rvvm_memfs_stat(fs, "/hnd", true, &info), RVVM_MEMFS_OK, "stat /hnd");
+        ino_idx = info.index;
+        ck_rc(rvvm_memfs_pin(fs, ino_idx), RVVM_MEMFS_OK, "pin the inode");
+        /* Rename while open: the inode is the same, so read_at still answers. */
+        ck_rc(rvvm_memfs_rename(fs, "/hnd", "/hnd2"), RVVM_MEMFS_OK, "rename the open file");
+        memset(buf, 0, sizeof(buf));
+        ck_rc(rvvm_memfs_read_at(fs, ino_idx, 0, buf, sizeof(buf), &done), RVVM_MEMFS_OK, "read_at after rename");
+        ck(done == 6 && !strcmp(buf, "abcdef"), "the descriptor still reads it");
+        ck_rc(rvvm_memfs_write_at(fs, ino_idx, 6, "!", 1, &done), RVVM_MEMFS_OK, "write_at after rename");
+        ck_rc(rvvm_memfs_stat_ino(fs, ino_idx, &info), RVVM_MEMFS_OK, "stat_ino");
+        ck(info.size == 7, "stat_ino sees the write");
+        ck(info.path[0] == '\0', "stat_ino leaves the path empty");
+        /* Unlink while open: the inode survives on the pin alone. */
+        ck_rc(rvvm_memfs_unlink(fs, "/hnd2", false), RVVM_MEMFS_OK, "unlink the open file");
+        ck_rc(rvvm_memfs_stat(fs, "/hnd2", true, &info), RVVM_MEMFS_ENOENT, "the name is gone");
+        memset(buf, 0, sizeof(buf));
+        ck_rc(rvvm_memfs_read_at(fs, ino_idx, 0, buf, sizeof(buf), &done), RVVM_MEMFS_OK, "read_at after unlink");
+        ck(done == 7 && !strcmp(buf, "abcdef!"), "the unlinked file is still readable");
+        ck_rc(rvvm_memfs_stat_ino(fs, ino_idx, &info), RVVM_MEMFS_OK, "stat_ino of the unlinked file");
+        ck(info.nlink == 0, "nlink is zero on the nameless inode");
+        /* Close: the last pin is what frees it. */
+        {
+            uint32_t live_before = rvvm_memfs_count(fs);
+            rvvm_memfs_unpin(fs, ino_idx);
+            ck(rvvm_memfs_count(fs) == live_before - 1, "the last unpin freed the inode");
+        }
+        ck_rc(rvvm_memfs_stat_ino(fs, ino_idx, &info), RVVM_MEMFS_ENOENT, "and it is gone");
+        ck_rc(rvvm_memfs_read_at(fs, ino_idx, 0, buf, sizeof(buf), &done), RVVM_MEMFS_ENOENT,
+              "read_at on a dead inode");
+        ck_rc(rvvm_memfs_truncate_ino(fs, ino_idx, 0), RVVM_MEMFS_ENOENT, "truncate_ino on a dead inode");
+
+        /* A directory descriptor lists by inode. */
+        ck_rc(rvvm_memfs_mkdir(fs, "/hd", 0755), RVVM_MEMFS_OK, "mkdir /hd");
+        ck_rc(rvvm_memfs_create_file(fs, "/hd/x", 0644), RVVM_MEMFS_OK, "file in /hd");
+        ck_rc(rvvm_memfs_stat(fs, "/hd", true, &info), RVVM_MEMFS_OK, "stat /hd");
+        dino = info.index;
+        ck_rc(rvvm_memfs_pin(fs, dino), RVVM_MEMFS_OK, "pin the directory");
+        pos2 = 0;
+        ck_rc(rvvm_memfs_getdents_ino(fs, dino, &pos2, name, sizeof(name), &kind, &ino),
+              RVVM_MEMFS_OK, "getdents_ino[/hd][0]");
+        ck(!strcmp(name, "x"), "it lists the child");
+        ck_rc(rvvm_memfs_getdents_ino(fs, dino, &pos2, name, sizeof(name), &kind, &ino),
+              RVVM_MEMFS_EOF, "getdents_ino done");
+        rvvm_memfs_unpin(fs, dino);
+    }
+
     stage("rename");
     /* --- rename, including the subtree reindex --- */
     ck_rc(rvvm_memfs_mkdir(fs, "/src", 0755), RVVM_MEMFS_OK, "mkdir /src");

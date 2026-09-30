@@ -63,9 +63,10 @@ Deliberate limits, so a reader does not expect more:
     those are not the same limit.
   - hard links share an inode, so writing through one name is visible through the
     other and nlink counts the names that reach it. A directory cannot be
-    hard-linked; its nlink is Linux's 2 + its subdirectories. There is still no
-    way to reach an inode with no name: unlink is the only removal, so a file
-    whose last name goes goes with it.
+    hard-linked; its nlink is Linux's 2 + its subdirectories.
+  - an inode can outlive its last name, but only while a descriptor pins it: the
+    unlinked-but-open file of POSIX. Nothing else reaches a nameless inode, since
+    unlink is the only removal.
   - no mmap, no O_DIRECT, no fsync, no quotas, no atime/mtime fidelity beyond a
     one-second clock. A guest that mmaps a tmpfs file gets the host's answer for
     a path that does not exist there, which is ENOENT - the same as any file this
@@ -109,6 +110,11 @@ typedef struct {
     uint64_t ino;       /* synthetic, stable, non-zero */
     uint32_t mode;      /* permission bits only; the type comes from @kind      */
     uint32_t nlink;     /* names pointing here, plus a directory's convention  */
+    /* Open handles holding this inode alive. A descriptor is an inode, not a
+     * name (see rvvm_memfs_pin()), so removing the last name of a file that is
+     * still open must not take the bytes away - which is why the free condition
+     * is "no names AND no pins" rather than "no names". */
+    uint32_t pins;
     int64_t  mtime;
     uint8_t  kind;      /* rvvm_memfs_kind_t                                    */
     /* The inode free-list link, meaningful only while the slot is free. A field
@@ -702,6 +708,12 @@ static void memfs_inode_unref_locked(rvvm_memfs_t* fs, uint32_t inode_idx)
             return; /* another name still reaches it */
         }
     }
+    if (in->pins != 0) {
+        /* An open descriptor still holds it. A nameless inode that is still open
+         * is Linux's unlinked-but-open file: it has no path to find it by, it
+         * still answers the descriptor, and the last unpin is what frees it. */
+        return;
+    }
     if (in->kind == RVVM_MEMFS_REG && fs->size_limit && fs->used >= in->size) {
         /* Only ever subtracting what a write charged, so the counter cannot be
          * driven below zero by a sequence of removes. */
@@ -1117,7 +1129,14 @@ static size_t memfs_check_locked(rvvm_memfs_t* fs, char* why, size_t whysize)
                 }
             }
             if (self == RVVM_MEMFS_NONE) {
-                snprintf(why, whysize, "live directory inode %zu has no name", i);
+                /* A directory removed while a descriptor still holds it: nameless,
+                 * kept alive by its pin, with its nlink frozen at the convention
+                 * value there is nothing left to compare it against. Any other
+                 * nameless directory is a leak. */
+                if (in->pins > 0) {
+                    continue;
+                }
+                snprintf(why, whysize, "live directory inode %zu has no name and no pin", i);
                 return i;
             }
             for (j = 0; j < fs->count; ++j) {
@@ -1135,6 +1154,12 @@ static size_t memfs_check_locked(rvvm_memfs_t* fs, char* why, size_t whysize)
                 }
             }
             expect = names;
+            /* A file whose last name is gone has to be held open, or unref would
+             * have freed it: a live nameless file with no pin is a leak. */
+            if (expect == 0 && in->pins == 0) {
+                snprintf(why, whysize, "nameless file inode %zu is live with no pin", i);
+                return i;
+            }
         }
         if (in->nlink != expect) {
             snprintf(why, whysize, "inode %zu (kind %u) reports nlink %u but %u reach it", i,
@@ -1878,12 +1903,17 @@ rvvm_memfs_result_t rvvm_memfs_readlink(rvvm_memfs_t* fs, const char* path,
     return rc;
 }
 
+/* The truncate itself is defined with the other inode-keyed helpers below, since
+ * the descriptor-keyed call shares it; declared here because this path-keyed one
+ * comes first. */
+static rvvm_memfs_result_t memfs_truncate_inode_locked(rvvm_memfs_t* fs, memfs_inode_t* in,
+                                                       uint64_t size);
+
 rvvm_memfs_result_t rvvm_memfs_truncate(rvvm_memfs_t* fs, const char* path, uint64_t size)
 {
     char                norm[RVVM_MEMFS_PATH_MAX];
     rvvm_memfs_result_t rc;
     uint32_t            idx;
-    memfs_inode_t*      in;
 
     if (!fs) {
         return RVVM_MEMFS_ENOENT;
@@ -1894,50 +1924,14 @@ rvvm_memfs_result_t rvvm_memfs_truncate(rvvm_memfs_t* fs, const char* path, uint
         return RVVM_MEMFS_EROFS;
     }
     rc = memfs_normalize(norm, sizeof(norm), path);
-    if (rc != RVVM_MEMFS_OK) {
-        rvvm_unlock(&fs->lock);
-        return rc;
+    if (rc == RVVM_MEMFS_OK) {
+        rc = memfs_resolve_locked(fs, norm, true, &idx);
     }
-    rc = memfs_resolve_locked(fs, norm, true, &idx);
-    if (rc != RVVM_MEMFS_OK) {
-        rvvm_unlock(&fs->lock);
-        return rc;
+    if (rc == RVVM_MEMFS_OK) {
+        rc = memfs_truncate_inode_locked(fs, memfs_inode_of(fs, idx), size);
     }
-    in = memfs_inode_of(fs, idx);
-    if (in->kind == RVVM_MEMFS_DIR) {
-        rvvm_unlock(&fs->lock);
-        return RVVM_MEMFS_EISDIR;
-    }
-    if (in->kind == RVVM_MEMFS_LNK) {
-        /* truncate() follows the link, so this is the target's answer. Reaching
-         * here means the target is not a regular file. */
-        rvvm_unlock(&fs->lock);
-        return RVVM_MEMFS_EINVAL;
-    }
-    if (size > in->size) {
-        uint64_t delta = size - in->size;
-        if (fs->size_limit && (fs->used + delta) > fs->size_limit) {
-            rvvm_unlock(&fs->lock);
-            return RVVM_MEMFS_ENOSPC;
-        }
-        if (!memfs_inode_reserve(in, (size_t)size)) {
-            rvvm_unlock(&fs->lock);
-            return RVVM_MEMFS_ENOMEM;
-        }
-        memset(in->data + in->size, 0, (size_t)delta);
-        fs->used += delta;
-    } else if (fs->size_limit && fs->used >= in->size) {
-        /* Shrinking releases, and the budget has to follow for the same reason
-         * truncation does: a guest that cuts a file to fit inside its limit and
-         * then writes to it again would otherwise be refused by a filesystem
-         * that is holding fewer bytes than it did before. Truncating one name of
-         * a hard-linked file truncates the single inode every name shares. */
-        fs->used -= in->size - (size_t)size;
-    }
-    in->size = (size_t)size;
-    in->mtime = memfs_now();
     rvvm_unlock(&fs->lock);
-    return RVVM_MEMFS_OK;
+    return rc;
 }
 
 rvvm_memfs_result_t rvvm_memfs_chmod(rvvm_memfs_t* fs, const char* path, uint32_t mode)
@@ -1970,14 +1964,125 @@ rvvm_memfs_result_t rvvm_memfs_chmod(rvvm_memfs_t* fs, const char* path, uint32_
 
 /* --- reading and writing ------------------------------------------------ */
 
+/* The read itself, on an inode the caller has already resolved. Split out so the
+ * path-keyed call and the descriptor-keyed one (rvvm_memfs_read_at) share one
+ * implementation: a descriptor names an inode, not a name, and the only
+ * difference is how the inode was found. Caller holds the lock. */
+static rvvm_memfs_result_t memfs_read_inode_locked(memfs_inode_t* in,
+                                                   uint64_t off, void* buf, size_t count,
+                                                   size_t* done)
+{
+    size_t avail;
+
+    if (in->kind == RVVM_MEMFS_DIR) {
+        return RVVM_MEMFS_EISDIR;
+    }
+    if (in->kind != RVVM_MEMFS_REG) {
+        /* Resolved with follow, so a link that survived is a link with no
+         * target - which is ENOENT to a caller, not a readable file. */
+        return RVVM_MEMFS_EINVAL;
+    }
+    if (off >= in->size) {
+        /* Past the end is a short read, not an error: read(2) at or beyond EOF
+         * returns 0, and a guest looping until it sees 0 is how a file copy
+         * terminates. */
+        return RVVM_MEMFS_OK;
+    }
+    avail = in->size - (size_t)off;
+    if (avail > count) {
+        avail = count;
+    }
+    memcpy(buf, in->data + off, avail);
+    if (done) {
+        *done = avail;
+    }
+    return RVVM_MEMFS_OK;
+}
+
+/* The write itself. Caller holds the lock, and the read-only check has already
+ * been made by whoever found the inode. */
+static rvvm_memfs_result_t memfs_write_inode_locked(rvvm_memfs_t* fs, memfs_inode_t* in,
+                                                    uint64_t off, const void* buf, size_t count,
+                                                    size_t* done)
+{
+    uint64_t need;
+
+    if (in->kind == RVVM_MEMFS_DIR) {
+        return RVVM_MEMFS_EISDIR;
+    }
+    if (in->kind != RVVM_MEMFS_REG) {
+        return RVVM_MEMFS_EINVAL;
+    }
+    need = off + count;
+    if (need > in->size) {
+        uint64_t delta = need - in->size;
+        if (fs->size_limit && (fs->used + delta) > fs->size_limit) {
+            /* ENOSPC and not a short write: the guest asked for @count bytes at
+             * @off and either all of it is stored or the call fails, so a
+             * partial write cannot leave a file the guest believes it filled. */
+            return RVVM_MEMFS_ENOSPC;
+        }
+        if (!memfs_inode_reserve(in, (size_t)need)) {
+            return RVVM_MEMFS_ENOMEM;
+        }
+        /* The gap a sparse write leaves has to read back as zeros, or a guest
+         * that seeks past the end and writes would hand its own reader whatever
+         * was in the reused buffer. */
+        if (off > in->size) {
+            memset(in->data + in->size, 0, (size_t)(off - in->size));
+        }
+        fs->used += delta;
+        in->size = (size_t)need;
+    }
+    memcpy(in->data + off, buf, count);
+    in->mtime = memfs_now();
+    if (done) {
+        *done = count;
+    }
+    return RVVM_MEMFS_OK;
+}
+
+/* The truncate itself. Caller holds the lock. */
+static rvvm_memfs_result_t memfs_truncate_inode_locked(rvvm_memfs_t* fs, memfs_inode_t* in,
+                                                       uint64_t size)
+{
+    if (in->kind == RVVM_MEMFS_DIR) {
+        return RVVM_MEMFS_EISDIR;
+    }
+    if (in->kind == RVVM_MEMFS_LNK) {
+        /* truncate() follows the link, so reaching a link here means its target
+         * is not a regular file. */
+        return RVVM_MEMFS_EINVAL;
+    }
+    if (size > in->size) {
+        uint64_t delta = size - in->size;
+        if (fs->size_limit && (fs->used + delta) > fs->size_limit) {
+            return RVVM_MEMFS_ENOSPC;
+        }
+        if (!memfs_inode_reserve(in, (size_t)size)) {
+            return RVVM_MEMFS_ENOMEM;
+        }
+        memset(in->data + in->size, 0, (size_t)delta);
+        fs->used += delta;
+    } else if (fs->size_limit && fs->used >= in->size) {
+        /* Shrinking releases, and the budget has to follow for the same reason
+         * truncation does: a guest that cuts a file to fit inside its limit and
+         * then writes to it again would otherwise be refused by a filesystem
+         * that is holding fewer bytes than it did before. Truncating one name of
+         * a hard-linked file truncates the single inode every name shares. */
+        fs->used -= in->size - (size_t)size;
+    }
+    in->size = (size_t)size;
+    in->mtime = memfs_now();
+    return RVVM_MEMFS_OK;
+}
+
 rvvm_memfs_result_t rvvm_memfs_read(rvvm_memfs_t* fs, const char* path,
                                     uint64_t off, void* buf, size_t count, size_t* done)
 {
     char                norm[RVVM_MEMFS_PATH_MAX];
     rvvm_memfs_result_t rc;
     uint32_t            idx;
-    memfs_inode_t*      in;
-    size_t              avail;
 
     if (done) {
         *done = 0;
@@ -1990,38 +2095,11 @@ rvvm_memfs_result_t rvvm_memfs_read(rvvm_memfs_t* fs, const char* path,
     if (rc == RVVM_MEMFS_OK) {
         rc = memfs_resolve_locked(fs, norm, true, &idx);
     }
-    if (rc != RVVM_MEMFS_OK) {
-        rvvm_unlock(&fs->lock);
-        return rc;
-    }
-    in = memfs_inode_of(fs, idx);
-    if (in->kind == RVVM_MEMFS_DIR) {
-        rvvm_unlock(&fs->lock);
-        return RVVM_MEMFS_EISDIR;
-    }
-    if (in->kind != RVVM_MEMFS_REG) {
-        /* Resolved with follow, so a link that survived is a link with no
-         * target - which is ENOENT, not a readable file. */
-        rvvm_unlock(&fs->lock);
-        return RVVM_MEMFS_EINVAL;
-    }
-    if (off >= in->size) {
-        /* Past the end is a short read, not an error: read(2) at or beyond EOF
-         * returns 0, and a guest looping until it sees 0 is how a file copy
-         * terminates. */
-        rvvm_unlock(&fs->lock);
-        return RVVM_MEMFS_OK;
-    }
-    avail = in->size - (size_t)off;
-    if (avail > count) {
-        avail = count;
-    }
-    memcpy(buf, in->data + off, avail);
-    if (done) {
-        *done = avail;
+    if (rc == RVVM_MEMFS_OK) {
+        rc = memfs_read_inode_locked(memfs_inode_of(fs, idx), off, buf, count, done);
     }
     rvvm_unlock(&fs->lock);
-    return RVVM_MEMFS_OK;
+    return rc;
 }
 
 rvvm_memfs_result_t rvvm_memfs_write(rvvm_memfs_t* fs, const char* path,
@@ -2030,8 +2108,6 @@ rvvm_memfs_result_t rvvm_memfs_write(rvvm_memfs_t* fs, const char* path,
     char                norm[RVVM_MEMFS_PATH_MAX];
     rvvm_memfs_result_t rc;
     uint32_t            idx;
-    memfs_inode_t*      in;
-    uint64_t            need;
 
     if (done) {
         *done = 0;
@@ -2055,46 +2131,177 @@ rvvm_memfs_result_t rvvm_memfs_write(rvvm_memfs_t* fs, const char* path,
     if (rc == RVVM_MEMFS_OK) {
         rc = memfs_resolve_locked(fs, norm, true, &idx);
     }
-    if (rc != RVVM_MEMFS_OK) {
-        rvvm_unlock(&fs->lock);
-        return rc;
+    if (rc == RVVM_MEMFS_OK) {
+        rc = memfs_write_inode_locked(fs, memfs_inode_of(fs, idx), off, buf, count, done);
     }
-    in = memfs_inode_of(fs, idx);
-    if (in->kind == RVVM_MEMFS_DIR) {
-        rvvm_unlock(&fs->lock);
-        return RVVM_MEMFS_EISDIR;
+    rvvm_unlock(&fs->lock);
+    return rc;
+}
+
+/* --- open handles: an inode a descriptor keeps alive -------------------- */
+
+/* Whether @ino names a live inode. Caller holds the lock. */
+static bool memfs_inode_live(const rvvm_memfs_t* fs, uint32_t ino)
+{
+    return ino < fs->ino_count && fs->inodes[ino].kind != 0;
+}
+
+/* The one dentry naming @ino, or RVVM_MEMFS_NONE. A directory has exactly one
+ * (a directory cannot be hard-linked), so this is how a directory inode is
+ * reached from a descriptor that holds only the inode. Caller holds the lock. */
+static uint32_t memfs_dentry_of_inode(const rvvm_memfs_t* fs, uint32_t ino)
+{
+    size_t i;
+    for (i = 0; i < fs->count; ++i) {
+        if (fs->dentries[i].path && fs->dentries[i].inode == ino) {
+            return (uint32_t)i;
+        }
     }
-    if (in->kind != RVVM_MEMFS_REG) {
+    return RVVM_MEMFS_NONE;
+}
+
+rvvm_memfs_result_t rvvm_memfs_pin(rvvm_memfs_t* fs, uint32_t ino)
+{
+    if (!fs) {
+        return RVVM_MEMFS_ENOENT;
+    }
+    rvvm_lock(&fs->lock);
+    if (!memfs_inode_live(fs, ino)) {
         rvvm_unlock(&fs->lock);
+        return RVVM_MEMFS_ENOENT;
+    }
+    fs->inodes[ino].pins++;
+    rvvm_unlock(&fs->lock);
+    return RVVM_MEMFS_OK;
+}
+
+void rvvm_memfs_unpin(rvvm_memfs_t* fs, uint32_t ino)
+{
+    memfs_inode_t* in;
+
+    if (!fs) {
+        return;
+    }
+    rvvm_lock(&fs->lock);
+    if (!memfs_inode_live(fs, ino)) {
+        rvvm_unlock(&fs->lock);
+        return;
+    }
+    in = &fs->inodes[ino];
+    if (in->pins == 0) {
+        rvvm_unlock(&fs->lock);
+        return;
+    }
+    in->pins--;
+    /* The last name may have gone while this pin held the inode, and dropping
+     * the last pin is what finally frees it. A file whose names are all gone has
+     * nlink 0; a directory, whose nlink is the 2+subdirectories convention
+     * rather than a count, is asked whether any name still reaches it. */
+    if (in->pins == 0 &&
+        ((in->kind != RVVM_MEMFS_DIR) ? (in->nlink == 0)
+                                      : (memfs_dentry_of_inode(fs, ino) == RVVM_MEMFS_NONE))) {
+        memfs_inode_release(in);
+        memfs_inode_slot_free(fs, ino);
+    }
+    rvvm_unlock(&fs->lock);
+}
+
+rvvm_memfs_result_t rvvm_memfs_read_at(rvvm_memfs_t* fs, uint32_t ino,
+                                       uint64_t off, void* buf, size_t count, size_t* done)
+{
+    rvvm_memfs_result_t rc;
+
+    if (done) {
+        *done = 0;
+    }
+    if (!fs || !buf) {
         return RVVM_MEMFS_EINVAL;
     }
-    need = off + count;
-    if (need > in->size) {
-        uint64_t delta = need - in->size;
-        if (fs->size_limit && (fs->used + delta) > fs->size_limit) {
-            /* ENOSPC and not a short write: the guest asked for @count bytes at
-             * @off and either all of it is stored or the call fails, so a
-             * partial write cannot leave a file the guest believes it filled. */
-            rvvm_unlock(&fs->lock);
-            return RVVM_MEMFS_ENOSPC;
-        }
-        if (!memfs_inode_reserve(in, (size_t)need)) {
-            rvvm_unlock(&fs->lock);
-            return RVVM_MEMFS_ENOMEM;
-        }
-        /* The gap a sparse write leaves has to read back as zeros, or a guest
-         * that seeks past the end and writes would hand its own reader whatever
-         * was in the reused buffer. */
-        if (off > in->size) {
-            memset(in->data + in->size, 0, (size_t)(off - in->size));
-        }
-        fs->used += delta;
-        in->size = (size_t)need;
+    rvvm_lock(&fs->lock);
+    if (!memfs_inode_live(fs, ino)) {
+        rc = RVVM_MEMFS_ENOENT;
+    } else {
+        rc = memfs_read_inode_locked(&fs->inodes[ino], off, buf, count, done);
     }
-    memcpy(in->data + off, buf, count);
-    in->mtime = memfs_now();
+    rvvm_unlock(&fs->lock);
+    return rc;
+}
+
+rvvm_memfs_result_t rvvm_memfs_write_at(rvvm_memfs_t* fs, uint32_t ino,
+                                        uint64_t off, const void* buf, size_t count, size_t* done)
+{
+    rvvm_memfs_result_t rc;
+
     if (done) {
-        *done = count;
+        *done = 0;
+    }
+    if (!fs || !buf) {
+        return RVVM_MEMFS_EINVAL;
+    }
+    if (count == 0) {
+        return RVVM_MEMFS_OK;
+    }
+    rvvm_lock(&fs->lock);
+    if (fs->read_only) {
+        rvvm_unlock(&fs->lock);
+        return RVVM_MEMFS_EROFS;
+    }
+    if (!memfs_inode_live(fs, ino)) {
+        rc = RVVM_MEMFS_ENOENT;
+    } else {
+        rc = memfs_write_inode_locked(fs, &fs->inodes[ino], off, buf, count, done);
+    }
+    rvvm_unlock(&fs->lock);
+    return rc;
+}
+
+rvvm_memfs_result_t rvvm_memfs_truncate_ino(rvvm_memfs_t* fs, uint32_t ino, uint64_t size)
+{
+    rvvm_memfs_result_t rc;
+
+    if (!fs) {
+        return RVVM_MEMFS_ENOENT;
+    }
+    rvvm_lock(&fs->lock);
+    if (fs->read_only) {
+        rvvm_unlock(&fs->lock);
+        return RVVM_MEMFS_EROFS;
+    }
+    if (!memfs_inode_live(fs, ino)) {
+        rc = RVVM_MEMFS_ENOENT;
+    } else {
+        rc = memfs_truncate_inode_locked(fs, &fs->inodes[ino], size);
+    }
+    rvvm_unlock(&fs->lock);
+    return rc;
+}
+
+/* The stat of an inode, for fstat(). @out->path is left empty on purpose: an
+ * inode reached by number has no one name, and inventing one - the first name
+ * that happens to reach it - would be a path the caller never asked about. Every
+ * other field is the inode's own. */
+rvvm_memfs_result_t rvvm_memfs_stat_ino(rvvm_memfs_t* fs, uint32_t ino, rvvm_memfs_info_t* out)
+{
+    memfs_inode_t* in;
+
+    if (!fs) {
+        return RVVM_MEMFS_ENOENT;
+    }
+    rvvm_lock(&fs->lock);
+    if (!memfs_inode_live(fs, ino)) {
+        rvvm_unlock(&fs->lock);
+        return RVVM_MEMFS_ENOENT;
+    }
+    if (out) {
+        in = &fs->inodes[ino];
+        out->index = ino;
+        out->path[0] = '\0';
+        out->kind  = in->kind;
+        out->mode  = in->mode;
+        out->size  = (in->kind == RVVM_MEMFS_REG) ? (uint64_t)in->size : 0;
+        out->ino   = in->ino;
+        out->nlink = in->nlink;
+        out->mtime = in->mtime;
     }
     rvvm_unlock(&fs->lock);
     return RVVM_MEMFS_OK;
@@ -2109,30 +2316,17 @@ static const char* memfs_dentry_name(const memfs_dentry_t* d)
     return memfs_basename(d->path);
 }
 
-rvvm_memfs_result_t rvvm_memfs_getdents(rvvm_memfs_t* fs, const char* path,
-                                        uint32_t* pos, char* out_name, size_t size,
-                                        uint8_t* out_kind, uint64_t* out_ino)
+/* One entry of the listing of the directory @dir (a dentry index). Caller holds
+ * the lock and has checked @pos and the buffers. Split out so the path-keyed and
+ * the descriptor-keyed calls share it, the same way read and write do. */
+static rvvm_memfs_result_t memfs_getdents_dentry_locked(rvvm_memfs_t* fs, uint32_t dir,
+                                                        uint32_t* pos, char* out_name, size_t size,
+                                                        uint8_t* out_kind, uint64_t* out_ino)
 {
-    char                norm[RVVM_MEMFS_PATH_MAX];
-    rvvm_memfs_result_t rc;
-    uint32_t            dir;
-    uint32_t            seen = 0;
-    uint32_t            kid;
+    uint32_t seen = 0;
+    uint32_t kid;
 
-    if (!fs || !pos || !out_name || size == 0) {
-        return RVVM_MEMFS_EINVAL;
-    }
-    rvvm_lock(&fs->lock);
-    rc = memfs_normalize(norm, sizeof(norm), path);
-    if (rc == RVVM_MEMFS_OK) {
-        rc = memfs_resolve_locked(fs, norm, true, &dir);
-    }
-    if (rc != RVVM_MEMFS_OK) {
-        rvvm_unlock(&fs->lock);
-        return rc;
-    }
     if (memfs_inode_of(fs, dir)->kind != RVVM_MEMFS_DIR) {
-        rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_ENOTDIR;
     }
     /* The cursor is a count of entries already handed out, not an index into the
@@ -2153,7 +2347,6 @@ rvvm_memfs_result_t rvvm_memfs_getdents(rvvm_memfs_t* fs, const char* path,
                  * so this is the caller's buffer being too small rather than a
                  * corrupt entry. Refusing is better than truncating a name,
                  * which would be a different name. */
-                rvvm_unlock(&fs->lock);
                 return RVVM_MEMFS_EINVAL;
             }
             memcpy(out_name, name, nlen + 1);
@@ -2165,9 +2358,57 @@ rvvm_memfs_result_t rvvm_memfs_getdents(rvvm_memfs_t* fs, const char* path,
             *out_ino = fs->inodes[fs->dentries[kid].inode].ino;
         }
         *pos = seen;
-        rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_OK;
     }
-    rvvm_unlock(&fs->lock);
     return RVVM_MEMFS_EOF;
+}
+
+rvvm_memfs_result_t rvvm_memfs_getdents(rvvm_memfs_t* fs, const char* path,
+                                        uint32_t* pos, char* out_name, size_t size,
+                                        uint8_t* out_kind, uint64_t* out_ino)
+{
+    char                norm[RVVM_MEMFS_PATH_MAX];
+    rvvm_memfs_result_t rc;
+    uint32_t            dir;
+
+    if (!fs || !pos || !out_name || size == 0) {
+        return RVVM_MEMFS_EINVAL;
+    }
+    rvvm_lock(&fs->lock);
+    rc = memfs_normalize(norm, sizeof(norm), path);
+    if (rc == RVVM_MEMFS_OK) {
+        rc = memfs_resolve_locked(fs, norm, true, &dir);
+    }
+    if (rc == RVVM_MEMFS_OK) {
+        rc = memfs_getdents_dentry_locked(fs, dir, pos, out_name, size, out_kind, out_ino);
+    }
+    rvvm_unlock(&fs->lock);
+    return rc;
+}
+
+/* The listing of a directory named by inode, for a descriptor that already
+ * resolved it. A directory removed while still open has no dentry left to walk,
+ * so its listing is empty (EOF) rather than an error - which is also true of the
+ * directory itself: rmdir only removes an empty one. */
+rvvm_memfs_result_t rvvm_memfs_getdents_ino(rvvm_memfs_t* fs, uint32_t ino,
+                                            uint32_t* pos, char* out_name, size_t size,
+                                            uint8_t* out_kind, uint64_t* out_ino)
+{
+    rvvm_memfs_result_t rc;
+    uint32_t            dir;
+
+    if (!fs || !pos || !out_name || size == 0) {
+        return RVVM_MEMFS_EINVAL;
+    }
+    rvvm_lock(&fs->lock);
+    if (!memfs_inode_live(fs, ino)) {
+        rc = RVVM_MEMFS_ENOENT;
+    } else {
+        dir = memfs_dentry_of_inode(fs, ino);
+        rc = (dir == RVVM_MEMFS_NONE)
+           ? RVVM_MEMFS_EOF
+           : memfs_getdents_dentry_locked(fs, dir, pos, out_name, size, out_kind, out_ino);
+    }
+    rvvm_unlock(&fs->lock);
+    return rc;
 }
