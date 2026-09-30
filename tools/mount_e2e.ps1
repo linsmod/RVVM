@@ -176,9 +176,67 @@ Check ($r -match 'No such file') "NOT YET: the mount point does not serve the fi
 $rc = ClientRc 'umount /mnt'
 Check ($rc -eq 0) "the proc mount unmounts again (rc $rc)"
 
+# --- a host directory mounted at a guest path --------------------------------
+# The other direction from a tmpfs: the bytes are the host's and the path is the
+# guest's. This is what WSL calls drvfs and MinGW spells /c, and it is how a guest
+# reaches a host tree without a global mode - a host directory is a mount, and a
+# mount is a row.
+$hd = Join-Path $env:TEMP 'vp_mount_e2e_hostfs'
+if (Test-Path $hd) { Remove-Item $hd -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $hd | Out-Null
+Set-Content -Path (Join-Path $hd 'marker.txt') -Value 'hostfs-marker' -NoNewline -Encoding ascii
+$hds = $hd.Replace('\', '/')
+
+$rc = ClientRc "mount -t hostfs '$hds' /hostdir"
+Check ($rc -eq 0) "mount -t hostfs <host dir> /hostdir succeeds (rc $rc)"
+
+$r = Client 'ls /hostdir'
+Check ($r -match 'marker\.txt') "the guest sees the host directory's names"
+
+$r = Client 'cat /hostdir/marker.txt'
+Check ($r -match 'hostfs-marker') "and reads the host file's bytes"
+
+$r = Client 'stat -c %s /hostdir/marker.txt'
+Check ($r.Trim() -eq '13') "the size is the host file's ('$($r.Trim())')"
+
+# Write-through is the difference between a mount and a copy: the guest's write
+# lands in the host's directory.
+$rc = ClientRc 'echo guest-side > /hostdir/from_guest.txt'
+Check ($rc -eq 0) "the guest writes through it (rc $rc)"
+$r = Get-Content (Join-Path $hd 'from_guest.txt') -ErrorAction SilentlyContinue
+Check ($r -match 'guest-side') "and the host's directory has the file"
+
+# The mount owns its own name, so nothing is appended for the mount point itself:
+# /hostdir asks the host for the directory, not for <dir>/hostdir. That is the
+# shape a mount has and a prefix does not - a prefix is a parent.
+$r = Client 'ls /hostdir/marker.txt'
+Check ($r -match 'marker\.txt') "the mount point is the host directory itself"
+
+# A source is not optional: the fstype names a host directory and with none there
+# is nothing to mount.
+$rc = ClientRc 'mount -t hostfs "" /hostdir2'
+Check ($rc -ne 0) "mount -t hostfs with no source is refused (rc $rc, EINVAL)"
+
+$rc = ClientRc "mount -t hostfs '$hds' /"
+Check ($rc -ne 0) "mounting a host directory over / is refused (rc $rc, EINVAL)"
+
+$rc = ClientRc "mount -t hostfs '$hds' /hostdir2"
+Check ($rc -eq 0) "the same directory can be mounted at a second path (rc $rc)"
+$r = Client 'cat /hostdir2/marker.txt'
+Check ($r -match 'hostfs-marker') "and answers there too"
+$rc = ClientRc 'umount /hostdir2'
+Check ($rc -eq 0) "the second mount unmounts (rc $rc)"
+
+$rc = ClientRc 'umount /hostdir'
+Check ($rc -eq 0) "umount /hostdir succeeds (rc $rc)"
+$r = Client 'cat /hostdir/marker.txt'
+Check ($r -match 'No such file') "and the host directory is no longer reachable"
+
 } finally {
     # Leave the namespace as we found it: a mount left behind is a mount the next
     # run of this script inherits, and the default-table check would fail on it.
+    Client 'umount /hostdir' | Out-Null
+    Client 'umount /hostdir2' | Out-Null
     Client 'umount /mnt' | Out-Null
     Client 'umount /srv' | Out-Null
     Client 'umount /opt' | Out-Null

@@ -1719,6 +1719,11 @@ typedef enum {
 #define RVVM_MOUNT_MAX      16
 #define RVVM_MOUNT_PATH_MAX  64
 #define RVVM_MOUNT_OPT_MAX   48
+/* Longest host directory a row can name. Longer than the guest-path bound because
+ * a host path is the longer of the two (a build tree inside a user profile), and
+ * a source longer than this is refused rather than truncated: a mount that quietly
+ * points at a prefix of the directory asked for is worse than one that fails. */
+#define RVVM_MOUNT_HOST_MAX 1024
 
 typedef struct {
     char                  path[RVVM_MOUNT_PATH_MAX];
@@ -1730,6 +1735,18 @@ typedef struct {
      * field in the row rather than an index into a side table because the row's
      * lifetime is exactly the filesystem's. */
     rvvm_memfs_t*         memfs;
+    /* Where a RVVM_MOUNT_HOSTFS row's bytes are, when they are not simply the
+     * host's tree at the same path.
+     *
+     * Empty means exactly that: the host's own /sys for /sys, the host's own /tmp
+     * for /tmp - the rows that reach through rather than across. Non-empty is a
+     * host directory mounted at a guest path of its own, which is what
+     * rvvm_user_mount_hostfs() and mount -t hostfs build: the WSL drvfs / MinGW /c
+     * shape, where the guest's namespace says where and the host's says what.
+     *
+     * Last in the struct so the default rows' positional initializers - one
+     * brace per row, four fields - keep meaning what they meant. */
+    char                  host_path[RVVM_MOUNT_HOST_MAX];
 } rvvm_mount_t;
 
 /* The run's mount namespace: ONE of these per run, shared by every process in
@@ -4489,62 +4506,92 @@ static rvvm_path_owner_t rvvm_path_owner(const struct rvvm_mount_ns* ns, const c
     return owner;
 }
 
-/* Whether a guest path skips the hostfs prefix - i.e. is answered by a mount of
- * its own rather than by the run's rootfs.
+/* Where a guest-absolute path hangs on the host, if anywhere.
  *
- * The rule is the one the array implemented, unchanged: a covered path does not
- * get the prefix, UNLESS the run's own rootfs has that directory - a minirootfs
- * ships /dev and /tmp as empty directories, and sending an access to the host's
- * root, where they do not exist, would lose a directory the guest can see in its
- * own listing. The lookup is on the mount point itself, never on the full path,
- * because a name that does not exist yet has no entry of its own and asking about
- * it would send that very open() to the host.
+ * The rule is the one the array implemented, unchanged in its first two cases: a
+ * path covered by a row of its own does not get the prefix, UNLESS the run's own
+ * rootfs has that directory - a minirootfs ships /dev and /tmp as empty
+ * directories, and sending an access to the host's root, where they do not exist,
+ * would lose a directory the guest can see in its own listing. The lookup is on
+ * the mount point itself, never on the full path, because a name that does not
+ * exist yet has no entry of its own and asking about it would send that very
+ * open() to the host.
  *
- * Every answer here now comes from the table, including the one that used to be
- * read off the prefix: prefix == NULL no longer means "the guest's paths are the
- * host's paths". It means the root row is memory-backed, and a memory-backed root
- * has no host directory for a prefix to be put in front of, so its paths do not
- * bypass - they simply have no host form at all, which is what the callers of
- * memfs_mount_for() are for.
- */
-static bool path_bypass(const char* path)
+ * What the callers get is not a yes/no but a directory: @dir is the host directory
+ * the path hangs under, and NULL means it has no host form at all. The old boolean
+ * could only say "prefix it" or "do not", which was enough while the only host
+ * directory in the table was the prefix; a row that names a host directory of its
+ * own needs the third answer, and this is where it is decided once.
+ *
+ * @with_guest_root says whether the run's root= applies inside @dir. It does only
+ * for the prefix, because that is the only directory root= is defined against: it
+ * says which part of the rootfs the guest calls "/", and a host tree mounted at
+ * /mnt/c is not a rootfs at all.
+ *
+ * Every answer comes from the table, including the one that used to be read off
+ * the prefix: prefix == NULL no longer means "the guest's paths are the host's
+ * paths". It means the root row is memory-backed, and a memory-backed root has no
+ * host directory for a prefix to be put in front of, so its paths have no host
+ * form - which is what the callers of memfs_mount_for() are for.
+ *
+ * @rest is what goes after @dir, and the two cases are genuinely different shapes:
+ * the prefix is a *parent*, so the whole guest path goes under it, while a mount
+ * owns its own name - /mnt/c maps to the directory itself and only what comes after
+ * /mnt/c belongs below it. @rest points into @path and is "" at the mount point.
+ *
+ * Caller holds the namespace lock: this is half table and half shadow, and the
+ * shadow can be replaced under it by another thread. */
+static void path_host_mapping(const rvvm_userland_t* ctx, const char* path,
+                              const char** dir, const char** rest, bool* with_guest_root)
 {
-    rvvm_userland_t*  ctx = uctx();
     rvvm_path_owner_t owner;
-    bool              bypassed;
 
-    if (!path) {
-        return false;
+    *dir             = NULL;
+    *rest            = path;
+    *with_guest_root = false;
+    if (!ctx->mountns || !path) {
+        return;
     }
-    /* Under the lock because it is half table and half shadow, and the shadow can
-     * be replaced under it by another thread. */
-    spin_lock(&ctx->mountns->lock);
     owner = rvvm_path_owner(ctx->mountns, path);
     if (!owner.mount) {
         /* No row answers at all, which only happens before the namespace exists.
-         * The prefix is then the only thing left, and a path under it is not
-         * bypassed. */
-        bypassed = (ctx->prefix_path == NULL);
-    } else if (mount_row_is_root(owner.mount)) {
+         * The prefix is then the only thing left. */
+        *dir             = ctx->prefix_path;
+        *with_guest_root = true;
+        return;
+    }
+    if (mount_row_is_root(owner.mount)) {
         /* The run's own root. Host-backed it takes the prefix - that is what the
          * prefix is; memory-backed there is no host directory to put in front of
-         * anything, so the path skips the mapping and the syscall layer answers it
-         * out of the storage. */
-        bypassed = (owner.provider != RVVM_MOUNT_HOSTFS);
-    } else if (ctx->shadow &&
-               vp_shadow_view_lookup(&ctx->shadow_view, owner.mount->path) != NULL) {
-        /* A mount the rootfs also ships as a real directory - a minirootfs has
-         * /dev and /tmp as empty ones - so the host directory wins and the prefix
-         * goes on after all. */
-        bypassed = false;
-    } else {
-        /* A core subtree, a memory filesystem, or one of the host's own trees:
-         * served by the row itself, and prefixing it would aim at a directory
-         * nobody made. */
-        bypassed = true;
+         * anything, so the path has no host form at all and the syscall layer
+         * answers it out of the storage. */
+        if (owner.provider == RVVM_MOUNT_HOSTFS) {
+            *dir             = ctx->prefix_path;
+            *with_guest_root = true;
+        }
+        return;
     }
-    spin_unlock(&ctx->mountns->lock);
-    return bypassed;
+    if (ctx->shadow && vp_shadow_view_lookup(&ctx->shadow_view, owner.mount->path) != NULL) {
+        /* A mount the rootfs also ships as a real directory - a minirootfs has /dev
+         * and /tmp as empty ones - so the host directory wins and that means the
+         * prefix rather than the row's own path. */
+        *dir             = ctx->prefix_path;
+        *with_guest_root = true;
+        return;
+    }
+    if (owner.provider == RVVM_MOUNT_HOSTFS) {
+        /* A hostfs row. An empty host_path is the host's own tree at the same path,
+         * which needs no rewriting and no directory to name; a named one is a host
+         * directory mounted where the guest asked for it, and it owns that name:
+         * /mnt/c IS the directory, and only what follows it goes below. */
+        if (owner.mount->host_path[0]) {
+            *dir  = owner.mount->host_path;
+            *rest = path + strlen(owner.mount->path);
+        }
+        return;
+    }
+    /* A core subtree or a memory filesystem: served by the row itself, and
+     * prefixing it would aim at a directory nobody made. */
 }
 
 /* Parse a tmpfs `size=` value: a byte count, or one of the usual k/m/g suffixes,
@@ -4662,19 +4709,105 @@ static rvvm_mount_t* mount_row_exact(struct rvvm_mount_ns* ns, const char* abs)
 
 /* The options string a tmpfs row reports, which is what /proc/mounts hands the
  * guest. Written from the storage rather than from the request, so the flag and
- * the size a guest reads there are the ones it is really under: a row that said
- * rw over storage that refuses every write is the kind of lie this whole table
- * exists to stop telling. */
-static void mount_row_tmpfs_options(rvvm_mount_t* m, bool read_only)
+ * the size a guest reads there are the ones it is really under: a row that said rw
+ * over storage that refuses every write is the kind of lie this whole table exists
+ * to stop telling.
+ *
+ * Takes the storage rather than the row so a row can be described before it exists
+ * - which is what mount_row_add() needs, since the string has to be ready by the
+ * time the row goes in. */
+static void tmpfs_options(char* options, size_t size, rvvm_memfs_t* memfs, bool read_only)
 {
-    uint64_t limit = rvvm_memfs_size_limit(m->memfs);
+    uint64_t limit = rvvm_memfs_size_limit(memfs);
 
     if (limit) {
-        snprintf(m->options, sizeof(m->options), "%s,relatime,size=%lluk",
+        snprintf(options, size, "%s,relatime,size=%lluk",
                  read_only ? "ro" : "rw", (unsigned long long)(limit / 1024));
     } else {
-        snprintf(m->options, sizeof(m->options), "%s,relatime", read_only ? "ro" : "rw");
+        snprintf(options, size, "%s,relatime", read_only ? "ro" : "rw");
     }
+}
+
+/* The row about to be added. A struct rather than eight arguments, and the reason
+ * mount(2) and rvvm_user_mount_hostfs() can share one code path: they differ only
+ * in which of these they fill in. */
+typedef struct {
+    const char*           fstype;
+    rvvm_mount_provider_t provider;
+    const char*           host_path; /* a host directory, for a HOSTFS row that names one */
+    rvvm_memfs_t*         memfs;     /* ownership passes to the row on success */
+    bool                  read_only; /* a tmpfs whose writes are refused */
+} rvvm_mount_spec_t;
+
+/* Add one row at @abs.
+ *
+ * Refuses a target something already covers, and that is deliberate rather than
+ * merely enforced: mounting over a mount needs a tree rather than a longest-match
+ * list, and a stack is the wrong shape to ask "what covers here" of. It also
+ * absorbs any mount already inside @abs, because longest-match would otherwise
+ * leave the outer row answering for the inner path's children and /proc/mounts
+ * would list two mounts where one covers both; whatever the absorbed row owned goes
+ * with it, so a nested tmpfs does not leak its filesystem. @spec.memfs is freed on
+ * every failure, so no caller has to remember to.
+ *
+ * Does not take the lock itself: the two callers are a syscall and a host API, and
+ * neither holds it. */
+static rvvm_addr_t mount_row_add(rvvm_userland_t* ctx, const char* abs,
+                                 const rvvm_mount_spec_t* spec)
+{
+    rvvm_mount_t* row;
+    unsigned      i;
+
+    spin_lock(&ctx->mountns->lock);
+    if (rvvm_mount_find(ctx->mountns, abs)) {
+        spin_unlock(&ctx->mountns->lock);
+        rvvm_memfs_free(spec->memfs);
+        return -UAPI_EBUSY;
+    }
+    if (ctx->mountns->count >= RVVM_MOUNT_MAX) {
+        spin_unlock(&ctx->mountns->lock);
+        rvvm_memfs_free(spec->memfs);
+        return -UAPI_ENOSPC;
+    }
+    for (i = 0; i < ctx->mountns->count; ++i) {
+        rvvm_mount_t* m = &ctx->mountns->mounts[i];
+        unsigned      j;
+        if (mount_row_is_root(m)) {
+            continue; /* the root is not absorbed by anything */
+        }
+        if (path_has_prefix(m->path, abs)) {
+            mount_row_release(m);
+            for (j = i; j + 1 < ctx->mountns->count; ++j) {
+                ctx->mountns->mounts[j] = ctx->mountns->mounts[j + 1];
+            }
+            ctx->mountns->count--;
+            memset(&ctx->mountns->mounts[ctx->mountns->count], 0, sizeof(rvvm_mount_t));
+            i--;
+        }
+    }
+    row = &ctx->mountns->mounts[ctx->mountns->count];
+    memset(row, 0, sizeof(*row));
+    rvvm_strlcpy(row->path, abs, sizeof(row->path));
+    rvvm_strlcpy(row->fstype, spec->fstype, sizeof(row->fstype));
+    row->provider = spec->provider;
+    row->memfs    = spec->memfs;
+    if (spec->host_path) {
+        rvvm_strlcpy(row->host_path, spec->host_path, sizeof(row->host_path));
+    }
+    if (spec->provider == RVVM_MOUNT_MEMFS) {
+        /* From the storage, so the row reports the flag and the size it is really
+         * under. */
+        tmpfs_options(row->options, sizeof(row->options), spec->memfs, spec->read_only);
+    } else {
+        rvvm_strlcpy(row->options, "rw,relatime", sizeof(row->options));
+    }
+    ctx->mountns->count++;
+    spin_unlock(&ctx->mountns->lock);
+    /* A new mount changes what paths resolve to, so a directory replay from the old
+     * table would list names that are no longer there - the same reason
+     * rvvm_user_set_shadow() drops them. */
+    memset(ctx->shadow_dirs, 0, sizeof(ctx->shadow_dirs));
+    return 0;
 }
 
 /* mount(2) and umount2(2) against the table.
@@ -4692,6 +4825,12 @@ static void mount_row_tmpfs_options(rvvm_mount_t* m, bool read_only)
  *                                  rvvm_session_pty_* pairs.
  *   tmpfs       RVVM_MOUNT_MEMFS.  A memory filesystem the mount owns.
  *   sysfs       RVVM_MOUNT_HOSTFS. As today.
+ *   hostfs      RVVM_MOUNT_HOSTFS. A host directory the source names, mounted where
+ *                                  the guest asks. This core's name for what WSL
+ *                                  calls drvfs and MinGW spells /c - it is the same
+ *                                  thing rvvm_user_mount_hostfs() builds, and the
+ *                                  reason a host tree the guest may reach is a
+ *                                  mount rather than a mode.
  *
  * Anything else is ENOSYS - which is what it already was, and is now for a reason
  * a caller can act on rather than by accident.
@@ -4718,8 +4857,9 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
     uint64_t              size_limit = 0;
     bool                  have_size  = false;
     bool                  read_only  = false;
+    const char*           host_path  = NULL;
+    char                  host_abs[RVVM_MOUNT_HOST_MAX];
     char                  abs[UAPI_PATH_MAX];
-    unsigned              i;
 
     if (!target) {
         return -UAPI_EFAULT;
@@ -4767,7 +4907,7 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
                  * remount of anything else still changes nothing, and that is
                  * honest: those rows have no writable state to turn off. */
                 rvvm_memfs_set_read_only(m->memfs, ro);
-                mount_row_tmpfs_options(m, ro);
+                tmpfs_options(m->options, sizeof(m->options), m->memfs, ro);
             }
         }
         spin_unlock(&ctx->mountns->lock);
@@ -4785,6 +4925,18 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
     } else if (!strcmp(fstype, "devtmpfs") || !strcmp(fstype, "devpts")) {
         provider = RVVM_MOUNT_CORE;
     } else if (!strcmp(fstype, "sysfs")) {
+        provider = RVVM_MOUNT_HOSTFS;
+    } else if (!strcmp(fstype, "hostfs")) {
+        /* A host directory mounted at a guest path, named by the source - which is
+         * what mount(2)'s source argument is: host-side metadata about where the
+         * bytes are, not a path the guest resolves. A guest naming one is a guest
+         * asking to see part of the host, and that is a decision the run's owner
+         * makes by giving it a mount(2) at all - the same trust the /sys and /tmp
+         * rows already assume, and the reason a sandboxed run is a run with a
+         * rootfs rather than a run with a mount table. */
+        if (!source || !source[0]) {
+            return -UAPI_EINVAL;
+        }
         provider = RVVM_MOUNT_HOSTFS;
     } else if (!strcmp(fstype, "tmpfs")) {
         /* The one filesystem whose bytes the core owns: private, dies with the
@@ -4812,6 +4964,23 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
         return -UAPI_EINVAL;
     }
     read_only = (flags & UAPI_MS_RDONLY) != 0;
+    if (provider == RVVM_MOUNT_HOSTFS && !strcmp(fstype, "hostfs")) {
+        const char* done;
+        /* Resolved against the host's working directory, because it is a host
+         * path: this is the setter's job in rvvm_user_set_prefix() for the same
+         * reason - a relative directory would resolve against whatever the guest
+         * did to the process's cwd next. */
+        if (strlen(source) >= sizeof(host_abs)) {
+            /* Refused rather than truncated: a row pointing at a prefix of the
+             * directory named would serve the wrong files, quietly. */
+            return -UAPI_ENAMETOOLONG;
+        }
+        done = host_path_absolute(host_abs, sizeof(host_abs), source);
+        if (!done) {
+            return -UAPI_EINVAL;
+        }
+        host_path = done;
+    }
     if (provider == RVVM_MOUNT_MEMFS) {
         bool data_ro = false;
         if (memfs_mount_options(data, &size_limit, &have_size, &data_ro)) {
@@ -4838,66 +5007,24 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
         }
     }
 
-    spin_lock(&ctx->mountns->lock);
-    /* Mounting over something already mounted needs a tree rather than a
-     * longest-match list, and a stack is the wrong shape to answer "what covers
-     * here" with anyway. Linux says EBUSY. */
-    if (rvvm_mount_find(ctx->mountns, abs)) {
-        spin_unlock(&ctx->mountns->lock);
-        rvvm_memfs_free(memfs);
-        return -UAPI_EBUSY;
-    }
-    if (ctx->mountns->count >= RVVM_MOUNT_MAX) {
-        spin_unlock(&ctx->mountns->lock);
-        rvvm_memfs_free(memfs);
-        return -UAPI_ENOSPC;
-    }
-
-    /* Absorb any mount already inside the new one. Longest-match would otherwise
-     * leave the outer entry answering for the inner path's children, and
-     * /proc/mounts would list two mounts where one covers both. Whatever the
-     * absorbed row owned goes with it - a nested tmpfs would otherwise leak its
-     * whole filesystem here. */
-    for (i = 0; i < ctx->mountns->count; ++i) {
-        rvvm_mount_t* m = &ctx->mountns->mounts[i];
-        unsigned      j;
-        if (m->path[0] == '/' && m->path[1] == '\0') {
-            continue;
-        }
-        if (path_has_prefix(m->path, abs)) {
-            mount_row_release(m);
-            for (j = i; j + 1 < ctx->mountns->count; ++j) {
-                ctx->mountns->mounts[j] = ctx->mountns->mounts[j + 1];
-            }
-            ctx->mountns->count--;
-            memset(&ctx->mountns->mounts[ctx->mountns->count], 0, sizeof(rvvm_mount_t));
-            i--;
-        }
-    }
-
     {
-        rvvm_mount_t* m = &ctx->mountns->mounts[ctx->mountns->count];
-        memset(m, 0, sizeof(*m));
-        rvvm_strlcpy(m->path, abs, sizeof(m->path));
-        rvvm_strlcpy(m->fstype, fstype, sizeof(m->fstype));
-        m->provider = provider;
-        m->memfs    = memfs;
-        if (provider == RVVM_MOUNT_MEMFS) {
-            /* From the storage that was just built, so the row reports the flag
-             * and the size the mount is really under. */
-            mount_row_tmpfs_options(m, read_only);
-        } else {
-            rvvm_strlcpy(m->options, "rw,relatime", sizeof(m->options));
+        /* The row is added by the one function that knows how, so a hostfs mount
+         * arriving through mount(2) and one arriving through
+         * rvvm_user_mount_hostfs() cannot drift apart. */
+        rvvm_mount_spec_t spec;
+        rvvm_addr_t       rc;
+
+        spec.fstype    = fstype;
+        spec.provider  = provider;
+        spec.host_path = host_path;
+        spec.memfs     = memfs;
+        spec.read_only = read_only;
+        rc = mount_row_add(ctx, abs, &spec);
+        if (rc == 0) {
+            rvvm_info("mount(%s, %s, %s): mounted", source ? source : "(none)", abs, fstype);
         }
-        ctx->mountns->count++;
+        return rc;
     }
-    spin_unlock(&ctx->mountns->lock);
-    /* A new mount changes what paths resolve to, so a directory replay from the
-     * old table would list names that are no longer there - the same reason
-     * rvvm_user_set_shadow() drops them. */
-    memset(ctx->shadow_dirs, 0, sizeof(ctx->shadow_dirs));
-    rvvm_info("mount(%s, %s, %s): mounted", source ? source : "(none)", abs, fstype);
-    return 0;
 }
 
 static rvvm_addr_t rvvm_user_umount(const char* target, int flags)
@@ -4947,12 +5074,81 @@ static rvvm_addr_t rvvm_user_umount(const char* target, int flags)
     return -UAPI_EINVAL;
 }
 
+/* Is @path already where the guest's cwd should be? Called with the host's
+ * getcwd() output, so this is a HOST path being asked about: one under the prefix
+ * is already the guest's root, and one that no row maps is a cwd the guest named
+ * as a row's own tree - the host's /tmp for the /tmp row - which moving into the
+ * prefix would take away from it. */
+/* The host-facing half of `mount -t hostfs`: the same row, built before the run
+ * rather than by the guest. A host that wants one of its own directories visible
+ * mounts it here; a guest that mounts one goes through rvvm_user_mount(). Both end
+ * in mount_row_add(), which is what keeps the two spellings from drifting apart. */
+PUBLIC int rvvm_user_mount_hostfs(rvvm_machine_t* machine, const char* guest_path,
+                                  const char* host_path)
+{
+    rvvm_userland_t*  ctx = rvvm_userland_ctx(machine);
+    rvvm_mount_spec_t spec;
+    const char*       resolved;
+    char              host_abs[RVVM_MOUNT_HOST_MAX];
+    char              abs[UAPI_PATH_MAX];
+    rvvm_addr_t       rc;
+
+    if (!ctx || !ctx->mountns) {
+        return -UAPI_EINVAL;
+    }
+    if (!guest_path || !guest_path[0] || !host_path || !host_path[0]) {
+        return -UAPI_EINVAL;
+    }
+    if (!guest_path_absolutize(abs, sizeof(abs), guest_path)) {
+        return -UAPI_ENAMETOOLONG;
+    }
+    if (abs[0] == '/' && abs[1] == '\0') {
+        /* The root is where the run's filesystem is, and
+         * rvvm_user_set_prefix() is what decides it: a host directory mounted over
+         * "/" would be a rootfs the rest of the core has never heard of. mount(2)
+         * refuses the same target for the same reason. */
+        return -UAPI_EINVAL;
+    }
+    if (strlen(host_path) >= sizeof(host_abs)) {
+        /* Refused rather than truncated: a row pointing at a prefix of the
+         * directory the host named would serve the wrong files, quietly. */
+        return -UAPI_ENAMETOOLONG;
+    }
+    resolved = host_path_absolute(host_abs, sizeof(host_abs), host_path);
+    if (!resolved) {
+        return -UAPI_EINVAL;
+    }
+    spec.fstype    = "hostfs";
+    spec.provider  = RVVM_MOUNT_HOSTFS;
+    spec.host_path = resolved;
+    spec.memfs     = NULL;
+    spec.read_only = false;
+    rc = mount_row_add(ctx, abs, &spec);
+    if (rc == 0) {
+        rvvm_info("mount_hostfs(%s -> %s): mounted", resolved, abs);
+    }
+    return (int)rc;
+}
+
 static bool path_wrapped(const char* path)
 {
-    const char* prefix = uctx()->prefix_path;
-    return prefix == NULL
-        || rvvm_strfind(path, prefix) == path
-        || path_bypass(path);
+    rvvm_userland_t* ctx = uctx();
+    const char*      dir       = NULL;
+    const char*      rest      = path;
+    bool             with_root = false;
+    bool             wrapped;
+
+    if (!ctx->prefix_path) {
+        return true;
+    }
+    if (rvvm_strfind(path, ctx->prefix_path) == path) {
+        return true;
+    }
+    spin_lock(&ctx->mountns->lock);
+    path_host_mapping(ctx, path, &dir, &rest, &with_root);
+    spin_unlock(&ctx->mountns->lock);
+    wrapped = (dir == NULL);
+    return wrapped;
 }
 
 /* ============================================================
@@ -5193,8 +5389,10 @@ static void shadow_hide_tree(uint32_t index)
     }
 }
 
-/* Map an already-absolute guest path into the host namespace: "<prefix><path>",
- * with the path_bypass() directories left alone.
+/* Map an already-absolute guest path into the host namespace: the directory the
+ * covering row names, in front of the path - the prefix for the run's own root, a
+ * row's own host_path for a host directory mounted at a guest path, and nothing at
+ * all for a path the core answers itself.
  *
  * A relative path is returned untouched. This is the entry point for paths that
  * do NOT come from a syscall argument - the guest ELF named on the command
@@ -5238,66 +5436,84 @@ static bool userland_proc_parse(const char* abs, uint32_t self_pid, rvvm_proc_pa
 
 static const char* map_abs_path_ex(char* buffer, const char* path, bool follow_final)
 {
-    const char* prefix = uctx()->prefix_path;
-    /* Whether the prefix applies is now the table's answer rather than this
-     * function's own reading of `prefix != NULL`, and the two are not the same
-     * question any more: a run with no prefix has a memory root, and every path
-     * under it bypasses. The prefix itself still means exactly what it did - the
-     * root row's host directory - so a path that does take it is mapped the way it
-     * always was. `prefix` is still consulted, for the one case the table and the
-     * context could disagree about. */
-    if (prefix && path && path[0] == '/' && !path_bypass(path)) {
-        if (rvvm_strfind(path, "/") == path) {
-            char followed[UAPI_PATH_MAX];
-            size_t prefix_len;
+    rvvm_userland_t* ctx = uctx();
+    const char*      dir  = NULL;
+    const char*      rest = path;
+    bool             with_guest_root = false;
+
+    if (!path || path[0] != '/') {
+        return path;
+    }
+    /* Which host directory this path hangs under is the table's answer, and NULL
+     * means there is none - a core subtree or a memory filesystem, which the
+     * syscall layer answers itself. Taken and released rather than held across the
+     * rewrites below, because those walk the shadow and a lock held there would be
+     * held across a lookup that has nothing to do with the mount table. */
+    spin_lock(&ctx->mountns->lock);
+    path_host_mapping(ctx, path, &dir, &rest, &with_guest_root);
+    spin_unlock(&ctx->mountns->lock);
+    if (!dir) {
+        return path;
+    }
+    {
+        char followed[UAPI_PATH_MAX];
+        size_t dir_len;
+        /* The two rewrites below are guest-namespace questions about the rootfs:
+         * a descriptor link, and a name the archive says is a link. Both mean "the
+         * same file under another name inside the root", so they belong where the
+         * directory IS the root. A host directory mounted at /mnt/c is not part of
+         * that index, and a name under it means whatever the host's directory says
+         * it means. */
+        if (with_guest_root) {
             /* A /proc/<pid>/fd/<n> path names a descriptor, not a place. Acting
-             * through one has to act on what it points at, because the prefix
-             * below would otherwise produce <prefix>/proc/self/fd/7 - a
-             * directory that is not there - and the operation fails with ENOENT
-             * against a path the caller never wrote. */
-            const char* fd_target = userland_proc_fd_path_target(followed, sizeof(followed), path);
+             * through one has to act on what it points at, because the directory
+             * below would otherwise produce <prefix>/proc/self/fd/7 - a directory
+             * that is not there - and the operation fails with ENOENT against a
+             * path the caller never wrote. */
+            const char* fd_target =
+                userland_proc_fd_path_target(followed, sizeof(followed), path);
             if (fd_target) {
                 path = fd_target;
+                rest = path;
             } else if (follow_final ? shadow_follow_path(followed, sizeof(followed), path)
                                     : shadow_resolve_parent(followed, sizeof(followed), path)) {
                 path = followed;
+                rest = path;
             }
-            prefix_len = rvvm_strlcpy(buffer, prefix, UAPI_PATH_MAX);
-            /* root= composes with the prefix rather than replacing it: this is
-             * "<prefix><guest_root><path>", which is chroot(2)'s arithmetic. The
-             * prefix keeps meaning one thing - where the rootfs is on the host -
-             * and root= says which part of it this run calls "/", so
-             * root=/data/app/foo means the same thing on a phone and on a PC.
-             *
-             * The same root the shadow view applies to its half, and reached
-             * through ctx->guest_root_path rather than through the view: this
-             * buffer is a HOST path and the view's value is an index-namespace
-             * guest path, which happen to be the same string today and must not
-             * be assumed to be - a view could be given a root the host half has
-             * never heard of, and the other way round.
-             *
-             * Not applied to a path that bypasses: /proc, /dev and /sys are
-             * resolved before this point (the check is above), and prefixing them
-             * would produce <prefix>/data/app/foo/proc, which is a directory
-             * nobody made. That is now the table's answer for each of them rather
-             * than a list in this function. */
-            if (uctx()->guest_root_path) {
-                size_t root_len = rvvm_strlcpy(buffer + prefix_len,
-                                               uctx()->guest_root_path,
-                                               UAPI_PATH_MAX - prefix_len);
-                prefix_len += root_len;
-            }
-            /* "/" is the prefix directory itself. Appending it would leave a
-             * trailing separator, which the host's stat()/open() may refuse
-             * (MinGW is strict about this, and "cd .." lands exactly here). */
-            if (path[1] == 0) {
-                return buffer;
-            }
-            rvvm_strlcpy(buffer + prefix_len, path, UAPI_PATH_MAX - prefix_len);
+        }
+        dir_len = rvvm_strlcpy(buffer, dir, UAPI_PATH_MAX);
+        /* root= composes with the prefix rather than replacing it: this is
+         * "<prefix><guest_root><path>", which is chroot(2)'s arithmetic. The
+         * prefix keeps meaning one thing - where the rootfs is on the host - and
+         * root= says which part of it this run calls "/", so root=/data/app/foo
+         * means the same thing on a phone and on a PC.
+         *
+         * The same root the shadow view applies to its half, and reached through
+         * ctx->guest_root_path rather than through the view: this buffer is a HOST
+         * path and the view's value is an index-namespace guest path, which happen
+         * to be the same string today and must not be assumed to be - a view could
+         * be given a root the host half has never heard of, and the other way
+         * round.
+         *
+         * Only where the table said the directory is the run's own root, which is
+         * the only place root= is defined: a host tree mounted at /mnt/c is not a
+         * rootfs and has no part that the guest calls "/". */
+        if (with_guest_root && ctx->guest_root_path) {
+            size_t root_len = rvvm_strlcpy(buffer + dir_len, ctx->guest_root_path,
+                                           UAPI_PATH_MAX - dir_len);
+            dir_len += root_len;
+        }
+        /* The directory itself, in either shape: the guest's "/" under the prefix,
+         * or the mount point of a host directory mounted at its own name. Appending
+         * anything would leave a trailing separator, which the host's stat()/open()
+         * may refuse (MinGW is strict about this, and "cd .." lands exactly here).
+         * "" is that case for a mount, "/" for the prefix. */
+        if (rest[0] == '\0' || (rest[0] == '/' && rest[1] == '\0')) {
             return buffer;
         }
+        rvvm_strlcpy(buffer + dir_len, rest, UAPI_PATH_MAX - dir_len);
+        return buffer;
     }
-    return path;
 }
 
 /* The common case: everything that names a file to act *on* follows links. */

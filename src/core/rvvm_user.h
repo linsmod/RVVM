@@ -319,12 +319,22 @@ void rvvm_session_pty_free(rvvm_host_pty_t* pty);
 // Override the guest's filesystem prefix - the directory guest absolute paths
 // are resolved against.
 //
-//   prefix = NULL  -> host paths pass through unchanged (no sandbox)
-//   prefix = "/x"  -> guest "/foo" becomes "/x/foo"; "/dev", "/sys", "/proc",
-//                     "/tmp", "/var/tmp" and relative paths still pass through
+//   prefix = NULL  -> the guest's "/" is an empty memory filesystem, which dies
+//                     with the run. That is a run with no rootfs rather than a
+//                     run with translation off: a program that needs no files
+//                     runs against nothing, and one that wants somewhere to write
+//                     gets a filesystem of its own. A dynamically linked program
+//                     cannot run that way - its interpreter is a guest path and
+//                     there is nothing there to hold it.
+//   prefix = "/x"  -> guest "/foo" becomes "/x/foo"; the paths a row of their own
+//                     answers - /dev, /sys, /proc, /tmp, /var/tmp, every tmpfs
+//                     mount - still do not take it, and relative paths never do.
 //
-// Passing NULL is how a host asks for passthrough. The direction of the mount
-// is always the host's, per machine: there is no environment override.
+// The prefix is the directory the run's own root row is backed by, not a mode the
+// whole namespace is put into: it says where "/" lives, and everything else is a
+// mount. A host tree the guest may reach at some other path is a mount too - see
+// rvvm_user_mount_hostfs(). The direction of the mount is always the host's, per
+// machine: there is no environment override.
 //
 // A relative @prefix is resolved against the working directory HERE, once, and
 // the stored string is always absolute. That is not tidiness: three consumers
@@ -342,9 +352,33 @@ void rvvm_session_pty_free(rvvm_host_pty_t* pty);
 // recorded - see rvvm_user_set_cmdline().
 void rvvm_user_set_prefix(rvvm_machine_t* machine, const char* prefix);
 
-// Read back the prefix in effect, always absolute when non-NULL (NULL when host
-// paths pass through). The pointer is owned by the machine.
+// Read back the prefix in effect, always absolute when non-NULL. NULL means the
+// guest's / is memory (see above). The pointer is owned by the machine.
 const char* rvvm_user_get_prefix(rvvm_machine_t* machine);
+
+// Mount a host directory at a guest path: the guest's /mnt/c is the host's C:\,
+// and everything under it is that host directory's. This is what WSL calls drvfs
+// and MinGW spells /c, and it is the answer to "how does a guest see a host tree"
+// that is not a global mode: a host tree the guest may reach is a mount, and a
+// mount is a row in the run's table.
+//
+// @host_path is a HOST path - resolved against the working directory here, once,
+// like a prefix - and it may be anything the host can open: a whole volume, a
+// directory of assets, the runtime directory a host keeps its own files in.
+// @guest_path is where it appears, and must not be "/": the run's root is what
+// rvvm_user_set_prefix() decides, and a host directory mounted over it would be a
+// rootfs that nothing knows is one.
+//
+// Returns 0, or a negative errno: -ENAMETOOLONG for a name longer than a row can
+// hold (refused rather than truncated, since a row pointing at a prefix of the
+// directory asked for would serve the wrong files), -EBUSY if something is
+// already mounted there, -ENOSPC if the table is full.
+//
+// The guest can also do this itself, with mount(2) - `mount -t hostfs <dir>
+// <path>` - which is the same row built from the same place: giving a guest a
+// mount(2) is already giving it the run's own view of the host.
+int rvvm_user_mount_hostfs(rvvm_machine_t* machine, const char* guest_path,
+                           const char* host_path);
 
 // root=: the guest directory that becomes "/". NULL, "" or "/" means no chroot,
 // which is the default and what every run did before the argument existed.
