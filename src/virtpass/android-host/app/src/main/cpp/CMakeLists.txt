@@ -91,9 +91,10 @@ add_library(rvvm_core STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/ndk_compat.c
 
     # Core
-    ${RVVM_SRC}/core/rvvm.c
-    ${RVVM_SRC}/core/rvvm_user.c
-    ${RVVM_SRC}/core/rvvm_irq.c
+${RVVM_SRC}/core/rvvm.c
+${RVVM_SRC}/core/rvvm_user.c
+${RVVM_SRC}/core/rvvm_memfs.c
+${RVVM_SRC}/core/rvvm_irq.c
     ${RVVM_SRC}/core/rvvm_region.c
     ${RVVM_SRC}/core/rvvm_isolation.c
     

@@ -27,6 +27,7 @@ add_executable(rvvm_winhost
     # Core
     ${RVVM_ROOT}/src/core/rvvm.c
     ${RVVM_ROOT}/src/core/rvvm_user.c
+    ${RVVM_ROOT}/src/core/rvvm_memfs.c
     ${RVVM_ROOT}/src/core/rvvm_irq.c
     ${RVVM_ROOT}/src/core/rvvm_region.c
     ${RVVM_ROOT}/src/core/rvvm_isolation.c
