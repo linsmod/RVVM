@@ -1631,6 +1631,50 @@ typedef struct {
 #define TTY_IN_RING 4096
 #define TTY_IN_LINE 1024
 
+/* ============================================================
+ * Mounts
+ *
+ * What answers a guest path, and which kind of answer it is. This replaces a
+ * five-element array of directories that skipped the hostfs prefix, and the
+ * replacement is worth the shape because the two kinds are not the same thing
+ * and the array could not say which was which:
+ *
+ *   RVVM_MOUNT_CORE    the core synthesizes the whole subtree. /proc is
+ *                      userland_proc_*, /dev is userland_dev_* and the pty pair.
+ *                      No host file is involved, and prefixing one would aim at
+ *                      a directory nobody made.
+ *   RVVM_MOUNT_HOSTFS  the host's own tree, reached directly. /tmp and /sys are
+ *                      this today, and they are the reason a prefix is not
+ *                      simply applied to everything: a guest that could not write
+ *                      its own /tmp would be a guest nobody runs.
+ *   RVVM_MOUNT_ROOTFS  the run's own root - the hostfs prefix. The entry exists
+ *                      for /proc/mounts and is not a match target; see
+ *                      rvvm_mount_find().
+ *
+ * The table is per context and seeded from a constant, so a run can be given a
+ * different set than the next one. Nothing edits it yet - mount(2) answering
+ * honestly rather than pretending is the next change - but /proc/mounts being
+ * generated from here instead of shipped as a string in the archive is already
+ * worth it: that string claimed six mounts, one of which (devpts) nothing
+ * implements, and a guest's mount(1), df and /proc/mounts all believed it.
+ */
+typedef enum {
+    RVVM_MOUNT_ROOTFS = 0,
+    RVVM_MOUNT_CORE,
+    RVVM_MOUNT_HOSTFS,
+} rvvm_mount_provider_t;
+
+#define RVVM_MOUNT_MAX      16
+#define RVVM_MOUNT_PATH_MAX  64
+#define RVVM_MOUNT_OPT_MAX   48
+
+typedef struct {
+    char                  path[RVVM_MOUNT_PATH_MAX];
+    char                  fstype[24];
+    char                  options[RVVM_MOUNT_OPT_MAX];
+    rvvm_mount_provider_t provider;
+} rvvm_mount_t;
+
 typedef struct rvvm_userland {
     // Machine this context belongs to; identical to rvvm_machine_t::userdata
     rvvm_machine_t* machine;
@@ -1650,7 +1694,12 @@ typedef struct rvvm_userland {
     // are different things - this one is a guest path, that one a host path - and
     // the two compose rather than replace each other. Owned here; the shadow view
     // keeps its own normalized copy. See rvvm_user_set_guest_root().
-    char*                      guest_root_path;
+char*                    guest_root_path;
+    // What answers a guest path (see the mounts section above). Seeded from a
+    // constant; nothing edits it yet, but /proc/mounts is generated from it, so
+    // it is the answer rather than a description of one.
+    rvvm_mount_t             mounts[RVVM_MOUNT_MAX];
+    unsigned                 mount_count;
     bool                     fake_root;
     // Guest credentials. fake_uid/fake_gid are the *real* (saved) ids and are
     // what stat() reports as the file owner; the e* twins are what the guest
@@ -4072,29 +4121,99 @@ static bool path_has_prefix(const char* path, const char* prefix)
     return rvvm_strfind(path, prefix) == path && (path[len] == '/' || path[len] == 0);
 }
 
+/* ============================================================
+ * Mounts
+ *
+ * The type and the table are declared above rvvm_userland_t, which holds the
+ * per-run set. What follows is the lookup and the one place the answer is used.
+ */
+
+/* The namespace a run starts in, and what /proc/mounts says about it.
+ *
+ * The options are not decoration: they are what the table answers, so a program
+ * reading them back is reading this and not a transcription of it. devpts is
+ * absent on purpose - /dev is served whole by RVVM_MOUNT_CORE and there is no
+ * separate devpts mount behind it, so listing one would be the same fiction this
+ * table exists to remove. */
+static const rvvm_mount_t rvvm_mount_default_table[] = {
+    { "/",        "auto",    "rw,relatime",                                   RVVM_MOUNT_ROOTFS },
+    { "/dev",     "devtmpfs", "rw,nosuid,size=65536k,mode=755",               RVVM_MOUNT_CORE   },
+    { "/sys",     "sysfs",   "rw,nosuid,nodev,noexec,relatime",              RVVM_MOUNT_HOSTFS },
+    { "/proc",    "proc",    "rw,nosuid,nodev,noexec,relatime",              RVVM_MOUNT_CORE   },
+    { "/tmp",     "tmpfs",   "rw,nosuid,nodev,relatime",                     RVVM_MOUNT_HOSTFS },
+    { "/var/tmp", "tmpfs",   "rw,nosuid,nodev,relatime",                     RVVM_MOUNT_HOSTFS },
+};
+
+/* The run's table, seeded. Called from rvvm_user_create() and from the fork
+ * path, because a child inherits the namespace it was forked in. */
+static void rvvm_mount_reset(rvvm_userland_t* ctx)
+{
+    size_t n = STATIC_ARRAY_SIZE(rvvm_mount_default_table);
+    if (n > RVVM_MOUNT_MAX) {
+        n = RVVM_MOUNT_MAX;
+    }
+    memcpy(ctx->mounts, rvvm_mount_default_table, n * sizeof(rvvm_mount_t));
+    ctx->mount_count = (unsigned)n;
+}
+
+/* The mount whose path covers @path, longest match first, or NULL.
+ *
+ * "/" is in the table for /proc/mounts and is deliberately not a match: every
+ * absolute guest path starts with it, so matching it would put every path on a
+ * mount and hand the question back to the caller. The run's root is the prefix,
+ * which is a different mechanism answering a different question. */
+static const rvvm_mount_t* rvvm_mount_find(const rvvm_userland_t* ctx, const char* path)
+{
+    const rvvm_mount_t* best = NULL;
+    size_t best_len = 0;
+    unsigned i;
+
+    if (!ctx || !path) {
+        return NULL;
+    }
+    for (i = 0; i < ctx->mount_count; ++i) {
+        const rvvm_mount_t* m = &ctx->mounts[i];
+        size_t len;
+        if (m->path[0] == '/' && m->path[1] == '\0') {
+            continue;
+        }
+        len = rvvm_strlen(m->path);
+        if (len <= best_len || !path_has_prefix(path, m->path)) {
+            continue;
+        }
+        best = m;
+        best_len = len;
+    }
+    return best;
+}
+
+/* Whether a guest path skips the hostfs prefix.
+ *
+ * The rule is the one the array implemented, unchanged: a mounted path does not
+ * get the prefix, UNLESS the run's own rootfs has that directory - a minirootfs
+ * ships /dev and /tmp as empty directories, and sending an access to the host's
+ * root, where they do not exist, would lose a directory the guest can see in its
+ * own listing. The lookup is on the mount point itself, never on the full path,
+ * because a name that does not exist yet has no entry of its own and asking about
+ * it would send that very open() to the host.
+ *
+ * prefix == NULL means the guest's paths ARE the host's paths, so everything
+ * bypasses. That is the one answer here that is not derived from the table, and
+ * it is what the next change removes.
+ */
 static bool path_bypass(const char* path)
 {
-    static const char* const dirs[] = { "/dev", "/sys", "/proc", "/tmp", "/var/tmp" };
+    const rvvm_mount_t* m;
     const char* prefix = uctx()->prefix_path;
 
     if (prefix == NULL) {
         return true;
     }
-    for (size_t i = 0; i < STATIC_ARRAY_SIZE(dirs); ++i) {
-        if (path_has_prefix(path, dirs[i])) {
-            /* The guest's own rootfs wins when the archive *has* the
-             * directory: a minirootfs ships /dev, /tmp, ... (empty), and
-             * sending an access to the host's root - where they do not
-             * exist - would lose a directory the guest can see in its own
-             * listing. The lookup is on the directory itself, never on the
-             * full path: a name that does not exist yet (a file about to be
-             * created under it) has no entry of its own, and asking about it
-             * would send that very open() to the host. */
-            return uctx()->shadow == NULL ||
-                   vp_shadow_view_lookup(&uctx()->shadow_view, dirs[i]) == NULL;
-        }
+    m = rvvm_mount_find(uctx(), path);
+    if (!m) {
+        return false;
     }
-    return false;
+    return uctx()->shadow == NULL || vp_shadow_view_lookup(&uctx()->shadow_view, m->path) == NULL;
 }
 
 static bool path_wrapped(const char* path)
@@ -7342,6 +7461,12 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
      * that decides what a view is - and the root is copied just after, which is
      * why the order here is view first. */
     vp_shadow_view_init(&ctx->shadow_view, ctx->shadow, parent->guest_root_path);
+    /* The mounts too: a child is in the same namespace as the process that
+     * forked it, and the table is part of what that means. Copied rather than
+     * re-seeded, because a parent that has been given a different set must pass
+     * it on - and re-seeding would quietly undo that. */
+    memcpy(ctx->mounts, parent->mounts, sizeof(ctx->mounts));
+    ctx->mount_count = parent->mount_count;
 
     /* Console output goes through the same sink, so a child's writes reach the
      * console its parent was started on. Its bytes are not parsed into the
@@ -11451,6 +11576,7 @@ static const char* const userland_proc_root_names[] = {
 };
 static const char* const userland_proc_root_files[] = {
     "uptime", "stat", "meminfo", "version", "cpuinfo", "loadavg", "filesystems", "cmdline",
+    "mounts",
 };
 static const char* const userland_proc_pid_names[] = {
     "stat", "status", "statm", "cmdline", "comm", "fd", "cwd", "exe", "root",
@@ -11520,11 +11646,6 @@ static bool userland_proc_parse(const char* abs, uint32_t self_pid, rvvm_proc_pa
     const char* tail = slash ? slash + 1 : NULL;
     if (tail && *tail == 0) {
         tail = NULL;
-    }
-
-    /* /proc/mounts is the bundle's real file: leave it to the host. */
-    if (!strcmp(first, "mounts")) {
-        return false;
     }
 
     bool self = !strcmp(first, "self") || !strcmp(first, "thread-self");
@@ -12170,6 +12291,49 @@ static void userland_fill_sysinfo(struct uapi_sysinfo* si)
     si->freeram  = userland_proc_free_bytes(uctx()) / si->mem_unit;
 }
 
+/*
+ * /proc/mounts, written out of the mount table.
+ *
+ * This file used to be a real file in the archive - a string constant in
+ * vp_bundle.c, installed into the rootfs at mount time - which is why
+ * userland_proc_parse() declined the name and let the host answer it. The
+ * problem was never that it was a file; it was that it was a *transcription* of
+ * a namespace, kept in a different place from the one that namespace is defined
+ * by, and therefore free to disagree with it. It did: it listed a devpts mount on
+ * /dev/pts that nothing implements, so a guest's mount(8), df(1) and every
+ * library that reads /proc/mounts were told about a filesystem that was not
+ * there.
+ *
+ * Generated here, it cannot disagree - and when mount(2) starts editing the
+ * table, the file follows for free rather than needing a second edit.
+ *
+ * The source column is always /dev/root and the fstype for the root line "auto",
+ * because there is one filesystem and it is the run's own; a guest asking where
+ * "/" came from gets an answer, and not a confusing one.
+ */
+static size_t userland_proc_gen_mounts(char* buf, size_t size)
+{
+    rvvm_userland_t* ctx = uctx();
+    size_t len = 0;
+    unsigned i;
+
+    /* userland_proc_appendf() returns the absolute new offset, not the number of
+     * bytes it added, so this is an assignment and not `+=`. Accumulating instead
+     * reports a length past the end of what was written, and the reader is told
+     * to copy that many bytes out of the buffer - which is how a correct
+     * /proc/mounts came back followed by whatever was on the stack. */
+    len = userland_proc_appendf(buf, size, len,
+                                "# Generated by the VirtPass host: the namespace the"
+                                " guest is given.\n");
+    for (i = 0; i < ctx->mount_count; ++i) {
+        const rvvm_mount_t* m = &ctx->mounts[i];
+        len = userland_proc_appendf(buf, size, len, "%s %s %s %s 0 0\n",
+                                    m->provider == RVVM_MOUNT_ROOTFS ? "/dev/root" : m->fstype,
+                                    m->path, m->fstype, m->options);
+    }
+    return len;
+}
+
 static size_t userland_proc_gen_root_file(const char* leaf, char* buf, size_t size)
 {
     if (!strcmp(leaf, "uptime"))    return userland_proc_gen_uptime(buf, size);
@@ -12179,6 +12343,7 @@ static size_t userland_proc_gen_root_file(const char* leaf, char* buf, size_t si
     if (!strcmp(leaf, "cpuinfo"))   return userland_proc_gen_cpuinfo(buf, size);
     if (!strcmp(leaf, "loadavg"))   return userland_proc_gen_loadavg(buf, size);
     if (!strcmp(leaf, "filesystems")) return userland_proc_gen_filesystems(buf, size);
+    if (!strcmp(leaf, "mounts"))     return userland_proc_gen_mounts(buf, size);
     if (!strcmp(leaf, "cmdline"))   return userland_proc_gen_root_cmdline(buf, size);
     return 0;
 }
@@ -16548,6 +16713,8 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
      * same as not having called it, and it exists so there is exactly one place
      * that decides what the view is. */
     vp_shadow_view_init(&ctx->shadow_view, NULL, NULL);
+    /* The namespace, before anything can ask about one. */
+    rvvm_mount_reset(ctx);
     return machine;
 }
 
