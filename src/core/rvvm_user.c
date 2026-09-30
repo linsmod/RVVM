@@ -137,6 +137,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "rvvm_user.h" // rvvm_user_io_callback typedef (this file's own public header)
 #include "virtpass/vp_shadow.h" // guest rootfs "shape" index (rvvm_user_set_shadow)
+#include "core/rvvm_memfs.h"    // the memory filesystem a tmpfs mount is served by
 #include "rvvmlib.h"
 
 #if defined(_WIN32)
@@ -1648,32 +1649,35 @@ typedef struct {
  *
  * What answers a guest path, and which kind of answer it is. This replaces a
  * five-element array of directories that skipped the hostfs prefix, and the
- * replacement is worth the shape because the two kinds are not the same thing
- * and the array could not say which was which:
+ * replacement is worth the shape because the kinds are not the same thing and
+ * the array could not say which was which:
  *
  *   RVVM_MOUNT_CORE    the core synthesizes the whole subtree. /proc is
  *                      userland_proc_*, /dev is userland_dev_* and the pty pair.
  *                      No host file is involved, and prefixing one would aim at
  *                      a directory nobody made.
- *   RVVM_MOUNT_HOSTFS  the host's own tree, reached directly. /tmp and /sys are
- *                      this today, and they are the reason a prefix is not
- *                      simply applied to everything: a guest that could not write
- *                      its own /tmp would be a guest nobody runs.
+ *   RVVM_MOUNT_HOSTFS  the host's own tree, reached directly. The default /sys
+ *                      row is this, and it is the reason a prefix is not simply
+ *                      applied to everything.
+ *   RVVM_MOUNT_MEMFS   storage the core owns: a rvvm_memfs_t, private to the run
+ *                      and bounded by whatever size= the mount asked for. What a
+ *                      tmpfs mount becomes - a host directory would outlive the
+ *                      run and could not be bounded, which is the one thing a
+ *                      tmpfs promises not to be.
  *   RVVM_MOUNT_ROOTFS  the run's own root - the hostfs prefix. The entry exists
- *                      for /proc/mounts and is not a match target; see
- *                      rvvm_mount_find().
+ *                      for /proc/mounts and is not a match target for mount(2);
+ *                      see rvvm_mount_find() and rvvm_mount_covering().
  *
- * The table is per context and seeded from a constant, so a run can be given a
- * different set than the next one. Nothing edits it yet - mount(2) answering
- * honestly rather than pretending is the next change - but /proc/mounts being
- * generated from here instead of shipped as a string in the archive is already
- * worth it: that string claimed six mounts, one of which (devpts) nothing
+ * The table is per context and seeded from a constant, and mount(2)/umount2(2)
+ * edit it. /proc/mounts is generated from it rather than shipped as a string in
+ * the archive: that string claimed six mounts, one of which (devpts) nothing
  * implements, and a guest's mount(1), df and /proc/mounts all believed it.
  */
 typedef enum {
     RVVM_MOUNT_ROOTFS = 0,
     RVVM_MOUNT_CORE,
     RVVM_MOUNT_HOSTFS,
+    RVVM_MOUNT_MEMFS,
 } rvvm_mount_provider_t;
 
 #define RVVM_MOUNT_MAX      16
@@ -1685,6 +1689,11 @@ typedef struct {
     char                  fstype[24];
     char                  options[RVVM_MOUNT_OPT_MAX];
     rvvm_mount_provider_t provider;
+    /* The storage of a RVVM_MOUNT_MEMFS row, NULL for every other kind: the
+     * core's own filesystem for that mount point, freed when the row goes. A
+     * field in the row rather than an index into a side table because the row's
+     * lifetime is exactly the filesystem's. */
+    rvvm_memfs_t*         memfs;
 } rvvm_mount_t;
 
 /* The run's mount namespace: ONE of these per run, shared by every process in
@@ -1740,9 +1749,24 @@ static void userland_mountns_ref(struct rvvm_mount_ns* ns)
     }
 }
 
+/* Give back everything a row owns beyond its own strings. Called wherever a row
+ * is erased: umount, an absorbed inner mount, and the namespace itself. The row
+ * is left for the caller to memset or drop; this only releases what it holds. */
+static void mount_row_release(rvvm_mount_t* m)
+{
+    if (m->memfs) {
+        rvvm_memfs_free(m->memfs);
+        m->memfs = NULL;
+    }
+}
+
 static void userland_mountns_unref(struct rvvm_mount_ns* ns)
 {
     if (ns && atomic_sub_uint32(&ns->refs, 1) == 1) {
+        unsigned i;
+        for (i = 0; i < ns->count; ++i) {
+            mount_row_release(&ns->mounts[i]);
+        }
         safe_free(ns);
     }
 }
@@ -4389,10 +4413,11 @@ static bool path_bypass(const char* path)
 static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
                                    const char* fstype, unsigned long flags)
 {
-    rvvm_userland_t*   ctx = uctx();
+    rvvm_userland_t*      ctx = uctx();
     rvvm_mount_provider_t provider;
-    char                abs[UAPI_PATH_MAX];
-    unsigned            i;
+    rvvm_memfs_t*         memfs = NULL;
+    char                  abs[UAPI_PATH_MAX];
+    unsigned              i;
 
     if (!target || !fstype) {
         return -UAPI_EFAULT;
@@ -4411,8 +4436,14 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
         provider = RVVM_MOUNT_CORE;
     } else if (!strcmp(fstype, "devtmpfs") || !strcmp(fstype, "devpts")) {
         provider = RVVM_MOUNT_CORE;
-    } else if (!strcmp(fstype, "tmpfs") || !strcmp(fstype, "sysfs")) {
+    } else if (!strcmp(fstype, "sysfs")) {
         provider = RVVM_MOUNT_HOSTFS;
+    } else if (!strcmp(fstype, "tmpfs")) {
+        /* The one filesystem whose bytes the core owns: private, dies with the
+         * run, and the only place a size= or a read-only flag can have anything
+         * behind it. A host directory would outlive the run and could not be
+         * bounded, so a tmpfs gets storage that belongs to the mount. */
+        provider = RVVM_MOUNT_MEMFS;
     } else {
         rvvm_info("mount(%s, %s, %s): %s is not a filesystem this core provides",
                   source ? source : "(none)", abs, fstype, fstype);
@@ -4421,10 +4452,25 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
 
     /* A flag with nothing behind it is worse than a refusal: a guest that mounts
      * /tmp nodev and then writes to it has been told it cannot. Nothing here
-     * enforces read-only or nodev, so nothing here accepts them. */
+     * enforces nodev or noexec, so nothing here accepts them - and MS_RDONLY
+     * stays refused until the tmpfs below is actually served, so that a mount
+     * this call accepts is a mount the run can honour. */
     if (flags & (UAPI_MS_RDONLY | UAPI_MS_NOSUID | UAPI_MS_NODEV | UAPI_MS_NOEXEC)) {
         return -UAPI_EINVAL;
     }
+
+    /* A tmpfs gets storage of its own, built before the row exists and outside
+     * the lock: nothing can see it until the row points at it, and allocating
+     * under the namespace lock would serialize every mounter behind an
+     * allocator. Every early return below hands it back (freeing NULL is a
+     * no-op for the mounts that have none). */
+    if (provider == RVVM_MOUNT_MEMFS) {
+        memfs = rvvm_memfs_create(false, 0);
+        if (!memfs) {
+            return -UAPI_ENOMEM;
+        }
+    }
+
     /* MS_REMOUNT asks about a mount that is already there, and init and mount(8)
      * pass it routinely. Refusing those is how a boot stops for no stated
      * reason. */
@@ -4432,6 +4478,7 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
     if (flags & UAPI_MS_REMOUNT) {
         int mounted = rvvm_mount_find(ctx->mountns, abs) != NULL;
         spin_unlock(&ctx->mountns->lock);
+        rvvm_memfs_free(memfs);
         return mounted ? 0 : -UAPI_EINVAL;
     }
     /* Mounting over something already mounted needs a tree rather than a
@@ -4439,16 +4486,20 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
      * here" with anyway. Linux says EBUSY. */
     if (rvvm_mount_find(ctx->mountns, abs)) {
         spin_unlock(&ctx->mountns->lock);
+        rvvm_memfs_free(memfs);
         return -UAPI_EBUSY;
     }
     if (ctx->mountns->count >= RVVM_MOUNT_MAX) {
         spin_unlock(&ctx->mountns->lock);
+        rvvm_memfs_free(memfs);
         return -UAPI_ENOSPC;
     }
 
     /* Absorb any mount already inside the new one. Longest-match would otherwise
      * leave the outer entry answering for the inner path's children, and
-     * /proc/mounts would list two mounts where one covers both. */
+     * /proc/mounts would list two mounts where one covers both. Whatever the
+     * absorbed row owned goes with it - a nested tmpfs would otherwise leak its
+     * whole filesystem here. */
     for (i = 0; i < ctx->mountns->count; ++i) {
         rvvm_mount_t* m = &ctx->mountns->mounts[i];
         unsigned      j;
@@ -4456,6 +4507,7 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
             continue;
         }
         if (path_has_prefix(m->path, abs)) {
+            mount_row_release(m);
             for (j = i; j + 1 < ctx->mountns->count; ++j) {
                 ctx->mountns->mounts[j] = ctx->mountns->mounts[j + 1];
             }
@@ -4472,6 +4524,7 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
         rvvm_strlcpy(m->fstype, fstype, sizeof(m->fstype));
         rvvm_strlcpy(m->options, "rw,relatime", sizeof(m->options));
         m->provider = provider;
+        m->memfs    = memfs;
         ctx->mountns->count++;
     }
     spin_unlock(&ctx->mountns->lock);
@@ -4506,6 +4559,9 @@ static rvvm_addr_t rvvm_user_umount(const char* target, int flags)
         }
         if (!strcmp(m->path, abs)) {
             unsigned j;
+            /* Released before the shift, while @m is still the row: a tmpfs that
+             * is unmounted gives its bytes back here. */
+            mount_row_release(m);
             for (j = i; j + 1 < ctx->mountns->count; ++j) {
                 ctx->mountns->mounts[j] = ctx->mountns->mounts[j + 1];
             }
