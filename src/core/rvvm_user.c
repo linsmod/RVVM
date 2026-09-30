@@ -295,6 +295,18 @@ typedef int32_t  uapi_long_t;
 #define UAPI_EPIPE           32
 #define UAPI_EDOM            33
 #define UAPI_ERANGE          34
+
+/* mount(2) and umount2(2) flags, from asm-generic/mount.h - the same numbers on
+ * every Linux arch riscv64 runs on, and spelled UAPI_* like the errno block above
+ * so nothing here has to have the guest's headers. Only the ones this core acts
+ * on are named: the rest of MS_* is not here because a flag that is not
+ * implemented is not something to accept quietly. */
+#define UAPI_MS_RDONLY       1
+#define UAPI_MS_NOSUID       2
+#define UAPI_MS_NODEV        4
+#define UAPI_MS_NOEXEC       8
+#define UAPI_MS_REMOUNT      32
+#define UAPI_MNT_DETACH      2
 #define UAPI_EDEADLK         35
 #define UAPI_ENAMETOOLONG    36
 #define UAPI_ENOLCK          37
@@ -1675,6 +1687,66 @@ typedef struct {
     rvvm_mount_provider_t provider;
 } rvvm_mount_t;
 
+/* The run's mount namespace: ONE of these per run, shared by every process in
+ * it, refcounted because a child outlives the process that forked it.
+ *
+ * Per-context was the first attempt and it is wrong in a way only a test shows.
+ * A mount is a property of a namespace, not of a process, and busybox's mount is
+ * a forked child that mounts and exits: with the table in the context, the mount
+ * was recorded in a copy that died with the child, so mount(2) returned success,
+ * umount(2) then said EINVAL because nothing was mounted, and /proc/mounts never
+ * mentioned it. Linux has the same shape - CLONE_NEWNS shares a namespace across
+ * processes - and the id space below is shared for the same reason: two branches
+ * of a fork tree that advance a counter per process hand out the same number
+ * twice.
+ *
+ * Locked because a mount can arrive on one thread while another's syscall reads
+ * the table, and unlike the id space this one is genuinely mutated at runtime.
+ */
+typedef struct rvvm_mount_ns {
+    spinlock_t    lock;
+    uint32_t      refs;
+    unsigned      count;
+    rvvm_mount_t  mounts[RVVM_MOUNT_MAX];
+} rvvm_mount_ns_t;
+
+static struct rvvm_mount_ns* userland_mountns_new(void)
+{
+    /* SPINLOCK_INIT is a brace initializer, so the whole struct goes down in one
+     * shot rather than field by field - and the defaults come with it. */
+    static const rvvm_mount_t defaults[] = {
+        { "/",        "auto",    "rw,relatime",                             RVVM_MOUNT_ROOTFS },
+        { "/dev",     "devtmpfs", "rw,nosuid,size=65536k,mode=755",         RVVM_MOUNT_CORE   },
+        { "/sys",     "sysfs",   "rw,nosuid,nodev,noexec,relatime",        RVVM_MOUNT_HOSTFS },
+        { "/proc",    "proc",    "rw,nosuid,nodev,noexec,relatime",        RVVM_MOUNT_CORE   },
+        { "/tmp",     "tmpfs",   "rw,nosuid,nodev,relatime",               RVVM_MOUNT_HOSTFS },
+        { "/var/tmp", "tmpfs",   "rw,nosuid,nodev,relatime",               RVVM_MOUNT_HOSTFS },
+    };
+    struct rvvm_mount_ns* ns = safe_new_obj(rvvm_mount_ns_t);
+
+    *ns = (struct rvvm_mount_ns){
+        .lock  = SPINLOCK_INIT,
+        .refs  = 1,
+        .count = STATIC_ARRAY_SIZE(defaults),
+    };
+    memcpy(ns->mounts, defaults, sizeof(defaults));
+    return ns;
+}
+
+static void userland_mountns_ref(struct rvvm_mount_ns* ns)
+{
+    if (ns) {
+        atomic_add_uint32(&ns->refs, 1);
+    }
+}
+
+static void userland_mountns_unref(struct rvvm_mount_ns* ns)
+{
+    if (ns && atomic_sub_uint32(&ns->refs, 1) == 1) {
+        safe_free(ns);
+    }
+}
+
 typedef struct rvvm_userland {
     // Machine this context belongs to; identical to rvvm_machine_t::userdata
     rvvm_machine_t* machine;
@@ -1695,11 +1767,9 @@ typedef struct rvvm_userland {
     // the two compose rather than replace each other. Owned here; the shadow view
     // keeps its own normalized copy. See rvvm_user_set_guest_root().
 char*                    guest_root_path;
-    // What answers a guest path (see the mounts section above). Seeded from a
-    // constant; nothing edits it yet, but /proc/mounts is generated from it, so
-    // it is the answer rather than a description of one.
-    rvvm_mount_t             mounts[RVVM_MOUNT_MAX];
-    unsigned                 mount_count;
+    // The run's mount namespace, shared with every process of the run and
+    // refcounted - see rvvm_mount_ns_t for why it is not per context.
+    struct rvvm_mount_ns*    mountns;
     bool                     fake_root;
     // Guest credentials. fake_uid/fake_gid are the *real* (saved) ids and are
     // what stat() reports as the file owner; the e* twins are what the guest
@@ -4128,52 +4198,32 @@ static bool path_has_prefix(const char* path, const char* prefix)
  * per-run set. What follows is the lookup and the one place the answer is used.
  */
 
-/* The namespace a run starts in, and what /proc/mounts says about it.
- *
- * The options are not decoration: they are what the table answers, so a program
- * reading them back is reading this and not a transcription of it. devpts is
- * absent on purpose - /dev is served whole by RVVM_MOUNT_CORE and there is no
- * separate devpts mount behind it, so listing one would be the same fiction this
- * table exists to remove. */
-static const rvvm_mount_t rvvm_mount_default_table[] = {
-    { "/",        "auto",    "rw,relatime",                                   RVVM_MOUNT_ROOTFS },
-    { "/dev",     "devtmpfs", "rw,nosuid,size=65536k,mode=755",               RVVM_MOUNT_CORE   },
-    { "/sys",     "sysfs",   "rw,nosuid,nodev,noexec,relatime",              RVVM_MOUNT_HOSTFS },
-    { "/proc",    "proc",    "rw,nosuid,nodev,noexec,relatime",              RVVM_MOUNT_CORE   },
-    { "/tmp",     "tmpfs",   "rw,nosuid,nodev,relatime",                     RVVM_MOUNT_HOSTFS },
-    { "/var/tmp", "tmpfs",   "rw,nosuid,nodev,relatime",                     RVVM_MOUNT_HOSTFS },
-};
+/* Forward-declared for mount(2)/umount2(2) below, which sit above its
+ * definition: a mount point is a guest path, and it has to be made absolute and
+ * normalized before it can be looked up in the table, exactly as chdir()'s own
+ * check does it. The alternative - moving those two below the path code - would
+ * put the namespace they edit on the far side of the path code from the
+ * namespace they belong to. */
+static bool guest_path_absolutize(char* out, size_t size, const char* path);
 
-/* The run's table, seeded. Called from rvvm_user_create() and from the fork
- * path, because a child inherits the namespace it was forked in. */
-static void rvvm_mount_reset(rvvm_userland_t* ctx)
-{
-    size_t n = STATIC_ARRAY_SIZE(rvvm_mount_default_table);
-    if (n > RVVM_MOUNT_MAX) {
-        n = RVVM_MOUNT_MAX;
-    }
-    memcpy(ctx->mounts, rvvm_mount_default_table, n * sizeof(rvvm_mount_t));
-    ctx->mount_count = (unsigned)n;
-}
-
-/* The mount whose path covers @path, longest match first, or NULL.
- *
- * "/" is in the table for /proc/mounts and is deliberately not a match: every
- * absolute guest path starts with it, so matching it would put every path on a
- * mount and hand the question back to the caller. The run's root is the prefix,
- * which is a different mechanism answering a different question. */
-static const rvvm_mount_t* rvvm_mount_find(const rvvm_userland_t* ctx, const char* path)
+/* The mount whose path covers @path, longest match first, or NULL. Caller holds
+ * the namespace lock. See rvvm_mount_ns_t for why the table is not per context. */
+static const rvvm_mount_t* rvvm_mount_find(const struct rvvm_mount_ns* ns, const char* path)
 {
     const rvvm_mount_t* best = NULL;
-    size_t best_len = 0;
-    unsigned i;
+    size_t               best_len = 0;
+    unsigned             i;
 
-    if (!ctx || !path) {
+    if (!ns || !path) {
         return NULL;
     }
-    for (i = 0; i < ctx->mount_count; ++i) {
-        const rvvm_mount_t* m = &ctx->mounts[i];
-        size_t len;
+    for (i = 0; i < ns->count; ++i) {
+        const rvvm_mount_t* m = &ns->mounts[i];
+        size_t               len;
+        /* "/" is in the table for /proc/mounts and is deliberately not a match:
+         * every absolute guest path starts with it, so matching it would put
+         * every path on a mount and hand the question back to the caller. The
+         * run's root is the prefix, which answers a different question. */
         if (m->path[0] == '/' && m->path[1] == '\0') {
             continue;
         }
@@ -4204,16 +4254,192 @@ static const rvvm_mount_t* rvvm_mount_find(const rvvm_userland_t* ctx, const cha
 static bool path_bypass(const char* path)
 {
     const rvvm_mount_t* m;
-    const char* prefix = uctx()->prefix_path;
+    const char*         prefix = uctx()->prefix_path;
+    bool                bypassed;
 
     if (prefix == NULL) {
         return true;
     }
-    m = rvvm_mount_find(uctx(), path);
-    if (!m) {
+    if (!path) {
         return false;
     }
-    return uctx()->shadow == NULL || vp_shadow_view_lookup(&uctx()->shadow_view, m->path) == NULL;
+    spin_lock(&uctx()->mountns->lock);
+    m        = rvvm_mount_find(uctx()->mountns, path);
+    /* Decided under the lock because it is half table and half shadow, and the
+     * shadow can be replaced under it by another thread. */
+    bypassed = (uctx()->shadow == NULL ||
+                vp_shadow_view_lookup(&uctx()->shadow_view, m ? m->path : path) == NULL);
+    spin_unlock(&uctx()->mountns->lock);
+    return m ? bypassed : false;
+}
+
+/* mount(2) and umount2(2) against the table.
+ *
+ * These used to be answered without consulting anything: mount(2) returned
+ * success for five fstypes and ENOSYS for the rest, umount2(2) returned success
+ * always, and neither changed the namespace. The success was there because init
+ * and getty refuse to go on otherwise - a real constraint, and not a reason to
+ * keep pretending now that there is a table to be honest with.
+ *
+ *   proc        RVVM_MOUNT_CORE.   The core synthesizes it (userland_proc_*).
+ *   devtmpfs    RVVM_MOUNT_CORE.   userland_dev_* and the pty pair.
+ *   devpts      RVVM_MOUNT_CORE.   The same, and it is a real capability that
+ *                                  was never expressed: /dev/pts holds the
+ *                                  rvvm_session_pty_* pairs.
+ *   tmpfs       RVVM_MOUNT_HOSTFS. The host's own directory, reached directly.
+ *   sysfs       RVVM_MOUNT_HOSTFS. As today.
+ *
+ * Anything else is ENOSYS - which is what it already was, and is now for a reason
+ * a caller can act on rather than by accident.
+ *
+ * A tmpfs's `data=` is not honoured, and that is the sharp edge. mount() has no
+ * way to say where a tmpfs should live on the host, so a new tmpfs mount point
+ * answers with the host's directory of the same name: /mnt answers /mnt. A
+ * caller who wanted a private directory asked for something this cannot express.
+ * It is accepted rather than refused, and the property is written on the entry
+ * rather than left to be discovered: refusing would fail every guest that mounts
+ * a tmpfs as a matter of routine. What is refused is what would be a lie -
+ * MS_RDONLY, MS_NODEV and friends, because nothing here enforces them.
+ */
+static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
+                                   const char* fstype, unsigned long flags)
+{
+    rvvm_userland_t*   ctx = uctx();
+    rvvm_mount_provider_t provider;
+    char                abs[UAPI_PATH_MAX];
+    unsigned            i;
+
+    if (!target || !fstype) {
+        return -UAPI_EFAULT;
+    }
+    if (!guest_path_absolutize(abs, sizeof(abs), target)) {
+        return -UAPI_ENAMETOOLONG;
+    }
+    /* The root is the run's own filesystem and a mount cannot replace it, which
+     * is what Linux says too. Checked before the fstype, so mounting over "/"
+     * is EINVAL rather than an ENOSYS that names the wrong problem. */
+    if (abs[0] == '/' && abs[1] == '\0') {
+        return -UAPI_EINVAL;
+    }
+
+    if (!strcmp(fstype, "proc")) {
+        provider = RVVM_MOUNT_CORE;
+    } else if (!strcmp(fstype, "devtmpfs") || !strcmp(fstype, "devpts")) {
+        provider = RVVM_MOUNT_CORE;
+    } else if (!strcmp(fstype, "tmpfs") || !strcmp(fstype, "sysfs")) {
+        provider = RVVM_MOUNT_HOSTFS;
+    } else {
+        rvvm_info("mount(%s, %s, %s): %s is not a filesystem this core provides",
+                  source ? source : "(none)", abs, fstype, fstype);
+        return -UAPI_ENOSYS;
+    }
+
+    /* A flag with nothing behind it is worse than a refusal: a guest that mounts
+     * /tmp nodev and then writes to it has been told it cannot. Nothing here
+     * enforces read-only or nodev, so nothing here accepts them. */
+    if (flags & (UAPI_MS_RDONLY | UAPI_MS_NOSUID | UAPI_MS_NODEV | UAPI_MS_NOEXEC)) {
+        return -UAPI_EINVAL;
+    }
+    /* MS_REMOUNT asks about a mount that is already there, and init and mount(8)
+     * pass it routinely. Refusing those is how a boot stops for no stated
+     * reason. */
+    spin_lock(&ctx->mountns->lock);
+    if (flags & UAPI_MS_REMOUNT) {
+        int mounted = rvvm_mount_find(ctx->mountns, abs) != NULL;
+        spin_unlock(&ctx->mountns->lock);
+        return mounted ? 0 : -UAPI_EINVAL;
+    }
+    /* Mounting over something already mounted needs a tree rather than a
+     * longest-match list, and a stack is the wrong shape to answer "what covers
+     * here" with anyway. Linux says EBUSY. */
+    if (rvvm_mount_find(ctx->mountns, abs)) {
+        spin_unlock(&ctx->mountns->lock);
+        return -UAPI_EBUSY;
+    }
+    if (ctx->mountns->count >= RVVM_MOUNT_MAX) {
+        spin_unlock(&ctx->mountns->lock);
+        return -UAPI_ENOSPC;
+    }
+
+    /* Absorb any mount already inside the new one. Longest-match would otherwise
+     * leave the outer entry answering for the inner path's children, and
+     * /proc/mounts would list two mounts where one covers both. */
+    for (i = 0; i < ctx->mountns->count; ++i) {
+        rvvm_mount_t* m = &ctx->mountns->mounts[i];
+        unsigned      j;
+        if (m->path[0] == '/' && m->path[1] == '\0') {
+            continue;
+        }
+        if (path_has_prefix(m->path, abs)) {
+            for (j = i; j + 1 < ctx->mountns->count; ++j) {
+                ctx->mountns->mounts[j] = ctx->mountns->mounts[j + 1];
+            }
+            ctx->mountns->count--;
+            memset(&ctx->mountns->mounts[ctx->mountns->count], 0, sizeof(rvvm_mount_t));
+            i--;
+        }
+    }
+
+    {
+        rvvm_mount_t* m = &ctx->mountns->mounts[ctx->mountns->count];
+        memset(m, 0, sizeof(*m));
+        rvvm_strlcpy(m->path, abs, sizeof(m->path));
+        rvvm_strlcpy(m->fstype, fstype, sizeof(m->fstype));
+        rvvm_strlcpy(m->options, "rw,relatime", sizeof(m->options));
+        m->provider = provider;
+        ctx->mountns->count++;
+    }
+    spin_unlock(&ctx->mountns->lock);
+    /* A new mount changes what paths resolve to, so a directory replay from the
+     * old table would list names that are no longer there - the same reason
+     * rvvm_user_set_shadow() drops them. */
+    memset(ctx->shadow_dirs, 0, sizeof(ctx->shadow_dirs));
+    rvvm_info("mount(%s, %s, %s): mounted", source ? source : "(none)", abs, fstype);
+    return 0;
+}
+
+static rvvm_addr_t rvvm_user_umount(const char* target, int flags)
+{
+    rvvm_userland_t* ctx = uctx();
+    char              abs[UAPI_PATH_MAX];
+    unsigned          i;
+
+    if (!target) {
+        return -UAPI_EFAULT;
+    }
+    if (!guest_path_absolutize(abs, sizeof(abs), target)) {
+        return -UAPI_ENAMETOOLONG;
+    }
+    if (abs[0] == '/' && abs[1] == '\0') {
+        return -UAPI_EINVAL;
+    }
+    spin_lock(&ctx->mountns->lock);
+    for (i = 0; i < ctx->mountns->count; ++i) {
+        rvvm_mount_t* m = &ctx->mountns->mounts[i];
+        if (m->path[0] == '/' && m->path[1] == '\0') {
+            continue;
+        }
+        if (!strcmp(m->path, abs)) {
+            unsigned j;
+            for (j = i; j + 1 < ctx->mountns->count; ++j) {
+                ctx->mountns->mounts[j] = ctx->mountns->mounts[j + 1];
+            }
+            ctx->mountns->count--;
+            memset(&ctx->mountns->mounts[ctx->mountns->count], 0, sizeof(rvvm_mount_t));
+            spin_unlock(&ctx->mountns->lock);
+            memset(ctx->shadow_dirs, 0, sizeof(ctx->shadow_dirs));
+            rvvm_info("umount2(%s): unmounted%s", abs,
+                      (flags & UAPI_MNT_DETACH) ? " (detached)" : "");
+            return 0;
+        }
+    }
+    spin_unlock(&ctx->mountns->lock);
+    /* EINVAL, not EBUSY: a path that is not a mount point is not busy, and
+     * nothing here is ever busy, since a mount point is a table row rather than
+     * a directory something can be using. MNT_DETACH is accepted and treated as
+     * an ordinary unmount - there is nothing to detach from, and it is gone
+     * either way. */
+    return -UAPI_EINVAL;
 }
 
 static bool path_wrapped(const char* path)
@@ -4495,6 +4721,12 @@ typedef struct {
 } rvvm_proc_path_t;
 
 static const char* userland_proc_fd_path_target(char* buffer, size_t size, const char* path);
+static bool guest_path_absolutize(char* out, size_t size, const char* path);
+/* For mount(2)/umount2(2), which sit above the definition: a mount point is a
+ * guest path and has to be made absolute and normalized before it can be looked
+ * up in the table, exactly as chdir()'s own check does it. The alternative -
+ * moving those two below here - would put the namespace they edit on the far
+ * side of the path code from the namespace they belong to. */
 static const char* userland_proc_fd_link_target(uint32_t pid, uint32_t fd,
                                                 char* buf, size_t size);
 static bool userland_proc_parse(const char* abs, uint32_t self_pid, rvvm_proc_path_t* out);
@@ -7461,12 +7693,12 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
      * that decides what a view is - and the root is copied just after, which is
      * why the order here is view first. */
     vp_shadow_view_init(&ctx->shadow_view, ctx->shadow, parent->guest_root_path);
-    /* The mounts too: a child is in the same namespace as the process that
-     * forked it, and the table is part of what that means. Copied rather than
-     * re-seeded, because a parent that has been given a different set must pass
-     * it on - and re-seeding would quietly undo that. */
-    memcpy(ctx->mounts, parent->mounts, sizeof(ctx->mounts));
-    ctx->mount_count = parent->mount_count;
+    /* The mount namespace too, by reference and not by copy - see
+     * rvvm_mount_ns_t. A child shares the namespace it was forked into, which is
+     * the whole point: busybox's mount is a child that mounts and exits, and the
+     * mount has to outlive it to be a mount at all. */
+    userland_mountns_ref(parent->mountns);
+    ctx->mountns = parent->mountns;
 
     /* Console output goes through the same sink, so a child's writes reach the
      * console its parent was started on. Its bytes are not parsed into the
@@ -12325,11 +12557,28 @@ static size_t userland_proc_gen_mounts(char* buf, size_t size)
     len = userland_proc_appendf(buf, size, len,
                                 "# Generated by the VirtPass host: the namespace the"
                                 " guest is given.\n");
-    for (i = 0; i < ctx->mount_count; ++i) {
-        const rvvm_mount_t* m = &ctx->mounts[i];
-        len = userland_proc_appendf(buf, size, len, "%s %s %s %s 0 0\n",
-                                    m->provider == RVVM_MOUNT_ROOTFS ? "/dev/root" : m->fstype,
-                                    m->path, m->fstype, m->options);
+    /* Under the namespace lock, and formatted with a bounded stack buffer rather
+     * than straight into @buf: a guest reading /proc/mounts can race a mount(2)
+     * from another thread, and the lock must not be held across a vsnprintf
+     * into the caller's buffer when it does not have to be. The length is
+     * reported from the shadow buffer, so a table that grew mid-read is a short
+     * answer rather than a wrong one. */
+    {
+        char line[RVVM_MOUNT_PATH_MAX + 96];
+        spin_lock(&ctx->mountns->lock);
+        for (i = 0; i < ctx->mountns->count; ++i) {
+            const rvvm_mount_t* m = &ctx->mountns->mounts[i];
+            int n = snprintf(line, sizeof(line), "%s %s %s %s 0 0\n",
+                             m->provider == RVVM_MOUNT_ROOTFS ? "/dev/root" : m->fstype,
+                             m->path, m->fstype, m->options);
+            if (n > 0) {
+                size_t room = (len < size) ? (size - len) : 0;
+                size_t take = ((size_t)n < room) ? (size_t)n : room;
+                memcpy(buf + len, line, take);
+                len += take;
+            }
+        }
+        spin_unlock(&ctx->mountns->lock);
     }
     return len;
 }
@@ -13660,27 +13909,16 @@ static void* rvvm_user_thread_wrap(void* arg)
                                           wrap_guest_path_ex(path_buf1, (int)a2, to_str(a3), false), a4));
                     break;
                 case 39: // umount2
-                    /* Nothing is really mounted (see mount below), so nothing
-                     * can be unmounted. Answering success keeps a session's
-                     * shutdown from tripping over it. */
-                    rvvm_info("sys_umount2(%s)", to_str(a0));
-                    a0 = 0;
+                    /* Consults the table now, so an unmount that happened is an
+                     * unmount, and one that did not is EINVAL rather than a
+                     * success that lies. See rvvm_user_umount(). */
+                    a0 = (rvvm_addr_t)(int64_t)rvvm_user_umount(to_str(a0), (int)a1);
                     break;
                 case 40: { // mount
                     const char* fstype = to_str(a2);
                     rvvm_info("sys_mount(%s, %s, %s)", to_str(a0), to_str(a1), fstype);
-                    /* The guest's rootfs already *is* the whole namespace, and
-                     * the devices a session needs are synthesized, so there is
-                     * nothing left to mount. These are answered as success
-                     * because init and getty refuse to go on otherwise; every
-                     * other fstype is honestly unsupported. */
-                    if (fstype && (!strcmp(fstype, "proc") || !strcmp(fstype, "sysfs") ||
-                                   !strcmp(fstype, "devtmpfs") || !strcmp(fstype, "tmpfs") ||
-                                   !strcmp(fstype, "devpts"))) {
-                        a0 = 0;
-                    } else {
-                        a0 = -UAPI_ENOSYS;
-                    }
+                    a0 = (rvvm_addr_t)(int64_t)rvvm_user_mount(to_str(a0), to_str(a1),
+                                                               fstype, (unsigned long)a3);
                     break;
                 }
                 case 43: { // statfs64
@@ -16713,8 +16951,8 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
      * same as not having called it, and it exists so there is exactly one place
      * that decides what the view is. */
     vp_shadow_view_init(&ctx->shadow_view, NULL, NULL);
-    /* The namespace, before anything can ask about one. */
-    rvvm_mount_reset(ctx);
+    /* The run's mount namespace, before anything can ask about one. */
+    ctx->mountns = userland_mountns_new();
     return machine;
 }
 
@@ -16863,6 +17101,11 @@ static void userland_destroy(rvvm_machine_t* machine)
     }
     machine->userdata = NULL;
     safe_free(ctx->prefix_owned);
+    /* Last reference to the run's mount namespace frees it. Ordered with the
+     * prefix rather than after everything else because the shadow_dirs sweep
+     * below reads the table when it closes a descriptor. */
+    userland_mountns_unref(ctx->mountns);
+    ctx->mountns = NULL;
     safe_free(ctx->guest_root_path);
     /* The timer thread holds a pointer to this context, so it is joined before
      * anything below is released. */
