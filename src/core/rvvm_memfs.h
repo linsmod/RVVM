@@ -52,13 +52,14 @@ typedef enum {
     RVVM_MEMFS_ENOTDIR   = -3,   /* a component on the way is not a directory      */
     RVVM_MEMFS_EISDIR    = -4,   /* the name is a directory and had to be a file   */
     RVVM_MEMFS_EINVAL    = -5,   /* a bad name, a bad mode, a bad size             */
-    RVVM_MEMFS_ENOSPC    = -6,   /* out of nodes, or over the size= limit          */
+    RVVM_MEMFS_ENOSPC    = -6,   /* out of nodes or names, or over size=           */
     RVVM_MEMFS_EROFS     = -7,   /* the mount is read-only                         */
     RVVM_MEMFS_EMFILE    = -8,   /* out of open descriptors                        */
     RVVM_MEMFS_EXDEV     = -9,   /* rename across a mount point                    */
     RVVM_MEMFS_ENOTEMPTY = -10,  /* rmdir of a directory with something in it      */
     RVVM_MEMFS_ELOOP     = -11,  /* too many symlinks on the way                   */
     RVVM_MEMFS_ENOMEM    = -12,  /* allocation failed                              */
+    RVVM_MEMFS_EPERM     = -13,  /* link() of a directory - directories are a tree */
 } rvvm_memfs_result_t;
 
 typedef enum {
@@ -85,18 +86,25 @@ typedef enum {
  * theoretical, and it is also what lets a node be a fixed-size record. */
 #define RVVM_MEMFS_MAX_NODES 4096
 
-/* What a caller gets back about one node. A value, not a pointer: nodes live in
- * an array that grows, and a pointer into it would not survive the next
- * rvvm_memfs_create_file() - which is the same reason vp_shadow hands out
- * indices and has callers look up again. */
+/* Names one filesystem holds. A node is an inode - one file, however many names
+ * reach it - and this bounds the names, which is what makes a hard link cost a
+ * name and nothing else. Twice the node bound, so a filesystem that is partly
+ * hard links is possible at all: a thousand files with two names each is a
+ * thousand nodes and two thousand names. */
+#define RVVM_MEMFS_MAX_NAMES (RVVM_MEMFS_MAX_NODES * 2)
+
+/* What a caller gets back about one node. A value, not a pointer: the node lives
+ * in an inode array that grows, and a pointer into it would not survive the next
+ * rvvm_memfs_create_file() - which is the same reason vp_shadow hands out indices
+ * and has callers look up again. */
 typedef struct {
-    uint32_t index;   /* stable for as long as the node exists; RVVM_MEMFS_NONE if gone */
-    char     path[RVVM_MEMFS_PATH_MAX];
+    uint32_t index;   /* the inode: stable, and shared by every hard link to it */
+    char     path[RVVM_MEMFS_PATH_MAX]; /* the name this lookup reached it by */
     uint8_t  kind;    /* rvvm_memfs_kind_t                                    */
     uint32_t mode;    /* permission bits only; the type comes from @kind       */
     uint64_t size;    /* bytes, for a regular file; 0 otherwise                */
     uint64_t ino;     /* synthetic, stable, non-zero                          */
-    uint32_t nlink;   /* hard-link count; 2+ means a directory or a link      */
+    uint32_t nlink;   /* names reaching it; a directory is 2 + its subdirs */
     int64_t  mtime;   /* seconds, from the last change that touched the node */
 } rvvm_memfs_info_t;
 
@@ -176,6 +184,14 @@ rvvm_memfs_result_t rvvm_memfs_unlink(rvvm_memfs_t* fs, const char* path, bool d
  * and rvvm_user.c asks it of the mount table before calling here. Both paths
  * arrive as mount-relative, which is what keeps that question outside this file. */
 rvvm_memfs_result_t rvvm_memfs_rename(rvvm_memfs_t* fs, const char* from, const char* to);
+
+/* link(2): give @from's inode a second name, @to. The two share contents, inode
+ * number and nlink, and a write through either is seen through both - the one
+ * thing a copy would not do and the reason this is not one. @from is not
+ * followed: Linux's link() links the symlink itself, not what it points at.
+ * EEXIST when @to is taken, EPERM for a directory (a directory with two parents
+ * is not a tree). */
+rvvm_memfs_result_t rvvm_memfs_link(rvvm_memfs_t* fs, const char* from, const char* to);
 
 rvvm_memfs_result_t rvvm_memfs_symlink(rvvm_memfs_t* fs, const char* target, const char* path);
 

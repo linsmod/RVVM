@@ -147,6 +147,92 @@ int main(void)
     ck_rc(rvvm_memfs_stat(fs, "/abs", true, &info), RVVM_MEMFS_OK, "absolute link resolves");
     ck(info.size == 5, "absolute link target size");
 
+    stage("hardlink");
+    /* --- hard links: one inode, several names --- */
+    {
+        uint64_t ino_h;
+        uint32_t names_before;
+        ck_rc(rvvm_memfs_create_file(fs, "/a/h0", 0644), RVVM_MEMFS_OK, "create /a/h0");
+        ck_rc(rvvm_memfs_write(fs, "/a/h0", 0, "hello", 5, &done), RVVM_MEMFS_OK, "write /a/h0");
+        ck_rc(rvvm_memfs_stat(fs, "/a/h0", true, &info), RVVM_MEMFS_OK, "stat /a/h0");
+        ino_h = info.ino;
+        ck(info.nlink == 1, "one name to start");
+        names_before = rvvm_memfs_count(fs);
+        ck_rc(rvvm_memfs_link(fs, "/a/h0", "/a/h1"), RVVM_MEMFS_OK, "link /a/h0 -> /a/h1");
+        ck(rvvm_memfs_count(fs) == names_before, "a hard link adds no node");
+        ck_rc(rvvm_memfs_stat(fs, "/a/h1", true, &info), RVVM_MEMFS_OK, "stat the second name");
+        ck(info.ino == ino_h, "the two names share an inode");
+        ck(info.nlink == 2, "nlink counts both names");
+        ck_rc(rvvm_memfs_stat(fs, "/a/h0", true, &info), RVVM_MEMFS_OK, "stat the first name");
+        ck(info.nlink == 2, "nlink is the same from either name");
+        /* A write through the second name is visible through the first - the
+         * property a copy would get wrong, and the whole reason a hard link
+         * exists. */
+        ck_rc(rvvm_memfs_write(fs, "/a/h1", 5, "!", 1, &done), RVVM_MEMFS_OK, "write through the link");
+        memset(buf, 0, sizeof(buf));
+        ck_rc(rvvm_memfs_read(fs, "/a/h0", 0, buf, sizeof(buf), &done), RVVM_MEMFS_OK, "read the original");
+        ck(done == 6 && !strcmp(buf, "hello!"), "the write is visible through the other name");
+        /* One name going leaves the other, and drops nlink. */
+        ck_rc(rvvm_memfs_unlink(fs, "/a/h0", false), RVVM_MEMFS_OK, "unlink one name");
+        ck_rc(rvvm_memfs_stat(fs, "/a/h0", true, &info), RVVM_MEMFS_ENOENT, "the removed name is gone");
+        ck_rc(rvvm_memfs_stat(fs, "/a/h1", true, &info), RVVM_MEMFS_OK, "the other name survives");
+        ck(info.nlink == 1, "nlink fell to one");
+        ck(info.size == 6, "and the contents are intact");
+        ck_rc(rvvm_memfs_unlink(fs, "/a/h1", false), RVVM_MEMFS_OK, "unlink the last name");
+        ck_rc(rvvm_memfs_stat(fs, "/a/h1", true, &info), RVVM_MEMFS_ENOENT, "the inode went with the last name");
+
+        /* Errors. */
+        ck_rc(rvvm_memfs_link(fs, "/a/nope", "/a/x"), RVVM_MEMFS_ENOENT, "link a missing source");
+        ck_rc(rvvm_memfs_create_file(fs, "/a/t", 0644), RVVM_MEMFS_OK, "create a name to collide with");
+        ck_rc(rvvm_memfs_create_file(fs, "/a/src2", 0644), RVVM_MEMFS_OK, "a real source");
+        ck_rc(rvvm_memfs_link(fs, "/a/src2", "/a/t"), RVVM_MEMFS_EEXIST, "link onto a taken name");
+        ck_rc(rvvm_memfs_link(fs, "/a", "/a/dirlink"), RVVM_MEMFS_EPERM, "no hard link to a directory");
+        /* A link to a symlink links the symlink itself (Linux linkat, no flags),
+         * not what it points at. */
+        ck_rc(rvvm_memfs_link(fs, "/a/link", "/a/link2"), RVVM_MEMFS_OK, "link a symlink");
+        ck_rc(rvvm_memfs_stat(fs, "/a/link2", false, &info), RVVM_MEMFS_OK, "lstat the linked symlink");
+        ck(info.kind == RVVM_MEMFS_LNK, "it is still a symlink");
+        ck(info.nlink == 2, "the symlink's own nlink counted the name");
+        ck_rc(rvvm_memfs_readlink(fs, "/a/link2", buf, sizeof(buf)), RVVM_MEMFS_OK, "readlink it");
+        ck(!strcmp(buf, "f"), "it points where the original did");
+
+        /* Renaming one name of a hard-linked file moves that name only. */
+        ck_rc(rvvm_memfs_create_file(fs, "/a/one", 0644), RVVM_MEMFS_OK, "create /a/one");
+        ck_rc(rvvm_memfs_link(fs, "/a/one", "/a/two"), RVVM_MEMFS_OK, "link /a/one -> /a/two");
+        ck_rc(rvvm_memfs_rename(fs, "/a/two", "/a/three"), RVVM_MEMFS_OK, "rename the second name");
+        ck_rc(rvvm_memfs_stat(fs, "/a/one", true, &info), RVVM_MEMFS_OK, "the first name is untouched");
+        ck(info.nlink == 2, "still two names");
+        ck_rc(rvvm_memfs_stat(fs, "/a/three", true, &info), RVVM_MEMFS_OK, "the renamed name is there");
+        ck_rc(rvvm_memfs_stat(fs, "/a/two", true, &info), RVVM_MEMFS_ENOENT, "the old name is gone");
+    }
+
+    stage("dirnlink");
+    /* --- a directory's nlink is 2 + its subdirectories --- */
+    {
+        uint32_t root_before;
+        ck_rc(rvvm_memfs_stat(fs, "/", true, &info), RVVM_MEMFS_OK, "stat root");
+        root_before = info.nlink;
+        ck_rc(rvvm_memfs_mkdir(fs, "/dn", 0755), RVVM_MEMFS_OK, "mkdir /dn");
+        ck_rc(rvvm_memfs_stat(fs, "/", true, &info), RVVM_MEMFS_OK, "stat root again");
+        ck(info.nlink == root_before + 1, "a subdirectory adds a link to its parent");
+        ck_rc(rvvm_memfs_stat(fs, "/dn", true, &info), RVVM_MEMFS_OK, "stat the new dir");
+        ck(info.nlink == 2, "an empty directory is 2");
+        ck_rc(rvvm_memfs_mkdir(fs, "/dn/s", 0755), RVVM_MEMFS_OK, "mkdir /dn/s");
+        ck_rc(rvvm_memfs_stat(fs, "/dn", true, &info), RVVM_MEMFS_OK, "stat /dn");
+        ck(info.nlink == 3, "each subdirectory is one more link");
+        /* Renaming a directory into a different parent moves the link. */
+        ck_rc(rvvm_memfs_mkdir(fs, "/other", 0755), RVVM_MEMFS_OK, "mkdir /other");
+        ck_rc(rvvm_memfs_rename(fs, "/dn/s", "/other/s"), RVVM_MEMFS_OK, "move a subdirectory");
+        ck_rc(rvvm_memfs_stat(fs, "/dn", true, &info), RVVM_MEMFS_OK, "stat the old parent");
+        ck(info.nlink == 2, "the old parent lost a link");
+        ck_rc(rvvm_memfs_stat(fs, "/other", true, &info), RVVM_MEMFS_OK, "stat the new parent");
+        ck(info.nlink == 3, "the new parent gained one");
+        /* And removing the subdirectory takes it back. */
+        ck_rc(rvvm_memfs_unlink(fs, "/other/s", true), RVVM_MEMFS_OK, "rmdir the moved subdir");
+        ck_rc(rvvm_memfs_stat(fs, "/other", true, &info), RVVM_MEMFS_OK, "stat the new parent again");
+        ck(info.nlink == 2, "rmdir took the link back");
+    }
+
     stage("rename");
     /* --- rename, including the subtree reindex --- */
     ck_rc(rvvm_memfs_mkdir(fs, "/src", 0755), RVVM_MEMFS_OK, "mkdir /src");
@@ -347,7 +433,7 @@ int main(void)
         toolong[sizeof(toolong) - 1] = '\0';
         ck_rc(rvvm_memfs_create_file(fs, toolong, 0644), RVVM_MEMFS_EINVAL, "name too long");
         {
-            char p[RVVM_MEMFS_NAME_MAX + 8];
+            char p[RVVM_MEMFS_NAME_MAX + 16];
             snprintf(p, sizeof(p), "/%s", toolong);
             ck_rc(rvvm_memfs_create_file(fs, p, 0644), RVVM_MEMFS_EINVAL,
                   "a component that is too long is refused");

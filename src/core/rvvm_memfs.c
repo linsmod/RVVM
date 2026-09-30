@@ -34,12 +34,15 @@ flag every host had to remember to set.
 
 Implementation notes:
 
-  - the path -> node map is open addressing with linear probing, keyed by the
+  - the path -> dentry map is open addressing with linear probing, keyed by the
     FNV-1a hash of the normalized path, exactly as vp_shadow's is. Slots hold
     index + 1 so 0 means empty.
-  - nodes live in one growable array; a returned index is invalidated by the next
-    rvvm_memfs_create_file(). The interface returns indices and values rather
-    than pointers for that reason, and so does vp_shadow.
+  - a filesystem is two growable arrays: inodes (identity and bytes) and dentries
+    (names and the tree). A file has one inode and at least one dentry, and a hard
+    link is a second dentry on the same inode - which is the whole reason the two
+    are apart. A returned index is invalidated by the next
+    rvvm_memfs_create_file(); the interface returns indices and values rather than
+    pointers for that reason, and so does vp_shadow.
   - one lock for the whole filesystem. Every operation here is a handful of
     memory operations, and a finer-grained scheme would be more code to get
     wrong than it saves. The mount table's own lock is a different thing and does
@@ -52,13 +55,17 @@ Implementation notes:
 
 Deliberate limits, so a reader does not expect more:
 
-  - size= is charged against file contents only. A directory and a symlink cost
-    a node, not bytes, and their cost is bounded by RVVM_MEMFS_MAX_NODES. A guest
-    that fills a tmpfs with a million empty files is stopped by the node bound
-    rather than by size=, and those are not the same limit.
-  - no hard links. A link is a copy here, so writing through one name is not
-    visible through the other. nlink is reported as 1 for a file and 2 for a
-    directory, which is what the shape of the data supports.
+  - size= is charged against file contents only, and a hard link charges nothing
+    extra: it is a second name for bytes that are already counted. A directory
+    and a symlink cost a node, not bytes, and node and name cost are bounded by
+    RVVM_MEMFS_MAX_NODES / RVVM_MEMFS_MAX_NAMES. A guest that fills a tmpfs with
+    a million empty files is stopped by the node bound rather than by size=, and
+    those are not the same limit.
+  - hard links share an inode, so writing through one name is visible through the
+    other and nlink counts the names that reach it. A directory cannot be
+    hard-linked; its nlink is Linux's 2 + its subdirectories. There is still no
+    way to reach an inode with no name: unlink is the only removal, so a file
+    whose last name goes goes with it.
   - no mmap, no O_DIRECT, no fsync, no quotas, no atime/mtime fidelity beyond a
     one-second clock. A guest that mmaps a tmpfs file gets the host's answer for
     a path that does not exist there, which is ENOENT - the same as any file this
@@ -89,44 +96,74 @@ Deliberate limits, so a reader does not expect more:
  * walk takes to notice. */
 #define MEMFS_MAX_FOLLOW 8
 
+/* An inode: identity and bytes, with no name. A name is a dentry's, which is
+ * what makes a hard link expressible at all - two dentries pointing here are two
+ * names for one file, and nothing about the data changes when the second name
+ * appears. Splitting the two is also what lets nlink be a real count rather than
+ * the constant the merged node reported. */
 typedef struct {
-    char*    path;      /* absolute within the mount: "/", "/a/b"; owned        */
-    char*    target;    /* symlink target; owned, NULL unless kind is LNK      */
     uint8_t* data;      /* file contents; owned, NULL unless kind is REG        */
+    char*    target;    /* symlink target; owned, NULL unless kind is LNK      */
     size_t   size;
     size_t   capacity;
-    uint64_t ino;       /* synthetic, stable, non-zero                         */
+    uint64_t ino;       /* synthetic, stable, non-zero */
     uint32_t mode;      /* permission bits only; the type comes from @kind      */
+    uint32_t nlink;     /* names pointing here, plus a directory's convention  */
+    int64_t  mtime;
+    uint8_t  kind;      /* rvvm_memfs_kind_t                                    */
+    /* The inode free-list link, meaningful only while the slot is free. A field
+     * of its own rather than a borrowed one: @nlink is a value a guest reads back
+     * through stat(), so reusing it as a link would make a free slot's nlink
+     * indistinguishable from a live one's. */
+    uint32_t free_next;
+} memfs_inode_t;
+
+/* A name in a directory: the tree, and the inode it names. @path is the full
+ * path kept here rather than rebuilt by walking @parent, so a lookup is one hash
+ * of one string instead of a component walk - the price is that renaming a
+ * directory rewrites its descendants' paths (see memfs_reindex_locked()), paid
+ * only on a directory rename. @inode is the shared identity: several dentries may
+ * name it. */
+typedef struct {
+    char*    path;      /* absolute within the mount: "/", "/a/b"; owned        */
+    uint32_t inode;     /* the inode this name refers to                        */
     uint32_t parent;    /* RVVM_MEMFS_NONE for the root                         */
     uint32_t child;     /* first child, RVVM_MEMFS_NONE ends it                 */
     uint32_t next;      /* next sibling, RVVM_MEMFS_NONE ends it               */
-    uint8_t  kind;      /* rvvm_memfs_kind_t                                    */
-    uint32_t nlink;
-    int64_t  mtime;
-} memfs_node_t;
+} memfs_dentry_t;
 
 struct rvvm_memfs {
     rvvm_lock_t lock;
     bool        read_only;
     uint64_t    size_limit;
     uint64_t    used;
-    memfs_node_t* entries;
-    uint32_t*   map;      /* open addressing over node indices + 1              */
+    memfs_dentry_t* dentries;
+    uint32_t*   map;      /* open addressing over dentry indices + 1            */
     size_t      map_size; /* power of two                                       */
-    /* Slots handed out, ever. NOT the number of live nodes: a removed slot is
+    /* Slots handed out, ever. NOT the number of live dentries: a removed slot is
      * kept and reused through free_head rather than returned, because returning
      * it would mean the next allocation lands on index @count - which is only
-     * the last live node when nothing has been removed yet. A filesystem that
-     * creates and deletes one file at a time would overwrite a live node on the
-     * second create, and the map would keep a key pointing at a node whose path
-     * had just become someone else's: every later lookup of the clobbered name
-     * compares a path against a key that no longer matches it, and answers
+     * the last live slot when nothing has been removed yet. A filesystem that
+     * creates and deletes one file at a time would overwrite a live name on the
+     * second create, and the map would keep a key pointing at a dentry whose
+     * path had just become someone else's: every later lookup of the clobbered
+     * name compares a path against a key that no longer matches it, and answers
      * ENOENT for a file that is still listed in its parent's directory. */
     size_t      count;
     size_t      capacity;   /* slots the array has room for, >= @count          */
-    uint32_t    free_head; /* first free slot, chained through ->child            */
-    size_t      live;      /* nodes in use, which is not @count                   */
-    uint32_t    root;
+    uint32_t    free_head; /* first free dentry slot, chained through ->child    */
+    size_t      live;      /* dentries in use, which is not @count               */
+    /* The inodes, with the same "hand out an index, keep the slot" discipline as
+     * the dentries and a free list of their own. Two lists rather than one: an
+     * inode can outlive any single name (a hard link) and a name can outlive no
+     * inode, so the two lifetimes are independent and sharing a list would tie
+     * them together for nothing. */
+    memfs_inode_t* inodes;
+    size_t      ino_count;    /* inode slots handed out, ever                  */
+    size_t      ino_capacity; /* inode slots the array has room for            */
+    uint32_t    ino_free;     /* first free inode slot, chained through free_next */
+    size_t      ino_live;     /* inodes in use                                 */
+    uint32_t    root;         /* the root dentry index                         */
     uint64_t    next_ino;  /* 0 is never handed out: a zero inode would read as
                             * "unset" to a guest that stats two files and
                             * compares, and 0 is what an uninitialized record
@@ -304,11 +341,11 @@ static rvvm_memfs_result_t memfs_normalize(char* out, size_t size, const char* p
     return RVVM_MEMFS_OK;
 }
 
-/* --- the path -> node map ------------------------------------------------ */
+/* --- the path -> dentry map ---------------------------------------------- */
 
 static void memfs_map_insert(rvvm_memfs_t* fs, uint32_t idx)
 {
-    uint32_t slot = memfs_hash(fs->entries[idx].path) & (uint32_t)(fs->map_size - 1);
+    uint32_t slot = memfs_hash(fs->dentries[idx].path) & (uint32_t)(fs->map_size - 1);
     while (fs->map[slot]) {
         slot = (slot + 1) & (uint32_t)(fs->map_size - 1);
     }
@@ -323,7 +360,7 @@ static void memfs_map_remove(rvvm_memfs_t* fs, const char* path)
     uint32_t j;
 
     while (fs->map[slot]) {
-        if (!strcmp(fs->entries[fs->map[slot] - 1].path, path)) {
+        if (!strcmp(fs->dentries[fs->map[slot] - 1].path, path)) {
             break;
         }
         slot = (slot + 1) & mask;
@@ -336,7 +373,7 @@ static void memfs_map_remove(rvvm_memfs_t* fs, const char* path)
      * everything after the hole one slot back is the version that looks right
      * and is not: an entry whose home IS its own slot would be moved to home-1,
      * and a probe that starts at home then walks forward never reaches it. The
-     * file is in the table, in its parent's child list, and unfindable - and
+     * name is in the table, in its parent's child list, and unfindable - and
      * since nothing else has gone wrong, the symptom is a plain ENOENT for a
      * file the guest can still see in a directory listing.
      *
@@ -358,7 +395,7 @@ static void memfs_map_remove(rvvm_memfs_t* fs, const char* path)
         if (!fs->map[j]) {
             break;
         }
-        k = memfs_hash(fs->entries[fs->map[j] - 1].path) & mask;
+        k = memfs_hash(fs->dentries[fs->map[j] - 1].path) & mask;
         d = (k - i) & mask;
         /* Cyclically, is k strictly after i and at or before j? That is
          * 0 < (k - i) <= (j - i), and the "strictly" is the part that is easy to
@@ -384,8 +421,8 @@ static bool memfs_map_grow(rvvm_memfs_t* fs)
     size_t newsize = fs->map_size * 2;
     uint32_t* newmap;
 
-    if (newsize > (size_t)RVVM_MEMFS_MAX_NODES * 4) {
-        return false; /* the node bound is the real limit; the map needs no more */
+    if (newsize > (size_t)RVVM_MEMFS_MAX_NAMES * 4) {
+        return false; /* the name bound is the real limit; the map needs no more */
     }
     newmap = calloc(newsize, sizeof(uint32_t));
     if (!newmap) {
@@ -400,7 +437,7 @@ static bool memfs_map_grow(rvvm_memfs_t* fs)
             /* Skip the holes. A free slot's path is NULL, and hashing it is not
              * a slow lookup - it is a crash in the strcmp the insert does when
              * the slot it lands on is occupied. */
-            if (fs->entries[i].path) {
+            if (fs->dentries[i].path) {
                 memfs_map_insert(fs, (uint32_t)i);
             }
         }
@@ -408,7 +445,7 @@ static bool memfs_map_grow(rvvm_memfs_t* fs)
     return true;
 }
 
-/* RVVM_MEMFS_NONE when there is no such node. Caller holds the lock. */
+/* RVVM_MEMFS_NONE when there is no such name. Caller holds the lock. */
 static uint32_t memfs_find_locked(rvvm_memfs_t* fs, const char* path)
 {
     uint32_t slot;
@@ -419,7 +456,7 @@ static uint32_t memfs_find_locked(rvvm_memfs_t* fs, const char* path)
     slot = memfs_hash(path) & (uint32_t)(fs->map_size - 1);
     while (fs->map[slot]) {
         uint32_t idx = fs->map[slot] - 1;
-        if (!strcmp(fs->entries[idx].path, path)) {
+        if (!strcmp(fs->dentries[idx].path, path)) {
             return idx;
         }
         slot = (slot + 1) & (uint32_t)(fs->map_size - 1);
@@ -427,34 +464,59 @@ static uint32_t memfs_find_locked(rvvm_memfs_t* fs, const char* path)
     return RVVM_MEMFS_NONE;
 }
 
-/* --- nodes -------------------------------------------------------------- */
+/* --- inodes and dentries ------------------------------------------------ */
 
-static void memfs_node_release(memfs_node_t* n)
+static void memfs_inode_release(memfs_inode_t* in)
 {
-    free(n->path);
-    free(n->target);
-    free(n->data);
-    n->path = n->target = NULL;
-    n->data = NULL;
-    n->size = n->capacity = 0;
+    free(in->target);
+    free(in->data);
+    in->target = NULL;
+    in->data = NULL;
+    in->size = in->capacity = 0;
+    /* @kind becomes the liveness marker: 0 is not a valid kind (DIR is 1), so a
+     * released slot is one whose kind is 0, and the consistency check can tell a
+     * free inode from a live one without a flag of its own. The free list link in
+     * ->free_next is planted by memfs_inode_slot_free() after this runs. */
+    in->kind = 0;
 }
 
-/* Hand a slot back for reuse. It must already be out of the map and out of its
- * parent's child list; what this adds is the free-list link and the live count,
- * which is what stops the next allocation from landing on it by arithmetic.
- *
- * The link goes in ->child because every other field of a released node is
- * either NULL or meaningless, and a field that is only ever read as a free-list
- * link cannot be confused with the child list it used to hold. */
-static void memfs_slot_free(rvvm_memfs_t* fs, uint32_t idx)
+static void memfs_dentry_release(memfs_dentry_t* d)
 {
-    memfs_node_t* n = &fs->entries[idx];
-    n->child  = fs->free_head;
-    n->parent = RVVM_MEMFS_NONE;
-    n->next   = RVVM_MEMFS_NONE;
+    free(d->path);
+    d->path = NULL;
+}
+
+/* Hand a dentry slot back for reuse. It must already be out of the map and out
+ * of its parent's child list; what this adds is the free-list link and the live
+ * count, which is what stops the next allocation from landing on it by
+ * arithmetic.
+ *
+ * The link goes in ->child because every other field of a released dentry is
+ * either NULL or meaningless, and a field that is only ever read as a free-list
+ * link cannot be confused with the child list it used to hold. @path must be
+ * NULL by the time this runs - memfs_dentry_release() leaves it so, and both the
+ * map grow and the consistency check read "path == NULL" as "free slot". */
+static void memfs_dentry_slot_free(rvvm_memfs_t* fs, uint32_t idx)
+{
+    memfs_dentry_t* d = &fs->dentries[idx];
+    d->child  = fs->free_head;
+    d->parent = RVVM_MEMFS_NONE;
+    d->next   = RVVM_MEMFS_NONE;
     fs->free_head = idx;
     if (fs->live) {
         fs->live--;
+    }
+}
+
+/* Hand an inode slot back for reuse. The link goes in ->free_next, the one field
+ * that exists only for this - see memfs_inode_t for why it is not borrowed. */
+static void memfs_inode_slot_free(rvvm_memfs_t* fs, uint32_t idx)
+{
+    memfs_inode_t* in = &fs->inodes[idx];
+    in->free_next = fs->ino_free;
+    fs->ino_free  = idx;
+    if (fs->ino_live) {
+        fs->ino_live--;
     }
 }
 
@@ -467,24 +529,24 @@ static void memfs_slot_free(rvvm_memfs_t* fs, uint32_t idx)
  * write. The over-allocation is not charged against size= - a limit on what a
  * guest may store is not a limit on what the allocator may reserve, and
  * charging it would make a 1M tmpfs refuse a 100-byte file. */
-static bool memfs_node_reserve(memfs_node_t* n, size_t need)
+static bool memfs_inode_reserve(memfs_inode_t* in, size_t need)
 {
     uint8_t* fresh;
     size_t   cap;
 
-    if (need <= n->capacity) {
+    if (need <= in->capacity) {
         return true;
     }
-    cap = n->capacity ? n->capacity : 64;
+    cap = in->capacity ? in->capacity : 64;
     while (cap < need) {
         cap *= 2;
     }
-    fresh = realloc(n->data, cap);
+    fresh = realloc(in->data, cap);
     if (!fresh) {
         return false;
     }
-    n->data     = fresh;
-    n->capacity = cap;
+    in->data     = fresh;
+    in->capacity = cap;
     return true;
 }
 
@@ -496,67 +558,114 @@ static int64_t memfs_now(void)
     return (int64_t)time(NULL);
 }
 
-/* Add a node. @parent must already exist. Caller holds the lock and has checked
- * the read-only flag and the node bound. */
-static rvvm_memfs_result_t memfs_add_locked(rvvm_memfs_t* fs, const char* path,
-                                            uint32_t parent, uint8_t kind,
-                                            uint32_t mode, uint32_t* out_idx)
+/* Allocate an inode of @kind. Caller holds the lock.
+ *
+ * The inode bound counts live inodes, not slots ever handed out: a filesystem
+ * that creates and removes the same file ten thousand times has used one inode,
+ * and ENOSPC there would be a lie about how full the filesystem is. */
+static rvvm_memfs_result_t memfs_inode_new_locked(rvvm_memfs_t* fs, uint8_t kind,
+                                                  uint32_t mode, uint32_t* out_inode)
 {
-    memfs_node_t* n;
-    char*         copy;
-    uint32_t      idx;
-    bool          grew = false;
+    memfs_inode_t* in;
+    uint32_t       idx;
 
-    /* The node bound counts live nodes, not slots ever handed out: a filesystem
-     * that creates and removes the same file ten thousand times has used one
-     * node, and ENOSPC there would be a lie about how full the filesystem is. */
-    if (fs->live >= RVVM_MEMFS_MAX_NODES) {
+    if (fs->ino_live >= RVVM_MEMFS_MAX_NODES) {
         return RVVM_MEMFS_ENOSPC;
     }
-    if (fs->free_head != RVVM_MEMFS_NONE) {
-        /* Reuse a hole. Its ->child is the free-list link, planted by
-         * memfs_remove_node_locked(); everything else in the record is zeroed. */
-        idx = fs->free_head;
-        fs->free_head = fs->entries[idx].child;
+    if (fs->ino_free != RVVM_MEMFS_NONE) {
+        /* Reuse a hole. Its ->free_next is the free-list link, planted by
+         * memfs_inode_slot_free(); everything else in the record is zeroed. */
+        idx = fs->ino_free;
+        fs->ino_free = fs->inodes[idx].free_next;
     } else {
-        if (fs->count >= fs->capacity) {
-            size_t        ncap = fs->capacity ? fs->capacity * 2 : MEMFS_MIN_CAPACITY;
-            memfs_node_t* nentries;
+        if (fs->ino_count >= fs->ino_capacity) {
+            size_t         ncap = fs->ino_capacity ? fs->ino_capacity * 2 : MEMFS_MIN_CAPACITY;
+            memfs_inode_t* ninodes;
             if (ncap > RVVM_MEMFS_MAX_NODES) {
                 ncap = RVVM_MEMFS_MAX_NODES;
             }
-            nentries = realloc(fs->entries, ncap * sizeof(memfs_node_t));
-            if (!nentries) {
+            ninodes = realloc(fs->inodes, ncap * sizeof(memfs_inode_t));
+            if (!ninodes) {
                 return RVVM_MEMFS_ENOMEM;
             }
-            fs->entries  = nentries;
-            fs->capacity = ncap;
+            fs->inodes       = ninodes;
+            fs->ino_capacity = ncap;
         }
-        idx = (uint32_t)fs->count++;
+        idx = (uint32_t)fs->ino_count++;
     }
+    in = &fs->inodes[idx];
+    memset(in, 0, sizeof(*in));
+    in->kind  = kind;
+    in->mode  = mode & 07777;
+    in->ino   = ++fs->next_ino;
+    /* A file and a symlink start with one name; a directory with the two a
+     * guest's stat() of an empty directory expects (its own entry and the one in
+     * its parent), and mkdir adds one more for each subdirectory it gains. */
+    in->nlink = (kind == RVVM_MEMFS_DIR) ? 2 : 1;
+    in->mtime = memfs_now();
+    fs->ino_live++;
+    *out_inode = idx;
+    return RVVM_MEMFS_OK;
+}
+
+/* Give @inode a new name @path under @parent, and file it in the map. Caller
+ * holds the lock; @parent and @inode must already exist. The name bound is what
+ * makes ENOSPC reachable for a filesystem that is all hard links. */
+static rvvm_memfs_result_t memfs_dentry_new_locked(rvvm_memfs_t* fs, const char* path,
+                                                   uint32_t parent, uint32_t inode,
+                                                   uint32_t* out_idx)
+{
+    memfs_dentry_t* d;
+    char*           copy;
+    uint32_t        idx;
+    bool            grew = false;
+
+    if (fs->live >= RVVM_MEMFS_MAX_NAMES) {
+        return RVVM_MEMFS_ENOSPC;
+    }
+    /* The name first, so a failed allocation of the slot never consumes one the
+     * caller would then have to know to hand back. */
     copy = strdup(path);
     if (!copy) {
         return RVVM_MEMFS_ENOMEM;
     }
-    n          = &fs->entries[idx];
-    memset(n, 0, sizeof(*n));
-    n->path     = copy;
-    n->kind     = kind;
-    n->mode     = mode & 07777;
-    n->ino      = ++fs->next_ino;
-    n->parent   = parent;
-    n->child    = RVVM_MEMFS_NONE;
-    n->next     = RVVM_MEMFS_NONE;
-    n->nlink    = 1;
-    n->mtime    = memfs_now();
+    if (fs->free_head != RVVM_MEMFS_NONE) {
+        /* Reuse a hole. Its ->child is the free-list link, planted by
+         * memfs_dentry_slot_free(); everything else in the record is zeroed. */
+        idx = fs->free_head;
+        fs->free_head = fs->dentries[idx].child;
+    } else {
+        if (fs->count >= fs->capacity) {
+            size_t          ncap = fs->capacity ? fs->capacity * 2 : MEMFS_MIN_CAPACITY;
+            memfs_dentry_t* ndentries;
+            if (ncap > RVVM_MEMFS_MAX_NAMES) {
+                ncap = RVVM_MEMFS_MAX_NAMES;
+            }
+            ndentries = realloc(fs->dentries, ncap * sizeof(memfs_dentry_t));
+            if (!ndentries) {
+                free(copy);
+                return RVVM_MEMFS_ENOMEM;
+            }
+            fs->dentries = ndentries;
+            fs->capacity = ncap;
+        }
+        idx = (uint32_t)fs->count++;
+    }
+    d = &fs->dentries[idx];
+    memset(d, 0, sizeof(*d));
+    d->path   = copy;
+    d->inode  = inode;
+    d->parent = parent;
+    d->child  = RVVM_MEMFS_NONE;
+    d->next   = RVVM_MEMFS_NONE;
     fs->live++;
 
-    /* Keep the map at least 70% full. Measured against live nodes, because a
+    /* Keep the map at least 70% full. Measured against live names, because a
      * free slot is not in the map and must not count towards the load. */
     if (!fs->map || (fs->live * 10) >= (fs->map_size * 7)) {
-        /* A successful grow has already re-inserted every live node, this one
+        /* A successful grow has already re-inserted every live name, this one
          * among them - so the insert below must not run. Doing both files this
-         * node under two slots with one key, and the two disagree about which
+         * name under two slots with one key, and the two disagree about which
          * one a removal should drop: the survivor is then an entry no probe
          * reaches, because the hole-closing pass moved it out of its own home's
          * run while the other copy was the one that got cleared. A duplicate is
@@ -564,7 +673,8 @@ static rvvm_memfs_result_t memfs_add_locked(rvvm_memfs_t* fs, const char* path,
          * removed, and unfindable afterwards. */
         grew = memfs_map_grow(fs);
         if (!grew && !fs->map) {
-            memfs_slot_free(fs, idx);
+            memfs_dentry_release(d);
+            memfs_dentry_slot_free(fs, idx);
             return RVVM_MEMFS_ENOMEM;
         }
     }
@@ -575,114 +685,136 @@ static rvvm_memfs_result_t memfs_add_locked(rvvm_memfs_t* fs, const char* path,
     return RVVM_MEMFS_OK;
 }
 
-/* Unlink a node from its parent's child list. Caller holds the lock.
+/* Drop one reference to @inode_idx. A file or a symlink lives while any name
+ * points at it, so this is a count down to zero; a directory is not hard-linked
+ * at all - its nlink is the 2+subdirectories convention, not a reference count -
+ * so it is released by the one removal that owns its single name. Caller holds
+ * the lock. */
+static void memfs_inode_unref_locked(rvvm_memfs_t* fs, uint32_t inode_idx)
+{
+    memfs_inode_t* in = &fs->inodes[inode_idx];
+
+    if (in->kind != RVVM_MEMFS_DIR) {
+        if (in->nlink > 0) {
+            in->nlink--;
+        }
+        if (in->nlink != 0) {
+            return; /* another name still reaches it */
+        }
+    }
+    if (in->kind == RVVM_MEMFS_REG && fs->size_limit && fs->used >= in->size) {
+        /* Only ever subtracting what a write charged, so the counter cannot be
+         * driven below zero by a sequence of removes. */
+        fs->used -= in->size;
+    }
+    memfs_inode_release(in);
+    memfs_inode_slot_free(fs, inode_idx);
+}
+
+/* Unlink a dentry from its parent's child list. Caller holds the lock.
  *
  * The parent's own slot holds the first child, and every later child is reached
  * through the previous sibling's ->next, so the two positions are separate and
- * both have to be handled. Taking the walk from n->next instead - which is what a
+ * both have to be handled. Taking the walk from d->next instead - which is what a
  * "is it the last child?" shortcut would do - silently misses the case where
- * @idx IS the first child, and a detach that misses leaves the node linked into
- * its old parent while memfs_attach_locked() links it into the new one. One node
+ * @idx IS the first child, and a detach that misses leaves the name linked into
+ * its old parent while memfs_attach_locked() links it into the new one. One name
  * in two child lists is a cycle, and the next walk over either of them never
  * ends - which is a hang in a rename, with nothing to point at.
  *
  * Leaving @parent and @next as they were found is deliberate: the caller either
- * frees the node or immediately re-attaches it, and a detach that cleared them
+ * frees the name or immediately re-attaches it, and a detach that cleared them
  * would have to be undone in the second case. */
 static void memfs_detach_locked(rvvm_memfs_t* fs, uint32_t idx)
 {
-    memfs_node_t* n = &fs->entries[idx];
-    uint32_t      p = n->parent;
-    uint32_t*     slot;
+    memfs_dentry_t* d = &fs->dentries[idx];
+    uint32_t        p = d->parent;
+    uint32_t*       slot;
 
     if (p == RVVM_MEMFS_NONE) {
         return;
     }
-    if (fs->entries[p].child == idx) {
-        fs->entries[p].child = n->next;
+    if (fs->dentries[p].child == idx) {
+        fs->dentries[p].child = d->next;
         return;
     }
-    slot = &fs->entries[p].child;
+    slot = &fs->dentries[p].child;
     while (*slot != RVVM_MEMFS_NONE) {
-        if (fs->entries[*slot].next == idx) {
-            fs->entries[*slot].next = n->next;
+        if (fs->dentries[*slot].next == idx) {
+            fs->dentries[*slot].next = d->next;
             return;
         }
-        slot = &fs->entries[*slot].next;
+        slot = &fs->dentries[*slot].next;
     }
 }
 
 static void memfs_attach_locked(rvvm_memfs_t* fs, uint32_t parent, uint32_t idx)
 {
-    memfs_node_t* n = &fs->entries[idx];
-    memfs_node_t* p = &fs->entries[parent];
+    memfs_dentry_t* d = &fs->dentries[idx];
+    memfs_dentry_t* p = &fs->dentries[parent];
 
-    n->parent = parent;
-    n->next   = p->child;
+    d->parent = parent;
+    d->next   = p->child;
     p->child  = idx;
-    p->mtime  = memfs_now();
+    fs->inodes[p->inode].mtime = memfs_now();
 }
 
-/* Remove a node, its whole subtree, and its entry. Caller holds the lock.
- * Recursive on the depth of the tree, which is bounded by
- * RVVM_MEMFS_MAX_SEGS, so this cannot overflow anything. */
-/* Delete @idx and everything under it, and NOTHING else.
+/* Delete @idx and everything under it, and NOTHING else. Caller holds the lock.
+ * Recursive on the depth of the tree, which is bounded by RVVM_MEMFS_MAX_SEGS,
+ * so this cannot overflow anything.
  *
  * Not the sibling chain, and that is the whole reason this is its own function
- * rather than the tail of a loop: memfs_remove_subtree_locked() below walks a
- * child list and recurses once per child, so a version that also advanced to
- * each child's next sibling would delete the entire list on the first call. The
- * parent loop would then be holding the index of a node that is already freed,
- * and the corruption that follows is in the allocator rather than in anything a
- * stack trace would point at. One node in, one subtree out; the caller owns
- * where it goes next. */
+ * rather than the tail of a loop: it walks a child list and recurses once per
+ * child, so a version that also advanced to each child's next sibling would
+ * delete the entire list on the first call. The parent loop would then be
+ * holding the index of a name that is already freed, and the corruption that
+ * follows is in the allocator rather than in anything a stack trace would point
+ * at. One name in, one subtree out; the caller owns where it goes next.
+ *
+ * The inode is unrefed here, so a name removed is a name gone however many
+ * others still reach the same inode (a hard link survives its siblings). A
+ * directory's inode goes with this single removal, and its parent's nlink is the
+ * caller's to fix - this function does not know whether the caller is emptying a
+ * whole subtree (where no surviving parent is involved) or cutting one name off
+ * (where one is). */
 static void memfs_remove_node_locked(rvvm_memfs_t* fs, uint32_t idx)
 {
-    while (idx != RVVM_MEMFS_NONE) {
-        memfs_node_t* n = &fs->entries[idx];
-        uint32_t      child = n->child;
+    memfs_dentry_t* d = &fs->dentries[idx];
+    uint32_t        inode = d->inode;
+    uint32_t        child = d->child;
 
-        while (child != RVVM_MEMFS_NONE) {
-            /* Read before the recursive call: it frees @child, and @kid is the
-             * only way back to the rest of the list. It stays valid because the
-             * node array is not compacted on removal - only its count moves, so
-             * a freed index is a hole rather than a shift. */
-            uint32_t kid = fs->entries[child].next;
-            memfs_remove_node_locked(fs, child);
-            child = kid;
-        }
-        if (n->kind == RVVM_MEMFS_REG && fs->size_limit && fs->used >= n->size) {
-            /* Only ever subtracting what a write charged, so the counter cannot
-             * be driven below zero by a sequence of removes. */
-            fs->used -= n->size;
-        }
-        memfs_detach_locked(fs, idx);
-        /* The map is keyed by this node's path and looks it up by value against
-         * entries[].path, so the entry has to leave the map BEFORE the string is
-         * freed. Copied first because node_release() frees the node's own
-         * pointer, and the copy is what outlives the call. */
-        {
-            char* key = strdup(n->path);
-            if (key) {
-                memfs_map_remove(fs, key);
-                free(key);
-            }
-        }
-        memfs_node_release(n);
-        memfs_slot_free(fs, idx);
-        idx = RVVM_MEMFS_NONE;
+    while (child != RVVM_MEMFS_NONE) {
+        /* Read before the recursive call: it frees @child, and @kid is the
+         * only way back to the rest of the list. It stays valid because the
+         * array is not compacted on removal - only its count moves, so a freed
+         * index is a hole rather than a shift. */
+        uint32_t kid = fs->dentries[child].next;
+        memfs_remove_node_locked(fs, child);
+        child = kid;
     }
+    memfs_detach_locked(fs, idx);
+    /* The map is keyed by this name's path and looks it up by value against
+     * dentries[].path, so the entry has to leave the map BEFORE the string is
+     * freed. Copied first because dentry_release() frees the dentry's own
+     * pointer, and the copy is what outlives the call. */
+    {
+        char* key = strdup(d->path);
+        if (key) {
+            memfs_map_remove(fs, key);
+            free(key);
+        }
+    }
+    memfs_dentry_release(d);
+    memfs_dentry_slot_free(fs, idx);
+    memfs_inode_unref_locked(fs, inode);
 }
-
-/* Remove a node and its whole subtree, then every sibling of it, so a caller
- * with a child list can empty it in one call. Only used where that is the
- * intent; memfs_remove_node_locked() is what the recursive cases want. Caller
- * holds the lock. */
 
 /* --- resolution --------------------------------------------------------- */
 
-/* Resolve @path to a node index, following symlinks when @follow. Caller holds
- * the lock.
+/* Resolve @path to a dentry index, following symlinks when @follow. Caller holds
+ * the lock. The index names the *name* that was reached, which is what stat() and
+ * readdir() then report; a caller that wants the identity behind it reads
+ * dentries[idx].inode.
  *
  * The symlink loop is a string walk rather than a recursive call: a link target
  * can point at another link that points back, and a recursive resolver would
@@ -705,7 +837,7 @@ static rvvm_memfs_result_t memfs_resolve_locked(rvvm_memfs_t* fs, const char* pa
         if (idx == RVVM_MEMFS_NONE) {
             return RVVM_MEMFS_ENOENT;
         }
-        if (!follow || fs->entries[idx].kind != RVVM_MEMFS_LNK) {
+        if (!follow || fs->inodes[fs->dentries[idx].inode].kind != RVVM_MEMFS_LNK) {
             *out_idx = idx;
             return RVVM_MEMFS_OK;
         }
@@ -718,7 +850,7 @@ static rvvm_memfs_result_t memfs_resolve_locked(rvvm_memfs_t* fs, const char* pa
              * blindly would turn "b" inside /a into /b, which is a different
              * file - and the difference is what makes a relative link work at
              * all. */
-            const char* target = fs->entries[idx].target;
+            const char* target = fs->inodes[fs->dentries[idx].inode].target;
             if (!target) {
                 return RVVM_MEMFS_EINVAL;
             }
@@ -749,9 +881,9 @@ static rvvm_memfs_result_t memfs_resolve_locked(rvvm_memfs_t* fs, const char* pa
     }
 }
 
-/* The parent directory of @path, resolved (its final component may be a link,
- * which a lookup of the parent has to follow to get somewhere real). Caller
- * holds the lock. */
+/* The parent directory of @path, resolved, as a dentry index (its final
+ * component may be a link, which a lookup of the parent has to follow to get
+ * somewhere real). Caller holds the lock. */
 static rvvm_memfs_result_t memfs_parent_locked(rvvm_memfs_t* fs, const char* path,
                                                uint32_t* out_parent)
 {
@@ -770,58 +902,70 @@ static rvvm_memfs_result_t memfs_parent_locked(rvvm_memfs_t* fs, const char* pat
          * same answer, so nothing is added here. */
         return rc;
     }
-    if (fs->entries[*out_parent].kind != RVVM_MEMFS_DIR) {
+    if (fs->inodes[fs->dentries[*out_parent].inode].kind != RVVM_MEMFS_DIR) {
         return RVVM_MEMFS_ENOTDIR;
     }
     return RVVM_MEMFS_OK;
 }
 
-static void memfs_fill_info(const rvvm_memfs_t* fs, uint32_t idx, rvvm_memfs_info_t* out)
+static void memfs_fill_info(const rvvm_memfs_t* fs, uint32_t dentry_idx, rvvm_memfs_info_t* out)
 {
-    const memfs_node_t* n = &fs->entries[idx];
+    const memfs_dentry_t* d  = &fs->dentries[dentry_idx];
+    const memfs_inode_t*  in = &fs->inodes[d->inode];
 
-    out->index = idx;
-    memcpy(out->path, n->path, strlen(n->path) + 1);
-    out->kind = n->kind;
-    out->mode = n->mode;
-    out->size = (n->kind == RVVM_MEMFS_REG) ? (uint64_t)n->size : 0;
-    out->ino  = n->ino;
-    /* No hard links (see the header), so a file is 1 and a directory is 2 -
-     * which is what a guest's stat() of a fresh directory expects, and what
-     * makes the two distinguishable by a program that counts links. */
-    out->nlink = (n->kind == RVVM_MEMFS_DIR) ? 2 : 1;
-    out->mtime = n->mtime;
+    /* The identity is the inode, not the name: two hard links to one file report
+     * the same @index and the same @ino, and differ only in @path - which is the
+     * name this lookup reached it by. */
+    out->index = d->inode;
+    memcpy(out->path, d->path, strlen(d->path) + 1);
+    out->kind  = in->kind;
+    out->mode  = in->mode;
+    out->size  = (in->kind == RVVM_MEMFS_REG) ? (uint64_t)in->size : 0;
+    out->ino   = in->ino;
+    /* The real count: a file is the number of names that reach it, a directory
+     * is Linux's 2 + its subdirectories. */
+    out->nlink = in->nlink;
+    out->mtime = in->mtime;
 }
 
 /* --- consistency check -------------------------------------------------- */
 
-/* Walk the map and the node array against each other and report the first
- * disagreement. Returns 0 when they agree.
+/* Walk the map, the dentries and the inodes against each other and report the
+ * first disagreement. Returns 0 when they agree.
  *
- * This exists because the two structures are updated by hand in eight places and
- * the failure mode when they drift is not a crash but a quiet wrong answer: a
- * lookup that compares a node's path against a key belonging to a different node
+ * This exists because the three structures are updated by hand in a dozen places
+ * and the failure mode when they drift is not a crash but a quiet wrong answer: a
+ * lookup that compares a name's path against a key belonging to a different name
  * concludes the file is not there. Every way that can happen - a removal leaving
  * a stale slot, a rename forgetting to re-key the root, a reused slot keeping an
- * old identity - produces the same symptom from the outside, and none of them
- * points at the line that caused it. Checking the invariant directly is the
- * difference between a test that says "the map is wrong" and one that says
- * "entry 37 is keyed as /clu/02 but its node says /clu/03".
+ * old identity, a hard link that forgot to move nlink - produces the same symptom
+ * from the outside, and none of them points at the line that caused it. Checking
+ * the invariants directly is the difference between a test that says "the map is
+ * wrong" and one that says "entry 37 is keyed as /clu/02 but its name says
+ * /clu/03".
+ *
+ * The split added two whole families of invariant to check, so this grew: a name
+ * must point at a live inode, an inode's nlink must equal the number of names (or
+ * subdirectories) that reach it, and every name's stored path must be the one its
+ * parent chain implies - the last of which is also what catches a cycle in the
+ * parent links, since a cycle can never reach the root.
  *
  * Caller holds the lock. */
 static size_t memfs_check_locked(rvvm_memfs_t* fs, char* why, size_t whysize)
 {
-    size_t i;
-    size_t j;
-    size_t occupied = 0;
+    size_t   i;
+    size_t   j;
+    size_t   occupied = 0;
+    uint32_t live_inodes = 0;
 
+    /* --- the map against the names --- */
     for (i = 0; i < fs->count; ++i) {
-        if (!fs->entries[i].path) {
+        if (!fs->dentries[i].path) {
             continue; /* a free slot */
         }
-        if (memfs_find_locked(fs, fs->entries[i].path) != (uint32_t)i) {
-            snprintf(why, whysize, "node %zu (%s) is not findable by its own path", i,
-                     fs->entries[i].path);
+        if (memfs_find_locked(fs, fs->dentries[i].path) != (uint32_t)i) {
+            snprintf(why, whysize, "dentry %zu (%s) is not findable by its own path", i,
+                     fs->dentries[i].path);
             return i;
         }
     }
@@ -841,17 +985,17 @@ static size_t memfs_check_locked(rvvm_memfs_t* fs, char* why, size_t whysize)
         }
         occupied++;
         idx = fs->map[i] - 1;
-        if (idx >= fs->count || !fs->entries[idx].path) {
-            snprintf(why, whysize, "slot %zu names node %u, which is free or past the end",
+        if (idx >= fs->count || !fs->dentries[idx].path) {
+            snprintf(why, whysize, "slot %zu names dentry %u, which is free or past the end",
                      i, idx);
             return i;
         }
-        h = memfs_hash(fs->entries[idx].path) & (uint32_t)(fs->map_size - 1);
+        h = memfs_hash(fs->dentries[idx].path) & (uint32_t)(fs->map_size - 1);
         for (t = h; t != i; t = (t + 1) & (uint32_t)(fs->map_size - 1)) {
             if (!fs->map[t] || ++steps > fs->map_size) {
                 snprintf(why, whysize,
-                         "slot %zu holds node %u (%s), whose home is %u: a gap in between",
-                         i, idx, fs->entries[idx].path, h);
+                         "slot %zu holds dentry %u (%s), whose home is %u: a gap in between",
+                         i, idx, fs->dentries[idx].path, h);
                 return i;
             }
         }
@@ -862,15 +1006,141 @@ static size_t memfs_check_locked(rvvm_memfs_t* fs, char* why, size_t whysize)
         }
         for (j = i + 1; j < fs->map_size; ++j) {
             if (fs->map[j] && fs->map[j] == fs->map[i]) {
-                snprintf(why, whysize, "node %u is filed in two slots (%zu and %zu)",
+                snprintf(why, whysize, "dentry %u is filed in two slots (%zu and %zu)",
                          fs->map[i] - 1, i, j);
                 return i;
             }
         }
     }
     if (occupied != fs->live) {
-        snprintf(why, whysize, "%zu slots occupied but %zu nodes live", occupied, fs->live);
+        snprintf(why, whysize, "%zu slots occupied but %zu names live", occupied, fs->live);
         return fs->map_size;
+    }
+
+    /* --- the inodes: a live marker, and the count of live ones --- */
+    for (i = 0; i < fs->ino_count; ++i) {
+        if (fs->inodes[i].kind != 0) {
+            live_inodes++;
+        }
+    }
+    if (live_inodes != fs->ino_live) {
+        snprintf(why, whysize, "%u inodes marked live but %zu counted", live_inodes,
+                 fs->ino_live);
+        return fs->ino_count;
+    }
+
+    /* --- every name reaches a live inode --- */
+    for (i = 0; i < fs->count; ++i) {
+        uint32_t inode;
+        if (!fs->dentries[i].path) {
+            continue;
+        }
+        inode = fs->dentries[i].inode;
+        if (inode >= fs->ino_count || fs->inodes[inode].kind == 0) {
+            snprintf(why, whysize, "dentry %zu (%s) names inode %u, which is free or past the end",
+                     i, fs->dentries[i].path, inode);
+            return i;
+        }
+    }
+
+    /* --- the root, and every name's parent chain --- */
+    if (fs->root >= fs->count || !fs->dentries[fs->root].path ||
+        strcmp(fs->dentries[fs->root].path, "/") ||
+        fs->dentries[fs->root].parent != RVVM_MEMFS_NONE) {
+        snprintf(why, whysize, "the root is not a parentless \"/\"");
+        return fs->root;
+    }
+    for (i = 0; i < fs->count; ++i) {
+        uint32_t    parent;
+        uint32_t    walk;
+        uint32_t    depth = 0;
+        char        expect[RVVM_MEMFS_PATH_MAX];
+        const char* base;
+        const char* dir;
+        int         n;
+
+        if (!fs->dentries[i].path || (uint32_t)i == fs->root) {
+            continue;
+        }
+        parent = fs->dentries[i].parent;
+        if (parent >= fs->count || !fs->dentries[parent].path) {
+            snprintf(why, whysize, "dentry %zu (%s) has no live parent", i, fs->dentries[i].path);
+            return i;
+        }
+        if (fs->inodes[fs->dentries[parent].inode].kind != RVVM_MEMFS_DIR) {
+            snprintf(why, whysize, "dentry %zu (%s) sits under something that is not a directory",
+                     i, fs->dentries[i].path);
+            return i;
+        }
+        /* The stored path must be exactly the one the parent chain implies. A
+         * name whose path disagreed with where it hangs is a name a lookup would
+         * find at one place and a readdir would list at another. */
+        base = memfs_basename(fs->dentries[i].path);
+        dir  = fs->dentries[parent].path;
+        n = !strcmp(dir, "/") ? snprintf(expect, sizeof(expect), "/%s", base)
+                              : snprintf(expect, sizeof(expect), "%s/%s", dir, base);
+        if (n <= 0 || (size_t)n >= sizeof(expect) || strcmp(expect, fs->dentries[i].path)) {
+            snprintf(why, whysize, "dentry %zu is %s but its parent chain says %s", i,
+                     fs->dentries[i].path, expect);
+            return i;
+        }
+        /* And the chain has to reach the root. A cycle among parent links never
+         * does, which is the one shape the path check above cannot see. */
+        for (walk = parent; walk != fs->root; walk = fs->dentries[walk].parent) {
+            if (walk == RVVM_MEMFS_NONE || walk >= fs->count ||
+                !fs->dentries[walk].path || ++depth > fs->count) {
+                snprintf(why, whysize, "dentry %zu (%s) does not reach the root", i,
+                         fs->dentries[i].path);
+                return i;
+            }
+        }
+    }
+
+    /* --- nlink, recomputed rather than trusted --- */
+    for (i = 0; i < fs->ino_count; ++i) {
+        memfs_inode_t* in = &fs->inodes[i];
+        uint32_t       expect;
+
+        if (in->kind == 0) {
+            continue;
+        }
+        if (in->kind == RVVM_MEMFS_DIR) {
+            uint32_t self = RVVM_MEMFS_NONE;
+            uint32_t subdirs = 0;
+            for (j = 0; j < fs->count; ++j) {
+                if (fs->dentries[j].path && fs->dentries[j].inode == (uint32_t)i) {
+                    if (self != RVVM_MEMFS_NONE) {
+                        snprintf(why, whysize, "directory inode %zu has more than one name", i);
+                        return j;
+                    }
+                    self = (uint32_t)j;
+                }
+            }
+            if (self == RVVM_MEMFS_NONE) {
+                snprintf(why, whysize, "live directory inode %zu has no name", i);
+                return i;
+            }
+            for (j = 0; j < fs->count; ++j) {
+                if (fs->dentries[j].path && fs->dentries[j].parent == self &&
+                    fs->inodes[fs->dentries[j].inode].kind == RVVM_MEMFS_DIR) {
+                    subdirs++;
+                }
+            }
+            expect = 2 + subdirs;
+        } else {
+            uint32_t names = 0;
+            for (j = 0; j < fs->count; ++j) {
+                if (fs->dentries[j].path && fs->dentries[j].inode == (uint32_t)i) {
+                    names++;
+                }
+            }
+            expect = names;
+        }
+        if (in->nlink != expect) {
+            snprintf(why, whysize, "inode %zu (kind %u) reports nlink %u but %u reach it", i,
+                     in->kind, in->nlink, expect);
+            return i;
+        }
     }
     return 0;
 }
@@ -902,11 +1172,12 @@ rvvm_memfs_t* rvvm_memfs_create(bool read_only, uint64_t size_limit)
     fs->size_limit = size_limit;
     fs->next_ino   = 0;
     fs->root       = RVVM_MEMFS_NONE;
-    /* Not 0, which is what calloc left: index 0 is the root and is about to be a
-     * live node, so a free list that starts there hands the root itself back out
-     * as the next free slot. The filesystem then has two claims on index 0 and
-     * the second one to be written wins. */
+    /* Not 0, which is what calloc left: index 0 is the root's dentry and inode 0
+     * is the root's inode, so a free list that starts at 0 hands the root itself
+     * back out as the next free slot. The filesystem then has two claims on slot
+     * 0 and the second one to be written wins. */
     fs->free_head  = RVVM_MEMFS_NONE;
+    fs->ino_free   = RVVM_MEMFS_NONE;
     fs->map_size   = MEMFS_MIN_MAP;
     fs->map        = calloc(fs->map_size, sizeof(uint32_t));
     if (!fs->map) {
@@ -914,19 +1185,25 @@ rvvm_memfs_t* rvvm_memfs_create(bool read_only, uint64_t size_limit)
         return NULL;
     }
     {
-        uint32_t root;
-        /* The root is created through the same path as everything else, so it has
-         * the same mode and the same mtime and a directory the guest makes is
-         * indistinguishable from the one it started with. Not read-only-checked:
-         * the root exists whether or not the mount can be written to, which is
-         * what makes a read-only mount still have a readable root. */
-        if (memfs_add_locked(fs, "/", RVVM_MEMFS_NONE, RVVM_MEMFS_DIR, 0755, &root) !=
-            RVVM_MEMFS_OK) {
+        uint32_t root_inode  = RVVM_MEMFS_NONE;
+        uint32_t root_dentry = RVVM_MEMFS_NONE;
+        /* The root is created through the same two calls as everything else, so
+         * it has the same mode and the same mtime and a directory the guest makes
+         * is indistinguishable from the one it started with. Not read-only
+         * checked: the root exists whether or not the mount can be written to,
+         * which is what makes a read-only mount still have a readable root. */
+        if (memfs_inode_new_locked(fs, RVVM_MEMFS_DIR, 0755, &root_inode) != RVVM_MEMFS_OK ||
+            memfs_dentry_new_locked(fs, "/", RVVM_MEMFS_NONE, root_inode, &root_dentry) !=
+                RVVM_MEMFS_OK) {
+            /* Either call may have been the one that failed, so both arrays are
+             * freed rather than the one the failing call happened to touch. */
+            free(fs->dentries);
+            free(fs->inodes);
             free(fs->map);
             free(fs);
             return NULL;
         }
-        fs->root = root;
+        fs->root = root_dentry;
     }
     return fs;
 }
@@ -939,9 +1216,16 @@ void rvvm_memfs_free(rvvm_memfs_t* fs)
         return;
     }
     for (i = 0; i < fs->count; ++i) {
-        memfs_node_release(&fs->entries[i]);
+        memfs_dentry_release(&fs->dentries[i]);
     }
-    free(fs->entries);
+    /* Through the whole inode array, not only the live part: release() is a
+     * no-op on a slot that was already released, so this needs no liveness test
+     * and cannot miss one that grew past ino_live. */
+    for (i = 0; i < fs->ino_count; ++i) {
+        memfs_inode_release(&fs->inodes[i]);
+    }
+    free(fs->dentries);
+    free(fs->inodes);
     free(fs->map);
     free(fs);
 }
@@ -961,6 +1245,8 @@ uint64_t rvvm_memfs_used(rvvm_memfs_t* fs)
     return used;
 }
 
+/* Live inodes, not dentries and not slots ever handed out: a hard link adds a
+ * name without adding a node, and a file deleted and recreated used one. */
 uint32_t rvvm_memfs_count(rvvm_memfs_t* fs)
 {
     uint32_t count;
@@ -968,7 +1254,7 @@ uint32_t rvvm_memfs_count(rvvm_memfs_t* fs)
         return 0;
     }
     rvvm_lock(&fs->lock);
-    count = (uint32_t)fs->count;
+    count = (uint32_t)fs->ino_live;
     rvvm_unlock(&fs->lock);
     return count;
 }
@@ -1008,7 +1294,23 @@ rvvm_memfs_result_t rvvm_memfs_isdir(rvvm_memfs_t* fs, const char* path)
     return (info.kind == RVVM_MEMFS_DIR) ? RVVM_MEMFS_OK : RVVM_MEMFS_ENOTDIR;
 }
 
-/* Shared prologue for the four name-changing operations: normalize, refuse a
+/* The inode a name refers to. Caller holds the lock. */
+static memfs_inode_t* memfs_inode_of(rvvm_memfs_t* fs, uint32_t dentry_idx)
+{
+    return &fs->inodes[fs->dentries[dentry_idx].inode];
+}
+
+/* Free an inode that was allocated but never got its first name - the dentry
+ * that was to carry it could not be filed. Both halves are undone here so a
+ * caller that only has the inode index does not have to know the pair. Caller
+ * holds the lock. */
+static void memfs_inode_abandon_locked(rvvm_memfs_t* fs, uint32_t inode_idx)
+{
+    memfs_inode_release(&fs->inodes[inode_idx]);
+    memfs_inode_slot_free(fs, inode_idx);
+}
+
+/* Shared prologue for the name-changing operations: normalize, refuse a
  * read-only mount, and find the parent. Everything that would change a name
  * goes through here so the read-only check cannot be forgotten in one of them -
  * it is the one check that has no second line of defence, because the bytes being
@@ -1052,8 +1354,9 @@ rvvm_memfs_result_t rvvm_memfs_mkdir(rvvm_memfs_t* fs, const char* path, uint32_
 {
     char                norm[RVVM_MEMFS_PATH_MAX];
     uint32_t            parent;
-    rvvm_memfs_result_t rc;
+    uint32_t            inode;
     uint32_t            idx;
+    rvvm_memfs_result_t rc;
 
     rc = memfs_prepare_write(fs, path, norm, sizeof(norm), &parent);
     if (rc != RVVM_MEMFS_OK) {
@@ -1063,9 +1366,18 @@ rvvm_memfs_result_t rvvm_memfs_mkdir(rvvm_memfs_t* fs, const char* path, uint32_
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_EEXIST;
     }
-    rc = memfs_add_locked(fs, norm, parent, RVVM_MEMFS_DIR, mode, &idx);
+    rc = memfs_inode_new_locked(fs, RVVM_MEMFS_DIR, mode, &inode);
+    if (rc == RVVM_MEMFS_OK) {
+        rc = memfs_dentry_new_locked(fs, norm, parent, inode, &idx);
+        if (rc != RVVM_MEMFS_OK) {
+            memfs_inode_abandon_locked(fs, inode);
+        }
+    }
     if (rc == RVVM_MEMFS_OK) {
         memfs_attach_locked(fs, parent, idx);
+        /* A new subdirectory is one more link to its parent: that is what makes a
+         * directory's nlink 2 + its subdirectories rather than a constant. */
+        memfs_inode_of(fs, parent)->nlink++;
     }
     rvvm_unlock(&fs->lock);
     return rc;
@@ -1075,8 +1387,9 @@ rvvm_memfs_result_t rvvm_memfs_create_file(rvvm_memfs_t* fs, const char* path, u
 {
     char                norm[RVVM_MEMFS_PATH_MAX];
     uint32_t            parent;
-    rvvm_memfs_result_t rc;
+    uint32_t            inode;
     uint32_t            idx;
+    rvvm_memfs_result_t rc;
 
     rc = memfs_prepare_write(fs, path, norm, sizeof(norm), &parent);
     if (rc != RVVM_MEMFS_OK) {
@@ -1084,12 +1397,12 @@ rvvm_memfs_result_t rvvm_memfs_create_file(rvvm_memfs_t* fs, const char* path, u
     }
     idx = memfs_find_locked(fs, norm);
     if (idx != RVVM_MEMFS_NONE) {
-        memfs_node_t* n = &fs->entries[idx];
-        if (n->kind == RVVM_MEMFS_DIR) {
+        memfs_inode_t* in = memfs_inode_of(fs, idx);
+        if (in->kind == RVVM_MEMFS_DIR) {
             rvvm_unlock(&fs->lock);
             return RVVM_MEMFS_EISDIR;
         }
-        if (n->kind == RVVM_MEMFS_LNK) {
+        if (in->kind == RVVM_MEMFS_LNK) {
             /* O_CREAT on a symlink is EEXIST, not "follow it and create the
              * target". Creating through a link is what open() without O_EXCL
              * does, and open() is the caller's decision to make, not this one. */
@@ -1097,20 +1410,28 @@ rvvm_memfs_result_t rvvm_memfs_create_file(rvvm_memfs_t* fs, const char* path, u
             return RVVM_MEMFS_EEXIST;
         }
         /* O_CREAT on an existing file truncates it, which is what the flag says
-         * and what a caller opening with O_TRUNC|O_CREAT expects. The bytes it
-         * held go back to the size budget as they are released: a guest that
-         * fills a tmpfs to its limit, truncates the file and rewrites it has to
-         * be able to, and keeping the old contents charged would fail the
-         * rewrite with ENOSPC on a filesystem that is now empty. */
-        if (fs->size_limit && fs->used >= n->size) {
-            fs->used -= n->size;
+         * and what a caller opening with O_TRUNC|O_CREAT expects. Truncating
+         * through one name of a hard-linked file truncates the one inode every
+         * name sees, which is exactly what a hard link means. The bytes it held
+         * go back to the size budget as they are released: a guest that fills a
+         * tmpfs to its limit, truncates the file and rewrites it has to be able
+         * to, and keeping the old contents charged would fail the rewrite with
+         * ENOSPC on a filesystem that is now empty. */
+        if (fs->size_limit && fs->used >= in->size) {
+            fs->used -= in->size;
         }
-        n->size  = 0;
-        n->mtime = memfs_now();
+        in->size  = 0;
+        in->mtime = memfs_now();
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_OK;
     }
-    rc = memfs_add_locked(fs, norm, parent, RVVM_MEMFS_REG, mode, &idx);
+    rc = memfs_inode_new_locked(fs, RVVM_MEMFS_REG, mode, &inode);
+    if (rc == RVVM_MEMFS_OK) {
+        rc = memfs_dentry_new_locked(fs, norm, parent, inode, &idx);
+        if (rc != RVVM_MEMFS_OK) {
+            memfs_inode_abandon_locked(fs, inode);
+        }
+    }
     if (rc == RVVM_MEMFS_OK) {
         memfs_attach_locked(fs, parent, idx);
     }
@@ -1122,8 +1443,9 @@ rvvm_memfs_result_t rvvm_memfs_unlink(rvvm_memfs_t* fs, const char* path, bool d
 {
     char                norm[RVVM_MEMFS_PATH_MAX];
     uint32_t            parent;
-    rvvm_memfs_result_t rc;
     uint32_t            idx;
+    uint8_t             kind;
+    rvvm_memfs_result_t rc;
 
     rc = memfs_prepare_write(fs, path, norm, sizeof(norm), &parent);
     if (rc != RVVM_MEMFS_OK) {
@@ -1134,13 +1456,14 @@ rvvm_memfs_result_t rvvm_memfs_unlink(rvvm_memfs_t* fs, const char* path, bool d
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_ENOENT;
     }
-    if (fs->entries[idx].kind == RVVM_MEMFS_DIR) {
+    kind = memfs_inode_of(fs, idx)->kind;
+    if (kind == RVVM_MEMFS_DIR) {
         if (!dir) {
             /* rmdir() asked to remove a file. */
             rvvm_unlock(&fs->lock);
             return RVVM_MEMFS_EISDIR;
         }
-        if (fs->entries[idx].child != RVVM_MEMFS_NONE) {
+        if (fs->dentries[idx].child != RVVM_MEMFS_NONE) {
             rvvm_unlock(&fs->lock);
             return RVVM_MEMFS_ENOTEMPTY;
         }
@@ -1149,30 +1472,111 @@ rvvm_memfs_result_t rvvm_memfs_unlink(rvvm_memfs_t* fs, const char* path, bool d
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_ENOTDIR;
     }
-    /* One node, not the sibling chain: unlinking /a must leave /b alone, and
-     * the two are the same call site one character apart. */
+    /* One name, not the sibling chain: unlinking /a must leave /b alone, and the
+     * two are the same call site one character apart. A hard link is the same
+     * idea: this drops the one name, and the inode goes only if it was the last -
+     * which memfs_remove_node_locked() decides from its nlink. */
     memfs_remove_node_locked(fs, idx);
-    /* The parent's mtime moved: a name came out of it. */
-    fs->entries[parent].mtime = memfs_now();
+    /* The parent moved: a name came out of it, and if that name was a directory,
+     * one more of its links. */
+    {
+        memfs_inode_t* p = memfs_inode_of(fs, parent);
+        p->mtime = memfs_now();
+        if (kind == RVVM_MEMFS_DIR && p->nlink > 0) {
+            p->nlink--;
+        }
+    }
     rvvm_unlock(&fs->lock);
     return RVVM_MEMFS_OK;
 }
 
-/* The longest path any node in @idx's subtree would have if @idx were moved to a
+/* link(2): give @from's inode a second name, @to. Whether the two are on the
+ * same mount is the caller's question - this module does not know where its
+ * mount point is - and so is EXDEV.
+ *
+ * The source is NOT followed: Linux's link() links the symlink itself, not what
+ * it points at, and following here would quietly make a link to a link into a
+ * second name for the target instead.
+ *
+ * Directories cannot be hard-linked (Linux answers EPERM): a directory with two
+ * parents is not a tree, and every walk from the root would have to survive the
+ * loop. */
+rvvm_memfs_result_t rvvm_memfs_link(rvvm_memfs_t* fs, const char* from, const char* to)
+{
+    char                src[RVVM_MEMFS_PATH_MAX];
+    char                dst[RVVM_MEMFS_PATH_MAX];
+    uint32_t            dstparent;
+    uint32_t            idx;
+    uint32_t            inode;
+    uint32_t            newidx;
+    rvvm_memfs_result_t rc;
+
+    if (!fs) {
+        return RVVM_MEMFS_ENOENT;
+    }
+    rvvm_lock(&fs->lock);
+    if (fs->read_only) {
+        rvvm_unlock(&fs->lock);
+        return RVVM_MEMFS_EROFS;
+    }
+    rc = memfs_normalize(src, sizeof(src), from);
+    if (rc == RVVM_MEMFS_OK) {
+        rc = memfs_normalize(dst, sizeof(dst), to);
+    }
+    if (rc != RVVM_MEMFS_OK) {
+        rvvm_unlock(&fs->lock);
+        return rc;
+    }
+    if (!strcmp(dst, "/")) {
+        rvvm_unlock(&fs->lock);
+        return RVVM_MEMFS_EINVAL;
+    }
+    /* find, not resolve: @from names the link itself, never its target. */
+    idx = memfs_find_locked(fs, src);
+    if (idx == RVVM_MEMFS_NONE) {
+        rvvm_unlock(&fs->lock);
+        return RVVM_MEMFS_ENOENT;
+    }
+    inode = fs->dentries[idx].inode;
+    if (fs->inodes[inode].kind == RVVM_MEMFS_DIR) {
+        rvvm_unlock(&fs->lock);
+        return RVVM_MEMFS_EPERM;
+    }
+    if (memfs_find_locked(fs, dst) != RVVM_MEMFS_NONE) {
+        rvvm_unlock(&fs->lock);
+        return RVVM_MEMFS_EEXIST;
+    }
+    rc = memfs_parent_locked(fs, dst, &dstparent);
+    if (rc != RVVM_MEMFS_OK) {
+        rvvm_unlock(&fs->lock);
+        return rc;
+    }
+    rc = memfs_dentry_new_locked(fs, dst, dstparent, inode, &newidx);
+    if (rc == RVVM_MEMFS_OK) {
+        memfs_inode_t* in = &fs->inodes[inode];
+        memfs_attach_locked(fs, dstparent, newidx);
+        in->nlink++;
+        in->mtime = memfs_now();
+    }
+    rvvm_unlock(&fs->lock);
+    return rc;
+}
+
+/* The longest path any name in @idx's subtree would have if @idx were moved to a
  * path of @prefix_len bytes. Measured before the move rather than discovered
  * while doing it, because a subtree whose deepest path no longer fits cannot be
- * half-renamed: the nodes already rewritten would be under the new prefix and the
+ * half-renamed: the names already rewritten would be under the new prefix and the
  * rest under the old one, and neither key would be findable. Caller holds the
  * lock. */
 static size_t memfs_subtree_extent(const rvvm_memfs_t* fs, uint32_t idx,
                                    size_t prefix_len)
 {
-    const memfs_node_t* n = &fs->entries[idx];
-    size_t              deepest = prefix_len;
-    uint32_t            kid;
+    const memfs_dentry_t* d = &fs->dentries[idx];
+    size_t                deepest = prefix_len;
+    uint32_t              kid;
 
-    for (kid = n->child; kid != RVVM_MEMFS_NONE; kid = fs->entries[kid].next) {
-        size_t here = prefix_len + 1 + strlen(memfs_basename(fs->entries[kid].path));
+    for (kid = d->child; kid != RVVM_MEMFS_NONE; kid = fs->dentries[kid].next) {
+        size_t here = prefix_len + 1 + strlen(memfs_basename(fs->dentries[kid].path));
         size_t down;
         if (here > deepest) {
             deepest = here;
@@ -1190,24 +1594,30 @@ static size_t memfs_subtree_extent(const rvvm_memfs_t* fs, uint32_t idx,
  * RVVM_MEMFS_MAX_SEGS components - so the call depth is bounded and cannot
  * overflow.
  *
- * An explicit stack was the first shape and it had to be sized for the node
+ * An explicit stack was the first shape and it had to be sized for the name
  * count rather than the depth: the walk is over child lists, so a directory with
  * a thousand subdirectories is legal and would have put a thousand entries on
  * the stack at once, and the cap would have silently abandoned the rest of the
  * subtree mid-rename. Depth-recursion has no such failure mode, because the
- * thing it recurses on is exactly the thing that is bounded. */
+ * thing it recurses on is exactly the thing that is bounded.
+ *
+ * The inode split did not make this O(1), and it is worth being exact about why:
+ * the identity is now the inode, but the *path* is still cached on each dentry so
+ * a lookup stays one hash. Renaming a directory therefore still rewrites every
+ * descendant's cached path. Only the data moved to the inode; the name did not. */
 static void memfs_reindex_locked(rvvm_memfs_t* fs, uint32_t idx)
 {
-    uint32_t kid = fs->entries[idx].child;
+    uint32_t kid = fs->dentries[idx].child;
 
     while (kid != RVVM_MEMFS_NONE) {
         /* Safe to build without a length check: memfs_subtree_extent() measured
          * this exact prefix before the move was committed, and refused the rename
          * if any of these would not fit. */
-        size_t need = strlen(fs->entries[idx].path) + 1 +
-                      strlen(memfs_basename(fs->entries[kid].path)) + 1;
-        char*  fresh = malloc(need);
-        char*  oldpath;
+        const char* dir  = fs->dentries[idx].path;
+        const char* base = memfs_basename(fs->dentries[kid].path);
+        size_t      need = strlen(dir) + 1 + strlen(base) + 1;
+        char*       fresh = malloc(need);
+        char*       oldpath;
 
         if (!fresh) {
             /* Out of memory halfway through. The root of the move is already
@@ -1220,25 +1630,24 @@ static void memfs_reindex_locked(rvvm_memfs_t* fs, uint32_t idx)
              * comments say so. */
             abort();
         }
-        memcpy(fresh, fs->entries[idx].path, strlen(fs->entries[idx].path));
-        fresh[strlen(fs->entries[idx].path)] = '/';
-        memcpy(fresh + strlen(fs->entries[idx].path) + 1,
-               memfs_basename(fs->entries[kid].path), strlen(memfs_basename(fs->entries[kid].path)) + 1);
+        memcpy(fresh, dir, strlen(dir));
+        fresh[strlen(dir)] = '/';
+        memcpy(fresh + strlen(dir) + 1, base, strlen(base) + 1);
 
         /* Remove by the OLD key before inserting the new one. The map has no
          * tombstones, and changing a key in place would leave the old spelling
          * findable and the new one absent - a lookup of either name answering
          * about the wrong file. */
-        oldpath = strdup(fs->entries[kid].path);
+        oldpath = strdup(fs->dentries[kid].path);
         if (oldpath) {
             memfs_map_remove(fs, oldpath);
             free(oldpath);
         }
-        free(fs->entries[kid].path);
-        fs->entries[kid].path = fresh;
+        free(fs->dentries[kid].path);
+        fs->dentries[kid].path = fresh;
         memfs_map_insert(fs, kid);
         memfs_reindex_locked(fs, kid);
-        kid = fs->entries[kid].next;
+        kid = fs->dentries[kid].next;
     }
 }
 
@@ -1252,6 +1661,8 @@ rvvm_memfs_result_t rvvm_memfs_rename(rvvm_memfs_t* fs, const char* from, const 
     uint32_t            idx;
     uint32_t            dstidx;
     uint32_t            walk;
+    uint8_t             src_kind;
+    uint8_t             dst_kind = 0;
     char*               newpath;
 
     if (!fs) {
@@ -1287,12 +1698,13 @@ rvvm_memfs_result_t rvvm_memfs_rename(rvvm_memfs_t* fs, const char* from, const 
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_ENOENT;
     }
+    src_kind = memfs_inode_of(fs, idx)->kind;
     /* A directory cannot be moved inside itself. Checked by walking the
      * destination's parent chain: /a/b/a exists iff /a/b is being moved into a
      * directory under itself, and this is the only way to ask without copying
      * the tree. */
-    if (fs->entries[idx].kind == RVVM_MEMFS_DIR) {
-        for (walk = dstparent; walk != RVVM_MEMFS_NONE; walk = fs->entries[walk].parent) {
+    if (src_kind == RVVM_MEMFS_DIR) {
+        for (walk = dstparent; walk != RVVM_MEMFS_NONE; walk = fs->dentries[walk].parent) {
             if (walk == idx) {
                 rvvm_unlock(&fs->lock);
                 return RVVM_MEMFS_EINVAL;
@@ -1301,27 +1713,26 @@ rvvm_memfs_result_t rvvm_memfs_rename(rvvm_memfs_t* fs, const char* from, const 
     }
     dstidx = memfs_find_locked(fs, dst);
     if (dstidx != RVVM_MEMFS_NONE) {
-        memfs_node_t* d = &fs->entries[dstidx];
-        if (d->kind == RVVM_MEMFS_DIR) {
-            if (fs->entries[idx].kind != RVVM_MEMFS_DIR) {
+        dst_kind = memfs_inode_of(fs, dstidx)->kind;
+        if (dst_kind == RVVM_MEMFS_DIR) {
+            if (src_kind != RVVM_MEMFS_DIR) {
                 rvvm_unlock(&fs->lock);
                 return RVVM_MEMFS_EISDIR;
             }
-            if (d->child != RVVM_MEMFS_NONE) {
+            if (fs->dentries[dstidx].child != RVVM_MEMFS_NONE) {
                 rvvm_unlock(&fs->lock);
                 return RVVM_MEMFS_ENOTEMPTY;
             }
-        } else if (fs->entries[idx].kind == RVVM_MEMFS_DIR) {
+        } else if (src_kind == RVVM_MEMFS_DIR) {
             rvvm_unlock(&fs->lock);
             return RVVM_MEMFS_ENOTDIR;
         }
     }
-    /* Every path under the moved node is prefixed with the new one, so the
+    /* Every path under the moved name is prefixed with the new one, so the
      * subtree's keys have to be rewritten. That is what makes a rename O(size of
-     * subtree) here rather than O(1) - a link-counted inode would make it O(1),
-     * and this module has no inodes to count because it has no hard links. The
-     * measurement is what makes the rewrite below unable to fail on a path that
-     * does not fit. */
+     * subtree) here rather than O(1): the inode is the identity now, but the
+     * cached path is still per dentry. The measurement is what makes the rewrite
+     * below unable to fail on a path that does not fit. */
     if (memfs_subtree_extent(fs, idx, strlen(dst)) >= RVVM_MEMFS_PATH_MAX) {
         /* ENAMETOOLONG is the honest answer and EINVAL would name the wrong
          * problem, but the whole tree cannot be renamed atomically, so this is
@@ -1336,24 +1747,30 @@ rvvm_memfs_result_t rvvm_memfs_rename(rvvm_memfs_t* fs, const char* from, const 
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_ENOMEM;
     }
-    /* The node being replaced goes FIRST, before this one is filed under its new
+    /* The name being replaced goes FIRST, before this one is filed under its new
      * name. Order matters here in a way that is not obvious from either step:
-     * once this node is inserted under @dst, the map holds two entries whose key
-     * is the same string - the replaced node's and this one's - and
-     * memfs_map_remove() finds a key, not a node. Removing the replaced one
+     * once this name is inserted under @dst, the map holds two entries whose key
+     * is the same string - the replaced name's and this one's - and
+     * memfs_map_remove() finds a key, not a slot. Removing the replaced one
      * afterwards would therefore take whichever slot the probe reached first,
      * which is the one just inserted, and leave the other behind pointing at a
-     * node whose path string is about to be freed. The map would then hold a
+     * dentry whose path string is about to be freed. The map would then hold a
      * dangling key, and the next lookup that walks past that slot reads freed
      * memory to compare a path with - which is a use-after-free that looks like
-     * an ordinary ENOENT until it does not. */
+     * an ordinary ENOENT until it does not.
+     *
+     * A replaced directory takes one link off its parent here; the count goes
+     * back on below if the source was a directory too. */
     if (dstidx != RVVM_MEMFS_NONE) {
         memfs_remove_node_locked(fs, dstidx);
+        if (dst_kind == RVVM_MEMFS_DIR) {
+            memfs_inode_of(fs, dstparent)->nlink--;
+        }
     }
-    /* This node's own key moves too, not only its descendants'. Doing that for
+    /* This name's own key moves too, not only its descendants'. Doing that for
      * the subtree only - which is what the reindex below does, and it is easy to
-     * assume it covers the root - leaves the map holding this node's OLD path as
-     * its key while entries[idx].path is the new one. Every later lookup then
+     * assume it covers the root - leaves the map holding this name's OLD path as
+     * its key while dentries[idx].path is the new one. Every later lookup then
      * compares the two and finds neither: the old name hashes to a slot whose
      * entry answers with a different path, and the new name finds nothing. */
     {
@@ -1363,11 +1780,18 @@ rvvm_memfs_result_t rvvm_memfs_rename(rvvm_memfs_t* fs, const char* from, const 
             free(oldkey);
         }
     }
-    free(fs->entries[idx].path);
-    fs->entries[idx].path = newpath;
+    free(fs->dentries[idx].path);
+    fs->dentries[idx].path = newpath;
     memfs_map_insert(fs, idx);
     memfs_detach_locked(fs, idx);
     memfs_attach_locked(fs, dstparent, idx);
+    /* A directory moved between two parents takes a link off the one it left and
+     * gives one to the one it entered. Moving it within one parent changes
+     * neither: the dentry never left, it was only renamed. */
+    if (src_kind == RVVM_MEMFS_DIR && srcparent != dstparent) {
+        memfs_inode_of(fs, srcparent)->nlink--;
+        memfs_inode_of(fs, dstparent)->nlink++;
+    }
     /* Reindex the moved subtree, and only now that the move is committed. */
     memfs_reindex_locked(fs, idx);
     rvvm_unlock(&fs->lock);
@@ -1378,9 +1802,10 @@ rvvm_memfs_result_t rvvm_memfs_symlink(rvvm_memfs_t* fs, const char* target, con
 {
     char                norm[RVVM_MEMFS_PATH_MAX];
     uint32_t            parent;
-    rvvm_memfs_result_t rc;
+    uint32_t            inode;
     uint32_t            idx;
     char*               tcopy;
+    rvvm_memfs_result_t rc;
 
     if (!target || !target[0]) {
         return RVVM_MEMFS_EINVAL;
@@ -1398,13 +1823,21 @@ rvvm_memfs_result_t rvvm_memfs_symlink(rvvm_memfs_t* fs, const char* target, con
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_ENOMEM;
     }
-    rc = memfs_add_locked(fs, norm, parent, RVVM_MEMFS_LNK, 0777, &idx);
+    rc = memfs_inode_new_locked(fs, RVVM_MEMFS_LNK, 0777, &inode);
+    if (rc == RVVM_MEMFS_OK) {
+        rc = memfs_dentry_new_locked(fs, norm, parent, inode, &idx);
+        if (rc != RVVM_MEMFS_OK) {
+            memfs_inode_abandon_locked(fs, inode);
+        }
+    }
     if (rc != RVVM_MEMFS_OK) {
         free(tcopy);
         rvvm_unlock(&fs->lock);
         return rc;
     }
-    fs->entries[idx].target = tcopy;
+    /* The target lives on the inode: it is a property of the link, and a link has
+     * exactly one name (hard-linking a symlink would share this). */
+    fs->inodes[inode].target = tcopy;
     memfs_attach_locked(fs, parent, idx);
     rvvm_unlock(&fs->lock);
     return RVVM_MEMFS_OK;
@@ -1429,10 +1862,10 @@ rvvm_memfs_result_t rvvm_memfs_readlink(rvvm_memfs_t* fs, const char* path,
         idx = memfs_find_locked(fs, norm);
         if (idx == RVVM_MEMFS_NONE) {
             rc = RVVM_MEMFS_ENOENT;
-        } else if (fs->entries[idx].kind != RVVM_MEMFS_LNK) {
+        } else if (memfs_inode_of(fs, idx)->kind != RVVM_MEMFS_LNK) {
             rc = RVVM_MEMFS_EINVAL;
         } else {
-            const char* t = fs->entries[idx].target ? fs->entries[idx].target : "";
+            const char* t = memfs_inode_of(fs, idx)->target ? memfs_inode_of(fs, idx)->target : "";
             size_t      n = strlen(t);
             if (n >= size) {
                 n = size - 1;
@@ -1450,7 +1883,7 @@ rvvm_memfs_result_t rvvm_memfs_truncate(rvvm_memfs_t* fs, const char* path, uint
     char                norm[RVVM_MEMFS_PATH_MAX];
     rvvm_memfs_result_t rc;
     uint32_t            idx;
-    memfs_node_t*       n;
+    memfs_inode_t*      in;
 
     if (!fs) {
         return RVVM_MEMFS_ENOENT;
@@ -1470,38 +1903,39 @@ rvvm_memfs_result_t rvvm_memfs_truncate(rvvm_memfs_t* fs, const char* path, uint
         rvvm_unlock(&fs->lock);
         return rc;
     }
-    n = &fs->entries[idx];
-    if (n->kind == RVVM_MEMFS_DIR) {
+    in = memfs_inode_of(fs, idx);
+    if (in->kind == RVVM_MEMFS_DIR) {
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_EISDIR;
     }
-    if (n->kind == RVVM_MEMFS_LNK) {
+    if (in->kind == RVVM_MEMFS_LNK) {
         /* truncate() follows the link, so this is the target's answer. Reaching
          * here means the target is not a regular file. */
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_EINVAL;
     }
-    if (size > n->size) {
-        uint64_t delta = size - n->size;
+    if (size > in->size) {
+        uint64_t delta = size - in->size;
         if (fs->size_limit && (fs->used + delta) > fs->size_limit) {
             rvvm_unlock(&fs->lock);
             return RVVM_MEMFS_ENOSPC;
         }
-        if (!memfs_node_reserve(n, (size_t)size)) {
+        if (!memfs_inode_reserve(in, (size_t)size)) {
             rvvm_unlock(&fs->lock);
             return RVVM_MEMFS_ENOMEM;
         }
-        memset(n->data + n->size, 0, (size_t)delta);
+        memset(in->data + in->size, 0, (size_t)delta);
         fs->used += delta;
-    } else if (fs->size_limit && fs->used >= n->size) {
+    } else if (fs->size_limit && fs->used >= in->size) {
         /* Shrinking releases, and the budget has to follow for the same reason
          * truncation does: a guest that cuts a file to fit inside its limit and
          * then writes to it again would otherwise be refused by a filesystem
-         * that is holding fewer bytes than it did before. */
-        fs->used -= n->size - (size_t)size;
+         * that is holding fewer bytes than it did before. Truncating one name of
+         * a hard-linked file truncates the single inode every name shares. */
+        fs->used -= in->size - (size_t)size;
     }
-    n->size = (size_t)size;
-    n->mtime = memfs_now();
+    in->size = (size_t)size;
+    in->mtime = memfs_now();
     rvvm_unlock(&fs->lock);
     return RVVM_MEMFS_OK;
 }
@@ -1527,7 +1961,7 @@ rvvm_memfs_result_t rvvm_memfs_chmod(rvvm_memfs_t* fs, const char* path, uint32_
          * one. */
         rc = memfs_resolve_locked(fs, norm, true, &idx);
         if (rc == RVVM_MEMFS_OK) {
-            fs->entries[idx].mode = mode & 07777;
+            memfs_inode_of(fs, idx)->mode = mode & 07777;
         }
     }
     rvvm_unlock(&fs->lock);
@@ -1542,7 +1976,7 @@ rvvm_memfs_result_t rvvm_memfs_read(rvvm_memfs_t* fs, const char* path,
     char                norm[RVVM_MEMFS_PATH_MAX];
     rvvm_memfs_result_t rc;
     uint32_t            idx;
-    memfs_node_t*       n;
+    memfs_inode_t*      in;
     size_t              avail;
 
     if (done) {
@@ -1560,29 +1994,29 @@ rvvm_memfs_result_t rvvm_memfs_read(rvvm_memfs_t* fs, const char* path,
         rvvm_unlock(&fs->lock);
         return rc;
     }
-    n = &fs->entries[idx];
-    if (n->kind == RVVM_MEMFS_DIR) {
+    in = memfs_inode_of(fs, idx);
+    if (in->kind == RVVM_MEMFS_DIR) {
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_EISDIR;
     }
-    if (n->kind != RVVM_MEMFS_REG) {
+    if (in->kind != RVVM_MEMFS_REG) {
         /* Resolved with follow, so a link that survived is a link with no
          * target - which is ENOENT, not a readable file. */
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_EINVAL;
     }
-    if (off >= n->size) {
+    if (off >= in->size) {
         /* Past the end is a short read, not an error: read(2) at or beyond EOF
          * returns 0, and a guest looping until it sees 0 is how a file copy
          * terminates. */
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_OK;
     }
-    avail = n->size - (size_t)off;
+    avail = in->size - (size_t)off;
     if (avail > count) {
         avail = count;
     }
-    memcpy(buf, n->data + off, avail);
+    memcpy(buf, in->data + off, avail);
     if (done) {
         *done = avail;
     }
@@ -1596,7 +2030,7 @@ rvvm_memfs_result_t rvvm_memfs_write(rvvm_memfs_t* fs, const char* path,
     char                norm[RVVM_MEMFS_PATH_MAX];
     rvvm_memfs_result_t rc;
     uint32_t            idx;
-    memfs_node_t*       n;
+    memfs_inode_t*      in;
     uint64_t            need;
 
     if (done) {
@@ -1625,18 +2059,18 @@ rvvm_memfs_result_t rvvm_memfs_write(rvvm_memfs_t* fs, const char* path,
         rvvm_unlock(&fs->lock);
         return rc;
     }
-    n = &fs->entries[idx];
-    if (n->kind == RVVM_MEMFS_DIR) {
+    in = memfs_inode_of(fs, idx);
+    if (in->kind == RVVM_MEMFS_DIR) {
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_EISDIR;
     }
-    if (n->kind != RVVM_MEMFS_REG) {
+    if (in->kind != RVVM_MEMFS_REG) {
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_EINVAL;
     }
     need = off + count;
-    if (need > n->size) {
-        uint64_t delta = need - n->size;
+    if (need > in->size) {
+        uint64_t delta = need - in->size;
         if (fs->size_limit && (fs->used + delta) > fs->size_limit) {
             /* ENOSPC and not a short write: the guest asked for @count bytes at
              * @off and either all of it is stored or the call fails, so a
@@ -1644,21 +2078,21 @@ rvvm_memfs_result_t rvvm_memfs_write(rvvm_memfs_t* fs, const char* path,
             rvvm_unlock(&fs->lock);
             return RVVM_MEMFS_ENOSPC;
         }
-        if (!memfs_node_reserve(n, (size_t)need)) {
+        if (!memfs_inode_reserve(in, (size_t)need)) {
             rvvm_unlock(&fs->lock);
             return RVVM_MEMFS_ENOMEM;
         }
         /* The gap a sparse write leaves has to read back as zeros, or a guest
          * that seeks past the end and writes would hand its own reader whatever
          * was in the reused buffer. */
-        if (off > n->size) {
-            memset(n->data + n->size, 0, (size_t)(off - n->size));
+        if (off > in->size) {
+            memset(in->data + in->size, 0, (size_t)(off - in->size));
         }
         fs->used += delta;
-        n->size = (size_t)need;
+        in->size = (size_t)need;
     }
-    memcpy(n->data + off, buf, count);
-    n->mtime = memfs_now();
+    memcpy(in->data + off, buf, count);
+    in->mtime = memfs_now();
     if (done) {
         *done = count;
     }
@@ -1668,12 +2102,11 @@ rvvm_memfs_result_t rvvm_memfs_write(rvvm_memfs_t* fs, const char* path,
 
 /* --- listing ------------------------------------------------------------ */
 
-/* The basename of @path, for a listing. A node's own last component, read off
- * its stored path rather than recomputed, so it cannot disagree with the key it
- * is filed under. */
-static const char* memfs_node_name(const memfs_node_t* n)
+/* The basename of a name, for a listing. Read off the dentry's own stored path
+ * rather than recomputed, so it cannot disagree with the key it is filed under. */
+static const char* memfs_dentry_name(const memfs_dentry_t* d)
 {
-    return memfs_basename(n->path);
+    return memfs_basename(d->path);
 }
 
 rvvm_memfs_result_t rvvm_memfs_getdents(rvvm_memfs_t* fs, const char* path,
@@ -1698,22 +2131,22 @@ rvvm_memfs_result_t rvvm_memfs_getdents(rvvm_memfs_t* fs, const char* path,
         rvvm_unlock(&fs->lock);
         return rc;
     }
-    if (fs->entries[dir].kind != RVVM_MEMFS_DIR) {
+    if (memfs_inode_of(fs, dir)->kind != RVVM_MEMFS_DIR) {
         rvvm_unlock(&fs->lock);
         return RVVM_MEMFS_ENOTDIR;
     }
     /* The cursor is a count of entries already handed out, not an index into the
      * child list. That costs a walk from the first child per call and buys a
      * cursor that cannot be invalidated: a child removed between two calls is
-     * then simply not visited, where a list-position cursor would name a node
+     * then simply not visited, where a list-position cursor would name a name
      * that is gone and have to be repaired against whatever index was reused in
      * its place - a file appearing in a directory it was never created in. */
-    for (kid = fs->entries[dir].child; kid != RVVM_MEMFS_NONE; kid = fs->entries[kid].next) {
+    for (kid = fs->dentries[dir].child; kid != RVVM_MEMFS_NONE; kid = fs->dentries[kid].next) {
         if (seen++ < *pos) {
             continue;
         }
         {
-            const char* name = memfs_node_name(&fs->entries[kid]);
+            const char* name = memfs_dentry_name(&fs->dentries[kid]);
             size_t      nlen = strlen(name);
             if (nlen >= size) {
                 /* A name this module stored cannot exceed RVVM_MEMFS_NAME_MAX,
@@ -1726,10 +2159,10 @@ rvvm_memfs_result_t rvvm_memfs_getdents(rvvm_memfs_t* fs, const char* path,
             memcpy(out_name, name, nlen + 1);
         }
         if (out_kind) {
-            *out_kind = fs->entries[kid].kind;
+            *out_kind = fs->inodes[fs->dentries[kid].inode].kind;
         }
         if (out_ino) {
-            *out_ino = fs->entries[kid].ino;
+            *out_ino = fs->inodes[fs->dentries[kid].inode].ino;
         }
         *pos = seen;
         rvvm_unlock(&fs->lock);
