@@ -85,6 +85,7 @@ Deliberate limits, so a reader does not expect more:
 #include <time.h>
 
 #include <util/spinlock.h>
+#include <util/atomics.h>
 
 /* Entries start here and double; the map rehashes at 70% load, where linear
  * probing is still short. 64 is small enough that an empty root costs one page
@@ -143,6 +144,12 @@ struct rvvm_memfs {
     bool        read_only;
     uint64_t    size_limit;
     uint64_t    used;
+    /* References. One is the mount that owns the storage; an open descriptor
+     * takes its own, which is what lets a descriptor outlive the unmount of its
+     * mount point - the descriptor names the filesystem, not the place it was
+     * reachable from (see rvvm_memfs_ref). Atomic because the unmount and the
+     * descriptor are on different threads. */
+    uint32_t    refs;
     memfs_dentry_t* dentries;
     uint32_t*   map;      /* open addressing over dentry indices + 1            */
     size_t      map_size; /* power of two                                       */
@@ -1195,6 +1202,7 @@ rvvm_memfs_t* rvvm_memfs_create(bool read_only, uint64_t size_limit)
     rvvm_lock_init(&fs->lock);
     fs->read_only  = read_only;
     fs->size_limit = size_limit;
+    fs->refs       = 1; /* the mount that asked for it holds the first reference */
     fs->next_ino   = 0;
     fs->root       = RVVM_MEMFS_NONE;
     /* Not 0, which is what calloc left: index 0 is the root's dentry and inode 0
@@ -1233,11 +1241,26 @@ rvvm_memfs_t* rvvm_memfs_create(bool read_only, uint64_t size_limit)
     return fs;
 }
 
+rvvm_memfs_t* rvvm_memfs_ref(rvvm_memfs_t* fs)
+{
+    if (fs) {
+        atomic_add_uint32(&fs->refs, 1);
+    }
+    return fs;
+}
+
 void rvvm_memfs_free(rvvm_memfs_t* fs)
 {
     size_t i;
 
     if (!fs) {
+        return;
+    }
+    /* Drop one reference, and free only on the last. The storage outlives its
+     * mount point for as long as a descriptor still names it, which is what the
+     * interface promises: an open descriptor keeps working across an unmount,
+     * because what it reads never depended on where it was reachable from. */
+    if (atomic_sub_uint32(&fs->refs, 1) != 1) {
         return;
     }
     for (i = 0; i < fs->count; ++i) {

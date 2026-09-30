@@ -132,6 +132,13 @@ int rvvm_memfs_selftest_consistency(rvvm_memfs_t* fs, char* why, size_t whysize)
 
 rvvm_memfs_t* rvvm_memfs_create(bool read_only, uint64_t size_limit);
 
+/* Take a reference on the filesystem, so it outlives an unmount of the mount
+ * point it was reachable from. A descriptor opened before the unmount keeps
+ * working because it holds one of these; the mount holds the first. */
+rvvm_memfs_t* rvvm_memfs_ref(rvvm_memfs_t* fs);
+
+/* Drop one reference. The storage is freed on the last one, so a caller that
+ * took a reference through rvvm_memfs_ref() must call this exactly once. */
 void          rvvm_memfs_free(rvvm_memfs_t* fs);
 
 /* The mount's own properties, for a mount table row to report.

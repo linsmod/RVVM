@@ -1612,6 +1612,33 @@ typedef struct {
     char     pending[RVVM_SHADOW_DIR_NAME_MAX];
 } rvvm_shadow_dir_t;
 
+/* ============================================================
+ * Memory filesystem descriptors
+ *
+ * A descriptor on a tmpfs names an inode of one mount's storage, not a host fd:
+ * the module is asked by inode (rvvm_memfs_read_at and friends), so what has to
+ * live between two syscalls - the cursor, the guest flags, and the inode
+ * reference that keeps the file alive across a rename or an unlink - lives here,
+ * and the number the guest sees is one of this layer's own. The storage is
+ * referenced as well (rvvm_memfs_ref), so a descriptor keeps reading across an
+ * unmount of the mount point it was opened through.
+ *
+ * 256 open files on one tmpfs is far more than a guest holds at once; past that
+ * open() answers EMFILE rather than growing a table per run.
+ * ============================================================ */
+#define RVVM_MEMFS_FD_BASE  0x7E000000  /* far above any host fd */
+#define RVVM_MEMFS_FD_MAX   256
+
+typedef struct {
+    int           fd;      /* RVVM_MEMFS_FD_BASE + slot; 0 = free slot         */
+    rvvm_memfs_t* fs;      /* the mount's storage, one reference held          */
+    uint32_t      ino;     /* the inode this descriptor names, pinned          */
+    uint64_t      off;     /* read/write cursor                                */
+    uint32_t      pos;     /* getdents cursor (see rvvm_sys_memfs_getdents)    */
+    uint32_t      flags;   /* guest open flags, for F_GETFL                    */
+    uint8_t       kind;    /* rvvm_memfs_kind_t, captured at open              */
+} rvvm_memfs_fd_t;
+
 /* One descriptor the procfs hands out (see the "procfs" section). A directory
  * carries a snapshot of the pid list taken when it was opened - a listing that
  * changed under the reader mid-walk would be worse than a slightly stale one -
@@ -1844,6 +1871,9 @@ char*                    guest_root_path;
     vp_shadow_view_t          shadow_view;
     // Real host directory fds whose listing must also carry the shadow's links.
     rvvm_shadow_dir_t        shadow_dirs[RVVM_SHADOW_DIR_MAX];
+    // Open descriptors on the memory filesystems (a tmpfs mount). Keyed by the
+    // synthetic fd the guest holds; see rvvm_memfs_fd_t.
+    rvvm_memfs_fd_t          memfs_fds[RVVM_MEMFS_FD_MAX];
 
     // --- Guest virtual memory allocator (group B) ---
     spinlock_t    guest_lock;
@@ -6618,6 +6648,110 @@ static void userland_fd_set_path(rvvm_userland_t* ctx, int fd, const char* path)
     ctx->fds[fd].path    = copy;
 }
 
+/* ============================================================
+ * Memory filesystem descriptors, the table itself
+ *
+ * Lookup and allocation are by the synthetic number, the way the asset and
+ * procfs tables are, because a number is all a syscall is handed back. The
+ * difference is what an entry holds: a pin on its inode and a reference on the
+ * storage, both given back exactly once, here.
+ * ============================================================ */
+
+/* Whether @fd is one of ours by its number alone - the range check the install
+ * path needs, before there is a slot to look up. */
+static bool memfs_fd_number(int fd)
+{
+    return fd >= RVVM_MEMFS_FD_BASE &&
+           (uint32_t)(fd - RVVM_MEMFS_FD_BASE) < RVVM_MEMFS_FD_MAX;
+}
+
+static rvvm_memfs_fd_t* memfs_fd_lookup(rvvm_userland_t* ctx, int fd)
+{
+    size_t i;
+    if (!ctx || !memfs_fd_number(fd)) {
+        return NULL;
+    }
+    for (i = 0; i < RVVM_MEMFS_FD_MAX; i++) {
+        if (ctx->memfs_fds[i].fd == fd) {
+            return &ctx->memfs_fds[i];
+        }
+    }
+    return NULL;
+}
+
+/* A free slot with its number filled in; the caller fills the rest and installs
+ * it. NULL when every RVVM_MEMFS_FD_MAX slot is taken. */
+static rvvm_memfs_fd_t* memfs_fd_alloc(rvvm_userland_t* ctx)
+{
+    size_t i;
+    if (!ctx) {
+        return NULL;
+    }
+    for (i = 0; i < RVVM_MEMFS_FD_MAX; i++) {
+        if (ctx->memfs_fds[i].fd == 0) {
+            memset(&ctx->memfs_fds[i], 0, sizeof(ctx->memfs_fds[i]));
+            ctx->memfs_fds[i].fd = RVVM_MEMFS_FD_BASE + (int)i;
+            return &ctx->memfs_fds[i];
+        }
+    }
+    return NULL;
+}
+
+/* Give back what a slot holds: the pin on the inode, then the reference on the
+ * storage, then the slot. Called from close(), from the run-end sweep, and
+ * wherever a half-built descriptor has to be undone. */
+static void memfs_fd_release(rvvm_memfs_fd_t* d)
+{
+    if (!d || d->fd == 0) {
+        return;
+    }
+    rvvm_memfs_unpin(d->fs, d->ino);
+    rvvm_memfs_free(d->fs);   /* drops this descriptor's reference */
+    memset(d, 0, sizeof(*d));
+}
+
+/* The memfs descriptor a guest fd names, or NULL when it is not one of ours. */
+static rvvm_memfs_fd_t* memfs_fd_for_guest(rvvm_userland_t* ctx, int guest_fd)
+{
+    return memfs_fd_lookup(ctx, userland_fd_host(ctx, guest_fd));
+}
+
+/* @abs - a guest-absolute path - turned into the mount-relative key the memory
+ * filesystem uses, whose root is the mount point. @mount->path is a prefix of
+ * @abs by construction (the caller resolved it), and the mount's own root is
+ * spelled "/" and not "". */
+static void memfs_rel_path(char* out, size_t size, const rvvm_mount_t* mount, const char* abs)
+{
+    size_t plen = rvvm_strlen(mount->path);
+    if (mount->path[0] == '/' && mount->path[1] == '\0') {
+        rvvm_strlcpy(out, abs, size);
+    } else if (abs[plen] == '\0') {
+        rvvm_strlcpy(out, "/", size);
+    } else {
+        rvvm_strlcpy(out, abs + plen, size);
+    }
+}
+
+/* What stat() reports for an inode of a memory filesystem, in the host form the
+ * rest of the stat path converts from. The device is synthetic for the same
+ * reason the shadow's is: the whole archive is one device in the guest's view. */
+#define RVVM_MEMFS_DEV 0x52564D46u
+
+static void memfs_info_to_stat(const rvvm_memfs_info_t* info, struct stat* st)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_mode  = (info->kind == RVVM_MEMFS_DIR) ? S_IFDIR
+                 : (info->kind == RVVM_MEMFS_LNK) ? S_IFLNK : S_IFREG;
+    st->st_mode |= (mode_t)(info->mode & 07777);
+    st->st_nlink = (unsigned)info->nlink;
+    st->st_size  = (off_t)info->size;
+    st->st_ino   = (ino_t)info->ino;
+    st->st_dev   = (dev_t)RVVM_MEMFS_DEV;
+    st->st_atime = st->st_mtime = st->st_ctime = (time_t)info->mtime;
+    st->st_uid   = (unsigned)uctx()->fake_uid;
+    st->st_gid   = (unsigned)uctx()->fake_gid;
+}
+
 static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
 {
     if (!userland_fd_tracked(ctx, fd)) {
@@ -6647,6 +6781,11 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
          * the number to release, and the host's own stdout is the host's to
          * close. The slot goes; the screen it named keeps being the screen for
          * every other descriptor that is still attached to it. */
+    } else if (memfs_fd_number(ctx->fds[fd].fd)) {
+        /* A tmpfs descriptor: the pin on its inode and the reference on the
+         * storage are given back here, and the slot is freed. The storage can
+         * outlive the mount point - another descriptor may still hold it. */
+        memfs_fd_release(memfs_fd_lookup(ctx, ctx->fds[fd].fd));
     } else if (userland_pty_by_fd(ctx->fds[fd].fd, &pty, &master)) {
         userland_pty_release(pty, master);
     } else if (userland_proc_is_fd(ctx->fds[fd].fd)) {
@@ -6729,6 +6868,218 @@ static int userland_fd_add(rvvm_userland_t* ctx, int host_fd, bool cloexec)
     return guest_fd;
 }
 
+/* The guest errno a memory filesystem result becomes. The module numbers its own
+ * codes (see rvvm_memfs_result_t) precisely so that the mapping lives here and
+ * not there. */
+static int memfs_errno(rvvm_memfs_result_t rc)
+{
+    switch (rc) {
+        case RVVM_MEMFS_OK:        return 0;
+        case RVVM_MEMFS_ENOENT:    return UAPI_ENOENT;
+        case RVVM_MEMFS_EEXIST:    return UAPI_EEXIST;
+        case RVVM_MEMFS_ENOTDIR:   return UAPI_ENOTDIR;
+        case RVVM_MEMFS_EISDIR:    return UAPI_EISDIR;
+        case RVVM_MEMFS_EINVAL:    return UAPI_EINVAL;
+        case RVVM_MEMFS_ENOSPC:    return UAPI_ENOSPC;
+        case RVVM_MEMFS_EROFS:     return UAPI_EROFS;
+        case RVVM_MEMFS_EMFILE:    return UAPI_EMFILE;
+        case RVVM_MEMFS_EXDEV:     return UAPI_EXDEV;
+        case RVVM_MEMFS_ENOTEMPTY: return UAPI_ENOTEMPTY;
+        case RVVM_MEMFS_ELOOP:     return UAPI_ELOOP;
+        case RVVM_MEMFS_ENOMEM:    return UAPI_ENOMEM;
+        case RVVM_MEMFS_EPERM:     return UAPI_EPERM;
+    }
+    return UAPI_EIO;
+}
+
+/* The d_type a memfs kind becomes, for a getdents64 record. */
+static uint8_t memfs_dt(uint8_t kind)
+{
+    return (kind == RVVM_MEMFS_DIR) ? RVVM_DT_DIR
+         : (kind == RVVM_MEMFS_LNK) ? RVVM_DT_LNK : RVVM_DT_REG;
+}
+
+/* Whether a memory filesystem owns @abs, and if so its storage - with one
+ * reference taken, for the caller to release - and the mount-relative path.
+ *
+ * The row is read under the namespace lock and the storage is used after it, so
+ * the caller never holds that lock across a filesystem operation, and an unmount
+ * on another thread can free the row while this call is still working: the
+ * reference is what keeps the bytes alive. */
+static bool memfs_mount_for(rvvm_memfs_t** fs_out, char* rel, size_t rel_size, const char* abs)
+{
+    rvvm_userland_t*  ctx = uctx();
+    rvvm_path_owner_t owner;
+    bool              ours = false;
+
+    *fs_out = NULL;
+    spin_lock(&ctx->mountns->lock);
+    owner = rvvm_path_owner(ctx->mountns, abs);
+    if (owner.provider == RVVM_MOUNT_MEMFS && owner.mount && owner.mount->memfs) {
+        *fs_out = rvvm_memfs_ref(owner.mount->memfs);
+        memfs_rel_path(rel, rel_size, owner.mount, abs);
+        ours = true;
+    }
+    spin_unlock(&ctx->mountns->lock);
+    return ours;
+}
+
+/* openat() on a memory filesystem, the whole of it: resolve, create or truncate
+ * as the flags ask, pin the inode and file the descriptor. Takes ownership of the
+ * @fs reference from memfs_mount_for(). Returns a guest fd or a negative errno. */
+static rvvm_addr_t rvvm_sys_memfs_open(rvvm_memfs_t* fs, const char* abs, const char* rel,
+                                       int flags, int mode)
+{
+    rvvm_userland_t*    ctx = uctx();
+    rvvm_memfs_info_t   info;
+    rvvm_memfs_fd_t*    d;
+    rvvm_memfs_result_t rc;
+    int                 acc = flags & 3;   /* O_RDONLY / O_WRONLY / O_RDWR */
+    int                 guest_fd;
+
+    rc = rvvm_memfs_stat(fs, rel, true, &info);
+    if (rc == RVVM_MEMFS_OK && (flags & UAPI_O_CREAT) && (flags & UAPI_O_EXCL)) {
+        /* O_CREAT|O_EXCL is the "must not exist" case, and it does. */
+        rvvm_memfs_free(fs);
+        return -UAPI_EEXIST;
+    }
+    if (rc == RVVM_MEMFS_ENOENT && (flags & UAPI_O_CREAT)) {
+        rc = rvvm_memfs_create_file(fs, rel, (uint32_t)mode);
+        if (rc == RVVM_MEMFS_OK) {
+            rc = rvvm_memfs_stat(fs, rel, true, &info);
+        }
+    }
+    if (rc != RVVM_MEMFS_OK) {
+        rvvm_memfs_free(fs);
+        return -(rvvm_addr_t)memfs_errno(rc);
+    }
+    if (flags & UAPI_O_TRUNC) {
+        /* Truncating a directory is EISDIR, and the storage says so itself. */
+        rc = rvvm_memfs_truncate(fs, rel, 0);
+        if (rc != RVVM_MEMFS_OK) {
+            rvvm_memfs_free(fs);
+            return -(rvvm_addr_t)memfs_errno(rc);
+        }
+    }
+    if ((flags & UAPI_O_DIRECTORY) && info.kind != RVVM_MEMFS_DIR) {
+        rvvm_memfs_free(fs);
+        return -UAPI_ENOTDIR;
+    }
+    if (info.kind == RVVM_MEMFS_DIR && acc != 0) {
+        /* A directory opened for writing: EISDIR, which is what Linux says. */
+        rvvm_memfs_free(fs);
+        return -UAPI_EISDIR;
+    }
+
+    d = memfs_fd_alloc(ctx);
+    if (!d) {
+        rvvm_memfs_free(fs);
+        return -UAPI_EMFILE;
+    }
+    if (rvvm_memfs_pin(fs, info.index) != RVVM_MEMFS_OK) {
+        memset(d, 0, sizeof(*d));
+        rvvm_memfs_free(fs);
+        return -UAPI_ENOENT;
+    }
+    d->fs    = fs;                 /* the reference is transferred to the slot */
+    d->ino   = info.index;
+    d->kind  = info.kind;
+    d->off   = (flags & UAPI_O_APPEND) ? (uint64_t)info.size : 0;
+    d->pos   = 0;
+
+    guest_fd = userland_fd_slot_alloc(ctx, 0);
+    if (guest_fd < 0) {
+        memfs_fd_release(d);       /* unpins and drops the reference */
+        return -UAPI_EMFILE;
+    }
+    userland_fd_install(ctx, guest_fd, d->fd, (flags & UAPI_O_CLOEXEC) != 0);
+    userland_fd_set_flags(ctx, guest_fd, (uint32_t)flags & (UAPI_O_ACCMODE | UAPI_SETFL_MASK));
+    /* Name it, so /proc/<pid>/fd/<n> can answer for it. The guest-absolute path,
+     * not the mount-relative one: a reader of that link has to be able to open
+     * what it names. */
+    {
+        char fdname[UAPI_PATH_MAX];
+        userland_fd_name_for(fdname, sizeof(fdname), UAPI_AT_FDCWD, abs);
+        userland_fd_set_path(ctx, guest_fd, fdname);
+    }
+    return (rvvm_addr_t)guest_fd;
+}
+
+/* stat() of a guest-absolute path on a memory filesystem. True when @abs is
+ * owned by one (and then @rc is 0 or a negative errno, with @st filled on 0);
+ * false when it is not, and the caller continues with the host. */
+static bool rvvm_sys_memfs_stat_abs(const char* abs, bool follow, struct stat* st, int* rc)
+{
+    rvvm_memfs_t*      fs = NULL;
+    rvvm_memfs_info_t  info;
+    char               rel[RVVM_MEMFS_PATH_MAX];
+
+    if (!memfs_mount_for(&fs, rel, sizeof(rel), abs)) {
+        return false;
+    }
+    *rc = memfs_errno(rvvm_memfs_stat(fs, rel, follow, &info));
+    if (*rc == 0) {
+        memfs_info_to_stat(&info, st);
+    }
+    rvvm_memfs_free(fs);
+    return true;
+}
+
+/* getdents64() on a memory-filesystem directory: one record per call, the same
+ * contract the asset and procfs listings keep. "." and ".." are synthesized (a
+ * memfs directory holds no such entries), and the cursor only moves once the
+ * record is known to fit, so a buffer too small for one entry consumes nothing. */
+static int64_t rvvm_sys_memfs_getdents(rvvm_memfs_fd_t* d, void* out, size_t size)
+{
+    struct uapi_linux_dirent64* de = out;
+    char        name[RVVM_MEMFS_NAME_MAX];
+    uint8_t     kind = RVVM_DT_UNKNOWN;
+    uint64_t    ino  = 0;
+    uint32_t    next;
+    size_t      name_len;
+    size_t      reclen;
+
+    if (d->kind != RVVM_MEMFS_DIR) {
+        return -UAPI_ENOTDIR;
+    }
+    if (d->pos == 0) {
+        rvvm_strlcpy(name, ".", sizeof(name));
+        kind = RVVM_DT_DIR;
+        next = 1;
+    } else if (d->pos == 1) {
+        rvvm_strlcpy(name, "..", sizeof(name));
+        kind = RVVM_DT_DIR;
+        next = 2;
+    } else {
+        uint32_t cur = d->pos - 2;
+        rvvm_memfs_result_t rc = rvvm_memfs_getdents_ino(d->fs, d->ino, &cur, name,
+                                                         sizeof(name), &kind, &ino);
+        if (rc == RVVM_MEMFS_EOF) {
+            return 0;              /* the end of the directory */
+        }
+        if (rc != RVVM_MEMFS_OK) {
+            return -memfs_errno(rc);
+        }
+        kind = memfs_dt(kind);
+        next = cur + 2;
+    }
+    name_len = rvvm_strlen(name);
+    reclen   = (sizeof(*de) + name_len + 1 + 7) & ~(size_t)7;
+    if (reclen > size) {
+        /* One record has to fit in one call, which is what a real getdents64
+         * answers when the caller buffer cannot hold even one entry. */
+        return -UAPI_EINVAL;
+    }
+    memset(de, 0, reclen);
+    de->d_ino    = ino ? ino : (uint64_t)d->ino;  /* "."/".." borrow the directory */
+    de->d_off    = (int64_t)de->d_ino;
+    de->d_reclen = (uint16_t)reclen;
+    de->d_type   = kind;
+    memcpy(de->d_name, name, name_len + 1);
+    d->pos = next;                 /* committed only now that the record is out */
+    return (int64_t)reclen;
+}
+
 /* dup(2) family and F_DUPFD: the host has already made the copy, so this only
  * files it - and it is filed at a guest number of this table's choosing, which
  * is the whole point, since the host's number for the copy has nothing to do
@@ -6806,6 +7157,42 @@ static int userland_own_fd_dup(rvvm_userland_t* ctx, int source_fd, int host_fd,
         }
         userland_proc_fd_ref(host_fd);
         userland_fd_install(ctx, guest_fd, host_fd, cloexec);
+        userland_fd_set_flags(ctx, guest_fd, userland_fd_flags(ctx, source_fd));
+        return guest_fd;
+    }
+    if (memfs_fd_number(host_fd)) {
+        /* Same inode, another guest number: one more pin and one more reference
+         * on the storage, and the copy carries its own cursor. (dup(2) shares the
+         * file offset on Linux; this models one cursor per guest number, the way
+         * the procfs table already does.) */
+        rvvm_memfs_fd_t* sd = memfs_fd_lookup(ctx, host_fd);
+        rvvm_memfs_fd_t* nd;
+        rvvm_memfs_t*    fs;
+        int              num;
+        int              guest_fd = userland_fd_slot_alloc(ctx, min_fd);
+        if (guest_fd < 0 || !sd) {
+            return -1;
+        }
+        nd = memfs_fd_alloc(ctx);
+        if (!nd) {
+            return -1;
+        }
+        num = nd->fd;
+        fs  = rvvm_memfs_ref(sd->fs);
+        if (rvvm_memfs_pin(fs, sd->ino) != RVVM_MEMFS_OK) {
+            rvvm_memfs_free(fs);
+            memset(nd, 0, sizeof(*nd));
+            return -1;
+        }
+        memset(nd, 0, sizeof(*nd));
+        nd->fd    = num;
+        nd->fs    = fs;
+        nd->ino   = sd->ino;
+        nd->off   = sd->off;
+        nd->pos   = sd->pos;
+        nd->flags = sd->flags;
+        nd->kind  = sd->kind;
+        userland_fd_install(ctx, guest_fd, nd->fd, cloexec);
         userland_fd_set_flags(ctx, guest_fd, userland_fd_flags(ctx, source_fd));
         return guest_fd;
     }
@@ -6954,6 +7341,37 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
                            parent->fds[fd].cloexec, parent->fds[fd].shared,
                            parent->fds[fd].backend, parent->fds[fd].flags, "inherit");
         child->fds[fd].holds_anchor_ref = child_anchored;
+        if (memfs_fd_number(parent->fds[fd].fd)) {
+            /* A tmpfs descriptor: the child gets a slot on the same inode, one
+             * pin and one storage reference of its own, so its close releases
+             * its own and the parent keeps reading. The child slot is filed at
+             * the parent's index, because the fd table was just handed the same
+             * synthetic number and the number is what names the slot. */
+            uint32_t         idx = (uint32_t)(parent->fds[fd].fd - RVVM_MEMFS_FD_BASE);
+            rvvm_memfs_fd_t* pd  = memfs_fd_lookup(parent, parent->fds[fd].fd);
+            rvvm_memfs_fd_t* cd  = &child->memfs_fds[idx];
+            memset(cd, 0, sizeof(*cd));
+            if (pd) {
+                rvvm_memfs_t* fs = rvvm_memfs_ref(pd->fs);
+                if (rvvm_memfs_pin(fs, pd->ino) == RVVM_MEMFS_OK) {
+                    cd->fd    = RVVM_MEMFS_FD_BASE + (int)idx;
+                    cd->fs    = fs;
+                    cd->ino   = pd->ino;
+                    cd->off   = pd->off;
+                    cd->pos   = pd->pos;
+                    cd->flags = pd->flags;
+                    cd->kind  = pd->kind;
+                } else {
+                    /* The inode is gone (it cannot be, while the parent pins it),
+                     * so the child is not handed a number naming storage it does
+                     * not hold. */
+                    rvvm_memfs_free(fs);
+                    userland_fds_write(child, fd, false, 0, false, false,
+                                       FD_BACKEND_HOST, 0, "inherit_memfs_fail");
+                }
+            }
+            continue;
+        }
         if (userland_pty_by_fd(parent->fds[fd].fd, &child_pty, &child_master)) {
             /* An emulator object, not a host descriptor: there is nothing to
              * dup, and the child shares the pair (its reference is counted, so
@@ -8556,7 +8974,7 @@ static bool userland_own_fd(int host_fd)
     bool master = false;
     int dev = -1;
     return userland_pty_by_fd(host_fd, &pty, &master) || userland_dev_by_fd(host_fd, &dev) ||
-           userland_proc_is_fd(host_fd);
+           userland_proc_is_fd(host_fd) || memfs_fd_number(host_fd);
 }
 
 /* Ready right now, for the direction being watched. A /dev entry never blocks
@@ -8572,6 +8990,11 @@ static bool userland_own_ready(int host_fd, bool write)
     }
     if (userland_proc_is_fd(host_fd)) {
         return !write;
+    }
+    /* A tmpfs file is memory: a read is always ready (its bytes, or its end) and
+     * so is a write. */
+    if (memfs_fd_number(host_fd)) {
+        return true;
     }
     return userland_dev_by_fd(host_fd, &dev);
 }
@@ -13817,6 +14240,44 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     int host_old = userland_fd_host(uctx(), oldfd);
 
+                    if (memfs_fd_number(host_old)) {
+                        /* A tmpfs descriptor: the copy is a slot of its own on the
+                         * same inode, one more pin and one more storage reference,
+                         * so closing either number cannot free the other. Copying
+                         * the number, as the generic own-fd path below does, would
+                         * put two guest fds on one slot and a close of one would
+                         * leave the other naming nothing. */
+                        rvvm_memfs_fd_t* sd = memfs_fd_lookup(uctx(), host_old);
+                        uint32_t         keep_flags = uctx()->fds[oldfd].flags;
+                        userland_fd_close(uctx(), newfd);
+                        if (sd) {
+                            rvvm_memfs_fd_t* nd = memfs_fd_alloc(uctx());
+                            if (nd) {
+                                int           num = nd->fd;
+                                rvvm_memfs_t* fs  = rvvm_memfs_ref(sd->fs);
+                                if (rvvm_memfs_pin(fs, sd->ino) == RVVM_MEMFS_OK) {
+                                    memset(nd, 0, sizeof(*nd));
+                                    nd->fd    = num;
+                                    nd->fs    = fs;
+                                    nd->ino   = sd->ino;
+                                    nd->off   = sd->off;
+                                    nd->pos   = sd->pos;
+                                    nd->kind  = sd->kind;
+                                    userland_fds_write(uctx(), newfd, true, nd->fd,
+                                                       (a2 & UAPI_O_CLOEXEC) != 0, false,
+                                                       FD_BACKEND_SIM, keep_flags, "dup3_memfs");
+                                    userland_fd_set_path(uctx(), newfd, uctx()->fds[oldfd].path);
+                                    a0 = newfd;
+                                    break;
+                                }
+                                rvvm_memfs_free(fs);
+                                memset(nd, 0, sizeof(*nd));
+                            }
+                        }
+                        a0 = -UAPI_EMFILE;
+                        break;
+                    }
+
                     /* A descriptor this userland owns - a console attach above all,
                      * whose number behind it is the host's own stdout - has no host
                      * fd to duplicate: the copy is another reference to the same
@@ -14092,6 +14553,16 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 46: // ftruncate64
                     rvvm_info("sys_ftruncate64(%ld, %lx)", a0, a1);
+                    {
+                        rvvm_memfs_fd_t* md = memfs_fd_for_guest(uctx(), (int)a0);
+                        if (md) {
+                            /* The inode the descriptor pins, resized: a name that
+                             * has since been renamed or unlinked does not matter. */
+                            a0 = -(rvvm_addr_t)memfs_errno(
+                                     rvvm_memfs_truncate_ino(md->fs, md->ino, a1));
+                            break;
+                        }
+                    }
                     a0 = errno_ret(ftruncate(userland_fd_host(uctx(), (int)a0), a1));
                     break;
 #ifdef __linux__
@@ -14166,6 +14637,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                         char abs[UAPI_PATH_MAX];
                         const char* asset = NULL;
                         bool have_abs = false;
+                        rvvm_memfs_t* mfs = NULL;
+                        char mrel[RVVM_MEMFS_PATH_MAX];
                         /* The asset mount is matched on the guest's own absolute
                          * path, before the prefix mapping - the host's asset tree
                          * is not a path in any file system, so there is nothing
@@ -14248,6 +14721,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                              * getdents64 path walks; a file its generated text. */
                             a0 = userland_proc_open_path(abs, userland_current_pid(),
                                                          (int)a2, (a2 & UAPI_O_CLOEXEC) != 0);
+                        } else if (have_abs && memfs_mount_for(&mfs, mrel, sizeof(mrel), abs)) {
+                            /* A tmpfs mount: open it against the storage the row
+                             * owns. This takes the reference memfs_mount_for()
+                             * just took. */
+                            a0 = rvvm_sys_memfs_open(mfs, abs, mrel, (int)a2, (int)a3);
                         } else {
                             /* NULL path with AT_EMPTY_PATH refers to the dirfd */
                             const char* host_path = wrap_guest_path(path_buf, (int)a0, path);
@@ -14390,12 +14868,47 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 61: { // getdents64
                     void* dirp = a2 ? to_ptr_sz_wr(a1, a2) : NULL;
-                    a0 = (a2 && !dirp) ? (rvvm_addr_t)-UAPI_EFAULT
-                         : (rvvm_addr_t)rvvm_sys_getdents64(userland_fd_host(uctx(), (int)a0), dirp, a2);
+                    rvvm_memfs_fd_t* mdir = memfs_fd_for_guest(uctx(), (int)a0);
+                    if (a2 && !dirp) {
+                        a0 = -UAPI_EFAULT;
+                    } else if (mdir) {
+                        a0 = (rvvm_addr_t)rvvm_sys_memfs_getdents(mdir, dirp, a2);
+                    } else {
+                        a0 = (rvvm_addr_t)rvvm_sys_getdents64(userland_fd_host(uctx(), (int)a0), dirp, a2);
+                    }
                     break;
                 }
                 case 62: { // lseek
+                    rvvm_memfs_fd_t* md = memfs_fd_for_guest(uctx(), (int)a0);
                     int lfd = userland_fd_host(uctx(), (int)a0);
+                    if (md) {
+                        /* The cursor is ours, and SEEK_END asks the inode for its
+                         * size rather than trusting a copy: the descriptor keeps
+                         * none. */
+                        int64_t base = 0;
+                        int64_t want;
+                        if (a2 == SEEK_CUR) {
+                            base = (int64_t)md->off;
+                        } else if (a2 == SEEK_END) {
+                            rvvm_memfs_info_t minfo;
+                            if (rvvm_memfs_stat_ino(md->fs, md->ino, &minfo) != RVVM_MEMFS_OK) {
+                                a0 = -UAPI_EBADF;
+                                break;
+                            }
+                            base = (int64_t)minfo.size;
+                        } else if (a2 != SEEK_SET) {
+                            a0 = -UAPI_EINVAL;
+                            break;
+                        }
+                        want = base + (int64_t)a1;
+                        if (want < 0) {
+                            a0 = -UAPI_EINVAL;
+                            break;
+                        }
+                        md->off = (uint64_t)want;
+                        a0 = (rvvm_addr_t)want;
+                        break;
+                    }
                     if (userland_proc_is_fd(lfd)) {
                         /* A procfs file: the cursor is ours. A directory rewind
                          * replays its listing from the start. */
@@ -14431,6 +14944,23 @@ static void* rvvm_user_thread_wrap(void* arg)
                            ? (rvvm_addr_t)user_tty_read(uctx(), buf, a2, block)
                            : (rvvm_addr_t)-UAPI_EAGAIN;
                         break;
+                    }
+                    {
+                        rvvm_memfs_fd_t* md = memfs_fd_for_guest(uctx(), (int)a0);
+                        if (md) {
+                            /* A tmpfs file: read the inode, not the name - the two
+                             * may have parted company since the open. */
+                            size_t              got = 0;
+                            rvvm_memfs_result_t mrc = rvvm_memfs_read_at(md->fs, md->ino, md->off,
+                                                                         buf, a2, &got);
+                            if (mrc != RVVM_MEMFS_OK) {
+                                a0 = -(rvvm_addr_t)memfs_errno(mrc);
+                            } else {
+                                md->off += got;
+                                a0 = (rvvm_addr_t)got;
+                            }
+                            break;
+                        }
                     }
                     if (userland_proc_is_fd(userland_fd_host(uctx(), (int)a0))) {
                         /* A generated /proc file: copy from its text (a
@@ -14481,6 +15011,34 @@ static void* rvvm_user_thread_wrap(void* arg)
                     bool console_out = userland_fd_is_console(uctx(), (int)a0);
                     int  host_fd     = userland_fd_host(uctx(), (int)a0);
                     int  wfd         = (int)a0;   // a0 is the result from here on
+                    {
+                        rvvm_memfs_fd_t* md = memfs_fd_for_guest(uctx(), (int)a0);
+                        if (md) {
+                            /* A tmpfs file: write the inode the descriptor names.
+                             * O_APPEND is re-asked of the inode here rather than
+                             * trusted from open time, which is what makes two
+                             * appended writes land end to end. */
+                            size_t              put = 0;
+                            uint64_t            woff = md->off;
+                            rvvm_memfs_result_t mrc;
+                            if (md->flags & UAPI_O_APPEND) {
+                                rvvm_memfs_info_t minfo;
+                                if (rvvm_memfs_stat_ino(md->fs, md->ino, &minfo) != RVVM_MEMFS_OK) {
+                                    a0 = -UAPI_EBADF;
+                                    break;
+                                }
+                                woff = minfo.size;
+                            }
+                            mrc = rvvm_memfs_write_at(md->fs, md->ino, woff, wbuf, a2, &put);
+                            if (mrc != RVVM_MEMFS_OK) {
+                                a0 = -(rvvm_addr_t)memfs_errno(mrc);
+                            } else {
+                                md->off = woff + put;
+                                a0 = (rvvm_addr_t)put;
+                            }
+                            break;
+                        }
+                    }
                     if (userland_proc_is_fd(host_fd)) {
                         a0 = -UAPI_EACCESS;   /* /proc is read-only */
                         break;
@@ -14553,8 +15111,41 @@ static void* rvvm_user_thread_wrap(void* arg)
                     int  iov_dev    = -1;
                     bool iov_own    = userland_pty_by_fd(iov_fd, &iov_pty, &iov_master) ||
                                       userland_dev_by_fd(iov_fd, &iov_dev);
+                    rvvm_memfs_fd_t* iov_memfs = memfs_fd_for_guest(uctx(), (int)a0);
 
-                    if (a7 == 65 && iov_own) {
+                    if (iov_memfs) {
+                        /* A tmpfs file, segment by segment - the same iovec loop
+                         * the console and /dev take, over the inode the descriptor
+                         * names. A read that drains returns rather than blocking
+                         * again on the next segment. */
+                        ssize_t total = 0;
+                        for (int i = 0; i < (int)a2; i++) {
+                            size_t              got = 0;
+                            rvvm_memfs_result_t mrc;
+                            if (!hiov[i].iov_len) {
+                                continue;
+                            }
+                            if (a7 == 65) {
+                                mrc = rvvm_memfs_read_at(iov_memfs->fs, iov_memfs->ino,
+                                                         iov_memfs->off, hiov[i].iov_base,
+                                                         hiov[i].iov_len, &got);
+                            } else {
+                                mrc = rvvm_memfs_write_at(iov_memfs->fs, iov_memfs->ino,
+                                                          iov_memfs->off, hiov[i].iov_base,
+                                                          hiov[i].iov_len, &got);
+                            }
+                            if (mrc != RVVM_MEMFS_OK) {
+                                total = total ? total : -(ssize_t)memfs_errno(mrc);
+                                break;
+                            }
+                            iov_memfs->off += got;
+                            total += (ssize_t)got;
+                            if (got == 0) {
+                                break;
+                            }
+                        }
+                        a0 = errno_ret(total);
+                    } else if (a7 == 65 && iov_own) {
                         /* The first non-empty segment blocks, the rest drain
                          * what is already there - the console's rule, so a
                          * multi-segment read returns as soon as it drained
@@ -14814,6 +15405,24 @@ static void* rvvm_user_thread_wrap(void* arg)
                             break;
                         }
                     }
+                    /* A path on a memory filesystem: the shape comes from the
+                     * storage, which is where the bytes are. */
+                    if (path && (path[0] == '/' || (int)a0 == UAPI_AT_FDCWD)) {
+                        char        mem_abs[UAPI_PATH_MAX];
+                        struct stat mem_st = {0};
+                        int         mem_rc = 0;
+                        if (guest_path_absolutize(mem_abs, sizeof(mem_abs), path) &&
+                            rvvm_sys_memfs_stat_abs(mem_abs, (a3 & AT_SYMLINK_NOFOLLOW) == 0,
+                                                    &mem_st, &mem_rc)) {
+                            if (mem_rc) {
+                                a0 = (rvvm_addr_t)mem_rc;
+                                break;
+                            }
+                            a0 = 0;
+                            uapi_stat_convert(out, &mem_st);
+                            break;
+                        }
+                    }
                     /* An archive symlink with AT_SYMLINK_NOFOLLOW: lstat() asks
                      * about the link itself, and the host has no file for it. */
                     if (uctx()->shadow && (a3 & AT_SYMLINK_NOFOLLOW) && path &&
@@ -14892,6 +15501,17 @@ static void* rvvm_user_thread_wrap(void* arg)
                          * fstat, so the shape is answered here. */
                         userland_proc_fd_fill_stat(userland_fd_host(uctx(), (int)fd), &st);
                         a0 = 0;
+                    } else if (memfs_fd_for_guest(uctx(), (int)fd)) {
+                        /* A tmpfs descriptor: the shape is the inode the
+                         * descriptor pins, so it stays right across a rename. */
+                        rvvm_memfs_fd_t*  md = memfs_fd_for_guest(uctx(), (int)fd);
+                        rvvm_memfs_info_t minfo;
+                        if (rvvm_memfs_stat_ino(md->fs, md->ino, &minfo) == RVVM_MEMFS_OK) {
+                            memfs_info_to_stat(&minfo, &st);
+                            a0 = 0;
+                        } else {
+                            a0 = -UAPI_EBADF;
+                        }
                     } else if (userland_fd_is_console(uctx(), (int)fd) && uctx()->tty) {
                         /* The run's console: a character device, exactly what
                          * /dev/tty1 and /dev/console report, and with the same
