@@ -6899,6 +6899,23 @@ static uint8_t memfs_dt(uint8_t kind)
          : (kind == RVVM_MEMFS_LNK) ? RVVM_DT_LNK : RVVM_DT_REG;
 }
 
+/* The guest's AT_REMOVEDIR, spelled here rather than taken from a host header:
+ * it is a value the *guest* passes in and this file interprets, so it must not
+ * change meaning with the host's libc. Linux's number. */
+#define RVVM_UAPI_AT_REMOVEDIR 0x200
+
+/* The guest-absolute form of an at-syscall's path, for the handlers that have to
+ * ask the mount table before the host. False when there is no absolute path to
+ * ask about - a NULL name, or a relative one with a real dirfd - which is the
+ * caller's cue to go straight to the host, exactly as it would have. */
+static bool guest_path_abs_of(int dirfd, const char* path, char* out, size_t size)
+{
+    if (!path || !(path[0] == '/' || dirfd == UAPI_AT_FDCWD)) {
+        return false;
+    }
+    return guest_path_absolutize(out, size, path);
+}
+
 /* Whether a memory filesystem owns @abs, and if so its storage - with one
  * reference taken, for the caller to release - and the mount-relative path.
  *
@@ -7017,7 +7034,12 @@ static bool rvvm_sys_memfs_stat_abs(const char* abs, bool follow, struct stat* s
     if (!memfs_mount_for(&fs, rel, sizeof(rel), abs)) {
         return false;
     }
-    *rc = memfs_errno(rvvm_memfs_stat(fs, rel, follow, &info));
+    /* Negative, the way a syscall reports an error: @rc is handed straight back
+     * as the syscall's return value, and a positive errno would be read by the
+     * guest as a *successful* return - stat() of a file that does not exist
+     * answering 2 instead of -ENOENT, which its libc takes as "it is there" and
+     * a caller like mv then acts on a stat buffer nothing wrote. */
+    *rc = -memfs_errno(rvvm_memfs_stat(fs, rel, follow, &info));
     if (*rc == 0) {
         memfs_info_to_stat(&info, st);
     }
@@ -14450,9 +14472,23 @@ static void* rvvm_user_thread_wrap(void* arg)
                                            guest_create_mode(a2), a3));
                     break;
                 case 34: { // mkdirat
-                    const char* mpath = wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false);
+                    char          mk_abs[UAPI_PATH_MAX];
+                    rvvm_memfs_t* mk_fs = NULL;
+                    char          mk_rel[RVVM_MEMFS_PATH_MAX];
+                    const char*   mpath;
+                    uint32_t      mmode;
                     rvvm_info("sys_mkdirat(%ld, %s, %lx)", a0, to_str(a1), a2);
-                    uint32_t mmode = guest_create_mode(a2);
+                    if (guest_path_abs_of((int)a0, to_str(a1), mk_abs, sizeof(mk_abs)) &&
+                        memfs_mount_for(&mk_fs, mk_rel, sizeof(mk_rel), mk_abs)) {
+                        /* A tmpfs: the directory is made in the storage the mount
+                         * owns, which is the only place it can be seen. */
+                        a0 = -(rvvm_addr_t)memfs_errno(
+                                 rvvm_memfs_mkdir(mk_fs, mk_rel, guest_create_mode(a2)));
+                        rvvm_memfs_free(mk_fs);
+                        break;
+                    }
+                    mpath = wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false);
+                    mmode = guest_create_mode(a2);
                     a0 = errno_ret(mkdirat(userland_fd_host(uctx(), (int)a0), mpath, mmode));
                     if ((int64_t)a0 >= 0) {
                         /* Same reason as openat: the host keeps no mode, so the
@@ -14463,12 +14499,25 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 }
                 case 35: { // unlinkat (guest rmdir is the same call with AT_REMOVEDIR)
-                    char unlink_abs[UAPI_PATH_MAX];
-                    bool have_unlink_abs = false;
-                    int unlink_ret;
+                    char          unlink_abs[UAPI_PATH_MAX];
+                    rvvm_memfs_t* rm_fs = NULL;
+                    char          rm_rel[RVVM_MEMFS_PATH_MAX];
+                    bool          have_unlink_abs = false;
+                    int           unlink_ret;
                     rvvm_info("sys_unlinkat(%ld, %s, %lx)", a0, to_str(a1), a2);
                     if (to_str(a1) && (to_str(a1)[0] == '/' || (int)a0 == UAPI_AT_FDCWD)) {
                         have_unlink_abs = guest_path_absolutize(unlink_abs, sizeof(unlink_abs), to_str(a1));
+                    }
+                    if (have_unlink_abs &&
+                        memfs_mount_for(&rm_fs, rm_rel, sizeof(rm_rel), unlink_abs)) {
+                        /* A tmpfs: one name goes, and the inode with it only if
+                         * that was the last name. AT_REMOVEDIR is the guest's
+                         * rmdir, and the module refuses it for a file. */
+                        a0 = -(rvvm_addr_t)memfs_errno(
+                                 rvvm_memfs_unlink(rm_fs, rm_rel,
+                                                   (a2 & RVVM_UAPI_AT_REMOVEDIR) != 0));
+                        rvvm_memfs_free(rm_fs);
+                        break;
                     }
                     unlink_ret = unlinkat(userland_fd_host(uctx(), (int)a0),
                                           wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false), a2);
@@ -14492,8 +14541,23 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     break;
                 }
-                case 36: // symlinkat
+                case 36: { // symlinkat
+                    char          sl_abs[UAPI_PATH_MAX];
+                    rvvm_memfs_t* sl_fs = NULL;
+                    char          sl_rel[RVVM_MEMFS_PATH_MAX];
                     rvvm_info("sys_symlinkat(%s, %ld, %s)", to_str(a0), a1, to_str(a2));
+                    if (guest_path_abs_of((int)a1, to_str(a2), sl_abs, sizeof(sl_abs)) &&
+                        memfs_mount_for(&sl_fs, sl_rel, sizeof(sl_rel), sl_abs)) {
+                        /* A tmpfs: the target is stored verbatim, which is what a
+                         * symlink is - not resolved now, not resolved against a
+                         * cwd. This is also the reason a memfs root needs no
+                         * shadow: the storage holds the link itself, where a host
+                         * directory cannot. */
+                        a0 = -(rvvm_addr_t)memfs_errno(
+                                 rvvm_memfs_symlink(sl_fs, to_str(a0), sl_rel));
+                        rvvm_memfs_free(sl_fs);
+                        break;
+                    }
                     /* The target is stored verbatim by the kernel, so it is not
                      * resolved against a cwd - only mapped as an absolute path.
                      * The link path is an ordinary guest path. */
@@ -14501,15 +14565,42 @@ static void* rvvm_user_thread_wrap(void* arg)
                                              userland_fd_host(uctx(), (int)a1),
                                              wrap_guest_path_ex(path_buf1, (int)a1, to_str(a2), false)));
                     break;
-                case 37: // linkat
+                }
+                case 37: { // linkat
+                    char          lk_src[UAPI_PATH_MAX];
+                    char          lk_dst[UAPI_PATH_MAX];
+                    rvvm_memfs_t* lk_sfs = NULL;
+                    rvvm_memfs_t* lk_dfs = NULL;
+                    char          lk_srel[RVVM_MEMFS_PATH_MAX];
+                    char          lk_drel[RVVM_MEMFS_PATH_MAX];
                     rvvm_info("sys_linkat(%ld, %s, %ld, %s, %lx)", a0, to_str(a1), a2, to_str(a3), a4);
-                    /* Neither name is dereferenced: the new one is created, and a
-                     * hard link to a symlink is legal. */
+                    if (guest_path_abs_of((int)a0, to_str(a1), lk_src, sizeof(lk_src)) &&
+                        guest_path_abs_of((int)a2, to_str(a3), lk_dst, sizeof(lk_dst))) {
+                        bool s_on = memfs_mount_for(&lk_sfs, lk_srel, sizeof(lk_srel), lk_src);
+                        bool d_on = memfs_mount_for(&lk_dfs, lk_drel, sizeof(lk_drel), lk_dst);
+                        if (s_on || d_on) {
+                            if (s_on && d_on && lk_sfs == lk_dfs) {
+                                /* Neither name is dereferenced: the new one is
+                                 * created, and a link to a symlink is legal. */
+                                a0 = -(rvvm_addr_t)memfs_errno(
+                                         rvvm_memfs_link(lk_sfs, lk_srel, lk_drel));
+                            } else {
+                                /* A link cannot cross a mount, which is Linux's
+                                 * EXDEV and the reason both sides are asked of
+                                 * the table before either is asked of the host. */
+                                a0 = -UAPI_EXDEV;
+                            }
+                            rvvm_memfs_free(lk_sfs);
+                            rvvm_memfs_free(lk_dfs);
+                            break;
+                        }
+                    }
                     a0 = errno_ret(linkat(userland_fd_host(uctx(), (int)a0),
                                           wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false),
                                           userland_fd_host(uctx(), (int)a2),
                                           wrap_guest_path_ex(path_buf1, (int)a2, to_str(a3), false), a4));
                     break;
+                }
                 case 39: // umount2
                     /* Consults the table now, so an unmount that happened is an
                      * unmount, and one that did not is EINVAL rather than a
@@ -14547,10 +14638,21 @@ static void* rvvm_user_thread_wrap(void* arg)
                     uapi_statfs64_convert(out, &stfs);
                     break;
                 }
-                case 45: // truncate64
+                case 45: { // truncate64
+                    char          tr_abs[UAPI_PATH_MAX];
+                    rvvm_memfs_t* tr_fs = NULL;
+                    char          tr_rel[RVVM_MEMFS_PATH_MAX];
                     rvvm_info("sys_truncate64(%s, %lx)", to_str(a0), a1);
+                    if (guest_path_abs_of(UAPI_AT_FDCWD, to_str(a0), tr_abs, sizeof(tr_abs)) &&
+                        memfs_mount_for(&tr_fs, tr_rel, sizeof(tr_rel), tr_abs)) {
+                        a0 = -(rvvm_addr_t)memfs_errno(
+                                 rvvm_memfs_truncate(tr_fs, tr_rel, a1));
+                        rvvm_memfs_free(tr_fs);
+                        break;
+                    }
                     a0 = errno_ret(truncate(wrap_guest_path(path_buf, UAPI_AT_FDCWD, to_str(a0)), a1));
                     break;
+                }
                 case 46: // ftruncate64
                     rvvm_info("sys_ftruncate64(%ld, %lx)", a0, a1);
                     {
@@ -14571,10 +14673,34 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = errno_ret(fallocate(userland_fd_host(uctx(), (int)a0), a1, a2, a3));
                     break;
 #endif
-                case 48: // faccessat
+                case 48: { // faccessat
+                    char          ac_abs[UAPI_PATH_MAX];
+                    rvvm_memfs_t* ac_fs = NULL;
+                    char          ac_rel[RVVM_MEMFS_PATH_MAX];
                     rvvm_info("sys_faccessat(%ld, %s, %lx)", a0, to_str(a1), a2);
+                    if (guest_path_abs_of((int)a0, to_str(a1), ac_abs, sizeof(ac_abs)) &&
+                        memfs_mount_for(&ac_fs, ac_rel, sizeof(ac_rel), ac_abs)) {
+                        /* Permissions are recorded and reported but not enforced
+                         * (see the module header), so the only two questions with
+                         * an answer here are "is it there" and "could a write
+                         * land" - and the second is the mount's read-only flag
+                         * rather than the inode's mode. */
+                        rvvm_memfs_result_t ac_rc = RVVM_MEMFS_OK;
+                        if (a2 & 2 /* W_OK */) {
+                            ac_rc = rvvm_memfs_read_only(ac_fs) ? RVVM_MEMFS_EROFS
+                                                                : RVVM_MEMFS_OK;
+                        }
+                        if (ac_rc == RVVM_MEMFS_OK) {
+                            rvvm_memfs_info_t ac_info;
+                            ac_rc = rvvm_memfs_stat(ac_fs, ac_rel, true, &ac_info);
+                        }
+                        a0 = -(rvvm_addr_t)memfs_errno(ac_rc);
+                        rvvm_memfs_free(ac_fs);
+                        break;
+                    }
                     a0 = rvvm_sys_faccessat(userland_fd_host(uctx(), (int)a0), to_str(a1), a2, 0);
                     break;
+                }
                 case 49: // chdir
                     rvvm_info("sys_chdir(%s)", to_str(a0));
                     a0 = rvvm_sys_chdir(to_str(a0));
@@ -14601,9 +14727,23 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 }
                 case 53: { // fchmodat
-                    int hdir = userland_fd_host(uctx(), (int)a0);
-                    const char* hpath = wrap_guest_path(path_buf, (int)a0, to_str(a1));
+                    char          cm_abs[UAPI_PATH_MAX];
+                    rvvm_memfs_t* cm_fs = NULL;
+                    char          cm_rel[RVVM_MEMFS_PATH_MAX];
+                    int           hdir = userland_fd_host(uctx(), (int)a0);
+                    const char*   hpath = wrap_guest_path(path_buf, (int)a0, to_str(a1));
                     rvvm_info("sys_fchmodat(%ld, %s, %lx)", a0, to_str(a1), a2);
+                    if (guest_path_abs_of((int)a0, to_str(a1), cm_abs, sizeof(cm_abs)) &&
+                        memfs_mount_for(&cm_fs, cm_rel, sizeof(cm_rel), cm_abs)) {
+                        /* The inode's mode, which is where a tmpfs keeps the only
+                         * copy there is. AT_SYMLINK_NOFOLLOW is not honoured:
+                         * the module's chmod follows, which is the ordinary
+                         * operation and the one this core has always served. */
+                        a0 = -(rvvm_addr_t)memfs_errno(
+                                 rvvm_memfs_chmod(cm_fs, cm_rel, (uint32_t)a2));
+                        rvvm_memfs_free(cm_fs);
+                        break;
+                    }
                     a0 = errno_ret(fchmodat(hdir, hpath, a2, 0));
                     if ((int64_t)a0 >= 0) {
                         mode_override_record_path(hpath, (uint32_t)a2, true);
@@ -15346,10 +15486,39 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 73: // ppoll_time32
                     a0 = rvvm_sys_poll_time32(a0, a1, to_ptr(a2));
                     break;
-                case 78: // readlinkat
+                case 78: { // readlinkat
+                    char          rl_abs[UAPI_PATH_MAX];
+                    rvvm_memfs_t* rl_fs = NULL;
+                    char          rl_rel[RVVM_MEMFS_PATH_MAX];
+                    char*         rl_out = to_ptr_wr(a2);
                     rvvm_info("sys_readlinkat(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
+                    if (rl_out && guest_path_abs_of((int)a0, to_str(a1), rl_abs, sizeof(rl_abs)) &&
+                        memfs_mount_for(&rl_fs, rl_rel, sizeof(rl_rel), rl_abs)) {
+                        /* The link itself, never its target - which is the whole
+                         * difference between readlink() and open(), and what the
+                         * storage holds verbatim. */
+                        char                rl_buf[RVVM_MEMFS_PATH_MAX];
+                        rvvm_memfs_result_t rl_rc =
+                            rvvm_memfs_readlink(rl_fs, rl_rel, rl_buf, sizeof(rl_buf));
+                        if (rl_rc == RVVM_MEMFS_OK) {
+                            /* Truncated rather than refused when the caller's
+                             * buffer is small, and no terminator: readlink(2)
+                             * reports a length, not a string. */
+                            size_t rl_len = rvvm_strlen(rl_buf);
+                            if (rl_len > (size_t)a3) {
+                                rl_len = (size_t)a3;
+                            }
+                            memcpy(rl_out, rl_buf, rl_len);
+                            a0 = (rvvm_addr_t)rl_len;
+                        } else {
+                            a0 = -(rvvm_addr_t)memfs_errno(rl_rc);
+                        }
+                        rvvm_memfs_free(rl_fs);
+                        break;
+                    }
                     a0 = rvvm_sys_readlinkat(userland_fd_host(uctx(), (int)a0), to_str(a1), to_ptr_wr(a2), a3);
                     break;
+                }
                 case 79: { // newfstatat
                     struct stat st = {0};
                     const int   dirfd = (int)a0;   /* a0 holds the result below */
@@ -16552,9 +16721,40 @@ case 179: // sysinfo
                     break;
 #endif
                 case 276: { // renameat2
-                    const char* from = wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false);
-                    const char* to   = wrap_guest_path_ex(path_buf1, (int)a2, to_str(a3), false);
+                    char          rn_src[UAPI_PATH_MAX];
+                    char          rn_dst[UAPI_PATH_MAX];
+                    rvvm_memfs_t* rn_sfs = NULL;
+                    rvvm_memfs_t* rn_dfs = NULL;
+                    char          rn_srel[RVVM_MEMFS_PATH_MAX];
+                    char          rn_drel[RVVM_MEMFS_PATH_MAX];
+                    const char*   from;
+                    const char*   to;
                     rvvm_info("sys_renameat2(%ld, %s, %ld, %s, %lx)", a0, to_str(a1), a2, to_str(a3), a4);
+                    if (guest_path_abs_of((int)a0, to_str(a1), rn_src, sizeof(rn_src)) &&
+                        guest_path_abs_of((int)a2, to_str(a3), rn_dst, sizeof(rn_dst))) {
+                        bool s_on = memfs_mount_for(&rn_sfs, rn_srel, sizeof(rn_srel), rn_src);
+                        bool d_on = memfs_mount_for(&rn_dfs, rn_drel, sizeof(rn_drel), rn_dst);
+                        if (s_on || d_on) {
+                            if (s_on && d_on && rn_sfs == rn_dfs) {
+                                /* The name moves and the inode it names does not:
+                                 * one identity, one path rewritten - and the whole
+                                 * subtree underneath, which is the O(subtree) the
+                                 * module documents. */
+                                a0 = -(rvvm_addr_t)memfs_errno(
+                                         rvvm_memfs_rename(rn_sfs, rn_srel, rn_drel));
+                            } else {
+                                /* A rename cannot cross a mount, which is Linux's
+                                 * EXDEV - and the reason both sides are asked of
+                                 * the table before either is asked of the host. */
+                                a0 = -UAPI_EXDEV;
+                            }
+                            rvvm_memfs_free(rn_sfs);
+                            rvvm_memfs_free(rn_dfs);
+                            break;
+                        }
+                    }
+                    from = wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false);
+                    to   = wrap_guest_path_ex(path_buf1, (int)a2, to_str(a3), false);
                     /* rename() moves the link, it never dereferences it. */
                     a0 = errno_ret(renameat(userland_fd_host(uctx(), (int)a0), from,
                                             userland_fd_host(uctx(), (int)a2), to));

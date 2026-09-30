@@ -128,6 +128,82 @@ Check ($r -match 'Is a directory') "reading a directory is EISDIR"
 $r = Client 'cat /mnt/big/also'
 Check ($r -match 'No such file') "a component that is a file answers ENOENT (Linux would say ENOTDIR)"
 
+# --- names: the operations that change the tree ------------------------------
+$rc = ClientRc 'mkdir /mnt/d'
+Check ($rc -eq 0) "mkdir through the mount (rc $rc)"
+$r = Client 'ls /mnt'
+Check ($r -match '(?m)\bd\b') "the directory is listed"
+
+$rc = ClientRc 'echo inner > /mnt/d/f'
+Check ($rc -eq 0) "write inside it (rc $rc)"
+$r = Client 'cat /mnt/d/f'
+Check ($r -match 'inner') "read it back"
+
+# A stat of a name that is not there has to FAIL, and this is the check that was
+# missing: the memory filesystem's stat was answering +ENOENT (a positive
+# syscall return, which the guest reads as success), so stat() of a missing file
+# reported "it is there" with a buffer nothing wrote - and a caller like mv then
+# asked whether to overwrite it.
+$r = Client 'stat /mnt/d/g'
+Check ($r -match 'No such file') "stat of a path that is not there fails"
+
+# rename, file and directory: one name moves and the identity does not.
+$rc = ClientRc 'mv /mnt/d/f /mnt/d/g'
+Check ($rc -eq 0) "rename a file (rc $rc)"
+$r = Client 'cat /mnt/d/g'
+Check ($r -match 'inner') "the new name reads"
+$r = Client 'cat /mnt/d/f'
+Check ($r -match 'No such file') "the old name is gone"
+
+$rc = ClientRc 'mv /mnt/d /mnt/d2'
+Check ($rc -eq 0) "rename a directory (rc $rc)"
+$r = Client 'cat /mnt/d2/g'
+Check ($r -match 'inner') "its contents came with it"
+
+# A symlink stores its target, and open() follows it.
+$rc = ClientRc 'ln -s g /mnt/d2/l'
+Check ($rc -eq 0) "symlink (rc $rc)"
+$r = Client 'readlink /mnt/d2/l'
+Check ($r.Trim() -eq 'g') "readlink says what it points at ('$($r.Trim())')"
+$r = Client 'cat /mnt/d2/l'
+Check ($r -match 'inner') "and reading through it follows"
+
+# A hard link is one inode under two names, not a copy.
+$rc = ClientRc 'ln /mnt/d2/g /mnt/d2/h'
+Check ($rc -eq 0) "hard link (rc $rc)"
+$r = Client 'stat -c %h /mnt/d2/g'
+Check ($r.Trim() -eq '2') "nlink counts both names ('$($r.Trim())')"
+$rc = ClientRc 'echo more >> /mnt/d2/h'
+Check ($rc -eq 0) "write through the second name (rc $rc)"
+$r = Client 'cat /mnt/d2/g'
+Check ($r -match 'more') "and the first name sees it"
+
+# chmod, which a tmpfs has somewhere to keep.
+$rc = ClientRc 'chmod 600 /mnt/d2/g'
+Check ($rc -eq 0) "chmod (rc $rc)"
+$r = Client 'stat -c %a /mnt/d2/g'
+Check ($r.Trim() -eq '600') "stat reports the mode ('$($r.Trim())')"
+
+# unlink and rmdir, and the tree coming down.
+$rc = ClientRc 'rm /mnt/d2/l'
+Check ($rc -eq 0) "unlink a symlink (rc $rc)"
+$rc = ClientRc 'rm /mnt/d2/g'
+Check ($rc -eq 0) "unlink one name of a hard-linked file (rc $rc)"
+$r = Client 'stat -c %h /mnt/d2/h'
+Check ($r.Trim() -eq '1') "the other name survives with nlink 1 ('$($r.Trim())')"
+$rc = ClientRc 'rmdir /mnt/d2'
+Check ($rc -ne 0) "rmdir a non-empty directory fails (rc $rc)"
+$r = Client 'rmdir /mnt/d2'
+Check ($r -match 'not empty') "and says why ('$($r.Trim())')"
+$rc = ClientRc 'rm /mnt/d2/h && rmdir /mnt/d2'
+Check ($rc -eq 0) "empty it and rmdir succeeds (rc $rc)"
+$r = Client 'ls /mnt'
+Check ($r -notmatch '(?m)\bd2\b') "the directory is gone"
+
+# A link cannot cross a mount, which is what keeps the two trees apart.
+$r = Client 'ln /mnt/big /tmp/hop'
+Check ($r -match 'cross-device') "a hard link across a mount is EXDEV ('$($r.Trim())')"
+
 # --- private, and it dies with the mount ------------------------------------
 $r = Client 'ls /mnt'
 Check ($r -match '(?m)\bf\b') "the file is there before the unmount"
