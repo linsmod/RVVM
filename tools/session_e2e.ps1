@@ -144,6 +144,29 @@ $errTask = $p.StandardError.ReadToEndAsync()
 # the contract, and reading the pipe would mean waiting for the whole run.
 $up = Wait-AshUp -Exe $exe -Port $Port -Process $p
 Check $up "vpsessiond publishes its endpoint (port $Port)"
+
+# The endpoint is host runtime state rather than a path under the rootfs: the
+# socket lives in <exe>\runtime\run, and the guest reaches it through a mount of
+# that directory (see win32_cmdpost_bridge.c). So it does not move when the
+# guest's / is backed by something else, which it used to - the client derived it
+# from the prefix, and a run whose root is memory has no such tree.
+$runDir = Join-Path ([IO.Path]::GetDirectoryName($exe)) 'runtime\run'
+$sock   = Get-AshSockPath -Exe $exe -Port $Port
+Check ($sock -like "$runDir\*") "the endpoint is in runtime\run ('$sock')"
+Check ($sock -notmatch 'runtime\\rootfs') "and not under the rootfs"
+
+# The registry names it, so a client has one place to ask both "which core" and
+# "where is its socket" instead of deriving the second from the release layout.
+$coreFile = Join-Path ([IO.Path]::GetDirectoryName($exe)) "runtime\cores\$Port.core"
+$reg      = Get-Content -LiteralPath $coreFile -ErrorAction SilentlyContinue
+Check (($reg -join "`n") -match [regex]::Escape("endpoint=$sock")) `
+      "the core registry names the endpoint"
+
+# And the daemon's own words: the guest path it bound is the mounted one, not a
+# directory under the rootfs.
+$dlogText = Get-Content -LiteralPath $dlog -ErrorAction SilentlyContinue
+Check (($dlogText -join "`n") -match '/run/vpsessiond/') `
+      "vpsessiond binds the mounted /run path"
 if (-not $up) {
     try { $p.Kill() } catch { }
     "--- core output ---"

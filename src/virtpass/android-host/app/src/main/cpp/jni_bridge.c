@@ -3279,9 +3279,12 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
      * of these syscalls. */
     rvvm_user_set_host_ctx(run->machine, run->cmdpost);
 
-    /* Default to passthrough (host paths unchanged); the bundle mount below
-     * points the prefix at this run's materialized rootfs when there is one.
-     * The core's build-time default prefix must not leak into a run. */
+    /* No rootfs until the bundle installs one: the guest's / is an empty memory
+     * filesystem, which is not a window onto the host. (This used to be called
+     * passthrough, and the name was the bug - an unmapped path no longer means a
+     * host path.) The bundle mount below points the prefix at this run's
+     * materialized rootfs when there is one, and the core's build-time default
+     * prefix must not leak into a run. */
     rvvm_user_set_prefix(run->machine, NULL);
 
     /* The bundle, when this build has one: the guest gets the archive's `/`, the

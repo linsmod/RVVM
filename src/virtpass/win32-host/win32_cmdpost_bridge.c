@@ -3172,13 +3172,39 @@ bool win32_host_start_guest(int argc, char** argv)
         char app_id[VP_APP_ID_MAX];
         bool have_app;
 
-        /* Default to passthrough (host paths unchanged); the bundle mount below
-         * points the prefix at the run's rootfs when it is there. The core's
-         * build-time default prefix must not leak into a run. */
+        /* No rootfs until the bundle installs one: the guest's / is an empty memory
+         * filesystem, which is not a window onto the host. (This line used to say
+         * "default to passthrough", and the name was the bug - an unmapped path no
+         * longer means a host path.) The bundle mount below points the prefix at
+         * the run's rootfs when it is there, and the core's build-time default
+         * prefix must not leak into a run. */
         rvvm_user_set_prefix(g_guest_machine, NULL);
         have_app = vp_bundle_app_id_from_guest_path(argc > 0 ? argv[0] : NULL,
                                                     app_id, sizeof(app_id));
         win32_guest_rootfs_mount(g_guest_machine, have_app ? app_id : NULL);
+
+        /* And where the session endpoints live: a host directory mounted at the
+         * guest path vpsessiond binds (see vpsessiond.c), rather than a directory
+         * under the rootfs. The socket has to be reachable by the host client
+         * whatever the guest's / is backed by, and a run with no rootfs has no
+         * directory under it to put one in - /run is the same choice Linux makes
+         * for runtime sockets, and for the same reason. */
+        {
+            char exe_dir[MAX_PATH];
+            char runtime[MAX_PATH];
+            char run_dir[MAX_PATH];
+
+            if (win32_exe_directory(exe_dir, sizeof(exe_dir))) {
+                snprintf(runtime, sizeof(runtime), "%s\\runtime", exe_dir);
+                CreateDirectoryA(runtime, NULL);
+                snprintf(run_dir, sizeof(run_dir), "%s\\runtime\\run", exe_dir);
+                CreateDirectoryA(run_dir, NULL);
+                if (rvvm_user_mount_hostfs(g_guest_machine, "/run/vpsessiond",
+                                           run_dir) != 0) {
+                    winhost_log("could not mount %s at /run/vpsessiond", run_dir);
+                }
+            }
+        }
 
         /* Boot arguments, after the bundle mount and not before, so that a
          * `root=` on the command line overrides the rootfs the image installed

@@ -36,9 +36,12 @@
  * Usage: vpsessiond [port]     (default 7900)
  *        SHELL=/bin/sh          (the shell each session runs)
  *
- * The listener is an AF_UNIX socket at /cores/vpsessiond-<port>.sock, a *guest*
- * path: the host maps it into its own namespace (that is the one rendezvous the
- * client and this server agree on), so nothing is exposed as a TCP port.
+ * The listener is an AF_UNIX socket at /run/vpsessiond/<port>.sock, a *guest*
+ * path: the host mounts a directory of its own there (see
+ * win32_cmdpost_bridge.c), so the two sides meet on one filesystem name without
+ * either learning the other's layout - and nothing is exposed as a TCP port. /run
+ * is where a Linux system keeps runtime sockets for the same reason: they are not
+ * part of a filesystem's contents, they are what is running.
  */
 
 #define _GNU_SOURCE
@@ -65,9 +68,19 @@
 #define DEFAULT_PORT  7900
 #define PORT_MAX     65535
 
-/* Where the core publishes its endpoint, as a guest path. */
-#define SOCK_DIR      "/cores"
-#define SOCK_FMT      SOCK_DIR "/vpsessiond-%d.sock"
+/* Where the core publishes its endpoint, as a guest path.
+ *
+ * /run is the tree a Linux system keeps its runtime sockets in, and this is one of
+ * them: not part of any filesystem's contents but of what is running, recreated
+ * per boot and not for people to look in.
+ *
+ * The host mounts a directory of its own here (see win32_cmdpost_bridge.c), so the
+ * socket is a filesystem object both sides can name without either learning the
+ * other's layout - and it does not depend on what the guest's / is backed by. That
+ * last part is why it is a mount rather than a directory under the rootfs: a run
+ * with no rootfs has no /cores to bind anything in. */
+#define SOCK_DIR      "/run/vpsessiond"
+#define SOCK_FMT      SOCK_DIR "/%d.sock"
 
 /* The daemon's own log, as a guest path, used when argv[3] does not name one.
 /tmp is the one directory every run gets (the host makes it under

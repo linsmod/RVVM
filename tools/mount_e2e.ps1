@@ -108,12 +108,19 @@ Check ($r -notmatch '(?m)^/dev/root / auto') "and no longer calls its type auto"
 foreach ($m in @('/dev devtmpfs', '/sys sysfs', '/proc proc', '/tmp tmpfs', '/var/tmp tmpfs')) {
     Check ($r -match ('(?m)^\S+ ' + [regex]::Escape($m) + ' ')) "/proc/mounts lists $m"
 }
+# The session endpoints: a host directory the runner mounts at the guest path
+# vpsessiond binds (see win32_cmdpost_bridge.c). It is a mount rather than a
+# directory under the rootfs so that it does not move when the guest's / is backed
+# by something else - /run is where Linux keeps runtime sockets for the same
+# reason.
+Check ($r -match '(?m)^\S+ /run/vpsessiond hostfs ') "/proc/mounts lists the session endpoint mount"
 # The lie this replaced: a devpts mount on /dev/pts that nothing implements.
 Check ($r -notmatch 'devpts') "/proc/mounts claims no devpts mount"
-# Six lines plus the header, and nothing else: this file is generated from the
-# table now, so a mount it does not know about cannot appear here.
-Check ((($r -split "`n" | Where-Object { $_ -match '\S' }).Count) -eq 7) `
-      "/proc/mounts is exactly the six default mounts plus its header"
+# Seven lines plus the header, and nothing else: this file is generated from the
+# table now, so a mount the table does not know about cannot appear here. Seven is
+# the six defaults plus the session endpoint mount above.
+Check ((($r -split "`n" | Where-Object { $_ -match '\S' }).Count) -eq 8) `
+      "/proc/mounts is exactly the seven mounts plus its header"
 
 # --- the namespace is shared across sessions --------------------------------
 # /mnt in one session, read back from the next: this is the check the per-context

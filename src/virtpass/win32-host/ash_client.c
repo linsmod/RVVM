@@ -142,24 +142,48 @@ static bool ash_core_file(int port, char* out, size_t size)
     return true;
 }
 
-/* The AF_UNIX endpoint a core publishes. It is the guest path the session
- * server binds (/cores/vpsessiond-<port>.sock, see vpsessiond.c) mapped through
- * the guest prefix: the run's persisted rootfs, <exe>\runtime\rootfs - the same
- * tree the bundle installs. Client and core agree without either learning the
- * other's layout, and it is a filesystem object, not a TCP port. */
-static bool ash_session_sock_path(int port, char* out, size_t size)
+/* The host directory the guest's /run/vpsessiond is mounted from (see
+ * win32_cmdpost_bridge.c). The session endpoints live here, one per port, and the
+ * client reaches them as plain host paths - beside runtime\cores (the core
+ * registry) and runtime\rootfs (the rootfs), because all three are the release
+ * tree's own runtime state rather than anything the guest owns. */
+static bool ash_runtime_run_dir(char* out, size_t size)
 {
     char exe_dir[MAX_PATH];
+    char runtime[MAX_PATH];
 
     if (!ash_exe_directory(exe_dir, sizeof(exe_dir))) {
         return false;
     }
-    if (snprintf(out, size, "%s\\runtime\\rootfs\\cores\\vpsessiond-%d.sock",
-                 exe_dir, port) >= (int)size) {
+    snprintf(runtime, sizeof(runtime), "%s\\runtime", exe_dir);
+    CreateDirectoryA(runtime, NULL);        /* already there after a run */
+    snprintf(out, size, "%s\\runtime\\run", exe_dir);
+    CreateDirectoryA(out, NULL);
+    return true;
+}
+
+/* The AF_UNIX endpoint a core publishes, as a host path. It is a filesystem
+ * object and not a TCP port, and it comes from a guest path -
+ * /run/vpsessiond/<port>.sock, see vpsessiond.c - that the host mounts a directory
+ * of its own at. So the endpoint does not move when the guest's / is backed by
+ * something else, which under a prefix it used to: the path was derived from
+ * <exe>\runtime\rootfs, and a run whose root is memory has no such tree. */
+static bool ash_session_sock_path(int port, char* out, size_t size)
+{
+    char dir[MAX_PATH];
+
+    if (!ash_runtime_run_dir(dir, sizeof(dir))) {
+        return false;
+    }
+    if (snprintf(out, size, "%s\\%d.sock", dir, port) >= (int)size) {
         return false;
     }
     return true;
 }
+
+/* One "key=value" out of a core's registry file (defined below, where the file is
+ * read). Declared here because resolving an endpoint asks the registry first. */
+static bool ash_core_field(int port, const char* key, char* out, size_t out_size);
 
 /* Discovery broker (stub).
  *
@@ -167,11 +191,18 @@ static bool ash_session_sock_path(int port, char* out, size_t size)
  * WSL's - a well-known local pipe (\\.\pipe\rvvm-ash-broker) that a machine-wide
  * service answers with the endpoint of the active distro ("list", or
  * "resolve <id>" -> the socket path). Until that service exists, this resolves
- * the one layout that does: this executable's own release tree, which is also
- * what --serve registered. Keeping it a single call here means the broker lands
- * as one function, not as a change at every connect site. */
+ * the one layout that does: the registry file the core writes, which names its own
+ * endpoint. Keeping it a single call here means the broker lands as one function,
+ * not as a change at every connect site.
+ *
+ * The registry is asked first because it is the core's own answer to "where am I";
+ * the derived path is only what a core of this version writes, and a registry
+ * without the line is one an older core left behind. */
 static bool ash_broker_resolve(int port, char* out, size_t size)
 {
+    if (ash_core_field(port, "endpoint", out, size) && out[0]) {
+        return true;
+    }
     return ash_session_sock_path(port, out, size);
 }
 
@@ -255,18 +286,26 @@ static DWORD ash_core_pid(int port)
 static void ash_core_register(int port, const char* shell)
 {
     char  path[MAX_PATH];
+    char  endpoint[MAX_PATH];
     FILE* f;
 
     if (!ash_core_file(port, path, sizeof(path))) {
         return;
     }
+    /* The endpoint is written down beside the pid rather than left for a reader to
+     * derive: a client that wants to connect should have to know which port a core
+     * owns, not where that core decided to put its socket. It is the same file that
+     * says whether the core is alive, so there is one place to ask both. */
+    if (!ash_session_sock_path(port, endpoint, sizeof(endpoint))) {
+        endpoint[0] = '\0';
+    }
     f = fopen(path, "w");
     if (!f) {
         return;
     }
-    fprintf(f, "port=%d\npid=%lu\nshell=%s\nstarted=%llu\n",
+    fprintf(f, "port=%d\npid=%lu\nshell=%s\nstarted=%llu\nendpoint=%s\n",
             port, (unsigned long)GetCurrentProcessId(), shell,
-            (unsigned long long)GetTickCount64());
+            (unsigned long long)GetTickCount64(), endpoint);
     fclose(f);
 }
 

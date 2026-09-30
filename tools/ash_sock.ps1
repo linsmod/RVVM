@@ -3,11 +3,12 @@
     Shared AF_UNIX plumbing for the ash e2e drivers.
 
     The core no longer listens on a TCP port: vpsessiond binds a filesystem
-    socket at /cores/vpsessiond-<port>.sock (a guest path the host maps into the
-    run's rootfs), and `ash --sock-path` is the single source of truth for where
-    that lands on the host. These helpers turn that path into a connected
-    System.Net.Sockets.Socket / NetworkStream, so no driver re-derives the
-    layout. Dot-source this file to use them.
+    socket at /run/vpsessiond/<port>.sock, a guest path the host mounts a
+    directory of its own at, and `ash --sock-path` is the single source of truth
+    for where that lands on the host - the core writes the same path into its
+    registry file, so the client asks rather than derives. These helpers turn
+    that path into a connected System.Net.Sockets.Socket / NetworkStream, so no
+    driver re-derives the layout. Dot-source this file to use them.
 #>
 
 # The host endpoint for the core on @Port, as printed by `ash --sock-path`.

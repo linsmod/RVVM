@@ -6166,11 +6166,11 @@ static size_t unwrap_path(char* buffer, const char* path, size_t size)
  * AF_UNIX addresses and the guest namespace
  *
  * A pathname AF_UNIX address carries a *guest* path - vpsessiond binds
- * /cores/vpsessiond-7900.sock - and that path is a filesystem name like any
- * other, so it has to go through the same guest->host mapping as every other
- * syscall path. Without it the host would create the socket next to its drive
- * root. Abstract sockets (sun_path[0] == '\0') have no filesystem name and are
- * passed through untouched.
+ * /run/vpsessiond/7900.sock, and the host mounts a directory of its own there - and
+ * that path is a filesystem name like any other, so it has to go through the same
+ * guest->host mapping as every other syscall path. Without it the host would
+ * create the socket next to its drive root. Abstract sockets (sun_path[0] == '\0')
+ * have no filesystem name and are passed through untouched.
  * ============================================================ */
 
 #define UAPI_UNIX_PATH_MAX 108
