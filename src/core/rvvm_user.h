@@ -346,6 +346,30 @@ void rvvm_user_set_prefix(rvvm_machine_t* machine, const char* prefix);
 // paths pass through). The pointer is owned by the machine.
 const char* rvvm_user_get_prefix(rvvm_machine_t* machine);
 
+// root=: the guest directory that becomes "/". NULL, "" or "/" means no chroot,
+// which is the default and what every run did before the argument existed.
+//
+// A GUEST path, composed with the prefix rather than replacing it:
+//
+//     guest /foo  ->  <prefix><root>/foo
+//
+// which is chroot(2)'s arithmetic. Deliberately not a host path: the rootfs sits
+// under the APK's private directory on Android and under the release tree on
+// win32, so a command line naming one would mean a different run on each.
+//
+// Applied by rvvm_user_set_cmdline(); settable on its own by a host that builds
+// a machine without a command line. A relative path is refused (the working
+// directory is wherever the host happened to start), and takes effect only when
+// there is a prefix - with passthrough there is no guest namespace to carve a
+// root out of, and half a chroot would look like a sandbox without being one.
+//
+// Must be called before rvvm_user_linux_ex().
+void rvvm_user_set_guest_root(rvvm_machine_t* machine, const char* root);
+
+// Read back root= in effect (NULL when the guest's / is the rootfs). The pointer
+// is owned by the machine.
+const char* rvvm_user_get_guest_root(rvvm_machine_t* machine);
+
 // --- The machine's command line ---
 //
 // rvvm_set_cmdline() (rvvm.h) records a command line; this records the same
@@ -354,37 +378,10 @@ const char* rvvm_user_get_prefix(rvvm_machine_t* machine);
 //
 // What is applied, and why so little:
 //
-//   root=<path>   NOT applied, and this is a real gap rather than an oversight.
-//                 It is the guest's spelling of "where / is", so applying it is
-//                 what a caller would expect - but the guest's filesystem is
-//                 answered from two places and only one of them is a host path.
-//                 The archive index (vp_shadow, via vp_shadow_lookup) answers
-//                 stat(), getdents64() and every symlink for any name in the
-//                 rootfs, and it knows nothing about a sub-root. Applying root=
-//                 to the host-path branch alone (map_abs_path_ex) was tried and
-//                 measured: with any real bundle present, `root=/sbin` still
-//                 resolved /etc/resolv.conf, because the answer came from the
-//                 index and never reached the prefix.
-//
-//                 A chroot needs three things that do not exist yet, and none
-//                 is a flag: re-rooted lookups at every vp_shadow_lookup() call
-//                 site, enumeration filtering so getdents64() cannot list what
-//                 is above the root, and symlink targets resolved inside it
-//                 (shadow_follow_path / shadow_resolve_parent /
-//                 shadow_link_target). /proc/self/root and /proc/<pid>/root have
-//                 to report the new root too. That is a mount table - see
-//                 path_bypass() for the list it would replace - and it is
-//                 larger than this argument.
-//
-//                 So the argument is kept, stored, and readable with
-//                 rvvm_user_cmdline_arg(machine, "root"). Kept rather than
-//                 refused so that a command line written for a machine with
-//                 mounts is still accepted and visible to the guest, and so the
-//                 day the mount table lands this becomes a one-line change
-//                 rather than a new spelling. Refusing it would also be worse:
-//                 the run would then fail on an argument whose meaning is
-//                 perfectly clear, which is the opposite of what a boot argument
-//                 is for.
+//   root=<path>   APPLIED, by rvvm_user_set_guest_root(): the guest directory
+//                 that becomes "/", composed with the prefix and applied to the
+//                 archive index through the same root. See
+//                 rvvm_user_set_prefix() for the two-layer arrangement.
 //
 //   init=<path>   NOT applied, and cannot be. It names the first program, and
 //                 only a host knows what programs exist - on win32 that is

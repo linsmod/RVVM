@@ -93,6 +93,13 @@ bool vp_shadow_hide(vp_shadow_t* shadow, const char* guest_path);
 bool vp_shadow_unhide(vp_shadow_t* shadow, const char* guest_path);
 void vp_shadow_unhide_all(vp_shadow_t* shadow);
 
+// Hide by entry index rather than by path. For the recursive case: once a
+// directory's index is known, its children are indices too, and a walk that
+// rebuilt a path at each step would have to know which namespace those paths are
+// in - the index's own, which is not the one a caller holding a root= sub-root
+// writes. Indices have no such ambiguity.
+bool vp_shadow_hide_index(vp_shadow_t* shadow, uint32_t idx);
+
 // Persist the "hidden" set to @path (one guest path per line) and load what is
 // already there. With a store set, every hide/unhide rewrites it, so a run that
 // is killed still leaves the deletions recorded. The set is tiny - it only holds
@@ -107,5 +114,69 @@ uint32_t vp_shadow_first_child(const vp_shadow_t* shadow, uint32_t parent);
 // (including the NUL). Returns false when the result would not fit or the path
 // has more components than the index supports (VP_SHADOW_MAX_SEGS).
 bool vp_shadow_normalize(char* out, size_t size, const char* path);
+
+/* The longest guest path the index accepts; the internal buffers are this size,
+ * and a view's own root field is sized by it. */
+#define VP_SHADOW_PATH_MAX 4096
+
+/* --- A sub-root view of an index ---
+ *
+ * root= names a directory inside the rootfs that becomes the guest's "/", and the
+ * index has to be read through that root or the guest walks out of it: an
+ * unprefixed lookup of "/etc/resolv.conf" finds the whole filesystem's
+ * resolv.conf, not the one the root makes reachable. (This was measured - the
+ * first attempt applied root= only where guest paths become host paths, and a
+ * guest chrooted into /sbin still read /etc/resolv.conf, because the answer came
+ * from here and never reached the prefix.)
+ *
+ * A view is that one prefix, applied on the way *into* the index. It adds no
+ * state to the index and does not copy the tree: the index already has
+ * parent/child links and vp_shadow_index(), so a sub-root is a path, not a new
+ * structure. The one thing a view owns is its own copy of the root string.
+ *
+ * Every view function takes a path in the GUEST's namespace - the one where "/"
+ * is the sub-root - and looks it up in the index's own namespace. The reverse
+ * direction (a guest path back out, which nothing needs) is deliberately absent:
+ * an entry's `path` is the index's spelling, and a caller that reached in with
+ * vp_shadow_entry() directly is deliberately opting out of the view.
+ *
+ * vp_shadow_view_path() is the primitive the others are built from, and it is
+ * exported because symlink resolution needs it in the other direction: an
+ * absolute link target is written in the guest's namespace ("/bin/busybox") and
+ * has to be read in the index's ("<root>/bin/busybox"). Same join, same answer.
+ *
+ * @root is an absolute guest path in the index's namespace, or NULL/"" for the
+ * whole index. vp_shadow_view_init() normalizes and copies it, so the caller
+ * does not have to keep the string alive and a view is safely a plain field.
+ */
+typedef struct {
+    vp_shadow_t* shadow;
+    char         root[VP_SHADOW_PATH_MAX];   /* "" = the whole index */
+} vp_shadow_view_t;
+
+void vp_shadow_view_init(vp_shadow_view_t* view, vp_shadow_t* shadow, const char* root);
+
+/* True when this view is the whole index - the case every caller can skip work
+ * for, and the reason an unrooted run pays nothing for the concept. */
+bool vp_shadow_view_is_whole(const vp_shadow_view_t* view);
+
+/* @guest_path (in the guest's namespace) as the index spells it, normalized.
+ * Returns false when the result would not fit, which is a caller bug rather than
+ * a guest-visible error: every caller has a UAPI_PATH_MAX buffer and a path that
+ * came out of the guest, so it fits by construction unless the root is absurd. */
+bool vp_shadow_view_path(const vp_shadow_view_t* view, char* out, size_t size,
+                         const char* guest_path);
+
+const vp_shadow_entry_t* vp_shadow_view_lookup(const vp_shadow_view_t* view,
+                                              const char* guest_path);
+const vp_shadow_entry_t* vp_shadow_view_lookup_raw(const vp_shadow_view_t* view,
+                                                   const char* guest_path);
+uint32_t vp_shadow_view_index(const vp_shadow_view_t* view, const char* guest_path);
+
+/* Hide/unhide through the view. Hiding takes a guest path, because that is what
+ * the guest called unlink() with; the store records the index's spelling, which
+ * is what a later run in the same rootfs needs to recognise it. */
+bool vp_shadow_view_hide(vp_shadow_view_t* view, const char* guest_path);
+bool vp_shadow_view_unhide(vp_shadow_view_t* view, const char* guest_path);
 
 #endif

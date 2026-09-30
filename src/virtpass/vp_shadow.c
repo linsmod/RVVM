@@ -466,6 +466,16 @@ bool vp_shadow_hide(vp_shadow_t* shadow, const char* guest_path)
     return true;
 }
 
+bool vp_shadow_hide_index(vp_shadow_t* shadow, uint32_t idx)
+{
+    if (!shadow || idx >= shadow->count || shadow->entries[idx].hidden) {
+        return false;
+    }
+    shadow->entries[idx].hidden = true;
+    shadow_hidden_store_save(shadow);
+    return true;
+}
+
 bool vp_shadow_unhide(vp_shadow_t* shadow, const char* guest_path)
 {
     uint32_t idx = vp_shadow_index(shadow, guest_path);
@@ -493,4 +503,138 @@ uint32_t vp_shadow_first_child(const vp_shadow_t* shadow, uint32_t parent)
         return VP_SHADOW_NONE;
     }
     return shadow->entries[parent].child;
+}
+
+/* ===================== sub-root views =====================
+ *
+ * Every function here is the plain one plus one prefix, which is the whole of it:
+ * the index already stores absolute guest paths in a hash map, so a sub-root is
+ * a string to put in front of a lookup rather than a second structure to keep in
+ * step. What that buys is that the unrooted case costs nothing - the view is
+ * whole, the join is a copy of the caller's own path, and no call site has to
+ * branch.
+ */
+
+void vp_shadow_view_init(vp_shadow_view_t* view, vp_shadow_t* shadow, const char* root)
+{
+    if (!view) {
+        return;
+    }
+    view->shadow = shadow;
+    view->root[0] = '\0';
+    /* Normalized once, here, because every later call trusts it: a root of "/"
+     * and a root of "" must mean the same thing, and deciding that per lookup
+     * would be one more comparison on the path a stat() took. A root that will
+     * not normalize is dropped rather than refused - a view with no root is the
+     * whole index, which is what a caller that named something unusable gets,
+     * and the command line that asked for it is still readable in
+     * /proc/cmdline rather than becoming a silent narrower namespace. */
+    if (root && root[0] && strcmp(root, "/") != 0) {
+        if (!vp_shadow_normalize(view->root, sizeof(view->root), root)) {
+            view->root[0] = '\0';
+        }
+    }
+}
+
+bool vp_shadow_view_is_whole(const vp_shadow_view_t* view)
+{
+    return !view || !view->shadow || !view->root[0];
+}
+
+bool vp_shadow_view_path(const vp_shadow_view_t* view, char* out, size_t size,
+                         const char* guest_path)
+{
+    char   guest[VP_SHADOW_PATH_MAX];
+    size_t root_len;
+    size_t guest_len;
+    size_t at;
+
+    if (!out || size == 0) {
+        return false;
+    }
+    if (vp_shadow_view_is_whole(view)) {
+        return vp_shadow_normalize(out, size, guest_path);
+    }
+    /* Normalized before the join, not after: a guest path reaching above the
+     * root ("/../etc") has to lose the ".." at the root rather than be clamped
+     * afterwards, and normalizing first is what makes ".." mean what it means
+     * everywhere else in the guest. */
+    if (!vp_shadow_normalize(guest, sizeof(guest), guest_path ? guest_path : "/")) {
+        return false;
+    }
+    root_len  = strlen(view->root);
+    guest_len = strlen(guest);
+    /* One separator, always needed and never doubled: the root is normalized so
+     * it carries no trailing '/', and @guest is absolute so it brings none. */
+    at = root_len + 1 + guest_len;
+    if (at + 1 > size) {
+        return false;
+    }
+    memcpy(out, view->root, root_len);
+    out[root_len] = '/';
+    /* guest + 1 skips the guest path's own leading '/', which the separator above
+     * has just replaced. */
+    memcpy(out + root_len + 1, guest + 1, guest_len);
+    out[at] = '\0';
+    return true;
+}
+
+const vp_shadow_entry_t* vp_shadow_view_lookup_raw(const vp_shadow_view_t* view,
+                                                   const char* guest_path)
+{
+    char path[VP_SHADOW_PATH_MAX];
+
+    if (vp_shadow_view_is_whole(view)) {
+        return vp_shadow_lookup_raw(view ? view->shadow : NULL, guest_path);
+    }
+    if (!vp_shadow_view_path(view, path, sizeof(path), guest_path)) {
+        return NULL;
+    }
+    return vp_shadow_lookup_raw(view->shadow, path);
+}
+
+const vp_shadow_entry_t* vp_shadow_view_lookup(const vp_shadow_view_t* view,
+                                              const char* guest_path)
+{
+    const vp_shadow_entry_t* entry = vp_shadow_view_lookup_raw(view, guest_path);
+    return (entry && !entry->hidden) ? entry : NULL;
+}
+
+uint32_t vp_shadow_view_index(const vp_shadow_view_t* view, const char* guest_path)
+{
+    char path[VP_SHADOW_PATH_MAX];
+
+    if (vp_shadow_view_is_whole(view)) {
+        return vp_shadow_index(view ? view->shadow : NULL, guest_path);
+    }
+    if (!vp_shadow_view_path(view, path, sizeof(path), guest_path)) {
+        return VP_SHADOW_NONE;
+    }
+    return vp_shadow_index(view->shadow, path);
+}
+
+bool vp_shadow_view_hide(vp_shadow_view_t* view, const char* guest_path)
+{
+    char path[VP_SHADOW_PATH_MAX];
+
+    if (vp_shadow_view_is_whole(view)) {
+        return vp_shadow_hide(view ? view->shadow : NULL, guest_path);
+    }
+    if (!vp_shadow_view_path(view, path, sizeof(path), guest_path)) {
+        return false;
+    }
+    return vp_shadow_hide(view->shadow, path);
+}
+
+bool vp_shadow_view_unhide(vp_shadow_view_t* view, const char* guest_path)
+{
+    char path[VP_SHADOW_PATH_MAX];
+
+    if (vp_shadow_view_is_whole(view)) {
+        return vp_shadow_unhide(view ? view->shadow : NULL, guest_path);
+    }
+    if (!vp_shadow_view_path(view, path, sizeof(path), guest_path)) {
+        return false;
+    }
+    return vp_shadow_unhide(view->shadow, path);
 }

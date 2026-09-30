@@ -798,7 +798,8 @@ typedef struct {
 } cmdline_token_t;
 
 /*
- * The token @key names in @cmdline, or NULL.
+ * Find the token @key names in @cmdline. True when there is one, and @out
+ * describes it. False when there is not, and @out is untouched.
  *
  * @key is matched whole and only up to its own length, so looking up "root"
  * does not answer for "rootflags" - the failure a substring match has, and a
@@ -808,15 +809,22 @@ typedef struct {
  * Empty keys are refused. Linux has no use for `=value`, and accepting one would
  * mean every malformed command line answers to the same key, which is a worse
  * answer than none.
+ *
+ * The out-parameter is not stylistic. This first returned `const
+ * cmdline_token_t*` pointing at a local of its own, which gcc reports as
+ * "returns address of local variable" and which at -O2 hands the caller a slot
+ * that has already been reused: every lookup came back NULL, so root= and init=
+ * silently did nothing while /proc/cmdline - which never goes through here -
+ * showed the string arriving perfectly. A struct filled in by the caller cannot
+ * have that problem.
  */
-static const cmdline_token_t* cmdline_find(const char* cmdline, const char* key)
+static bool cmdline_find(const char* cmdline, const char* key, cmdline_token_t* out)
 {
-    cmdline_token_t tok;
-    size_t         key_len;
-    size_t         i = 0;
+    size_t key_len;
+    size_t i = 0;
 
     if (!cmdline || !key || !key[0]) {
-        return NULL;
+        return false;
     }
     key_len = strlen(key);
 
@@ -830,10 +838,10 @@ static const cmdline_token_t* cmdline_find(const char* cmdline, const char* key)
         while (cmdline[i] && cmdline[i] != ' ' && cmdline[i] != '\t') {
             i++;
         }
-        tok.key       = cmdline + start;
-        tok.key_len   = i - start;
-        tok.value     = cmdline + i;
-        tok.has_value = false;
+        out->key       = cmdline + start;
+        out->key_len   = i - start;
+        out->value     = cmdline + i;
+        out->has_value = false;
 
         eq = start;
         while (eq < i && cmdline[eq] != '=') {
@@ -843,13 +851,13 @@ static const cmdline_token_t* cmdline_find(const char* cmdline, const char* key)
          * `init=/sbin/a=b` is a path that happens to contain '='. Only the
          * first one at or before the token's end can start the value. */
         if (eq > start) {
-            tok.has_value = (eq < i);
-            if (tok.has_value) {
-                tok.value    = cmdline + eq + 1;
-                tok.key_len  = eq - start;
+            out->has_value = (eq < i);
+            if (out->has_value) {
+                out->value   = cmdline + eq + 1;
+                out->key_len = eq - start;
             }
-            if (tok.key_len == key_len && !strncmp(tok.key, key, key_len)) {
-                return &tok;
+            if (out->key_len == key_len && !strncmp(out->key, key, key_len)) {
+                return true;
             }
         }
 
@@ -857,21 +865,25 @@ static const cmdline_token_t* cmdline_find(const char* cmdline, const char* key)
             i++;
         }
     }
-    return NULL;
+    return false;
 }
 
 const char* rvvm_cmdline_get(const char* cmdline, const char* key)
 {
-    const cmdline_token_t* tok = cmdline_find(cmdline, key);
+    cmdline_token_t tok;
     /* NULL for a bare flag rather than "": `debug` has no value, and a caller
      * handed "" could not tell it from `debug=`. Ask rvvm_cmdline_has() for the
      * flag case. */
-    return (tok && tok->has_value) ? tok->value : NULL;
+    if (!cmdline_find(cmdline, key, &tok) || !tok.has_value) {
+        return NULL;
+    }
+    return tok.value;
 }
 
 bool rvvm_cmdline_has(const char* cmdline, const char* key)
 {
-    return cmdline_find(cmdline, key) != NULL;
+    cmdline_token_t tok;
+    return cmdline_find(cmdline, key, &tok);
 }
 
 void rvvm_apply_cmdline_logging(const char* cmdline)

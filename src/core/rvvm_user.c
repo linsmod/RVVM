@@ -1645,6 +1645,12 @@ typedef struct rvvm_userland {
     const char*              prefix_path;
     // Prefix set through rvvm_user_set_prefix(): the string is owned here
     char*                    prefix_owned;
+    // root= from the command line: the guest directory that becomes "/", NULL
+    // when the guest's / is the rootfs. Kept apart from prefix_path because they
+    // are different things - this one is a guest path, that one a host path - and
+    // the two compose rather than replace each other. Owned here; the shadow view
+    // keeps its own normalized copy. See rvvm_user_set_guest_root().
+    char*                      guest_root_path;
     bool                     fake_root;
     // Guest credentials. fake_uid/fake_gid are the *real* (saved) ids and are
     // what stat() reports as the file owner; the e* twins are what the guest
@@ -1683,7 +1689,16 @@ typedef struct rvvm_userland {
     // materializes the regular files into prefix_path and hands the index over
     // here; what the host directory cannot express - symlinks above all - is
     // answered from it. NULL when the host mounts no archive.
+    //
+    // shadow is the index itself, kept for the things that are not a lookup:
+    // the NULL test, and vp_shadow_first_child() (which walks an index, not a
+    // path, and so is already inside whatever root the view chose).
     vp_shadow_t*             shadow;
+    // The same index seen through root=, and what every path lookup goes through.
+    // Rebuilt whenever the index or the root changes - one pointer and one path -
+    // which is cheaper than keeping a second copy of the root in step by hand,
+    // and cannot get out of step.
+    vp_shadow_view_t          shadow_view;
     // Real host directory fds whose listing must also carry the shadow's links.
     rvvm_shadow_dir_t        shadow_dirs[RVVM_SHADOW_DIR_MAX];
 
@@ -3756,6 +3771,8 @@ PUBLIC const char* rvvm_user_get_prefix(rvvm_machine_t* machine)
 
 PUBLIC void rvvm_user_set_cmdline(rvvm_machine_t* machine, const char* str)
 {
+    const char* root;
+
     if (!machine) {
         return;
     }
@@ -3763,6 +3780,12 @@ PUBLIC void rvvm_user_set_cmdline(rvvm_machine_t* machine, const char* str)
      * /proc/cmdline have to come from the same call, or a kernel guest and a
      * userland guest on this machine disagree about what it was booted with. */
     rvvm_set_cmdline(machine, str ? str : "");
+
+    /* Only root=. See the header for why init= is not here: it names the first
+     * program, and that is a question about what this host installed, which the
+     * core cannot answer. */
+    root = rvvm_cmdline_get(machine->cmdline, "root");
+    rvvm_user_set_guest_root(machine, root);
 }
 
 PUBLIC const char* rvvm_user_get_cmdline(rvvm_machine_t* machine)
@@ -3795,10 +3818,95 @@ PUBLIC void rvvm_user_set_shadow(rvvm_machine_t* machine, vp_shadow_t* shadow)
     rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
     if (ctx) {
         ctx->shadow = shadow;
+        /* The view holds the index pointer as well as the root, so a new index
+         * means a new view even when the root did not change. */
+        vp_shadow_view_init(&ctx->shadow_view, shadow, ctx->guest_root_path);
         /* A new index is a new namespace: any directory replay from a previous
          * one would list names that no longer exist. */
         memset(ctx->shadow_dirs, 0, sizeof(ctx->shadow_dirs));
     }
+}
+
+/*
+ * root=: the guest directory that becomes "/".
+ *
+ * NOT the hostfs base. Those are two different things and conflating them is
+ * what this used to do - root= went straight into rvvm_user_set_prefix(), so a
+ * boot argument named a host directory, and the same command line meant
+ * different runs on two machines because the rootfs sits under the APK's private
+ * directory on Android and under the release tree on win32. A boot argument that
+ * is not portable is not a boot argument.
+ *
+ * So root= is a path in the guest's own namespace, and it composes with the
+ * prefix instead of replacing it:
+ *
+ *     guest /foo  ->  <prefix><root>/foo
+ *
+ * which is what chroot(2) does. On the index side it is the same idea from the
+ * other end: every lookup goes through ctx->shadow_view, which prepends the root
+ * before asking the index. Both halves are needed and neither is sufficient -
+ * applying only the prefix half was measured and a guest chrooted into /sbin
+ * still read /etc/resolv.conf, because the answer came from the index.
+ *
+ * Accepted forms, and nothing else:
+ *
+ *   absent, "", "/"   no chroot. The guest's "/" is the rootfs, which is what a
+ *                     boot without root= means and what every run here did
+ *                     before this argument existed.
+ *   "/some/path"      that directory, relative to the prefix.
+ *
+ * A relative path is refused rather than resolved against the process's cwd:
+ * cwd is wherever the host happened to be started, so `root=runtime/rootfs` and
+ * `root=/runtime/rootfs` would be two different machines' roots on the same
+ * build. An unusable root= is worse than none - it would chroot the run into
+ * somewhere empty and every failure afterwards would be about the wrong thing.
+ *
+ * Only takes effect when there is a prefix, because that is the only case where
+ * the guest's namespace is a namespace. With prefix == NULL the guest's paths
+ * ARE host paths (see path_bypass()), and chrooting them would move /foo while
+ * /proc, /dev and /sys stayed put - half a chroot, which is worse than none
+ * because it looks like a sandbox.
+ */
+PUBLIC void rvvm_user_set_guest_root(rvvm_machine_t* machine, const char* root)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    char             normalized[VP_SHADOW_PATH_MAX];
+
+    if (!ctx) {
+        return;
+    }
+    /* Reset first, so a refused root leaves the whole index visible rather than
+     * the previous root - a run whose second root= was rejected should not be
+     * left in the first one's subtree by accident. */
+    safe_free(ctx->guest_root_path);
+    ctx->guest_root_path = NULL;
+
+    if (root && root[0] && !(root[0] == '/' && root[1] == '\0')) {
+        if (root[0] != '/') {
+            rvvm_warn("root=%s is not an absolute path; ignoring it (the guest's / "
+                      "stays the rootfs)", root);
+        } else if (!vp_shadow_normalize(normalized, sizeof(normalized), root)) {
+            rvvm_warn("root=%s is not a usable path; ignoring it", root);
+        } else {
+            /* Normalized before it is stored, so every later comparison against
+             * it - and the view's own copy - is against one spelling. Copied
+             * rather than pointed at, because `normalized` is this frame's. */
+            size_t n = strlen(normalized) + 1;
+            char*  copy = safe_malloc(n);
+            memcpy(copy, normalized, n);
+            ctx->guest_root_path = copy;
+        }
+    }
+    /* Rebuilt even when nothing changed: this is the one place the view and the
+     * root can disagree, and there is no second path by which they are kept in
+     * step. */
+    vp_shadow_view_init(&ctx->shadow_view, ctx->shadow, ctx->guest_root_path);
+}
+
+PUBLIC const char* rvvm_user_get_guest_root(rvvm_machine_t* machine)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    return ctx ? ctx->guest_root_path : NULL;
 }
 
 static bool proc_mem_readable(const void* addr, size_t size)
@@ -3974,7 +4082,7 @@ static bool path_bypass(const char* path)
              * created under it) has no entry of its own, and asking about it
              * would send that very open() to the host. */
             return uctx()->shadow == NULL ||
-                   vp_shadow_lookup(uctx()->shadow, dirs[i]) == NULL;
+                   vp_shadow_view_lookup(&uctx()->shadow_view, dirs[i]) == NULL;
         }
     }
     return false;
@@ -4065,21 +4173,33 @@ static bool shadow_link_target(char* out, size_t size, const char* link_path, co
  * which is the common case, and the signal to leave the path alone. */
 static bool shadow_follow_path(char* out, size_t size, const char* abs)
 {
-    vp_shadow_t* shadow = uctx()->shadow;
+    vp_shadow_view_t* view = &uctx()->shadow_view;
     char current[UAPI_PATH_MAX];
     size_t len = rvvm_strlen(abs);
     bool touched = false;
 
-    if (!shadow || len >= sizeof(current)) {
+    if (!view->shadow || len >= sizeof(current)) {
         return false;
     }
     memcpy(current, abs, len + 1);
 
-    for (int hop = 0; hop < RVVM_SHADOW_MAX_FOLLOW; ++hop) {
-        const vp_shadow_entry_t* entry = vp_shadow_lookup(shadow, current);
+for (int hop = 0; hop < RVVM_SHADOW_MAX_FOLLOW; ++hop) {
+        const vp_shadow_entry_t* entry = vp_shadow_view_lookup(view, current);
         if (!entry || entry->kind != VP_SHADOW_LINK || !entry->target || !*entry->target) {
             break;
         }
+        /* shadow_link_target() keeps @current in the GUEST's namespace, and so
+         * does the next hop's lookup - the view prepends the root, not this
+         * string. That is why an absolute target needs no help here: a link
+         * recorded as "/bin/busybox" becomes the view's "<root>/bin/busybox",
+         * which is exactly what "an absolute symlink, read from inside the root"
+         * means. Prepending the root to @current as well would apply it twice
+         * and send the guest to <root>/<root>/bin/busybox.
+         *
+         * @out is likewise in the guest's namespace, because it goes on to
+         * map_abs_path_ex(), which prepends the root for the host half. Each of
+         * the two halves wants the guest's spelling - which is the whole reason
+         * the root lives in the view rather than in the path strings. */
         if (!shadow_link_target(current, sizeof(current), current, entry->target)) {
             break; // too long to resolve: let the host syscall report it
         }
@@ -4176,7 +4296,7 @@ static bool stat_apply_shadow_mode(const char* abs, struct stat* st)
     if (!uctx()->shadow || !abs) {
         return false;
     }
-    entry = vp_shadow_lookup(uctx()->shadow, abs);
+    entry = vp_shadow_view_lookup(&uctx()->shadow_view, abs);
     if (!entry || entry->hidden) {
         return false;
     }
@@ -4188,31 +4308,29 @@ static bool stat_apply_shadow_mode(const char* abs, struct stat* st)
     return true;
 }
 
-/* Hide @abs and, when it is an archive directory, everything under it: the host
+/* Hide @index and, when it is an archive directory, everything under it: the host
  * rmdir removed a real (empty) directory, and the index must stop reporting the
- * names it held. */
-static void shadow_hide_tree(const char* abs)
+ * names it held.
+ *
+ * Takes an index rather than a path, which is what makes the recursion below
+ * honest: a child's index is a child of its parent's index, so the walk never
+ * builds a path string and never has to know which namespace a path would be in.
+ * That matters because the caller got here from a guest path, root= may have
+ * translated it, and the two spellings differ - a walk that rebuilt paths from
+ * vp_shadow_entry()->path and fed them back through a root= view would apply the
+ * root twice. */
+static void shadow_hide_tree(uint32_t index)
 {
     vp_shadow_t* shadow = uctx()->shadow;
-    uint32_t index;
 
-    if (!shadow || !vp_shadow_hide(shadow, abs)) {
+    if (!shadow || index == VP_SHADOW_NONE || !vp_shadow_hide_index(shadow, index)) {
         return;
     }
-    index = vp_shadow_index(shadow, abs);
-    if (index != VP_SHADOW_NONE) {
-        for (uint32_t child = vp_shadow_first_child(shadow, index); child != VP_SHADOW_NONE;
-             child = vp_shadow_entry(shadow, child)->next) {
-            /* Recursing through the public API keeps this a tree walk of the
-             * index rather than of a path string. */
-            char path[UAPI_PATH_MAX];
-            const vp_shadow_entry_t* entry = vp_shadow_entry(shadow, child);
-            size_t len = rvvm_strlen(entry->path);
-            if (len + 1 <= sizeof(path)) {
-                memcpy(path, entry->path, len + 1);
-                shadow_hide_tree(path);
-            }
-        }
+    for (uint32_t child = vp_shadow_first_child(shadow, index); child != VP_SHADOW_NONE;
+         child = vp_shadow_entry(shadow, child)->next) {
+        /* Recursing through the public API keeps this a tree walk of the index
+         * rather than of a path string. */
+        shadow_hide_tree(child);
     }
 }
 
@@ -4277,6 +4395,30 @@ static const char* map_abs_path_ex(char* buffer, const char* path, bool follow_f
                 path = followed;
             }
             prefix_len = rvvm_strlcpy(buffer, prefix, UAPI_PATH_MAX);
+            /* root= composes with the prefix rather than replacing it: this is
+             * "<prefix><guest_root><path>", which is chroot(2)'s arithmetic. The
+             * prefix keeps meaning one thing - where the rootfs is on the host -
+             * and root= says which part of it this run calls "/", so
+             * root=/data/app/foo means the same thing on a phone and on a PC.
+             *
+             * The same root the shadow view applies to its half, and reached
+             * through ctx->guest_root_path rather than through the view: this
+             * buffer is a HOST path and the view's value is an index-namespace
+             * guest path, which happen to be the same string today and must not
+             * be assumed to be - a view could be given a root the host half has
+             * never heard of, and the other way round.
+             *
+             * Not applied to a path_bypass() name: /proc, /dev and /sys are
+             * resolved before this point (the check is above), and prefixing them
+             * would produce <prefix>/data/app/foo/proc, which is a directory
+             * nobody made. Replacing that list with real mounts is the remaining
+             * half of this work - see path_bypass(). */
+            if (uctx()->guest_root_path) {
+                size_t root_len = rvvm_strlcpy(buffer + prefix_len,
+                                               uctx()->guest_root_path,
+                                               UAPI_PATH_MAX - prefix_len);
+                prefix_len += root_len;
+            }
             /* "/" is the prefix directory itself. Appending it would leave a
              * trailing separator, which the host's stat()/open() may refuse
              * (MinGW is strict about this, and "cd .." lands exactly here). */
@@ -4798,7 +4940,7 @@ static void shadow_dir_track(int fd, const char* abs)
     if (fd <= 0 || !ctx->shadow || !abs || abs[0] != '/') {
         return;
     }
-    index = vp_shadow_index(ctx->shadow, abs);
+    index = vp_shadow_view_index(&ctx->shadow_view, abs);
     if (index == VP_SHADOW_NONE || !shadow_dir_has_links(index)) {
         return;
     }
@@ -7160,6 +7302,14 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
         memcpy(ctx->prefix_owned, parent->prefix_path, len);
         ctx->prefix_path = ctx->prefix_owned;
     }
+    /* root= is copied for the same reason and because it has to be: a session's
+     * shell forks, and a fork that lost the chroot would be a program running
+     * outside the root its run was given - which for a per-app root= is the whole
+     * isolation, gone in the child. Copied through the setter so the child's view
+     * is rebuilt from the same normalized string this one holds. */
+    if (parent->guest_root_path) {
+        rvvm_user_set_guest_root(machine, parent->guest_root_path);
+    }
     rvvm_strlcpy(ctx->cwd, parent->cwd, sizeof(ctx->cwd));
 
     /* The same asset mount: the ops are the host's and outlive any run. The
@@ -7171,6 +7321,18 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
      * parent for now: the emulator's fork copies the address space, and the two
      * keep seeing one namespace. */
     ctx->shadow = parent->shadow;
+    /* The view too, and unconditionally. Copying only the index pointer leaves
+     * the child's shadow_view.shadow NULL, and shadow_follow_path() reads the
+     * view - so every forked child stopped resolving symlinks and /bin/sh came
+     * back ENOENT from execve() while the parent, still whole, was fine. It
+     * looked like a root= problem because that is where the view is otherwise
+     * rebuilt, and it only showed up in a run whose guest forks: vpsessiond's
+     * system() is the first thing in the tree that does.
+     *
+     * Rebuilt from the parent's ROOT rather than copied, so there is one place
+     * that decides what a view is - and the root is copied just after, which is
+     * why the order here is view first. */
+    vp_shadow_view_init(&ctx->shadow_view, ctx->shadow, parent->guest_root_path);
 
     /* Console output goes through the same sink, so a child's writes reach the
      * console its parent was started on. Its bytes are not parsed into the
@@ -8701,7 +8863,7 @@ static rvvm_addr_t rvvm_sys_readlinkat(int dirfd, const char* pathname, char* bu
     if (buffer && uctx()->shadow && pathname &&
         (pathname[0] == '/' || dirfd == UAPI_AT_FDCWD) &&
         guest_path_absolutize(abs, sizeof(abs), pathname)) {
-        const vp_shadow_entry_t* entry = vp_shadow_lookup(uctx()->shadow, abs);
+        const vp_shadow_entry_t* entry = vp_shadow_view_lookup(&uctx()->shadow_view, abs);
         if (entry) {
             size_t len;
             if (entry->kind != VP_SHADOW_LINK || !entry->target) {
@@ -13255,18 +13417,20 @@ static void* rvvm_user_thread_wrap(void* arg)
                                           wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false), a2);
                     a0 = errno_ret(unlink_ret);
                     if (have_unlink_abs && uctx()->shadow) {
-                        if (a0 == -UAPI_ENOENT && vp_shadow_lookup(uctx()->shadow, unlink_abs)) {
+                        uint32_t unlink_index =
+                            vp_shadow_view_index(&uctx()->shadow_view, unlink_abs);
+                        if (a0 == -UAPI_ENOENT && unlink_index != VP_SHADOW_NONE) {
                             /* The index knows this name but the host has no file
                              * for it: the guest just unlinked an archive-only
                              * entry, a symlink above all. The host seeing
                              * nothing to remove is expected - recording the
                              * hidden flag *is* the unlink, and it succeeds. */
-                            shadow_hide_tree(unlink_abs);
+                            shadow_hide_tree(unlink_index);
                             a0 = 0;
                         } else if (unlink_ret == 0) {
                             /* A materialized entry was removed from this run's
                              * own copy; the index must stop reporting it too. */
-                            shadow_hide_tree(unlink_abs);
+                            shadow_hide_tree(unlink_index);
                         }
                     }
                     break;
@@ -14070,7 +14234,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     if (uctx()->shadow && (a3 & AT_SYMLINK_NOFOLLOW) && path &&
                         (path[0] == '/' || (int)a0 == UAPI_AT_FDCWD) &&
                         guest_path_absolutize(abs, sizeof(abs), path)) {
-                        const vp_shadow_entry_t* entry = vp_shadow_lookup(uctx()->shadow, abs);
+                        const vp_shadow_entry_t* entry = vp_shadow_view_lookup(&uctx()->shadow_view, abs);
                         if (entry && entry->kind == VP_SHADOW_LINK) {
                             shadow_fill_stat(&st, entry);
                             a0 = 0;
@@ -16338,6 +16502,11 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
      * need an absolute string, and neither can tell that this one was assigned
      * without ever going through it. */
     rvvm_user_set_prefix(machine, USERLAND_DEFAULT_PREFIX);
+    /* And the view, so a machine is never briefly holding an index it will not
+     * read through. No root yet - this is the whole filesystem - so this is the
+     * same as not having called it, and it exists so there is exactly one place
+     * that decides what the view is. */
+    vp_shadow_view_init(&ctx->shadow_view, NULL, NULL);
     return machine;
 }
 
@@ -16486,6 +16655,7 @@ static void userland_destroy(rvvm_machine_t* machine)
     }
     machine->userdata = NULL;
     safe_free(ctx->prefix_owned);
+    safe_free(ctx->guest_root_path);
     /* The timer thread holds a pointer to this context, so it is joined before
      * anything below is released. */
     userland_itimer_stop(ctx);

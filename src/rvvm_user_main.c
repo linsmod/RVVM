@@ -279,5 +279,8 @@ int main(int argc, char** argv, char** envp)
     fprintf(stderr, "rvvm_user: prefix %s\n",
             rvvm_user_get_prefix(machine) ? rvvm_user_get_prefix(machine)
                                           : "(passthrough)");
+    fprintf(stderr, "rvvm_user: guest root %s\n",
+            rvvm_user_get_guest_root(machine) ? rvvm_user_get_guest_root(machine)
+                                              : "(none)");
     return rvvm_user_linux_ex(machine, guest_argc, guest_argv, envp);
 }
