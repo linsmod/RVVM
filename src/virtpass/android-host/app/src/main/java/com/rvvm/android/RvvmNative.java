@@ -376,6 +376,70 @@ public class RvvmNative {
     /** Stop the listener and drop every client. */
     public static native void nativeConsoleStop();
 
+    /* --- Driving a core: one machine, one session per client ---
+     *
+     * A console is one machine with one keyboard, so a second client used to
+     * type into the same line discipline and the two crossed. Its own machine per
+     * client does not help either: separate machines are separate /proc, so no
+     * session's ps would name another's processes.
+     *
+     * A core is one machine and a terminal each. A session is a pty out of that
+     * machine's pool and the guest forks a shell onto it - ordinary guest
+     * behaviour, which is why the sessions appear in one ps. The host holds the
+     * master end, the guest the slave, and the console protocol is untouched.
+     *
+     * The fork itself is idle's (guest-samples/idle.c), booted as the run root so
+     * the machine outlives every client. It is told which pty carries the
+     * requests; these calls create the ptys and write the requests. */
+
+    /**
+     * Say that the next run to start is a core.
+     *
+     * <p>A flag rather than an argument because the control terminal cannot be
+     * asked for beforehand: it belongs to a machine, and the machine is created by
+     * the run's start. The guest opens that terminal as its first act, so it has
+     * to exist before the guest thread does - which is the one moment the run's
+     * start is in a position to make it, and the reason this cannot be a value
+     * handed in from here.</p>
+     */
+    public static native void nativeArmCore();
+
+    /**
+     * The control terminal's path, for the core's own {@code --control} argument.
+     * Valid once the run has started; null before, because there is no machine to
+     * own a terminal yet.
+     */
+    public static native String nativeCoreControlPty(int guestId);
+
+    /**
+     * A session's terminal, by its path, already sized.
+     *
+     * <p>Sized here rather than at spawn time, because the shell's first prompt is
+     * laid out against it - a terminal sized after the shell is running costs a
+     * full-screen program a wrong frame.</p>
+     *
+     * @return the path ({@code /dev/pts/N}), or null when no terminal is available
+     */
+    public static native String nativeCoreSessionPty(int guestId, int rows, int cols);
+
+    /**
+     * Ask the core to fork a shell onto {@code path}. The terminal exists and is
+     * sized; this is only the request, so returning true means "asked", not
+     * "started" - nothing runs there until the guest has read it.
+     */
+    public static native boolean nativeCoreSessionSpawn(int guestId, String path,
+                                                       int rows, int cols);
+
+    /** Tell a session's terminal it has been resized. */
+    public static native boolean nativeCoreSessionResize(int guestId, String path,
+                                                        int rows, int cols);
+
+    /**
+     * Give the terminal back. Closing its master end is the hangup, so a shell
+     * still reading it sees EIO - what closing a terminal window does.
+     */
+    public static native void nativeCoreSessionRelease(int guestId, String path);
+
     /**
      * Register (or with null, clear) the console's "a client is here" listener.
      *

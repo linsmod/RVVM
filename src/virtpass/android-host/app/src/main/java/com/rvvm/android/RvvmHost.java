@@ -181,6 +181,63 @@ public final class RvvmHost extends Application {
         return initialized;
     }
 
+    /* ==================================================================
+     * The core: one machine, one session per client
+     * ==================================================================
+     *
+     * This is the Application because the machine is a process-wide thing, not a
+     * property of whichever Activity happens to be in front. A run's machine is
+     * created once (rvvm_user_create() per run) and torn down by on_guest_exit
+     * the moment its root process returns - so a core needs a root that does not
+     * return, and that decision belongs here rather than in an Activity that a
+     * client could navigate away from mid-session.
+     *
+     * It also matters for the path. A core's root is /sbin/idle, a *system*
+     * program: it has no manifest and no per-id directory, so it is not in the
+     * apps archive and nativeAppEntryPath() cannot name it. Resolving it here,
+     * where the guest layout is a host-level fact, is what lets the Activity
+     * layer keep resolving an app by name and nothing else. */
+
+    /** The run root for a core: holds the machine open and spawns the sessions.
+     *  A system program, so a guest path rather than an app id. */
+    public static final String CORE_ROOT = "/sbin/idle";
+
+    /** The shell each session runs. */
+    private String sessionShell = "/bin/sh";
+
+    /** The control terminal's path, once the core is up. Null until then. */
+    private String controlPty;
+
+    /** The shell each session runs. */
+    public synchronized void setSessionShell(String path) {
+        if (path != null && !path.isEmpty()) {
+            this.sessionShell = path;
+        }
+    }
+
+    /** Record the core's control terminal, once its run has started.
+     *
+     *  <p>Not something the host can ask for beforehand: a terminal belongs to a
+     *  machine, and the machine is created by the run's start. So the run makes it
+     *  and tells us, and from here on this is what session requests go into.</p> */
+    public synchronized void noteControlPty(String path) {
+        if (path != null && !path.isEmpty()) {
+            this.controlPty = path;
+        }
+    }
+
+    /** The control terminal's path, or null when no core is up. */
+    public synchronized String getControlPty() {
+        return controlPty;
+    }
+
+    /** The shell each session runs. A session is a terminal with this shell forked
+     *  onto it, so this is the one piece of a session that is a host's choice
+     *  rather than the core's. */
+    public synchronized String getSessionShell() {
+        return sessionShell;
+    }
+
     /** Pin the guest panel before any guest can observe its geometry. */
     public synchronized void setPanelSize(int width, int height) {
         if (width <= 0 || height <= 0) {

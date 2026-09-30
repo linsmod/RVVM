@@ -7,12 +7,14 @@ the host installs it by extracting the archive as a layer - no copy logic, and
 the guest names it like any other program:
 
     sbin/vpsessiond
+    sbin/idle
 
 SYSTEM_PROGRAMS below is the single place a system program is declared: adding
 one here is the whole change. tools/pack_apps.py is pointed at this archive
 (--exclude-from) and skips every name it holds, so a system program is never
 also packed as an app. The session server's guest path must match
-VP_GUEST_SESSIOND in src/virtpass/vp_rootfs.h.
+VP_GUEST_SESSIOND in src/virtpass/vp_rootfs.h, and the idle core's must match
+VP_GUEST_IDLE.
 
 The archive is built deterministically - zero mtime, no owner, gzip mtime 0 -
 so repacking an unchanged set produces the same bytes.
@@ -34,6 +36,7 @@ import tarfile
 # relative - the archive's root is the guest's `/`.
 SYSTEM_PROGRAMS = [
     ("vpsessiond", "sbin/vpsessiond"),
+    ("idle", "sbin/idle"),
 ]
 
 # (guest path, content, mode). Small config files layered over the rootfs -

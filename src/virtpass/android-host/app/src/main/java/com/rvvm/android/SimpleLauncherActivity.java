@@ -48,6 +48,10 @@ public class SimpleLauncherActivity extends Activity {
     private String pendingApp;
     private String pendingArgvB64;
     private boolean pendingLaunched;
+    /** A core's run root, named by guest path rather than app name: /sbin/idle is
+     *  a system program, so the app-name lookup cannot reach it. */
+    private String pendingPath;
+    private boolean pendingCore;
     /** Whether any client is on the socket, so a later arming can answer an
      *  attach that has already happened instead of waiting for a second one. */
     private boolean clientAttached;
@@ -213,10 +217,19 @@ public class SimpleLauncherActivity extends Activity {
         if (intent == null || !intent.getBooleanExtra(GuestActivity.EXTRA_CONSOLE, false)) {
             return;
         }
-        String app = intent.getStringExtra(GuestActivity.EXTRA_APP_NAME);
-        if (app == null || app.isEmpty()) {
-            return;
+        /* A core names its root by guest path, not by app name: /sbin/idle is a
+         * system program with no manifest, so the app-name lookup cannot reach it
+         * and there is no app id to look up. The Application owns that decision
+         * (see RvvmHost); this is only the pass-through. */
+        String path = intent.getStringExtra(GuestActivity.EXTRA_GUEST_PATH);
+        String app  = intent.getStringExtra(GuestActivity.EXTRA_APP_NAME);
+        if (path == null || path.isEmpty()) {
+            if (app == null || app.isEmpty()) {
+                return;
+            }
         }
+        pendingPath      = path;
+        pendingCore      = intent.getBooleanExtra(GuestActivity.EXTRA_CORE, false);
         pendingApp       = app;
         pendingArgvB64   = intent.getStringExtra(GuestActivity.EXTRA_GUEST_ARGS_B64);
         pendingLaunched  = false;
@@ -228,9 +241,9 @@ public class SimpleLauncherActivity extends Activity {
          * waits for a READY that nothing is going to send.
          *
          * So the arming answers an attach that already happened, rather than
-         * only watching for the next one. Checking pendingApp is what makes it
-         * safe: a client that has not attached yet leaves it set, and the
-         * arriving client takes this path as before. */
+         * only watching for the next one. Checking the pending name is what
+         * makes it safe: a client that has not attached yet leaves it set, and
+         * the arriving client takes this path as before. */
         if (clientAttached) {
             onConsoleClient();
         } else {
@@ -258,20 +271,29 @@ public class SimpleLauncherActivity extends Activity {
          * was armed the run that starts. */
         final String app = pendingApp;
         final String argvB64 = pendingArgvB64;
+        final String path = pendingPath;
+        final boolean core = pendingCore;
         mainHandler.post(() -> {
             if (pendingLaunched) {
                 return;
             }
             pendingLaunched = true;
             pendingApp = null;
-            if (app == null) {
+            pendingPath = null;
+            if (app == null && path == null) {
                 return;
             }
             Intent intent = new Intent(this, GuestActivity.class);
-            intent.setAction(app);
+            intent.setAction(app != null ? app : path);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT
                     | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
-            intent.putExtra(GuestActivity.EXTRA_APP_NAME, app);
+            if (app != null) {
+                intent.putExtra(GuestActivity.EXTRA_APP_NAME, app);
+            }
+            if (path != null) {
+                intent.putExtra(GuestActivity.EXTRA_GUEST_PATH, path);
+                intent.putExtra(GuestActivity.EXTRA_CORE, core);
+            }
             if (argvB64 != null && !argvB64.isEmpty()) {
                 intent.putExtra(GuestActivity.EXTRA_GUEST_ARGS_B64, argvB64);
             }

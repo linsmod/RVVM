@@ -104,6 +104,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <sys/resource.h> // getrusage()
 #include <grp.h>          // setgroups()
 
+// Host-driven sessions (rvvm_session_pty_* below) make a *real* pty for the host
+// to drive, so the host side needs the terminal vocabulary rather than the
+// guest's simulated one: grantpt/unlockpt/ptsname for the pair, termios for the
+// window size, and stdlib for posix_openpt. Absent on Windows, which is why the
+// whole block is behind __linux__ - there a session is built the other way round
+// (see the pty section's note on /dev).
+#if defined(__linux__)
+#include <stdlib.h>      // posix_openpt()
+#include <termios.h>      // struct winsize, tc*attr()
+#endif
+
 // Event notification: native epoll on Linux, emulated over poll() on win32
 // (see src/win/posix_shim.c)
 #if defined(__linux__) || defined(_WIN32)
@@ -9827,6 +9838,45 @@ static bool guest_dev_device(char* abs, size_t size, const char* path)
            !strcmp(abs, "/dev/null")    || !strcmp(abs, "/dev/zero");
 }
 
+/* A host-made terminal pair: the host drives one end, a guest process is given
+ * the other.
+ *
+ * Defined up here rather than with the pair-making code below, because the
+ * device table below is answered earlier and has to hand back one of these'
+ * slave ends - which needs the whole struct, not a pointer to a forward
+ * declaration.
+ *
+ * `master` and `slave` are what they are on the host: a real descriptor pair
+ * where there is a kernel pty, and numbers in the machine's own table on Windows,
+ * which has no /dev at all. A session means the same thing either way - a
+ * terminal a host can drive and a guest can claim - which is why one set of entry
+ * points covers both and a host need not know which kind it got. */
+struct rvvm_host_pty {
+    int  master;                    /* the host's end: write to type, read for output */
+    int  slave;                     /* what a guest is handed */
+    int  rows;
+    int  cols;
+    /* The pid of the process the slave was given to, or 0. Kept so a resize can
+     * find it again, and so the pair can be recognised as spent. */
+    int32_t pid;
+#if defined(_WIN32)
+    /* Which pair, and the context that owns the table.
+     *
+     * The simulated table is the machine's, not the host's, and reading a pair
+     * resolves the calling process through that machine's context - which a host
+     * thread has none of. Both are therefore kept here, so the entry points need
+     * not be handed a machine to work out what they already know. */
+    uint32_t              index;
+    struct userland_pty*  pty;
+    rvvm_userland_t*      ctx;
+#endif
+};
+
+/* Where a session's own terminals are looked up when a guest opens /dev/pts/N.
+ * Defined with the pair-making code further down; declared here because the
+ * device table is answered long before that. */
+static struct rvvm_host_pty* vps_lookup(uint32_t index);
+
 /* openat() on one of them, in host errno terms (the dispatch converts). */
 static int userland_dev_open(const char* abs, int flags)
 {
@@ -9843,6 +9893,67 @@ static int userland_dev_open(const char* abs, int flags)
                 break;
             }
         }
+#if !defined(_WIN32)
+        /* A number this host handed out for a session answers with that
+         * session's own terminal, not with the core's simulated pair.
+         *
+         * The two are different objects, and on a host with a kernel pty the
+         * simulated one is nothing anybody holds: it exists so a *guest* can make
+         * a terminal, which is a different job from the host making one. So the
+         * number a host gave a guest, and the number the guest opens, have to
+         * mean the same terminal - otherwise the guest is told to open a
+         * /dev/pts/N that is not there, and reports ENOENT for a terminal that
+         * plainly exists.
+         *
+         * The slave end is returned as it is, and the caller's fd table files it
+         * as an ordinary host descriptor: read, write and ioctl then reach the
+         * real pty through the existing routing (see userland_read_fd, where a
+         * descriptor that is neither a /proc record nor a simulated pair nor the
+         * console falls through to the host's own read). Nothing else has to
+         * change, and the guest's TIOCSCTTY, its line discipline and its ^C are
+         * the kernel's rather than a reimplementation of them.
+         *
+         * A number nobody registered falls through to the simulated pair below,
+         * which is what a guest making its own terminal gets - unchanged. */
+        struct rvvm_host_pty* hp = vps_lookup((uint32_t)index);
+        if (hp) {
+#if defined(_WIN32)
+            /* The pair is this machine's own simulated one - there is no other on
+             * a host with no /dev - and its ends are numbers in the machine's
+             * table, not host descriptors. So the number is handed over as it is,
+             * which is exactly what a guest opening /dev/pts/N gets anyway: a
+             * second descriptor on the same pair, which is what
+             * userland_pty_open_slave() is for. close(2) on it releases that
+             * reference and nothing else, so the host's own end is untouched.
+             *
+             * dup() would be wrong here: it would hand the CRT a number out of a
+             * range it never allocated. */
+            return userland_pty_open_slave((uint32_t)index);
+#else
+            /* A *new* descriptor every time, as open(2) promises: two opens of
+             * the same /dev/pts/N are two descriptors onto one terminal, and
+             * closing one must not take the terminal away from the other. That is
+             * also what keeps the host's own end out of the guest's hands - the
+             * guest gets a duplicate and the host keeps the original, so a guest
+             * that closes or dup2s cannot reach the master behind it.
+             *
+             * The duplicate is what lands in the guest's fd table as an ordinary
+             * host descriptor, so read, write and ioctl reach the real pty
+             * through the existing routing (userland_read_fd, where a descriptor
+             * that is no /proc record, no simulated pair and not the console
+             * falls through to the host's own read). Nothing else changes, and the
+             * guest's TIOCSCTTY, its line discipline and its ^C are the kernel's
+             * rather than a reimplementation of them. */
+            int dup_fd = dup(hp->slave);
+            if (dup_fd < 0) {
+                rvvm_info("session: dup of /dev/pts/%lu failed: %s",
+                          index, strerror(errno));
+                return -1;
+            }
+            return dup_fd;
+#endif
+        }
+#endif
         return userland_pty_open_slave((uint32_t)index);
     }
     if (!strcmp(abs, "/dev/urandom") || !strcmp(abs, "/dev/random")) {
@@ -9988,13 +10099,600 @@ static int64_t userland_pty_write(struct userland_pty* pty, bool master, const v
     }
 }
 
+/* ==================================================================
+ * Host-driven sessions: one pty per client, in one machine
+ * ==================================================================
+ *
+ * A host that serves several clients out of one machine needs a terminal per
+ * client, not one shared console. The pieces for that are all here already -
+ * a process claims a terminal with setsid() + TIOCSCTTY, and the line
+ * discipline, foreground group, ^C and window size all hang off that terminal.
+ * What was missing is a way for a *host thread* to hand a process a terminal of
+ * its own, because the console is a single keyboard: rvvm_user_tty_input()
+ * feeds one foreground process and there is no second.
+ *
+ * So these make a real pty and give its slave end to a guest process, which is
+ * the whole of what a terminal login does. Two shapes, because the host decides:
+ *
+ *   - A session process (one per client) is forked from the core and handed the
+ *     slave as its 0/1/2. The host keeps the master and moves bytes. This is
+ *     what several clients at once means, and it is also why they can see each
+ *     other: one machine, one process table, one /proc.
+ *
+ * The terminal itself is the *host's* pty, not a simulated one. That is not a
+ * detail: on a host with a /dev (Linux, Android) a guest opening /dev/ptmx
+ * already reaches the real kernel, and the simulated pair below exists only
+ * because Windows has no /dev at all (see the pty section above). A host
+ * building a pty for its own use wants the real thing, or the two would not
+ * agree about line discipline, ^C and window size - and a session whose
+ * terminal the host cannot faithfully reproduce is a session whose ^C goes
+ * somewhere else.
+ */
+
+/* A host-side pty pair, and the guest process holding its slave.
+ *
+ * One type for both hosts, and the difference between them is what `master` and
+ * `slave` *are*: on a host with a kernel pty they are real descriptors, and on
+ * Windows they are numbers in the machine's own table. What a session is does
+ * not change with that - it is a terminal a host can drive and a guest can
+ * claim - and one API for it is what keeps a host from having to know which kind
+ * it got. Defined above, next to the device table that hands one out. */
+
+/* Why the last rvvm_session_pty_new() failed, as an errno. Read by the host
+ * straight after a NULL: the core cannot log, and a host that cannot open
+ * /dev/ptmx and one that is merely not allowed to are the same symptom from out
+ * here while being fixed in entirely different places. */
+static int g_session_pty_errno = 0;
+
+/* The pairs this host has made for its sessions, by the N of /dev/pts/N.
+ *
+ * This is what makes a session's terminal reachable *by name* from inside the
+ * guest. The guest's open() is answered from the core's own device table, where
+ * /dev/pts/N would otherwise be the simulated pair - a different object entirely,
+ * and on a host with a kernel pty a pair nothing else holds. So the number a
+ * guest is told to open is recorded here, and that open is answered with the
+ * slave end we already hold.
+ *
+ * The alternative - handing the guest a descriptor - needs the fd injected into
+ * a process that does not exist yet at the time the core is booted, and it would
+ * mean the guest had to be told a number rather than a name. Naming it is both
+ * simpler and closer to what a terminal actually is.
+ *
+ * Small and fixed because it is only ever as large as the number of sessions a
+ * host is willing to hold at once, which is the host's choice and not the
+ * guest's. Not a pool: an entry belongs to a live session and goes when it does. */
+#define VPS_MAX_HOST_PTY 16
+static struct {
+    spinlock_t            lock;
+    uint32_t              index[VPS_MAX_HOST_PTY];   /* the N of /dev/pts/N */
+    struct rvvm_host_pty* pty[VPS_MAX_HOST_PTY];
+    int                   count;
+} g_host_pty = { SPINLOCK_INIT, { 0 }, { NULL }, 0 };
+
+static void vps_register(struct rvvm_host_pty* p, uint32_t index)
+{
+    spin_lock(&g_host_pty.lock);
+    /* First come, first served, and a slot that is already this pair's is
+     * simply refreshed - a re-registration must not make two entries for one
+     * terminal, or closing it would leave the second behind as a live number
+     * that nothing holds. */
+    for (int i = 0; i < VPS_MAX_HOST_PTY; i++) {
+        if (g_host_pty.pty[i] == NULL || g_host_pty.pty[i] == p) {
+            g_host_pty.index[i] = index;
+            g_host_pty.pty[i]   = p;
+            break;
+        }
+    }
+    spin_unlock(&g_host_pty.lock);
+}
+
+static void vps_unregister(struct rvvm_host_pty* p)
+{
+    spin_lock(&g_host_pty.lock);
+    for (int i = 0; i < VPS_MAX_HOST_PTY; i++) {
+        if (g_host_pty.pty[i] == p) {
+            g_host_pty.index[i] = 0;
+            g_host_pty.pty[i]   = NULL;
+            break;
+        }
+    }
+    spin_unlock(&g_host_pty.lock);
+}
+
+/* The pair a guest is asking for by number, or NULL. NULL is the answer on
+ * Windows for every number, because there the guest's own /dev/pts/N is already
+ * the same simulated table this host's sessions come from - so the two agree
+ * without any lookup here. */
+static struct rvvm_host_pty* vps_lookup(uint32_t index)
+{
+    struct rvvm_host_pty* found = NULL;
+    spin_lock(&g_host_pty.lock);
+    for (int i = 0; i < VPS_MAX_HOST_PTY; i++) {
+        if (g_host_pty.pty[i] && g_host_pty.index[i] == index) {
+            found = g_host_pty.pty[i];
+            break;
+        }
+    }
+    spin_unlock(&g_host_pty.lock);
+    return found;
+}
+
+/* The pair is made the same way on both hosts; only what a pair *is* differs, so
+ * the flags it is made with are spelled per host rather than at the call site.
+ *
+ * O_NOCTTY because the host is not the session: if the host claimed the terminal
+ * the guest opening the slave would be a second controller of it. It has no
+ * Windows equivalent, and needs none - the table does not let a process claim a
+ * terminal just by opening a number. */
+#if defined(_WIN32)
+#define VPS_OPEN_FLAGS 0
+#else
+#define VPS_OPEN_FLAGS (O_RDWR | O_NOCTTY)
+#endif
+#define VPS_SLAVE_FLAGS VPS_OPEN_FLAGS
+#if defined(_WIN32)
+/* A new pair with the master open, as a descriptor number in the machine's
+ * table. userland_pty_open_master() already allocates and does the grantpt and
+ * unlockpt that posix_openpt() would, so there is nothing to add on top of it.
+ *
+ * This is the whole point of the shim rather than a parallel implementation: on
+ * Windows a session's terminal and a guest program's terminal are then the same
+ * kind of object, reached the same way, instead of two pty systems that disagree
+ * about line discipline, ^C and window size. */
+static int vps_openpt(int flags)
+{
+    (void)flags;   /* O_NOCTTY has no meaning here: no process claims it */
+    return userland_pty_open_master();
+}static int vps_grantpt(int master)
+{
+    (void)master;
+    return 0;     /* done by vps_openpt */
+}
+static int vps_unlockpt(int master)
+{
+    (void)master;
+    return 0;
+}
+/* The pair's index, which is the N of /dev/pts/N. Recovered from the number
+ * rather than kept alongside it, because the number is the only thing
+ * userland_pty_open_master() hands back. */
+static uint32_t vps_index(int master)
+{
+    if (master < RVVM_PTY_FD_BASE) {
+        return 0;
+    }
+    return (uint32_t)(((size_t)master - RVVM_PTY_FD_BASE) / 2);
+}
+static int vps_slave(int master)
+{
+    return userland_pty_open_slave(vps_index(master));
+}static int vps_name(int master, char* buf, size_t cap)
+{
+    int n = snprintf(buf, cap, "/dev/pts/%u", vps_index(master));
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+/* The table's numbers are not host descriptors, so closing one is not close(2):
+ * it is releasing the reference that number stands for, which is the pair's own
+ * accounting rather than the CRT's. */
+static void vps_close_master(int master)
+{
+    if (master < RVVM_PTY_FD_BASE) {
+        return;
+    }
+    uint32_t index = vps_index(master);
+    spin_lock(&userland_pty_lock);
+    struct userland_pty* pty = (index < USERLAND_PTY_MAX) ? userland_ptys[index] : NULL;
+    spin_unlock(&userland_pty_lock);
+    if (pty) {
+        userland_pty_release(pty, true);
+    }
+}
+static void vps_close_slave(int slave)
+{
+    if (slave < RVVM_PTY_FD_BASE) {
+        return;
+    }
+    uint32_t index = (uint32_t)(((size_t)slave - RVVM_PTY_FD_BASE - 1) / 2);
+    spin_lock(&userland_pty_lock);
+    struct userland_pty* pty = (index < USERLAND_PTY_MAX) ? userland_ptys[index] : NULL;
+    spin_unlock(&userland_pty_lock);
+    if (pty) {
+        userland_pty_release(pty, false);
+    }
+}
+#else   /* a host with a kernel pty */
+static int vps_openpt(int flags)          { return posix_openpt(flags); }
+static int vps_grantpt(int master)        { return grantpt(master); }
+static int vps_unlockpt(int master)       { return unlockpt(master); }
+static int vps_slave(int master)
+{
+    const char* name = ptsname(master);
+    return name ? open(name, VPS_SLAVE_FLAGS) : -1;
+}
+static int vps_name(int master, char* buf, size_t cap)
+{
+    const char* name = ptsname(master);
+    if (!name) {
+        buf[0] = '\0';
+        return -1;
+    }
+    snprintf(buf, cap, "%s", name);
+    return 0;
+}
+static void vps_close_master(int master)  { if (master >= 0) { close(master); } }
+static void vps_close_slave(int slave)    { if (slave >= 0) { close(slave); } }
+#endif
+
+/* A pty pair for a host thread to drive, or NULL when the host cannot make one
+ * (no /dev/ptmx, or the process is not allowed to open one).
+ *
+ * On failure rvvm_session_pty_errno() says why as an errno. The core is a plain
+ * C library with nowhere to log, and "no terminal" is a symptom: a host without
+ * /dev/ptmx and a host whose app context may not open one look identical from
+ * the outside, and they are fixed in completely different places.
+ *
+ * The body is the same on both hosts; only what a pair is differs. */
+PUBLIC struct rvvm_host_pty* rvvm_session_pty_new(rvvm_machine_t* machine)
+{
+    /* Not safe_new_obj: it is a macro that pastes the type into `type*`, which a
+     * struct tag does not survive. calloc, checked - a NULL here is a real
+     * out-of-memory and must not turn into a session that silently has no
+     * terminal. */
+    struct rvvm_host_pty* p = (struct rvvm_host_pty*)calloc(1, sizeof(*p));
+    if (!p) {
+        g_session_pty_errno = ENOMEM;
+        return NULL;
+    }
+    p->master = -1;
+    p->slave  = -1;
+    p->rows   = 24;
+    p->cols   = 80;
+
+    /* O_NOCTTY because the host is not the session: if the host claimed the
+     * terminal, the guest that opens the slave would be a second controller of
+     * it. It has no meaning on the Windows shim, which cannot claim one. */
+    p->master = vps_openpt(VPS_OPEN_FLAGS);
+    if (p->master < 0) {
+        g_session_pty_errno = errno ? errno : ENODEV;
+        rvvm_info("session: openpt failed: %s", strerror(g_session_pty_errno));
+        free(p);
+        return NULL;
+    }
+    if (vps_grantpt(p->master) || vps_unlockpt(p->master)) {
+        g_session_pty_errno = errno ? errno : EIO;
+        rvvm_info("session: grantpt/unlockpt failed: %s", strerror(g_session_pty_errno));
+        vps_close_master(p->master);
+        free(p);
+        return NULL;
+    }
+    p->slave = vps_slave(p->master);
+    if (p->slave < 0) {
+        g_session_pty_errno = errno ? errno : EIO;
+        rvvm_info("session: open(slave) failed: %s", strerror(g_session_pty_errno));
+        vps_close_master(p->master);
+        free(p);
+        return NULL;
+    }
+#if defined(_WIN32)
+    /* The simulated table is the machine's, so the pair is meaningless without
+     * it and both go together - which is why the machine is taken here rather
+     * than at every call. */
+    p->ctx   = rvvm_userland_ctx(machine);
+    p->index = vps_index(p->master);
+    spin_lock(&userland_pty_lock);
+    p->pty   = (p->index < USERLAND_PTY_MAX) ? userland_ptys[p->index] : NULL;
+    spin_unlock(&userland_pty_lock);
+    if (!p->pty) {
+        g_session_pty_errno = ENOENT;
+        vps_close_slave(p->slave);
+        vps_close_master(p->master);
+        free(p);
+        return NULL;
+    }
+#else
+    (void)machine;
+#endif
+    g_session_pty_errno = 0;
+    /* The size before anyone can ask: a session's first prompt is laid out
+     * against this, and TIOCSWINSZ afterwards would only produce a redraw. */
+    rvvm_session_pty_resize(p, p->rows, p->cols);
+    /* Recorded by its number, so a guest that opens /dev/pts/N gets *this* pair
+     * rather than the core's own. See g_host_pty. */
+    char name[64] = { 0 };
+    if (vps_name(p->master, name, sizeof(name)) == 0) {
+        const char* slash = strrchr(name, '/');
+        if (slash && slash[1]) {
+            vps_register(p, (uint32_t)strtoul(slash + 1, NULL, 10));
+        }
+    }
+    return p;
+}
+
+/* Why the last rvvm_session_pty_new() failed, as an errno; 0 if it did not. */
+PUBLIC int rvvm_session_pty_errno(void)
+{
+    return g_session_pty_errno;
+}
+
+/* The host's end, for write(2)/read(2). -1 when there is no pair. */
+PUBLIC int rvvm_session_pty_master(struct rvvm_host_pty* p)
+{
+    return p ? p->master : -1;
+}
+
+/* The guest descriptor for the slave, for a caller that would rather hand the
+ * number over itself (execve's fds) than have it injected. Negative on error. */
+PUBLIC int rvvm_session_pty_slave(struct rvvm_host_pty* p)
+{
+    return p ? p->slave : -1;
+}
+
+/* The N of /dev/pts/N, for a guest that opens the slave by name. 0 when unknown.
+ * Kept because a guest told its terminal's path can open it itself, which is
+ * what lets a process that has not been forked yet be given one. */
+PUBLIC int rvvm_session_pty_name(struct rvvm_host_pty* p, char* buf, size_t cap)
+{
+    if (!p || !buf || !cap) {
+        return -1;
+    }
+    return vps_name(p->master, buf, cap);
+}
+
+/* A resize, as TIOCSWINSZ on the master.
+ *
+ * On a host with a kernel pty the kernel delivers SIGWINCH to the slave's
+ * foreground group itself, which is why this does not have to find the guest
+ * process to signal it, and why a full-screen program re-lays out when a client
+ * drags its window. On Windows the size is the table's own, which the slave
+ * answers from on its next TIOCGWINSZ. */
+PUBLIC int rvvm_session_pty_resize(struct rvvm_host_pty* p, int rows, int cols)
+{
+    if (!p || p->master < 0 || rows <= 0 || cols <= 0) {
+        return -1;
+    }
+    p->rows = rows;
+    p->cols = cols;
+#if defined(_WIN32)
+    if (!p->pty) {
+        return -1;
+    }
+    spin_lock(&p->pty->lock);
+    p->pty->rows = (uint32_t)rows;
+    p->pty->cols = (uint32_t)cols;
+    spin_unlock(&p->pty->lock);
+    return 0;
+#else
+    struct winsize ws;
+    memset(&ws, 0, sizeof(ws));
+    ws.ws_row = (unsigned short)rows;
+    ws.ws_col = (unsigned short)cols;
+    return ioctl(p->master, TIOCSWINSZ, &ws) == 0 ? 0 : -1;
+#endif
+}
+
+PUBLIC int rvvm_session_pty_winsize(struct rvvm_host_pty* p, int* rows, int* cols)
+{
+    if (!p) {
+        return -1;
+    }
+    if (rows) {
+        *rows = p->rows;
+    }
+    if (cols) {
+        *cols = p->cols;
+    }
+    return 0;
+}
+
+/* The pty the guest is told to use for its control channel, by name. A host
+ * that keeps one terminal for the lifetime of a machine does not have to hand
+ * over the descriptor: a guest that opens the path gets the same terminal, and
+ * the host keeps the master. */
+PUBLIC int rvvm_session_pty_unlock(struct rvvm_host_pty* p)
+{
+    /* Nothing to unlock for a real pty - grantpt/unlockpt happened at
+     * construction. Kept because the Windows-shaped API had one, and a caller
+     * written against that should not have to know which host it is on. */
+    return p ? 0 : -1;
+}
+
+PUBLIC void rvvm_session_pty_free(struct rvvm_host_pty* p)
+{
+    if (!p) {
+        return;
+    }
+    /* Out of the registry first, so a guest that opens the old number in the
+     * window between here and the close is refused rather than handed a pair
+     * whose master is on its way out. */
+    vps_unregister(p);
+    /* Closing the master is the hangup: a guest still reading the slave sees
+     * EIO, which is how a session's shell learns its client is gone. That is the
+     * same thing closing a terminal window does, and it is why the slave is not
+     * closed first - the guest owns that end now, and closing it here would pull
+     * the terminal out from under a running shell. */
+    vps_close_master(p->master);
+    vps_close_slave(p->slave);
+    free(p);
+}
+
+/* Host -> guest: the bytes a terminal would deliver to the slave's foreground
+ * group.
+ *
+ * They cross the pty's own line discipline, so ICANON, ECHO, ICRNL and the ^C /
+ * ^Z in ISIG belong to this session and no other - which is the entire point of a
+ * session being a terminal rather than a pipe. Returns the byte count, or
+ * negative; a partial write is reported as such rather than hidden, because the
+ * bytes that did not fit are somebody's keystrokes. */
+PUBLIC int64_t rvvm_session_pty_input(struct rvvm_host_pty* p, const void* buf, size_t len)
+{
+    if (!p || p->master < 0 || !buf || !len) {
+        return 0;
+    }
+#if defined(_WIN32)
+    /* The table's numbers are not host descriptors, so read(2)/write(2) cannot
+     * carry these bytes - they would reach the CRT with a number that means
+     * nothing there. The pair's own path is the simulated one, exactly as a guest
+     * program's read and write on that terminal take. */
+    if (!p->pty || !p->ctx) {
+        return -EIO;
+    }
+    return userland_pty_write(p->pty, true, buf, len, p->ctx, true);
+#else
+    const uint8_t* src = (const uint8_t*)buf;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = write(p->master, src + done, len - done);
+        if (n > 0) {
+            done += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        /* EAGAIN is the master being non-blocking and its input queue full,
+         * which is a client typing faster than a shell can read. Waiting is the
+         * honest answer: dropping the bytes would lose keystrokes, and a session
+         * is exactly where they are least acceptable to lose. */
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct timespec ts = { 0, 1000000 };    /* 1ms */
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        return done ? (int64_t)done : -errno;
+    }
+    return (int64_t)done;
+#endif
+}
+
+/* Guest -> host: what this session's shell has written. Non-blocking - 0 means
+ * nothing yet, -EIO is the hangup that says the shell is gone. */
+PUBLIC int64_t rvvm_session_pty_output(struct rvvm_host_pty* p, void* buf, size_t len)
+{
+    if (!p || p->master < 0 || !buf || !len) {
+        return 0;
+    }
+#if defined(_WIN32)
+    if (!p->pty || !p->ctx) {
+        return -EIO;
+    }
+    /* The read side resolves the calling process through the thread-local guest
+     * context, which a host thread has none of, so it is entered with the
+     * machine's own installed for the duration and taken back out after. */
+    rvvm_userland_t* saved = tls_userland;
+    tls_userland = p->ctx;
+    int64_t n = userland_pty_read(p->pty, true, buf, len, false);
+    tls_userland = saved;
+    return n;
+#else
+    for (;;) {
+        ssize_t n = read(p->master, buf, len);
+        if (n >= 0) {
+            return (int64_t)n;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+        return -errno;
+    }
+#endif
+}
+
+/* Make @p's slave end a guest process's 0/1/2, and its controlling terminal.
+ *
+ * This is the whole of what a session is, and it is the ordinary login sequence
+ * rather than anything new: a session leader claiming the terminal is what makes
+ * open("/dev/tty") inside it answer *this* pty instead of the run's console, and
+ * putting it in the foreground group is what makes a ^C written to the master
+ * reach the job rather than the process that relayed the byte.
+ *
+ * The process is not forked here. It is @pid, a guest process in @machine, and
+ * the caller has already made it a session leader (a process that has not called
+ * setsid() is not allowed to claim a terminal, which is Linux's rule and the one
+ * a shell's own job-control probe depends on).
+ *
+ * Returns 0, or a negative errno. */
+PUBLIC int rvvm_session_pty_attach(rvvm_machine_t* machine, int pid,
+                                   struct rvvm_host_pty* p)
+{
+#if defined(__linux__)
+    if (!machine || !p || p->slave < 0) {
+        return -UAPI_EINVAL;
+    }
+    /* The process table is the machine's *family* root, not any one context: a
+     * session is a process the core forked, and a fork's children are registered
+     * in the root's table, so asking any other context would not find it. */
+    rvvm_userland_t* root = userland_family_root(rvvm_userland_ctx(machine));
+    if (!root) {
+        return -UAPI_ESRCH;
+    }
+    rvvm_process_t* proc = userland_proc_find(root, (uint32_t)pid);
+    if (!proc) {
+        return -UAPI_ESRCH;
+    }
+    rvvm_userland_t* ctx = userland_proc_ctx(root, proc);
+    userland_proc_unref(proc);
+    if (!ctx) {
+        return -UAPI_ESRCH;
+    }
+    /* Three slots, and the numbers are fixed rather than "the next free ones":
+     * a session's standard descriptors are 0/1/2 by definition, and a guest that
+     * opened something else must not find its terminal moved out from under it.
+     * The backend is HOST because the number names a real descriptor on this
+     * host - the pty slave - and the guest's read/write go straight to it. */
+    for (int fd = 0; fd <= 2; fd++) {
+        userland_fds_write(ctx, fd, true, p->slave, false, false,
+                           FD_BACKEND_HOST, 0, "session");
+    }
+    p->pid = pid;
+    return 0;
+#else
+    (void)machine; (void)pid; (void)p;
+    return -UAPI_ENOSYS;
+#endif
+}
+
+/* Whether a session's guest end is still there. A hangup closes the master and
+ * the slave reads EIO, which is how a host stops pumping a session whose client
+ * is the only thing that was holding it. */
+PUBLIC int rvvm_session_pty_alive(struct rvvm_host_pty* p)
+{
+    if (!p || p->master < 0) {
+        return 0;
+    }
+#if defined(_WIN32)
+    /* No POLLHUP to ask for: the table has no kernel behind it, so "the guest
+     * end is gone" is the pair's own reference count having dropped to the host's
+     * alone. */
+    if (!p->pty) {
+        return 0;
+    }
+    spin_lock(&p->pty->lock);
+    bool slave_gone = (p->pty->refs[1] == 0);
+    spin_unlock(&p->pty->lock);
+    return slave_gone ? 0 : 1;
+#else
+    /* POLLHUP without POLLIN: the far end is gone. Readable *and* hung up is the
+     * normal end of a session's output, which is why the readable case is not
+     * what this asks. */
+    struct pollfd pfd;
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd     = p->master;
+    pfd.events = 0;
+    int r = poll(&pfd, 1, 0);
+    return (r > 0 && (pfd.revents & POLLHUP)) ? 0 : 1;
+#endif
+}
+
+
 /* The same read/write dispatch the read(2)/write(2) cases perform, factored out
  * for callers that move bytes between two ordinary guest descriptors (sendfile).
  * Reading or writing `userland_fd_host(fd)` directly would send a pty's bytes to
  * the host's CRT layer, where the pty's synthetic number means nothing. */
 static int64_t userland_read_fd(struct rvvm_userland* ctx, int fd, void* buf,
-                                size_t count, bool block)
-{
+                                size_t count, bool block){
     int host_fd = userland_fd_host(ctx, fd);
     struct userland_pty* pty = NULL;
     bool master = false;
@@ -12565,11 +13263,28 @@ static void* rvvm_user_thread_wrap(void* arg)
                                     a0 = guest_fd;
                                 } else {
                                     /* No slot: the descriptor cannot be handed
-                                     * over, so the object goes back. */
+                                     * over, so whatever was opened goes back.
+                                     *
+                                     * Both kinds have to be undone, and they are
+                                     * undone differently: a simulated pair gives
+                                     * back the reference it was holding, while a
+                                     * session's terminal is a real descriptor and
+                                     * is simply closed. Checking only for the
+                                     * former - as this did before a session's
+                                     * terminal could be opened here - leaked a
+                                     * descriptor on every open that ran out of
+                                     * slots, and slots run out exactly when a
+                                     * driver opens many. */
                                     struct userland_pty* pty = NULL;
                                     bool master = false;
                                     if (userland_pty_by_fd(obj, &pty, &master)) {
                                         userland_pty_release(pty, master);
+                                    } else {
+                                        int dev = -1;
+                                        if (!userland_dev_by_fd(obj, &dev) &&
+                                            !userland_proc_is_fd(obj)) {
+                                            close(obj);
+                                        }
                                     }
                                     a0 = -UAPI_EMFILE;
                                 }

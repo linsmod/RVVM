@@ -64,6 +64,15 @@ module at all, so it is excluded from librvvm and built into a host that links
 // loose ELF. tools/pack_system.py declares the same path when packing.
 #define VP_GUEST_SESSIOND  "/sbin/vpsessiond"
 
+// The idle core: a run root that never returns, so the machine it was booted
+// into outlives every client. A command's run is torn down by on_guest_exit the
+// moment its root exits, which is right for `vp exec-out` and wrong for a core
+// several clients attach to - each arriving with its own run would get its own
+// machine, and separate machines are separate /proc, so no two of them could
+// see each other's processes. This holds the machine open; the host puts the
+// sessions on top of it.
+#define VP_GUEST_IDLE      "/sbin/idle"
+
 typedef struct vp_rootfs vp_rootfs_t;
 
 // Open and index a .tar.gz. Returns NULL when the file cannot be read or is not

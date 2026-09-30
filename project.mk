@@ -145,7 +145,7 @@ override SRC_USE_JIT       := $(SRCDIR)/rvjit/rvjit.c $(SRCDIR)/rvjit/rvjit_emit
 override SRC_USE_RV32      := $(SRCDIR)/cpu/riscv32_interpreter.c
 override SRC_USE_RV64      := $(SRCDIR)/cpu/riscv64_interpreter.c
 override SRC_USE_LIBRETRO  := $(SRCDIR)/bindings/libretro/libretro.c
-override SRC_USE_VERTPASS  := $(SRCDIR)/virtpass/vp_cmdpost.c $(SRCDIR)/virtpass/vp_sensor.c $(SRCDIR)/virtpass/vp_session.c
+override SRC_USE_VERTPASS  := $(SRCDIR)/virtpass/vp_cmdpost.c $(SRCDIR)/virtpass/vp_sensor.c $(SRCDIR)/virtpass/vp_session.c $(SRCDIR)/virtpass/vp_core.c
 override SRC_USE_JNI       := $(SRCDIR)/bindings/jni/rvvm_jni.c
 # Win32 implementations of the POSIX API declared in include/mingw_compat
 # (win_socket.c is the WinSock 2 backend behind the BSD socket shim)
@@ -213,7 +213,7 @@ override lib_src_virtpass_guest := $(SRCDIR)/virtpass/vp_ndk_stub.c $(SRCDIR)/vi
 # instead of librvvm, which stays free of the dependency. vp_shadow.c is the
 # plain index the core queries and has no such dependency, so it does live in
 # librvvm.
-override lib_src_virtpass_nonhost := $(SRCDIR)/virtpass/guest-samples/% $(SRCDIR)/virtpass/android-host/% $(SRCDIR)/virtpass/win32-host/% $(SRCDIR)/virtpass/vp-sdk/% $(SRCDIR)/virtpass/vp_rootfs.c $(SRCDIR)/virtpass/vp_zip.c $(SRCDIR)/virtpass/vp_app.c $(SRCDIR)/virtpass/vp_bundle.c
+override lib_src_virtpass_nonhost := $(SRCDIR)/virtpass/guest-samples/% $(SRCDIR)/virtpass/android-host/% $(SRCDIR)/virtpass/win32-host/% $(SRCDIR)/virtpass/vp-sdk/% $(SRCDIR)/virtpass/vp_rootfs.c $(SRCDIR)/virtpass/vp_zip.c $(SRCDIR)/virtpass/vp_app.c $(SRCDIR)/virtpass/vp_bundle.c $(SRCDIR)/virtpass/vp_core.c
 
 # virtpass_stub bundles those guest-side stubs so guest programs can link them
 # against the virtpass passthrough. It is only buildable on a native riscv64
@@ -640,10 +640,10 @@ fetch-rootfs:
 #
 # A system program is not an app: pack_system.py declares the list (source name
 # -> guest path) and lays each one out at its guest path in system.tar.gz
-# (sbin/vpsessiond), so the host extracts the archive as a layer and the guest
-# names it like any other program - no manifest, no per-id directory. pack-apps
-# reads that same archive back (--exclude-from), so a system program is never
-# also packed as an app: the archive is the single source of truth.
+# (sbin/vpsessiond, sbin/idle), so the host extracts the archive as a layer and
+# the guest names it like any other program - no manifest, no per-id directory.
+# pack-apps reads that same archive back (--exclude-from), so a system program
+# is never also packed as an app: the archive is the single source of truth.
 #
 # An app is packed as apps/<id>/{app.json,bin/<id>.exe,assets/...} and installed
 # under <guest>/data/app/<id>. Nothing in an app is host-specific, so this one

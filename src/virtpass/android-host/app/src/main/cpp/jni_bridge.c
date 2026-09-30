@@ -174,6 +174,14 @@ struct android_run {
 static struct android_run* g_runs[VP_ANDROID_MAX_GUESTS_CEILING];
 static struct android_run* g_active_run = NULL;
 
+/* Set by nativeArmCore() so that the next run's start makes a control terminal
+ * for it. It cannot be a plain argument to nativeRunElf because the terminal has
+ * to exist before the guest thread starts - the guest opens it as its first act -
+ * and nativeRunElf is what creates the machine it would belong to. A flag set
+ * beforehand is the only way to say "this next run is a core" at the point where
+ * the machine appears. */
+static int g_core_pending = 0;
+
 /* Guards the run's display geometry and the window. Held for short reads/writes
  * only, never across an ANativeWindow_lock()/unlockAndPost() pair. */
 static pthread_mutex_t g_surf_cs = PTHREAD_MUTEX_INITIALIZER;
@@ -1238,6 +1246,75 @@ Java_com_rvvm_android_RvvmNative_nativeConsoleStop(JNIEnv* env, jobject thiz)
 {
     (void)env; (void)thiz;
     vp_console_stop();
+}
+
+
+/* ==================================================================
+ * Driving a core: one machine, one session per client
+ * ==================================================================
+ *
+ * A console on its own is one machine with one keyboard, so every client typed
+ * into the same line discipline and two clients' bytes interleaved in one
+ * shell. Giving each client its own machine does not fix that either: separate
+ * machines are separate /proc, so no session's ps would ever name another's
+ * processes.
+ *
+ * What does is one machine and a terminal each. A session is a pty out of that
+ * machine's pool, with the guest forking a shell onto it - ordinary guest
+ * behaviour, and the reason the sessions show up in a single ps. The host holds
+ * the master end and moves bytes; the guest holds the slave. The console
+ * protocol is untouched: a session is the same five-byte framing as before,
+ * only there are now several pipes and each is attached to its own terminal.
+ *
+ * The guest side of the fork is idle (guest-samples/idle.c), booted as the run
+ * root so the machine outlives every client. It is told which terminal carries the
+ * requests, and this side writes one short line per session into it - a line of
+ * text rather than a socket, because these two ends already have a protocol and
+ * this is not meant to be a second one.
+ */
+
+/* Say that the next run to start is a core, so its start makes a control
+ * terminal. Asked for from Java immediately before nativeRunElf, because the
+ * terminal has to exist before the guest thread starts: the guest opens it as
+ * its very first act, and a machine - which a terminal belongs to - does not
+ * exist until nativeRunElf has created it. */
+JNIEXPORT void JNICALL
+Java_com_rvvm_android_RvvmNative_nativeArmCore(JNIEnv* env, jobject thiz)
+{
+    (void)env; (void)thiz;
+    g_core_pending = 1;
+    vp_console_arm_core();
+}
+
+/* The control terminal's path, for the --control argument the core is booted
+ * with. Valid once the run has started; null before, because there is no machine
+ * to own a terminal yet.
+ *
+ * Read from the console rather than kept here: the console owns the core (see
+ * vp_core.h), and a second reference to its control terminal would be a second
+ * thing to keep in step - and this one cannot outlive the machine it belongs to
+ * without something having to say so. */
+JNIEXPORT jstring JNICALL
+Java_com_rvvm_android_RvvmNative_nativeCoreControlPty(JNIEnv* env, jobject thiz, jint guestId)
+{
+    (void)thiz;
+    struct android_run* run = android_run_for_call(guestId);
+    if (!run) {
+        LOGE("nativeCoreControlPty: no run (guestId %d)", guestId);
+        return NULL;
+    }
+    if (!run->machine) {
+        LOGE("nativeCoreControlPty: guest %d has not started", guestId);
+        return NULL;
+    }
+    const char* path = vp_console_control_path();
+    if (!path) {
+        LOGE("nativeCoreControlPty: guest %d is not a core, or its control "
+             "terminal could not be had (%s)", guestId,
+             strerror(rvvm_session_pty_errno()));
+        return NULL;
+    }
+    return (*env)->NewStringUTF(env, path);
 }
 
 /* Mark the first presented frame. Called from both present paths: the CPU
@@ -3075,6 +3152,55 @@ Java_com_rvvm_android_RvvmNative_nativeRunElf(JNIEnv* env, jobject thiz, jint gu
     /* The console types into this machine. Bound before the thread starts,
      * because the first thing a guest does may be to read its console. */
     vp_console_bind(run->machine);
+    /* A core's --control argument, from here rather than from Java, because this
+     * is the first moment the path exists: the terminal belongs to the machine
+     * created two lines up (vp_console_set_core, called from vp_console_bind just
+     * above), and the guest opens it as its first act - so it has to be in argv
+     * before the thread below starts.
+     *
+     * argv[0] is set here rather than left to the guest thread, which does it
+     * later: this block runs before that thread exists, and it is the one place
+     * that knows argc is final. Leaving it to the thread left argv[0] unset while
+     * this was assembling the rest, which booted a guest with a null argv[0] and a
+     * usage message naming none of the arguments it had been given. */
+    if (g_core_pending) {
+        g_core_pending = 0;
+        const char* ctl = vp_console_control_path();
+        if (!ctl) {
+            LOGE("Core has no control terminal (%s); the guest cannot take "
+                 "sessions", strerror(rvvm_session_pty_errno()));
+        } else {
+            LOGI("Core control channel ready: %s", ctl);
+            run->argv[0] = run->elf_path;
+            if (run->argc + 2 <= (int)(sizeof(run->argv) / sizeof(run->argv[0]))) {
+                snprintf(run->arg_buf[run->argc],
+                         sizeof(run->arg_buf[run->argc]), "--control");
+                run->argv[run->argc] = run->arg_buf[run->argc];
+                run->argc++;
+                snprintf(run->arg_buf[run->argc],
+                         sizeof(run->arg_buf[run->argc]), "%s", ctl);
+                run->argv[run->argc] = run->arg_buf[run->argc];
+                run->argc++;
+            } else {
+                LOGE("Core argv is full; the guest cannot be told its control "
+                     "terminal");
+            }
+            /* What the guest will see, in order. A core that boots without its
+             * --control prints its usage and exits, and the usage names no
+             * argument as missing - so the argv is echoed to make that readable. */
+            {
+                char seen[512] = { 0 };
+                for (int i = 0; i < run->argc && i < 12; i++) {
+                    strncat(seen, run->argv[i] ? run->argv[i] : "(null)",
+                            sizeof(seen) - strlen(seen) - 1);
+                    if (i + 1 < run->argc) {
+                        strncat(seen, " ", sizeof(seen) - strlen(seen) - 1);
+                    }
+                }
+                LOGI("Core argv is now: %s", seen);
+            }
+        }
+    }
 
     /* This run's cmdpost instance is normally made by nativeClearLifecycleCmds()
      * (Java queues the startup sequence right after that call, and it has to

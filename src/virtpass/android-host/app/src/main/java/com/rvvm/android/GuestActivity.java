@@ -79,6 +79,19 @@ public class GuestActivity extends Activity {
 
     public static final String EXTRA_APP_NAME = "guest_app_name";
 
+    /** Boot this guest path directly, skipping the app-name lookup.
+     *
+     *  <p>For a system program: one laid out in the bundle's system layer at a
+     *  guest path, with no manifest and no per-id directory. The app-name lookup
+     *  cannot name one, and the assets fallback would look for a file that is not
+     *  there - so a core's run root is named this way, and the decision to boot
+     *  one belongs to {@link RvvmHost} rather than to whichever Activity is in
+     *  front.</p> */
+    public static final String EXTRA_GUEST_PATH = "guest_path";
+
+    /** This run is a core: the machine outlives the client that started it. */
+    public static final String EXTRA_CORE = "core";
+
 
     /** Guest exit behavior: "finish" closes the activity when the guest exits,
      *  any other value (e.g. "stay") keeps it up so the user can read the
@@ -308,24 +321,37 @@ public class GuestActivity extends Activity {
 
         isInitialized = true;
 
-        // Bundle build: boot the app by its guest path (/data/app/<id>/<entry>
-        // from the manifest), no ELF is ever copied out of the APK. Bundle-less
-        // build: the old path - copy the loose .exe from the assets to
-        // internal storage (always refreshed so an updated build takes effect).
-        String guestEntry = RvvmNative.nativeAppEntryPath(appName);
-        if (guestEntry != null && !guestEntry.isEmpty()) {
-            elfPath = guestEntry;
+        // A core's run root is named by guest path, not by app name: /sbin/idle
+        // is a *system* program, with no manifest and no per-id directory, so
+        // the two lookups below cannot find it and the assets fallback would
+        // fail on a file that is not there. The Application decides what a core
+        // is (see RvvmHost) and this Activity is only told; that split is the
+        // point, because the machine is process-wide and a client can navigate
+        // away from whichever Activity started it.
+        String guestPath = getIntent().getStringExtra(EXTRA_GUEST_PATH);
+        if (guestPath != null && !guestPath.isEmpty()) {
+            elfPath = guestPath;
+            Log.i(TAG, "booting a guest path directly: " + elfPath);
         } else {
-            File elfFile = new File(getFilesDir(), appName);
-            try {
-                copyAssetToFile(appName, elfFile);
-                elfPath = elfFile.getAbsolutePath();
-            } catch (IOException e) {
-                Log.e(TAG, "Failed to copy ELF: " + appName, e);
-                Toast.makeText(this, "Failed to copy ELF: " + e.getMessage(),
-                        Toast.LENGTH_SHORT).show();
-                finish();
-                return;
+            // Bundle build: boot the app by its guest path (/data/app/<id>/<entry>
+            // from the manifest), no ELF is ever copied out of the APK. Bundle-less
+            // build: the old path - copy the loose .exe from the assets to
+            // internal storage (always refreshed so an updated build takes effect).
+            String guestEntry = RvvmNative.nativeAppEntryPath(appName);
+            if (guestEntry != null && !guestEntry.isEmpty()) {
+                elfPath = guestEntry;
+            } else {
+                File elfFile = new File(getFilesDir(), appName);
+                try {
+                    copyAssetToFile(appName, elfFile);
+                    elfPath = elfFile.getAbsolutePath();
+                } catch (IOException e) {
+                    Log.e(TAG, "Failed to copy ELF: " + appName, e);
+                    Toast.makeText(this, "Failed to copy ELF: " + e.getMessage(),
+                            Toast.LENGTH_SHORT).show();
+                    finish();
+                    return;
+                }
             }
         }
 
@@ -714,6 +740,20 @@ public class GuestActivity extends Activity {
             return;
         }
 
+        // A core's root is idle, and it cannot run without being told which
+        // terminal carries the session requests. That terminal belongs to the
+        // machine, and the machine is created by the run's start - so all that can
+        // be said from here is "this next run is a core", and nativeRunElf makes
+        // the terminal and passes its path in argv once it has one. The guest
+        // opens it as its first act, which is why this cannot be a value handed
+        // in from Java: there is nothing to hand in yet.
+        String[] args = guestArgs;
+        if (isCore()) {
+            RvvmNative.nativeArmCore();
+            args = new String[] { "--shell", RvvmHost.getInstance().getSessionShell() };
+            Log.i(TAG, "core starting: idle " + args[0] + " " + args[1]);
+        }
+
         // Re-deliver the lifecycle state a freshly started guest expects to see
         RvvmNative.nativeClearLifecycleCmds(guestId);
         postLifecycleCmd(APP_CMD_START);
@@ -724,16 +764,31 @@ public class GuestActivity extends Activity {
         }
 
         // Actually run the ELF
-        boolean started = RvvmNative.nativeRunElf(guestId, elfPath, guestArgs);
+        boolean started = RvvmNative.nativeRunElf(guestId, elfPath, args);
+        if (started && isCore()) {
+            String ctl = RvvmNative.nativeCoreControlPty(guestId);
+            if (ctl == null) {
+                Log.e(TAG, "the core started but has no control terminal, so it "
+                           + "cannot take sessions");
+            } else {
+                RvvmHost.getInstance().noteControlPty(ctl);
+                Log.i(TAG, "core control channel is " + ctl);
+            }
+        }
         if (started) {
             isGuestStarted = true;
             Log.i(TAG, "Guest started: " + appName + " (guestId=" + guestId
-                    + ", argv=" + (guestArgs == null ? "none" : java.util.Arrays.toString(guestArgs))
+                    + ", argv=" + (args == null ? "none" : java.util.Arrays.toString(args))
                     + ")");
         } else {
             Log.e(TAG, "Failed to start guest: " + appName);
             Toast.makeText(this, "Failed to start guest", Toast.LENGTH_SHORT).show();
         }
+    }
+
+    /** Whether this run is a core: one machine, one session per client. */
+    private boolean isCore() {
+        return getIntent().getBooleanExtra(EXTRA_CORE, false);
     }
 
     /** Push the real device configuration to native. */

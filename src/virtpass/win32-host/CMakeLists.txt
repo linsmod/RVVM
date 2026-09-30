@@ -20,6 +20,7 @@ add_executable(rvvm_winhost
     # vp_cmdpost + the host session (single copies, shared with the Android app build)
     ${RVVM_ROOT}/src/virtpass/vp_cmdpost.c
     ${RVVM_ROOT}/src/virtpass/vp_session.c
+    ${RVVM_ROOT}/src/virtpass/vp_core.c
     # POSIX shim implementations for MinGW (see include/mingw_compat/)
     ${RVVM_ROOT}/src/win/posix_shim.c
     ${RVVM_ROOT}/src/win/win_socket.c

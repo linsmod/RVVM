@@ -234,6 +234,88 @@ int         rvvm_tty_serial(rvvm_tty_t* tty);
 // stdin. Safe to call from any thread; a no-op when no TTY is attached.
 void rvvm_user_tty_input(rvvm_machine_t* machine, const void* buf, size_t len);
 
+// --- Host-driven sessions: one pty per client, in one machine ---
+//
+// A host serving several clients out of one machine needs a terminal per client
+// rather than one shared console. rvvm_user_tty_input() above is that shared
+// console: a single keyboard feeding a single foreground process, and every
+// client on it is typing into the same line discipline.
+//
+// These make a terminal for the host to drive and give its slave end to a guest
+// process, which is the whole of what a terminal login does. Several clients are
+// then several terminals in one machine: isolated line discipline, echo, window
+// size and ^C, and - because it is one machine - one PID space, so a session's ps
+// names every other session's processes. A per-command machine could never offer
+// that, each having its own /proc.
+//
+// One API, two backends, because a session means the same thing on either host
+// and a host should not have to know which it got. Where there is a kernel pty
+// the pair is a real one; on Windows, which has no /dev at all, it comes out of
+// the same table a guest opening /dev/ptmx gets - so a session's terminal and a
+// guest program's terminal are the same kind of object reached the same way,
+// rather than two pty systems that disagree about line discipline and ^C.
+//
+// Which is why the entry points are named rvvm_ and not posix_: on Windows there
+// is no fd to return, so a posix_openpt() spelling would be a promise the
+// platform cannot keep - read(2) on its result would reach the CRT and quietly
+// do the wrong thing. The *pair-making* is shimmed internally (vps_*); the bytes
+// always move through these.
+//
+// Safe to call from any host thread. The machine is needed only to find the pair
+// on Windows, and is ignored elsewhere.
+typedef struct rvvm_host_pty rvvm_host_pty_t;
+
+// A terminal pair for a host thread to drive, or NULL when one cannot be made.
+// On failure rvvm_session_pty_errno() says why.
+rvvm_host_pty_t* rvvm_session_pty_new(rvvm_machine_t* machine);
+
+// Why the last rvvm_session_pty_new() failed, as an errno; 0 if it did not fail.
+// The core cannot log, so this is the only way a host learns that /dev/ptmx is
+// missing as opposed to merely not openable by this process.
+int rvvm_session_pty_errno(void);
+
+// The host's end: write to it to type, read it for the session's output.
+// -1 when there is no pair.
+int rvvm_session_pty_master(rvvm_host_pty_t* pty);
+
+// The slave descriptor, for a caller that hands the number to a guest itself
+// (execve's fds) rather than having it injected. Negative on error.
+int rvvm_session_pty_slave(rvvm_host_pty_t* pty);
+
+// The slave's path (/dev/pts/N), for a guest that opens its terminal by name.
+int rvvm_session_pty_name(rvvm_host_pty_t* pty, char* buf, size_t cap);
+
+// Host -> guest: the bytes a terminal would deliver. They cross this pty's own
+// line discipline, so echo, canonical line assembly and ^C/^Z belong to this
+// session alone. Byte count, or negative.
+int64_t rvvm_session_pty_input(rvvm_host_pty_t* pty, const void* buf, size_t len);
+
+// Guest -> host: what this session's shell has written. Non-blocking - 0 means
+// nothing yet, -EIO is the hangup that says the shell is gone.
+int64_t rvvm_session_pty_output(rvvm_host_pty_t* pty, void* buf, size_t len);
+
+// Make the slave this process's 0/1/2. The process must already lead its own
+// session (setsid), because that is Linux's condition for claiming a terminal
+// and the one a shell's job-control probe depends on. 0, or negative.
+int rvvm_session_pty_attach(rvvm_machine_t* machine, int pid, rvvm_host_pty_t* pty);
+
+// A resize, as TIOCSWINSZ on the master. The kernel delivers SIGWINCH to the
+// slave's foreground group itself, which is why a full-screen program re-lays
+// out when a client drags its window. 0, or negative.
+int rvvm_session_pty_resize(rvvm_host_pty_t* pty, int rows, int cols);
+int rvvm_session_pty_winsize(rvvm_host_pty_t* pty, int* rows, int* cols);
+
+// Whether the session's guest end is still there, 0 once it has hung up.
+int rvvm_session_pty_alive(rvvm_host_pty_t* pty);
+
+// Present on both hosts so a caller written against the Windows-shaped API still
+// builds: a real pty has nothing to unlock, so this always succeeds.
+int rvvm_session_pty_unlock(rvvm_host_pty_t* pty);
+
+// Drop the pair. Closing the master is the hangup, so a guest still reading the
+// slave sees EIO - the same thing closing a terminal window does.
+void rvvm_session_pty_free(rvvm_host_pty_t* pty);
+
 // Override the guest's filesystem prefix - the directory guest absolute paths
 // are resolved against.
 //

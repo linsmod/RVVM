@@ -131,6 +131,7 @@ add_library(rvvm_core STATIC
     ${RVVM_SRC}/virtpass/vp_cmdpost.c
     ${RVVM_SRC}/virtpass/vp_sensor.c
     ${RVVM_SRC}/virtpass/vp_session.c
+    ${RVVM_SRC}/virtpass/vp_core.c
 
     # The guest rootfs "shape" index (plain data, no zlib)
     ${RVVM_SRC}/virtpass/vp_shadow.c

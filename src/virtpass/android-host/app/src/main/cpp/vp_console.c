@@ -70,23 +70,25 @@
  * the machine holding the cable - not from the network the device is on. */
 #define CONSOLE_BIND_ADDR "127.0.0.1"
 
-/* One client at a time, and that is the whole point.
+/* How many clients a core serves at once.
  *
- * The console is a single byte pipe onto a single foreground guest, so a
- * second client is not a second viewer - it is a second writer racing the
- * first into the same line discipline, and both are fanned the same output.
- * Two `vp exec-out`s on one phone did exactly that: the second attached to the
- * busybox the first had running, read its prompt and its `ps -ef`, and neither
- * command's own output arrived. Sized for the run table (4 guests) on the
- * assumption that clients and guests pair up one-to-one, which nothing here
- * enforced: vp_console_tap pushes to every connection, so N clients meant N
- * readers of one guest's stream.
+ * This was 1, and it was right while a console *was* one session: the byte pipe
+ * is a single machine's single keyboard, so a second client was a second writer
+ * racing the first into the same line discipline, both fanned the same output.
+ * Two `vp exec-out`s on one phone did exactly that - the second attached to the
+ * busybox the first had running and read its prompt and its `ps -ef`, while its
+ * own output went to both.
  *
- * So the newest client takes the console and the previous one is dropped. A
- * client that wanted to be one of several has to say so, and the alternative -
- * interleaving two commands into one guest - is not a feature anyone can use
- * deliberately. */
-#define CONSOLE_MAX_CONN 1
+ * It is not 1 any more because a client no longer shares a keyboard. Each gets a
+ * terminal of its own out of the machine (see vp_core.h), so two clients are two
+ * terminals in one machine: separate line discipline, separate echo, separate ^C,
+ * and - the point of sharing the machine - each one's `ps` names the other's
+ * processes.
+ *
+ * The cap is a resource bound now rather than a correctness one, and it sits under
+ * what vp_core will hand out so the refusal is "no sessions" rather than a
+ * terminal that cannot be had. */
+#define CONSOLE_MAX_CONN 8
 
 /* Bytes a client may fall behind by before it is dropped rather than waited
  * for. A real terminal makes the writer block; here the writer is a guest
@@ -140,6 +142,28 @@ struct console_conn {
      * guest the client named is started *because* it connected, so at that
      * moment there is nothing to type into. See vp_console_tap. */
     int             ready_sent;
+    /* This client's session, or NULL when it has none - which is the case for
+     * every client on a host that launched a single named guest, and the reason
+     * the tap below still fans to connections that have no session.
+     *
+     * A session is a terminal (see vp_core.h), so its bytes come from that
+     * terminal and never from the run's console: the two paths cannot see each
+     * other, which is what makes two clients two terminals rather than one
+     * keyboard with two typists. */
+    struct vp_core_session* session;
+    /* Whether this connection has already been offered one. A client that
+     * arrives before the run has started is offered one when it does, and this
+     * is what stops that happening twice - which would orphan the first
+     * terminal, with a shell forked onto it and its output read by nobody. */
+    int             session_tried;
+    /* The client's terminal size, as its last WINDOWSIZE packet said. Held
+     * because a session can be opened before any packet has been read - the run
+     * is held until a client arrives, and the terminal is opened the moment the
+     * machine exists - so a client that sends its size first would otherwise get
+     * its shell laid out for the default and then resized, a visible jump on the
+     * first prompt. */
+    int             winsz_rows;
+    int             winsz_cols;
 };
 
 #define CONSOLE_PENDING_MAX (256 * 1024)
@@ -155,6 +179,100 @@ static struct {
 } g_console = { -1, 0, 0, PTHREAD_MUTEX_INITIALIZER, NULL, NULL, NULL };
 
 static rvvm_machine_t* g_console_machine = NULL;
+
+/* The core this machine is serving sessions out of, and the only place sessions
+ * come from. Created with the machine and gone with it - see vp_console_set_core.
+ *
+ * The session work itself is not here: it is vp_core.c, shared with the other
+ * host, because it is the same code there and this is not the place for a second
+ * copy of it. */
+static vp_core_t* g_core = NULL;
+
+/* Whether the next run to start is a core. See vp_console_arm_core. */
+static int g_core_armed = 0;
+
+void vp_console_arm_core(void)
+{
+    g_core_armed = 1;
+}
+
+int vp_console_core_armed(void)
+{
+    return g_core_armed;
+}
+
+/* Defined below: a connection's terminal, and the thread that moves its output.
+ * Declared here because vp_console_set_core() - which runs from
+ * vp_console_set_machine(), well above them - is what starts both. */
+static void conn_open_session(struct console_conn* c);
+static void* conn_session_pump(void* arg);
+static void vp_console_open_pending_sessions(rvvm_machine_t* machine);
+
+const char* vp_console_control_path(void)
+{
+    return g_core ? vp_core_control_path(g_core) : NULL;
+}
+
+void vp_console_set_core(rvvm_machine_t* machine)
+{
+    if (!machine) {
+        g_core = NULL;
+        return;
+    }
+    /* Only when the host armed one. A machine appears for every run, and most of
+     * them are a command - `vp exec-out "ls"` boots a guest, answers and is gone.
+     * Making a core of every one of those would hand each a terminal and a shell
+     * nobody asked for, and - worse - the client's output would arrive by the
+     * session path while the command that produced it is writing to the run's
+     * console, which is the crossed-wires arrangement in a new place. A run with
+     * no core keeps the plain console: one machine, one keyboard, this client. */
+    if (!vp_console_core_armed()) {
+        g_core = NULL;
+        return;
+    }
+    /* Made here and not at accept, because a terminal belongs to a machine and a
+     * core has no machine until its run starts. The run is held until a client is
+     * connected, so a client on a core always arrives *before* this - which is
+     * exactly why opening a session at accept always found nothing to open one
+     * on, and fell back to the single keyboard this whole arrangement exists to
+     * stop using. */
+    g_core = vp_core_new(machine);
+    if (!g_core) {
+        LOGE("no core: %s", strerror(rvvm_session_pty_errno()));
+        return;
+    }
+    LOGI("core up, control terminal is %s", vp_core_control_path(g_core));
+    /* Now there is a machine to own terminals, every waiting client gets one. */
+    vp_console_open_pending_sessions(machine);
+}
+
+static void conn_open_session(struct console_conn* c)
+{
+    int rows = 24, cols = 80;
+    pthread_mutex_lock(&c->lock);
+    if (c->winsz_rows > 0 && c->winsz_cols > 0) {
+        rows = c->winsz_rows;
+        cols = c->winsz_cols;
+    }
+    pthread_mutex_unlock(&c->lock);
+
+    struct vp_core_session* s = vp_core_session_open(g_core, rows, cols);
+    if (!s) {
+        LOGE("no session for this client; it keeps the run's own console");
+        return;
+    }
+    c->session = s;
+    LOGI("client has a session on %s (%dx%d)", vp_core_session_path(s), cols, rows);
+
+    /* The pump starts here rather than at accept, because the session does not
+     * exist until now. */
+    pthread_t pump;
+    if (pthread_create(&pump, NULL, conn_session_pump, c) == 0) {
+        pthread_detach(pump);
+    } else {
+        LOGE("cannot start the session pump: %s", strerror(errno));
+    }
+}
 
 void vp_console_set_machine(rvvm_machine_t* machine)
 {
@@ -184,6 +302,31 @@ void vp_console_set_machine(rvvm_machine_t* machine)
         if (eof) {
             rvvm_user_tty_input(machine, "\x04", 1);
         }
+    }
+    pthread_mutex_unlock(&g_console.lock);
+
+    /* And the sessions: a machine is the one thing a session needs to exist, and
+     * this is the only moment there is one. */
+    vp_console_set_core(machine);
+}
+
+static void vp_console_open_pending_sessions(rvvm_machine_t* machine)
+{
+    if (!machine || !g_core) {
+        return;
+    }
+    pthread_mutex_lock(&g_console.lock);
+    /* Under the lock because a connection can end at any moment, and a session
+     * handed to one that has just gone would be a terminal nobody holds: the
+     * shell would be forked onto it and its output read by nobody. */
+    for (struct console_conn* c = g_console.conns; c; c = c->next) {
+        if (c->session || c->session_tried) {
+            continue;
+        }
+        pthread_mutex_lock(&c->lock);
+        c->session_tried = 1;
+        pthread_mutex_unlock(&c->lock);
+        conn_open_session(c);
     }
     pthread_mutex_unlock(&g_console.lock);
 }
@@ -388,6 +531,16 @@ void vp_console_tap(int fd, const void* data, size_t len)
 
     pthread_mutex_lock(&g_console.lock);
     for (struct console_conn* c = g_console.conns; c; c = c->next) {
+        /* Only the run's own console. A client with a session reads that
+         * session's terminal instead, pumped by its own thread, and pushing the
+         * machine's fd 1/2 at it as well is what crossed two clients: the tap
+         * reached every connection, so a second client read the first one's
+         * output as if it were its own. A session shell's output never passes
+         * through here at all - it writes to its terminal - so skipping these
+         * loses nothing. */
+        if (c->session) {
+            continue;
+        }
         pthread_mutex_lock(&c->lock);
         conn_push_locked(c, id, data, len);
         /* READY goes out just behind the guest's first words, and that is the
@@ -406,6 +559,57 @@ void vp_console_tap(int fd, const void* data, size_t len)
         pthread_mutex_unlock(&c->lock);
     }
     pthread_mutex_unlock(&g_console.lock);
+}
+
+/* Move one session's output from its terminal to its client.
+ *
+ * This is the session's half of the byte pipe, and it is what lets a session and
+ * a plain console client coexist: a session's bytes come from the terminal its
+ * shell runs on, a plain client's from the run's fd 1/2, and neither path can see
+ * the other's.
+ *
+ * Ends when the session's guest end is gone - the terminal answers a hangup,
+ * which is how a shell that exited reaches its client as an end of output rather
+ * than a client left waiting on a shell that is not there. The connection is not
+ * closed here: the client may still be reading its transcript, and the reader
+ * thread is what decides the socket is done. */
+static void* conn_session_pump(void* arg)
+{
+    struct console_conn* c = (struct console_conn*)arg;
+    for (;;) {
+        uint8_t buf[4096];
+        int64_t n = vp_core_session_output(c->session, buf, sizeof(buf));
+        if (n < 0) {
+            LOGI("session %s ended (%lld)", vp_core_session_path(c->session),
+                 (long long)n);
+            break;
+        }
+        if (n == 0) {
+            /* Nothing yet. A short sleep rather than a spin: this thread belongs
+             * to a client probably sitting at a prompt, and would otherwise run
+             * flat out for the life of the session. 5ms is well inside what a
+             * person perceives as instant and costs nothing when idle. */
+            struct timespec ts = { 0, 5 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        pthread_mutex_lock(&c->lock);
+        if (c->dropped) {
+            pthread_mutex_unlock(&c->lock);
+            break;
+        }
+        conn_push_locked(c, VP_CONSOLE_STDOUT, buf, (size_t)n);
+        /* READY just behind the session's first words, for the same reason and
+         * at the same moment as the console path: a client must not type before
+         * there is a prompt to type at. */
+        if (!c->ready_sent) {
+            conn_push_locked(c, VP_CONSOLE_READY, "console ready\n", 14);
+            c->ready_sent = 1;
+        }
+        pthread_cond_broadcast(&c->filled);
+        pthread_mutex_unlock(&c->lock);
+    }
+    return NULL;
 }
 
 /* The run's status, as its own packet. Sent after everything the guest
@@ -463,11 +667,19 @@ static void* conn_reader(void* arg)
                  * through and no ring to hold them, so they are kept here: the
                  * client connects as soon as the listener is up, which is
                  * before the run it named has started, and throwing away what
-                 * it typed in between loses the beginning of every script. */
-                rvvm_machine_t* m = vp_console_machine();
-                if (m) {
+                 * it typed in between loses the beginning of every script.                  * A client with a session types into *its* terminal, not the run's
+                 * shared console. That is what makes two clients two terminals:
+                 * the bytes go through that shell's own line discipline, so its
+                 * echo, its erase and its ^C are its own and another session's
+                 * keystrokes are nowhere near it. */
+                struct vp_core_session* s = c->session;
+                if (s) {
+                    LOGI("stdin %zu byte(s) -> session %s", len,
+                         vp_core_session_path(s));
+                    vp_core_session_input(s, buf, len);
+                } else if (vp_console_machine()) {
                     LOGI("stdin %zu byte(s) -> live guest", len);
-                    rvvm_user_tty_input(m, buf, len);
+                    rvvm_user_tty_input(vp_console_machine(), buf, len);
                 } else {
                     LOGI("stdin %zu byte(s) held: no guest yet", len);
                     pthread_mutex_lock(&c->lock);
@@ -496,13 +708,55 @@ static void* conn_reader(void* arg)
             /* A real pty has an EOF. The run keeps going, but nothing more
              * can be typed into it. Held with the rest when the guest is not
              * up yet, so a script's EOF does not overtake its own lines. */
-            rvvm_machine_t* m = vp_console_machine();
-            if (m) {
-                rvvm_user_tty_input(m, "\x04", 1);
+            struct vp_core_session* s = c->session;
+            if (s) {
+                /* Into that session's terminal, so the ^D reaches that shell's
+                 * read() and not the run's console - and not some other
+                 * session's. */
+                vp_core_session_input(s, "\x04", 1);
+            } else if (vp_console_machine()) {
+                rvvm_user_tty_input(vp_console_machine(), "\x04", 1);
             } else {
                 pthread_mutex_lock(&c->lock);
                 c->pending_eof = 1;
                 pthread_mutex_unlock(&c->lock);
+            }
+        } else if (hdr[0] == VP_CONSOLE_WINDOWSIZE) {
+            /* The client's terminal, as "<rows>:<cols>" - the same text the win32
+             * client sends and the same shape it parses, so the wire format is
+             * untouched by any of the session work.
+             *
+             * Recorded as well as applied: a session can be opened before any
+             * packet has been read, so a client that sends its size first still
+             * gets its shell laid out correctly.
+             *
+             * The body is read here rather than in the block above because that
+             * block owns the buffer and frees it. A body too long to be
+             * "<rows>:<cols>" is not one, and ends the connection rather than
+             * being truncated into something that would parse. */
+            char sz[32];
+            if (len >= sizeof(sz)) {
+                LOGW("client sent a %u byte window size; dropping it", len);
+                break;
+            }
+            if (len && read_all(c->fd, sz, len) < 0) {
+                break;
+            }
+            sz[len] = '\0';
+            int rows = 0, cols = 0;
+            if (sscanf(sz, "%d:%d", &rows, &cols) == 2 &&
+                rows > 0 && cols > 0) {
+                pthread_mutex_lock(&c->lock);
+                c->winsz_rows = rows;
+                c->winsz_cols = cols;
+                struct vp_core_session* s2 = c->session;
+                pthread_mutex_unlock(&c->lock);
+                if (s2) {
+                    vp_core_session_resize(s2, rows, cols);
+                } else {
+                    rvvm_user_tty_resize(vp_console_machine(), rows, cols);
+                }
+                LOGI("client window is now %dx%d", cols, rows);
             }
         }
     }
@@ -535,13 +789,13 @@ static void conn_destroy(struct console_conn* c)
      * exits, which is the same thing a real terminal's hangup does. The guest's
      * lifetime past that is the Activity's business, not the pipe's.
      *
-     * A connection that was *taken over* is the exception, and skipping it is
-     * the point: the ^D would go to whichever guest is current, which after a
-     * handover is the new client's, not this one's. Sending it there would EOF
-     * a run that had only just started - the takeover would kill the guest it
-     * was making room for. */
+     * A connection with a *session* is the other exception, for the same reason:
+     * its shell was on a terminal of its own, so a ^D aimed at the run's console
+     * would not reach its shell at all - it would reach some *other* guest's.
+     * Its own shell is ended by the hangup instead, which is what releasing the
+     * session does, and that happens in conn_serve before this. */
     rvvm_machine_t* m = vp_console_machine();
-    if (m && !c->taken_over) {
+    if (m && !c->taken_over && !c->session) {
         rvvm_user_tty_input(m, "\x04", 1);
     }
     if (c->fd >= 0) {
@@ -610,6 +864,15 @@ static void* conn_serve(void* arg)
     pthread_join(c->reader, NULL);
     pthread_join(c->writer, NULL);
     conn_unlink(c);
+    /* The session's terminal goes back with the client, or a long-lived core
+     * would run out of them after a handful of visitors. Releasing it is also
+     * what ends the shell that was on it - the hangup is the same thing closing
+     * a terminal window does - so the shell is gone before its terminal is. */
+    if (c->session) {
+        LOGI("session %s released", vp_core_session_path(c->session));
+        vp_core_session_release(c->session);
+        c->session = NULL;
+    }
     conn_destroy(c);
     LOGI("client disconnected");
     return NULL;

@@ -61,6 +61,11 @@
 #define VP_DEFAULT_PORT 7979
 #define VP_DEFAULT_GUEST "test_busybox"
 
+/* The core's run root, by guest path. A system program (the bundle's system layer
+ * lays it out at /sbin/), so it has no manifest and no app id - which is why
+ * boot_core() names it by path instead of looking an app up by name. */
+#define VP_CORE_ROOT "/sbin/idle"
+
 /* AF_INET / SOCK_STREAM, WinSock's own numbering. */
 #define VP_AF_INET      AF_INET
 #define VP_SOCK_STREAM  SOCK_STREAM
@@ -740,6 +745,69 @@ static void send_winsize(void)
  * "a client is here" and the only way to tell them apart from outside was to
  * wait and hope. Handing the run to the app in the same intent that asks for
  * the console moves the decision to the one place that knows the answer. */
+/* Boot the core and connect to it, rather than running a one-shot guest.
+ *
+ * The two are different machines, and which one you want is the whole question
+ * `vp shell` cannot answer on its own:
+ *
+ *   - a one-shot guest is a *command*. `am start` names an app, a run boots it,
+ *     it answers and the machine is torn down by on_guest_exit. Two such
+ *     commands are two machines, which is why they can never see each other.
+ *   - a core is a *machine that outlives its clients*. Its run root is /sbin/idle
+ *     - a program that holds the machine open and forks a shell per client - and
+ *     every client gets a pty out of that one machine's pool, so `ps` in one
+ *     session names every other session's processes.
+ *
+ * So the flag is not a mode of the same thing, it is a different thing, and the
+ * app name is not used: idle is a system program with no manifest, named here by
+ * guest path. */
+static bool boot_core(const char* serial, const char* cmd)
+{
+    char* gs[12];
+    int   gn = 0;
+    gs[gn++] = (char*)"shell";
+    gs[gn++] = (char*)"am";
+    gs[gn++] = (char*)"start";
+    gs[gn++] = (char*)"-n";
+    gs[gn++] = (char*)"com.rvvm.android/.SimpleLauncherActivity";
+    gs[gn++] = (char*)"--es";
+    gs[gn++] = (char*)"guest_path";
+    gs[gn++] = (char*)VP_CORE_ROOT;
+    gs[gn++] = (char*)"--ez";
+    gs[gn++] = (char*)"core";
+    gs[gn++] = (char*)"true";
+    gs[gn++] = (char*)"--ez";
+    gs[gn++] = (char*)"console";
+    gs[gn++] = (char*)"true";
+    gs[gn] = NULL;
+    char told[512];
+    if (run_adb(serial, gs, told, sizeof(told)) != 0) {
+        fprintf(stderr, "vp: could not start the core%s%s\n",
+                told[0] ? ": " : "", told);
+        return false;
+    }
+    /* The core is up by the time this returns if one was already running, and
+     * otherwise the connect below is what starts it: the run is held until a
+     * client is on the socket, which is the point of holding it. So there is no
+     * wait here - connecting *is* the start. */
+    if (!console_connect() || !await_ready()) {
+        return false;
+    }
+    /* Typed after READY, never before. The session's shell issues a cursor
+     * query as soon as it has a terminal, and anything sent ahead of its prompt
+     * lands in the same read as the answer to that query - where a shell reads it
+     * as a malformed report and drops it. Awaity_ready() is the gate that makes
+     * this safe, and it is the reason a scripted command works on a core at all. */
+    if (cmd && *cmd) {
+        char line[2048];
+        int  n = snprintf(line, sizeof(line), "%s\n", cmd);
+        if (n > 0 && (size_t)n < sizeof(line)) {
+            send_packet(VP_ID_STDIN, line, (size_t)n);
+        }
+    }
+    return true;
+}
+
 static bool boot_guest(const char* serial, const char* app, const char* cmd)
 {
     /* argv travels base64'd, NUL-joined: `--esa` is a multi-value option and
@@ -889,6 +957,7 @@ static int cmd_shell(int argc, char** argv)
      * never exits, so the app comes from a flag and every remaining token is
      * part of the command. */
     const char* app = NULL;
+    bool core = false;
     while (argc > 0 && argv[0][0] == '-') {
         if (!strcmp(argv[0], "--app") && argc > 1) {
             app = argv[1];
@@ -898,10 +967,25 @@ static int cmd_shell(int argc, char** argv)
             app = argv[0] + 6;
             argv++;
             argc--;
+        } else if (!strcmp(argv[0], "--core")) {
+            /* One machine, one session per client. Anything typed here is run by
+             * a shell of this session's own, and `ps` names the other sessions'
+             * processes - which a one-shot guest cannot do, because each is its
+             * own machine with its own /proc. */
+            core = true;
+            argv++;
+            argc--;
         } else {
             fprintf(stderr, "vp shell: unknown option %s\n", argv[0]);
             return 2;
         }
+    }
+    if (core && app) {
+        fprintf(stderr,
+                "vp shell: --core and --app are different things.\n"
+                "    --core is one machine with a session each; its shell is\n"
+                "    the host's, not an app of yours.\n");
+        return 2;
     }
     char cmd[2048];
     cmd[0] = '\0';
@@ -909,7 +993,13 @@ static int cmd_shell(int argc, char** argv)
         size_t at = strlen(cmd);
         snprintf(cmd + at, sizeof(cmd) - at, "%s%s", at ? " " : "", argv[i]);
     }
-    if (!boot_guest(d->serial, app, cmd[0] ? cmd : NULL)) {
+    /* A core is attached to, not booted into: the run is held until a client is
+     * on the socket, so connecting is what starts it, and there is nothing to
+     * run *at* - whatever tokens followed are the command to type, not an argv
+     * for a guest. */
+    bool ok = core ? boot_core(d->serial, cmd[0] ? cmd : NULL)
+                   : boot_guest(d->serial, app, cmd[0] ? cmd : NULL);
+    if (!ok) {
         return 1;
     }
 
@@ -1027,8 +1117,21 @@ static int cmd_shell(int argc, char** argv)
 
 static int cmd_exec_out(int argc, char** argv)
 {
+    bool core = false;
+    /* `--core` first, so it can be spelled before the command. It is a flag of
+     * this verb and not a global, exactly like `devices -l`. */
+    while (argc > 0 && argv[0][0] == '-' && argv[0][1]) {
+        if (!strcmp(argv[0], "--core")) {
+            core = true;
+            argv++;
+            argc--;
+        } else {
+            break;
+        }
+    }
     if (argc < 1) {
-        fprintf(stderr, "usage: vp exec-out COMMAND\n");
+        fprintf(stderr, core ? "usage: vp exec-out --core COMMAND\n"
+                             : "usage: vp exec-out COMMAND [APP]\n");
         return 1;
     }
     devices_load();
@@ -1036,11 +1139,38 @@ static int cmd_exec_out(int argc, char** argv)
     if (!d) {
         return 1;
     }
-    const char* app = (argc > 1) ? argv[1] : NULL;
-    if (!boot_guest(d->serial, app, argv[0])) {
+    /* With a core the command is run by that session's own shell, so the app
+     * slot does not apply: there is no guest to name, and the point is that the
+     * session is one of several in the same machine. */
+    const char* app = (!core && argc > 1) ? argv[1] : NULL;
+    bool ok = core ? boot_core(d->serial, argv[0]) : boot_guest(d->serial, app, argv[0]);
+    if (!ok) {
         return 1;
     }
-
+    if (core) {
+        /* A core's shell is interactive and does not exit with the command, so
+         * there is no exit packet coming and no exit code to report. Typed into
+         * a session like any other input, and the transcript ends when the
+         * connection does. */
+        char* body = NULL;
+        size_t blen = 0;
+        for (;;) {
+            int id = recv_packet(&body, &blen);
+            if (id < 0) {
+                break;
+            }
+            if (id == VP_ID_STDOUT || id == VP_ID_STDERR) {
+                fwrite(body ? body : "", 1, blen, stdout);
+                fflush(stdout);
+            }
+            free(body);
+            body = NULL;
+        }
+        free(body);
+        closesocket(console_fd);
+        console_fd = -1;
+        return 0;
+    }
     char* body = NULL;
     size_t blen = 0;
     int    exit_code = 0;
