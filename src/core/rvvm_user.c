@@ -3901,6 +3901,15 @@ PUBLIC void rvvm_user_set_guest_root(rvvm_machine_t* machine, const char* root)
      * root can disagree, and there is no second path by which they are kept in
      * step. */
     vp_shadow_view_init(&ctx->shadow_view, ctx->shadow, ctx->guest_root_path);
+    /* Directory replays are dropped as well as the view being rebuilt. A tracked
+     * directory holds an index into the shadow, chosen by a lookup under the
+     * PREVIOUS root, and a getdents64() on it would replay that subtree's names
+     * into a directory that is now somewhere else. Same reasoning as
+     * rvvm_user_set_shadow(): a different namespace cannot answer a cursor from
+     * the old one. It costs a re-open of each directory, which nothing does
+     * often, and it is the difference between a chroot that hides /etc and one
+     * that lists it until the guest happens to re-open the directory. */
+    memset(ctx->shadow_dirs, 0, sizeof(ctx->shadow_dirs));
 }
 
 PUBLIC const char* rvvm_user_get_guest_root(rvvm_machine_t* machine)
@@ -8731,19 +8740,30 @@ static rvvm_addr_t rvvm_sys_chdir(const char* path)
     return 0;
 }
 
-/* chroot(2): the host has no equivalent and the guest cannot be given one - a
- * guest process here runs with the same filesystem reach as the emulator, so
- * there is nothing left for a chroot to withhold. What a guest can still rely
- * on is the answer's *meaning*, so the path is resolved and checked exactly as
- * chdir() checks it (missing -> ENOENT, not a directory -> ENOTDIR, a real
- * directory -> success) and the root itself is left where it is.
+/* chroot(2): real, and it moves ctx->guest_root_path - the same sub-root the
+ * command line's root= names, so a guest that chroots and a guest that boots
+ * with root= land in the same place and are read the same way (see
+ * rvvm_user_set_guest_root()).
  *
- * This is not a corner case. OpenSSH's pre-auth privsep child chroots to
- * ChrootDirectory/var/empty and treats ENOSYS as fatal, which is why sshd used
- * to die with "chroot(\"/var/empty\"): Function not implemented" and every
- * connection ended in a RST. Callers that only chroot to shed privileges are
- * unaffected; a guest that chroots in order to *isolate* gets no isolation here.
- */
+ * It used to check the path and then do nothing, on the grounds that "there is
+ * nothing left for a chroot to withhold" - true only while the hostfs prefix is
+ * absent, since prefix == NULL hands the guest the emulator's whole filesystem.
+ * With a prefix there was something to withhold and the syscall still declined
+ * to, which is the half of this that was wrong.
+ *
+ * Not enforced against the caller's credentials, as Linux does with
+ * CAP_SYS_CHROOT. That is a real omission and it is left visible rather than
+ * quietly added: a guest here is one address space run for its own sake, and a
+ * privilege check would turn every unprivileged chroot into EPERM - which is
+ * what sshd's pre-auth privsep child does after it has dropped, and it treats
+ * that as fatal. Add it with the mount table, where "who may mount" has to be
+ * answered anyway.
+ *
+ * The path checks are unchanged and still load-bearing: OpenSSH's pre-auth child
+ * chroots to ChrootDirectory/var/empty and treats ENOSYS as fatal, which is why
+ * sshd used to die with "chroot(\"/var/empty\"): Function not implemented" and
+ * every connection ended in a RST. It needs a truthful ENOENT/ENOTDIR, which is
+ * what it gets.
 /* The guest's struct rlimit: two 64-bit fields, which is also the host's. */
 typedef struct rvvm_rlimit {
     uint64_t rlim_cur;
@@ -8817,12 +8837,28 @@ static rvvm_addr_t rvvm_sys_chroot(const char* path)
     }
     RVVM_TRC(RVVM_TRC_PATH, "path: syscall %ld chroot \"%s\" -> \"%s\"",
               (long)tls_cur_syscall, path, map_abs_path(host, abs));
+    /* Stat'd against the CURRENT root, before it moves: that is what makes the
+     * new root necessarily inside the old one, which is the property chroot(2)
+     * is for. */
     if (stat(map_abs_path(host, abs), &st) != 0) {
         return last_errno();
     }
     if (!S_ISDIR(st.st_mode)) {
         return -UAPI_ENOTDIR;
     }
+    /* "/" names the caller's CURRENT root, not the top of the filesystem, so a
+     * second chroot("/") leaves a chrooted process exactly where it was. Without
+     * this, "/" would mean rvvm_user_set_guest_root()'s "no chroot" and a
+     * process could walk out of its own jail with one call - which is precisely
+     * the escape chroot is supposed to prevent, and the reason this is safe here
+     * at all is that every guest path is already relative to the root.
+     *
+     * The reverse does not need a check: any other path resolves through the
+     * current root, so it cannot name what is outside it. */
+    if (abs[0] == '/' && abs[1] == '\0' && uctx()->guest_root_path) {
+        return 0;
+    }
+    rvvm_user_set_guest_root(uctx()->machine, abs);
     return 0;
 }
 
@@ -12652,7 +12688,12 @@ static int userland_proc_readlink(const char* abs, uint32_t self_pid, char* buff
         if (!strcmp(pp.leaf, "cwd")) {
             target = uctx()->cwd;
         } else if (!strcmp(pp.leaf, "root")) {
-            target = "/";
+            /* The root as this process sees it, which after a chroot(2) or a
+             * root= is not "/" - and a program that reads /proc/self/root to
+             * find out whether it has been jailed is asking exactly this. The
+             * guest spelling, not the index's: the caller is inside the jail and
+             * has no way to spell what is outside it. */
+            target = uctx()->guest_root_path ? uctx()->guest_root_path : "/";
         } else if (!strcmp(pp.leaf, "exe")) {
             target = uctx()->main_elf_path[0] ? uctx()->main_elf_path : "unknown";
         }
