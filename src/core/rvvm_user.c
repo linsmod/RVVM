@@ -1730,6 +1730,12 @@ typedef enum {
  * package managers, build trees - and small enough that a runaway write stops
  * somewhere. */
 #define RVVM_TMPFS_DEFAULT_SIZE (262144ull * 1024)
+
+/* The mount point the procfs name operations answer at. They are attached only
+ * to the row whose path is this one (see mount_row_set_fs), and the name syscalls
+ * hand the ops a mount-relative path, which the ops reconstruct into the
+ * guest-absolute path the proc parser expects. */
+#define RVVM_PROC_MOUNT_POINT "/proc"
 /* Longest host directory a row can name. Longer than the guest-path bound because
  * a host path is the longer of the two (a build tree inside a user profile), and
  * a source longer than this is refused rather than truncated: a mount that quietly
@@ -1773,6 +1779,8 @@ typedef struct {
 
 /* Point a row's dispatch at its storage. Called wherever the storage is set or
  * replaced: the defaults' build, mount_row_add() and the root's backing change. */
+static const rvvm_fs_ops_t* procfs_fs_ops(void);
+
 static void mount_row_set_fs(rvvm_mount_t* m)
 {
     m->ops  = NULL;
@@ -1781,6 +1789,12 @@ static void mount_row_set_fs(rvvm_mount_t* m)
         rvvm_fs_t view = rvvm_fs_view_memfs(m->memfs);
         m->ops  = view.ops;
         m->priv = view.priv;
+    } else if (m->provider == RVVM_MOUNT_CORE &&
+               !strcmp(m->path, RVVM_PROC_MOUNT_POINT)) {
+        /* The one core row whose name operations the shared shape can carry:
+         * the refusals. A proc mounted elsewhere is still a recorded, reported
+         * row that serves nothing - which is what mount_e2e pins. */
+        m->ops = procfs_fs_ops();
     }
 }
 
@@ -1875,13 +1889,15 @@ static struct rvvm_mount_ns* userland_mountns_new(const char* root_host_dir)
         rvvm_mount_t* m = &ns->mounts[i];
         if (m->provider == RVVM_MOUNT_MEMFS && !m->memfs) {
             m->memfs = rvvm_memfs_create(false, RVVM_TMPFS_DEFAULT_SIZE);
-            mount_row_set_fs(m);
             if (m->memfs) {
                 tmpfs_options(m->options, sizeof(m->options), m->memfs, false);
             } else {
                 rvvm_warn("no memory for the %s filesystem; it answers nothing", m->path);
             }
         }
+        /* Every default row gets its dispatch pointed at whatever it owns - the
+         * tmpfs rows their storage, /proc its name operations. */
+        mount_row_set_fs(m);
     }
     return ns;
 }
@@ -14376,6 +14392,165 @@ static bool userland_proc_has(const char* abs)
     return userland_proc_parse(abs, userland_current_pid(), &pp);
 }
 
+/* --- procfs through the shared operations shape --------------------------- */
+
+/* What the /proc row answers through rvvm_fs_ops_t: the refusals.
+ *
+ * procfs is a filesystem with no storage behind any of its names and no
+ * descriptor this shape can model - an open there generates a descriptor of
+ * the core's own, which is the openat note's reason the ops table has no open
+ * slot at all. What the shared shape can carry is exactly what a name question
+ * deserves when the name has nothing behind it: "no".
+ *
+ * EPERM is what Linux says for a mutating operation on a procfs name, and it
+ * is better than what these paths got before the row carried ops: the name
+ * syscalls fell through to the host, which answered for a path that does not
+ * exist there - ENOENT for a mkdir /proc never named - or a quiet success
+ * where the rootfs happens to ship the name, as touch /proc/mounts had. A
+ * refusal that names the truth - nothing under here can be changed - is the
+ * one a guest can act on.
+ *
+ * The slots this shape cannot carry faithfully stay ENOTSUP rather than
+ * growing a plausible wrong answer: a stat through here would lose the dev
+ * and uid words userland_proc_path_stat() fills (which is why newfstatat
+ * keeps its own branch), and a readlink through here would duplicate the one
+ * rvvm_sys_readlinkat() already reaches. ENOTSUP is the explicit "not this
+ * shape", which is the answer the header's note on slots asks for. */
+
+static bool procfs_fs_read_only(void* priv)
+{
+    (void)priv;
+    return true; /* there is no storage, so nothing is writable */
+}
+
+static rvvm_fs_result_t procfs_fs_mkdir(void* priv, const char* rel, uint32_t mode)
+{
+    (void)priv; (void)rel; (void)mode;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t procfs_fs_create_file(void* priv, const char* rel, uint32_t mode)
+{
+    (void)priv; (void)rel; (void)mode;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t procfs_fs_unlink(void* priv, const char* rel, bool dir)
+{
+    (void)priv; (void)rel; (void)dir;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t procfs_fs_rename(void* priv, const char* from, const char* to)
+{
+    (void)priv; (void)from; (void)to;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t procfs_fs_link(void* priv, const char* from, const char* to)
+{
+    (void)priv; (void)from; (void)to;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t procfs_fs_symlink(void* priv, const char* target, const char* rel)
+{
+    (void)priv; (void)target; (void)rel;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t procfs_fs_truncate(void* priv, const char* rel, uint64_t size)
+{
+    (void)priv; (void)rel; (void)size;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t procfs_fs_chmod(void* priv, const char* rel, uint32_t mode)
+{
+    (void)priv; (void)rel; (void)mode;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t procfs_fs_touch(void* priv, const char* rel)
+{
+    (void)priv; (void)rel;
+    return RVVM_FS_EPERM;
+}
+
+/* The one question besides "may I change this" the shape can carry: what does
+ * this link say. userland_proc_readlink() answers in its own three words -
+ * not ours, ours-but-not-a-link, ours-with-no-name - and the map to the shared
+ * codes is the one rvvm_sys_readlinkat() already makes: a length, EINVAL for
+ * a name the row covers that is no link, ENOENT for one with nothing behind
+ * it. Not-ours cannot happen for a path the row answers - every /proc name is
+ * either a proc name or a name the row covers that the parser leaves alone
+ * (/proc/mounts) - and that second kind is not a link, which is EINVAL. */
+static rvvm_fs_result_t procfs_fs_readlink(void* priv, const char* rel,
+                                           char* buf, size_t size)
+{
+    char        abs[UAPI_PATH_MAX];
+    rvvm_addr_t out = 0;
+    int         n;
+    int         rc;
+
+    (void)priv;
+    if (size == 0) {
+        return RVVM_FS_EINVAL;
+    }
+    /* @rel is mount-relative and starts with '/' (or is "/" itself), so the
+     * guest-absolute name is the mount point followed by it. */
+    n = snprintf(abs, sizeof(abs), "%s%s", RVVM_PROC_MOUNT_POINT, rel);
+    if (n < 0 || (size_t)n >= sizeof(abs)) {
+        return RVVM_FS_EINVAL;
+    }
+    rc = userland_proc_readlink(abs, userland_current_pid(), buf, size, &out);
+    if (rc == 1) {
+        /* The parser reports the length rather than writing a terminator -
+         * readlink(2) semantics, which is what rvvm_sys_readlinkat() consumes.
+         * This shape's readlink hands back a name, so put the terminator where
+         * the length says and let the caller strlen it. */
+        size_t len = (size_t)out;
+        if (len >= size) {
+            len = size - 1;
+        }
+        buf[len] = '\0';
+        return RVVM_FS_OK;
+    }
+    if (rc == 0) {
+        return RVVM_FS_EINVAL; /* ours, but not a link */
+    }
+    if (rc == 2) {
+        return RVVM_FS_ENOENT; /* ours, and there is no name to give */
+    }
+    return RVVM_FS_EINVAL; /* the row covers it, and it is no link */
+}
+
+static const rvvm_fs_ops_t rvvm_fs_ops_procfs = {
+    .name      = "procfs",
+    .read_only = procfs_fs_read_only,
+    .stat      = NULL, /* see the block comment: userland_proc_path_stat() */
+    .mkdir     = procfs_fs_mkdir,
+    .create_file = procfs_fs_create_file,
+    .unlink    = procfs_fs_unlink,
+    .rename    = procfs_fs_rename,
+    .link      = procfs_fs_link,
+    .symlink   = procfs_fs_symlink,
+    .readlink  = procfs_fs_readlink,
+    .truncate  = procfs_fs_truncate,
+    .chmod     = procfs_fs_chmod,
+    .touch     = procfs_fs_touch,
+    /* Descriptor and listing slots: procfs descriptors are generated objects
+     * with their own read/lseek/getdents dispatch (userland_proc_by_fd), not
+     * name-pinned views of a storage. NULL rather than a stub, so a caller
+     * that ever reaches for one through here fails loudly in review instead
+     * of quietly at runtime. */
+};
+
+static const rvvm_fs_ops_t* procfs_fs_ops(void)
+{
+    return &rvvm_fs_ops_procfs;
+}
+
 /* stat(2)/lstat(2) of a procfs path. False when @abs is not ours. */
 static bool userland_proc_path_stat(const char* abs, uint32_t self_pid, bool follow,
                                     struct stat* st)
@@ -15569,6 +15744,17 @@ static void* rvvm_user_thread_wrap(void* arg)
                     char          ac_rel[RVVM_MEMFS_PATH_MAX];
                     rvvm_info("sys_faccessat(%ld, %s, %lx)", a0, to_str(a1), a2);
                     if (guest_path_abs_of((int)a0, to_str(a1), ac_abs, sizeof(ac_abs)) &&
+                        userland_proc_has(ac_abs)) {
+                        /* A procfs path answers inside rvvm_sys_faccessat, not
+                         * through the row's ops: the EACCES a mode-0444 proc
+                         * file says for a write probe is not the EROFS of a
+                         * read-only mount, and that distinction is the
+                         * filesystem's, not the caller's. */
+                        a0 = rvvm_sys_faccessat(userland_fd_host(uctx(), (int)a0),
+                                                to_str(a1), a2, 0);
+                        break;
+                    }
+                    if (guest_path_abs_of((int)a0, to_str(a1), ac_abs, sizeof(ac_abs)) &&
                         mount_fs_for(&ac_view, &ac_ref, ac_rel, sizeof(ac_rel), ac_abs)) {
                         /* Permissions are recorded and reported but not enforced
                          * (see the module header), so the only two questions with
@@ -15749,7 +15935,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                              * the host tree has an empty directory (and a real
                              * /proc/mounts, which userland_proc_parse() leaves
                              * to the host). A directory gets a snapshot fd the
-                             * getdents64 path walks; a file its generated text. */
+                             * getdents64 path walks; a file its generated text.
+                             *
+                             * This stays an open of its own rather than an ops
+                             * slot: a procfs open GENERATES a descriptor of the
+                             * core's own, and the shared shape deliberately has
+                             * no open to model that with. */
                             a0 = userland_proc_open_path(abs, userland_current_pid(),
                                                          (int)a2, (a2 & UAPI_O_CLOEXEC) != 0);
                         } else if (have_abs && memfs_mount_for(&mfs, mrel, sizeof(mrel), abs)) {
@@ -16441,7 +16632,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                         break;
                     }
                     /* A procfs path: a directory, a generated file, or a link
-                     * (its target when followed, the link itself for lstat). */
+                     * (its target when followed, the link itself for lstat).
+                     * This keeps its own branch rather than going through the
+                     * row's ops: the guest's stat needs the dev and uid words
+                     * the shared info_t does not carry, and userland_proc_path_
+                     * stat() fills them. */
                     if (path && (path[0] == '/' || (int)a0 == UAPI_AT_FDCWD)) {
                         char proc_abs[UAPI_PATH_MAX];
                         struct stat proc_st = {0};
