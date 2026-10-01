@@ -52,7 +52,7 @@ $exe  = Join-Path $env:TEMP 'rvvm_hostfs_selftest.exe'
 # here rather than by the test: a test that picks its own idea of a temp
 # directory is a test that leaves one behind on the wrong platform.
 $scratch = Join-Path $env:TEMP 'rvvm_hostfs_selftest_root'
-Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $scratch) { Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue }
 
 if (-not (Get-Command $Cc -ErrorAction SilentlyContinue)) {
     "SKIP: no '$Cc' on PATH; rvvm_hostfs's own checks did not run"
@@ -81,7 +81,7 @@ if (-not $NoSanitize) {
     if ($LASTEXITCODE -eq 0) {
         $flags += '-fsanitize=address,undefined'
         $sanitize = $true
-        Remove-Item "$env:TEMP\rvvm_san_probe.exe" -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath "$env:TEMP\rvvm_san_probe.exe") { Remove-Item "$env:TEMP\rvvm_san_probe.exe" -ErrorAction SilentlyContinue }
     }
 }
 
@@ -97,8 +97,8 @@ if (-not $sanitize) {
 
 & $exe $scratch
 $rc = $LASTEXITCODE
-Remove-Item $exe -ErrorAction SilentlyContinue
-Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $exe) { Remove-Item $exe -ErrorAction SilentlyContinue }
+if (Test-Path -LiteralPath $scratch) { Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue }
 if ($rc -ne 0) {
     "FAIL: rvvm_hostfs's own checks failed (exit $rc)"
     exit 1

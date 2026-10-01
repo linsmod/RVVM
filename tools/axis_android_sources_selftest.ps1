@@ -91,7 +91,7 @@ $m1 = Invoke-ScratchGate
     ForEach-Object { Write-Host "  $_" }
 if ($m1.Code -eq 0) { Write-Host '  NOT CAUGHT - a new source can be added without the NDK build seeing it'; $failed++ }
 else { Write-Host "  caught (exit $($m1.Code))" }
-Remove-Item $newFile -Force
+if (Test-Path -LiteralPath $newFile) { Remove-Item $newFile -Force }
 
 Write-Host ''
 Write-Host 'MUTATION 2: an exclusion that no longer excludes anything'
@@ -121,7 +121,7 @@ Write-Host "  exit=$($m4.Code)"
 if ($m4.Code -ne 0) { Write-Host '  the scratch tree did not come back'; $failed++ }
 else { Write-Host '  clean' }
 
-Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $scratch) { Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue }
 
 Write-Host ''
 if ($failed) { Write-Host "$failed mutation(s) not caught"; exit 1 }

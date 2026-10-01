@@ -61,7 +61,8 @@ function ClientRc([string]$cmd) {
 
 $out = Join-Path $env:TEMP 'memfs_root_e2e_core_out.txt'
 $err = Join-Path $env:TEMP 'memfs_root_e2e_core_err.txt'
-Remove-Item $out, $err -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $out) { Remove-Item $out -ErrorAction SilentlyContinue }
+if (Test-Path -LiteralPath $err) { Remove-Item $err -ErrorAction SilentlyContinue }
 
 # A stale core would answer for us, and a stale one is a persisted rootfs: make
 # sure ours is the one.
@@ -73,7 +74,7 @@ Start-Sleep -Milliseconds 300
 # earlier run cannot read as this one's.
 $hostRoot = Join-Path $dir 'runtime\rootfs'
 $hostFile = Join-Path $hostRoot 'wrote-in-memory.txt'
-Remove-Item $hostFile -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $hostFile) { Remove-Item $hostFile -ErrorAction SilentlyContinue }
 
 $core = Start-Process -FilePath $exe -ArgumentList '--serve', '--memfs', '--port', "$Port" `
                       -WorkingDirectory $dir -PassThru `

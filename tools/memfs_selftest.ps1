@@ -71,7 +71,7 @@ if (-not $NoSanitize) {
     if ($LASTEXITCODE -eq 0) {
         $flags += '-fsanitize=address,undefined'
         $sanitize = $true
-        Remove-Item "$env:TEMP\rvvm_san_probe.exe" -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath "$env:TEMP\rvvm_san_probe.exe") { Remove-Item "$env:TEMP\rvvm_san_probe.exe" -ErrorAction SilentlyContinue }
     }
 }
 
@@ -87,7 +87,7 @@ if (-not $sanitize) {
 
 & $exe
 $rc = $LASTEXITCODE
-Remove-Item $exe -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $exe) { Remove-Item $exe -ErrorAction SilentlyContinue }
 if ($rc -ne 0) {
     "FAIL: rvvm_memfs's own checks failed (exit $rc)"
     exit 1

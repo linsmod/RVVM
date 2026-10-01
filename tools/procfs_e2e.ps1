@@ -53,7 +53,8 @@ function Client([string]$cmd) {
 
 $out = Join-Path $env:TEMP 'procfs_e2e_core_out.txt'
 $err = Join-Path $env:TEMP 'procfs_e2e_core_err.txt'
-Remove-Item $out, $err -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $out) { Remove-Item $out -ErrorAction SilentlyContinue }
+if (Test-Path -LiteralPath $err) { Remove-Item $err -ErrorAction SilentlyContinue }
 
 # A stale core from an earlier run would answer for us: make sure ours is the one.
 Get-Process -Name 'rvvm_ash_x86_64' -ErrorAction SilentlyContinue |

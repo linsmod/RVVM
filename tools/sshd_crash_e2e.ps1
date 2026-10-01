@@ -148,7 +148,8 @@ function Guest([string]$Cmd, [int]$TimeoutSec = 240) {
 $errfile = Join-Path $env:TEMP 'sshd_crash_core_err.txt'
 $outfile = Join-Path $env:TEMP 'sshd_crash_core_out.txt'
 $dlog = Join-Path $exedir 'runtime\rootfs\tmp\sshd_crash-vpsessiond.log'
-Remove-Item $errfile, $outfile -EA SilentlyContinue
+if (Test-Path -LiteralPath $errfile) { Remove-Item $errfile -EA SilentlyContinue }
+if (Test-Path -LiteralPath $outfile) { Remove-Item $outfile -EA SilentlyContinue }
 if (Test-Path -LiteralPath $dlog) { Remove-Item -LiteralPath $dlog -Force }
 
 # RVVM_TRACE has to reach the core, and Start-Process inherits the driver's
