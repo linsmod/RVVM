@@ -108,6 +108,12 @@ Check ($r -notmatch '(?m)^/dev/root / auto') "and no longer calls its type auto"
 foreach ($m in @('/dev devtmpfs', '/sys sysfs', '/proc proc', '/tmp tmpfs', '/var/tmp tmpfs')) {
     Check ($r -match ('(?m)^\S+ ' + [regex]::Escape($m) + ' ')) "/proc/mounts lists $m"
 }
+# /tmp and /var/tmp are tmpfs the core backs with storage of its own now, and
+# the options are written from that storage: the size is the bound the guest is
+# really under, and the flags nothing enforces are gone rather than reported.
+Check ($r -match '(?m)^\S+ /tmp tmpfs rw,relatime,size=262144k') "/proc/mounts reports the /tmp tmpfs's bound"
+Check ($r -match '(?m)^\S+ /var/tmp tmpfs rw,relatime,size=262144k') "and /var/tmp's"
+Check ($r -notmatch '(?m)^\S+ /tmp tmpfs [^\r\n]*nosuid') "and the tmpfs rows no longer report flags nothing enforces"
 # The session endpoints: a host directory the runner mounts at the guest path
 # vpsessiond binds (see win32_cmdpost_bridge.c). It is a mount rather than a
 # directory under the rootfs so that it does not move when the guest's / is backed
@@ -121,6 +127,19 @@ Check ($r -notmatch 'devpts') "/proc/mounts claims no devpts mount"
 # the six defaults plus the session endpoint mount above.
 Check ((($r -split "`n" | Where-Object { $_ -match '\S' }).Count) -eq 8) `
       "/proc/mounts is exactly the seven mounts plus its header"
+
+# --- /tmp is served by the storage its row owns -------------------------------
+# The type said tmpfs and the writes went to a host directory - the row said one
+# thing and the bytes did another. Now the storage is the run's own, so the
+# write reads back through it and nothing lands in the prefix's tmp directory.
+$rc = ClientRc 'echo tmpfs-served > /tmp/served.txt'
+Check ($rc -eq 0) "a write to /tmp lands in the tmpfs the row owns (rc $rc)"
+$r = Client 'cat /tmp/served.txt'
+Check ($r -match 'tmpfs-served') "and reads back through it"
+$hostside = Join-Path $dir 'runtime/rootfs/tmp/served.txt'
+Check (-not (Test-Path -LiteralPath $hostside)) "and nothing landed in the host's prefix directory"
+$rc = ClientRc 'rm -f /tmp/served.txt'
+Check ($rc -eq 0) "and unlinks again"
 
 # --- the namespace is shared across sessions --------------------------------
 # /mnt in one session, read back from the next: this is the check the per-context

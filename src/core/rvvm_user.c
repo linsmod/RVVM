@@ -1720,6 +1720,16 @@ typedef enum {
 #define RVVM_MOUNT_MAX      16
 #define RVVM_MOUNT_PATH_MAX  64
 #define RVVM_MOUNT_OPT_MAX   48
+
+/* What the default /tmp and /var/tmp are bounded to. A tmpfs is storage the run
+ * owns, and the one thing a tmpfs promises is a bound - a guest writing without
+ * one would spend the host's memory to the last page before it saw an error. A
+ * fixed count rather than a share of RAM, for the reason memfs_parse_size()
+ * refuses percentages: there is no machine memory here to take a share of, only
+ * bytes this filesystem hands out. Large enough for what guests put in /tmp -
+ * package managers, build trees - and small enough that a runaway write stops
+ * somewhere. */
+#define RVVM_TMPFS_DEFAULT_SIZE (262144ull * 1024)
 /* Longest host directory a row can name. Longer than the guest-path bound because
  * a host path is the longer of the two (a build tree inside a user profile), and
  * a source longer than this is refused rather than truncated: a mount that quietly
@@ -1739,8 +1749,8 @@ typedef struct {
     /* Where a RVVM_MOUNT_HOSTFS row's bytes are, when they are not simply the
      * host's tree at the same path.
      *
-     * Empty means exactly that: the host's own /sys for /sys, the host's own /tmp
-     * for /tmp - the rows that reach through rather than across. Non-empty is a
+     * Empty means exactly that: the host's own /sys for /sys - the one default row
+     * that still reaches through rather than across. Non-empty is a
      * host directory mounted at a guest path of its own, which is what
      * rvvm_user_mount_hostfs() and mount -t hostfs build: the WSL drvfs / MinGW /c
      * shape, where the guest's namespace says where and the host's says what.
@@ -1773,21 +1783,28 @@ typedef struct rvvm_mount_ns {
     rvvm_mount_t  mounts[RVVM_MOUNT_MAX];
 } rvvm_mount_ns_t;
 
+/* Defined with the mount syscalls; the defaults below ask for it, because a
+ * tmpfs row's options are written from the storage rather than from the request. */
+static void tmpfs_options(char* options, size_t size, rvvm_memfs_t* memfs, bool read_only);
+
 static struct rvvm_mount_ns* userland_mountns_new(const char* root_host_dir)
 {
     /* SPINLOCK_INIT is a brace initializer, so the whole struct goes down in one
      * shot rather than field by field - and these come with it. Every row but the
-     * root is a constant: /dev and /proc the core synthesizes, /sys and /tmp are
-     * the host's own trees at the same path, and none of them depends on where
-     * this run's root lives. */
+     * root is a constant: /dev and /proc the core synthesizes, /sys the host's own
+     * tree at the same path, /tmp and /var/tmp memory filesystems whose storage is
+     * built below - and none of them depends on where this run's root lives. The
+     * tmpfs rows' options are rewritten from their storage once it exists, so the
+     * string a guest reads in /proc/mounts is the one the storage wrote. */
     static const rvvm_mount_t defaults[] = {
         { "/dev",     "devtmpfs", "rw,nosuid,size=65536k,mode=755",         RVVM_MOUNT_CORE   },
         { "/sys",     "sysfs",   "rw,nosuid,nodev,noexec,relatime",        RVVM_MOUNT_HOSTFS },
         { "/proc",    "proc",    "rw,nosuid,nodev,noexec,relatime",        RVVM_MOUNT_CORE   },
-        { "/tmp",     "tmpfs",   "rw,nosuid,nodev,relatime",               RVVM_MOUNT_HOSTFS },
-        { "/var/tmp", "tmpfs",   "rw,nosuid,nodev,relatime",               RVVM_MOUNT_HOSTFS },
+        { "/tmp",     "tmpfs",   "rw,relatime",                            RVVM_MOUNT_MEMFS  },
+        { "/var/tmp", "tmpfs",   "rw,relatime",                            RVVM_MOUNT_MEMFS  },
     };
     struct rvvm_mount_ns* ns = safe_new_obj(rvvm_mount_ns_t);
+    unsigned              i;
 
     *ns = (struct rvvm_mount_ns){
         .lock  = SPINLOCK_INIT,
@@ -1821,6 +1838,25 @@ static struct rvvm_mount_ns* userland_mountns_new(const char* root_host_dir)
         }
     }
     memcpy(ns->mounts + 1, defaults, sizeof(defaults));
+    /* The tmpfs rows get the storage their type promised, here where the root's
+     * is built too: a static constant cannot hold a pointer to something the run
+     * owns. The options are then written from that storage, so /proc/mounts
+     * reports the size the guest is really under - and on the way it drops
+     * nosuid and nodev, because nothing here enforces them (mount(2) refuses
+     * the flags) and a row reporting them would be the kind of lie this table
+     * exists to stop telling. A row whose storage could not be built answers
+     * nothing, exactly like the memory-backed root without storage above. */
+    for (i = 1; i < ns->count; ++i) {
+        rvvm_mount_t* m = &ns->mounts[i];
+        if (m->provider == RVVM_MOUNT_MEMFS && !m->memfs) {
+            m->memfs = rvvm_memfs_create(false, RVVM_TMPFS_DEFAULT_SIZE);
+            if (m->memfs) {
+                tmpfs_options(m->options, sizeof(m->options), m->memfs, false);
+            } else {
+                rvvm_warn("no memory for the %s filesystem; it answers nothing", m->path);
+            }
+        }
+    }
     return ns;
 }
 
@@ -1843,7 +1879,7 @@ static void mount_row_release(rvvm_mount_t* m)
 }
 
 /* Whether @m is the run's own root row. By path rather than by provider, because
- * that is what actually distinguishes it: /sys and /tmp are RVVM_MOUNT_HOSTFS too,
+ * that is what actually distinguishes it: /sys is RVVM_MOUNT_HOSTFS too,
  * but the root is the row the prefix belongs to - the one whose host directory is
  * the rootfs, the one mount(2) may not replace and umount2(2) may not remove. */
 static bool mount_row_is_root(const rvvm_mount_t* m)
@@ -4511,9 +4547,11 @@ static rvvm_path_owner_t rvvm_path_owner(const struct rvvm_mount_ns* ns, const c
  *
  * The rule is the one the array implemented, unchanged in its first two cases: a
  * path covered by a row of its own does not get the prefix, UNLESS the run's own
- * rootfs has that directory - a minirootfs ships /dev and /tmp as empty
- * directories, and sending an access to the host's root, where they do not exist,
- * would lose a directory the guest can see in its own listing. The lookup is on
+ * rootfs has that directory - a minirootfs ships /dev as an empty
+ * directory, and sending an access to the host's root, where it does not exist,
+ * would lose a directory the guest can see in its own listing. (/tmp ships as
+ * one too, but its row owns the name out of its own storage now, so its paths
+ * never reach this lookup.) The lookup is on
  * the mount point itself, never on the full path, because a name that does not
  * exist yet has no entry of its own and asking about it would send that very
  * open() to the host.
@@ -4574,8 +4612,10 @@ static void path_host_mapping(const rvvm_userland_t* ctx, const char* path,
     }
     if (ctx->shadow && vp_shadow_view_lookup(&ctx->shadow_view, owner.mount->path) != NULL) {
         /* A mount the rootfs also ships as a real directory - a minirootfs has /dev
-         * and /tmp as empty ones - so the host directory wins and that means the
-         * prefix rather than the row's own path. */
+         * as an empty one - so the host directory wins and that means the
+         * prefix rather than the row's own path. A memory-backed row never gets
+         * here: the syscalls that would ask have already answered out of the
+         * storage, which is the whole point of the row owning its name. */
         *dir             = ctx->prefix_path;
         *with_guest_root = true;
         return;
@@ -5078,7 +5118,7 @@ static rvvm_addr_t rvvm_user_umount(const char* target, int flags)
 /* Is @path already where the guest's cwd should be? Called with the host's
  * getcwd() output, so this is a HOST path being asked about: one under the prefix
  * is already the guest's root, and one that no row maps is a cwd the guest named
- * as a row's own tree - the host's /tmp for the /tmp row - which moving into the
+ * as a row's own tree - the host's /sys for the /sys row - which moving into the
  * prefix would take away from it. */
 PUBLIC rvvm_memfs_t* rvvm_user_root_memfs(rvvm_machine_t* machine)
 {
