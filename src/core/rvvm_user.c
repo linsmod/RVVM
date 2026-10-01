@@ -138,6 +138,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "rvvm_user.h" // rvvm_user_io_callback typedef (this file's own public header)
 #include "virtpass/vp_shadow.h" // guest rootfs "shape" index (rvvm_user_set_shadow)
 #include "core/rvvm_memfs.h"    // the memory filesystem a tmpfs mount is served by
+#include "core/rvvm_fs.h"       // ... and the shape both filesystems answer through
 #include "rvvmlib.h"
 
 #if defined(_WIN32)
@@ -7467,6 +7468,37 @@ static int memfs_errno(rvvm_memfs_result_t rc)
         case RVVM_MEMFS_ELOOP:     return UAPI_ELOOP;
         case RVVM_MEMFS_ENOMEM:    return UAPI_ENOMEM;
         case RVVM_MEMFS_EPERM:     return UAPI_EPERM;
+    }
+    return UAPI_EIO;
+}
+
+/* The same, for an answer that came through rvvm_fs rather than from a provider
+ * directly. One converter and not one per provider, which is the point of the
+ * table: a caller cannot tell which filesystem answered, so it must not have to
+ * know which errno table to use either.
+ *
+ * ENOTSUP is the one code memfs never produces - it is how hostfs says a host
+ * cannot do something at all - and it becomes EOPNOTSUPP rather than being folded
+ * into EPERM, because the two tell a guest different things: "you may not" versus
+ * "this is not a thing here". */
+static int rvvm_fs_errno(rvvm_fs_result_t rc)
+{
+    switch (rc) {
+        case RVVM_FS_OK:        return 0;
+        case RVVM_FS_ENOENT:    return UAPI_ENOENT;
+        case RVVM_FS_EEXIST:    return UAPI_EEXIST;
+        case RVVM_FS_ENOTDIR:   return UAPI_ENOTDIR;
+        case RVVM_FS_EISDIR:    return UAPI_EISDIR;
+        case RVVM_FS_EINVAL:    return UAPI_EINVAL;
+        case RVVM_FS_ENOSPC:    return UAPI_ENOSPC;
+        case RVVM_FS_EROFS:     return UAPI_EROFS;
+        case RVVM_FS_EMFILE:    return UAPI_EMFILE;
+        case RVVM_FS_EXDEV:     return UAPI_EXDEV;
+        case RVVM_FS_ENOTEMPTY: return UAPI_ENOTEMPTY;
+        case RVVM_FS_ELOOP:     return UAPI_ELOOP;
+        case RVVM_FS_ENOMEM:    return UAPI_ENOMEM;
+        case RVVM_FS_EPERM:     return UAPI_EPERM;
+        case RVVM_FS_ENOTSUP:   return UAPI_EOPNOTSUPP;
     }
     return UAPI_EIO;
 }
@@ -15064,8 +15096,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                         memfs_mount_for(&mk_fs, mk_rel, sizeof(mk_rel), mk_abs)) {
                         /* A tmpfs: the directory is made in the storage the mount
                          * owns, which is the only place it can be seen. */
-                        a0 = -(rvvm_addr_t)memfs_errno(
-                                 rvvm_memfs_mkdir(mk_fs, mk_rel, guest_create_mode(a2)));
+                        rvvm_fs_t mk_view = rvvm_fs_view_memfs(mk_fs);
+                        a0 = -(rvvm_addr_t)rvvm_fs_errno(
+                                 rvvm_fs_mkdir(&mk_view, mk_rel, guest_create_mode(a2)));
                         rvvm_memfs_free(mk_fs);
                         break;
                     }
@@ -15095,9 +15128,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                         /* A tmpfs: one name goes, and the inode with it only if
                          * that was the last name. AT_REMOVEDIR is the guest's
                          * rmdir, and the module refuses it for a file. */
-                        a0 = -(rvvm_addr_t)memfs_errno(
-                                 rvvm_memfs_unlink(rm_fs, rm_rel,
-                                                   (a2 & RVVM_UAPI_AT_REMOVEDIR) != 0));
+                        rvvm_fs_t rm_view = rvvm_fs_view_memfs(rm_fs);
+                        a0 = -(rvvm_addr_t)rvvm_fs_errno(
+                                 rvvm_fs_unlink(&rm_view, rm_rel,
+                                                (a2 & RVVM_UAPI_AT_REMOVEDIR) != 0));
                         rvvm_memfs_free(rm_fs);
                         break;
                     }
@@ -15135,8 +15169,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                          * cwd. This is also the reason a memfs root needs no
                          * shadow: the storage holds the link itself, where a host
                          * directory cannot. */
-                        a0 = -(rvvm_addr_t)memfs_errno(
-                                 rvvm_memfs_symlink(sl_fs, to_str(a0), sl_rel));
+                        rvvm_fs_t sl_view = rvvm_fs_view_memfs(sl_fs);
+                        a0 = -(rvvm_addr_t)rvvm_fs_errno(
+                                 rvvm_fs_symlink(&sl_view, to_str(a0), sl_rel));
                         rvvm_memfs_free(sl_fs);
                         break;
                     }
@@ -15164,8 +15199,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                             if (s_on && d_on && lk_sfs == lk_dfs) {
                                 /* Neither name is dereferenced: the new one is
                                  * created, and a link to a symlink is legal. */
-                                a0 = -(rvvm_addr_t)memfs_errno(
-                                         rvvm_memfs_link(lk_sfs, lk_srel, lk_drel));
+                                rvvm_fs_t lk_view = rvvm_fs_view_memfs(lk_sfs);
+                                a0 = -(rvvm_addr_t)rvvm_fs_errno(
+                                         rvvm_fs_link(&lk_view, lk_srel, lk_drel));
                             } else {
                                 /* A link cannot cross a mount, which is Linux's
                                  * EXDEV and the reason both sides are asked of
@@ -15228,8 +15264,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_truncate64(%s, %lx)", to_str(a0), a1);
                     if (guest_path_abs_of(UAPI_AT_FDCWD, to_str(a0), tr_abs, sizeof(tr_abs)) &&
                         memfs_mount_for(&tr_fs, tr_rel, sizeof(tr_rel), tr_abs)) {
-                        a0 = -(rvvm_addr_t)memfs_errno(
-                                 rvvm_memfs_truncate(tr_fs, tr_rel, a1));
+                        rvvm_fs_t tr_view = rvvm_fs_view_memfs(tr_fs);
+                        a0 = -(rvvm_addr_t)rvvm_fs_errno(
+                                 rvvm_fs_truncate(&tr_view, tr_rel, a1));
                         rvvm_memfs_free(tr_fs);
                         break;
                     }
@@ -15268,16 +15305,17 @@ static void* rvvm_user_thread_wrap(void* arg)
                          * an answer here are "is it there" and "could a write
                          * land" - and the second is the mount's read-only flag
                          * rather than the inode's mode. */
-                        rvvm_memfs_result_t ac_rc = RVVM_MEMFS_OK;
+                        rvvm_fs_t         ac_view = rvvm_fs_view_memfs(ac_fs);
+                        rvvm_fs_result_t  ac_rc   = RVVM_FS_OK;
                         if (a2 & 2 /* W_OK */) {
-                            ac_rc = rvvm_memfs_read_only(ac_fs) ? RVVM_MEMFS_EROFS
-                                                                : RVVM_MEMFS_OK;
+                            ac_rc = rvvm_fs_read_only(&ac_view) ? RVVM_FS_EROFS
+                                                                : RVVM_FS_OK;
                         }
-                        if (ac_rc == RVVM_MEMFS_OK) {
-                            rvvm_memfs_info_t ac_info;
-                            ac_rc = rvvm_memfs_stat(ac_fs, ac_rel, true, &ac_info);
+                        if (ac_rc == RVVM_FS_OK) {
+                            rvvm_fs_info_t ac_info;
+                            ac_rc = rvvm_fs_stat(&ac_view, ac_rel, true, &ac_info);
                         }
-                        a0 = -(rvvm_addr_t)memfs_errno(ac_rc);
+                        a0 = -(rvvm_addr_t)rvvm_fs_errno(ac_rc);
                         rvvm_memfs_free(ac_fs);
                         break;
                     }
@@ -15322,8 +15360,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                          * copy there is. AT_SYMLINK_NOFOLLOW is not honoured:
                          * the module's chmod follows, which is the ordinary
                          * operation and the one this core has always served. */
-                        a0 = -(rvvm_addr_t)memfs_errno(
-                                 rvvm_memfs_chmod(cm_fs, cm_rel, (uint32_t)a2));
+                        rvvm_fs_t cm_view = rvvm_fs_view_memfs(cm_fs);
+                        a0 = -(rvvm_addr_t)rvvm_fs_errno(
+                                 rvvm_fs_chmod(&cm_view, cm_rel, (uint32_t)a2));
                         rvvm_memfs_free(cm_fs);
                         break;
                     }
@@ -16343,7 +16382,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                              * ENOENT for a name that is not present - which is what
                              * sends touch on to create it - and a fresh mtime for one
                              * that is. */
-                            a0 = -(rvvm_addr_t)memfs_errno(rvvm_memfs_touch(ut_fs, ut_rel));
+                            rvvm_fs_t ut_view = rvvm_fs_view_memfs(ut_fs);
+                            a0 = -(rvvm_addr_t)rvvm_fs_errno(rvvm_fs_touch(&ut_view, ut_rel));
                             rvvm_memfs_free(ut_fs);
                             break;
                         }
@@ -17358,8 +17398,9 @@ case 179: // sysinfo
                                  * one identity, one path rewritten - and the whole
                                  * subtree underneath, which is the O(subtree) the
                                  * module documents. */
-                                a0 = -(rvvm_addr_t)memfs_errno(
-                                         rvvm_memfs_rename(rn_sfs, rn_srel, rn_drel));
+                                rvvm_fs_t rn_view = rvvm_fs_view_memfs(rn_sfs);
+                                a0 = -(rvvm_addr_t)rvvm_fs_errno(
+                                         rvvm_fs_rename(&rn_view, rn_srel, rn_drel));
                             } else {
                                 /* A rename cannot cross a mount, which is Linux's
                                  * EXDEV - and the reason both sides are asked of
