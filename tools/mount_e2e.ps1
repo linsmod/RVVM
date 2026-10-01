@@ -141,6 +141,19 @@ Check (-not (Test-Path -LiteralPath $hostside)) "and nothing landed in the host'
 $rc = ClientRc 'rm -f /tmp/served.txt'
 Check ($rc -eq 0) "and unlinks again"
 
+# --- statfs is answered by the filesystem the path names ----------------------
+# statfs(2) used to ask the host disk whatever the guest named; now the row
+# covering the path answers out of its own state. tmpfs magic is Linux's
+# 0x01021994, proc's is 0x9fa0 - the identifiers a guest's fstab tooling reads.
+$r = Client 'stat -f -c %t /tmp'
+Check ($r.Trim() -eq '1021994') "statfs on /tmp reports the tmpfs magic ('$($r.Trim())')"
+$r = Client 'df -k /tmp'
+Check ($r -match '(?m)^\S+\s+262144\s') "df on /tmp reports the tmpfs's bound ('$($r.Trim())')"
+$r = Client 'stat -f -c %t /proc'
+Check ($r.Trim() -eq '9fa0') "statfs on /proc reports the proc magic ('$($r.Trim())')"
+$r = Client 'df -k /proc'
+Check ($r -match '(?m)^\S+\s+0\s+0\s+0\s') "df on /proc reports a filesystem with no storage ('$($r.Trim())')"
+
 # --- the namespace is shared across sessions --------------------------------
 # /mnt in one session, read back from the next: this is the check the per-context
 # table failed, and it is the whole reason the table is a namespace.

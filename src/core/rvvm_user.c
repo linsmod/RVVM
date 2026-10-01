@@ -5115,6 +5115,126 @@ static rvvm_addr_t rvvm_user_umount(const char* target, int flags)
     return -UAPI_EINVAL;
 }
 
+/* --- statfs, answered by the filesystem the path belongs to ---------------- */
+
+/* The superblock identifiers a guest's df and its fstab tooling read out of
+ * statfs(2). Linux's own numbers: a filesystem that claimed another's magic
+ * would have the same kind of tools believing the wrong thing about it as a
+ * /proc/mounts row would. */
+#define RVVM_STATFS_TMPFS_MAGIC    0x01021994u
+#define RVVM_STATFS_PROC_MAGIC     0x00009FA0u
+#define RVVM_STATFS_DEVTMPFS_MAGIC 0x64626774u
+#define RVVM_STATFS_DEVPTS_MAGIC   0x00001CD1u
+
+/* What stat() and statfs() report as the device of a memory filesystem. The
+ * device is synthetic for the same reason the shadow's is: the whole filesystem
+ * is one device in the guest's view. ("RVMF".) */
+#define RVVM_MEMFS_DEV 0x52564D46u
+
+/* statfs(2) for a memory filesystem, from the storage itself. The blocks are
+ * the size= the mount asked for and the free ones are what is still unspent of
+ * it - a df on /tmp is a question about the tmpfs's budget, and the host disk's
+ * answer would be a lie with the row's name on it. The node counts are the
+ * storage's own bounds (see RVVM_MEMFS_MAX_NODES), which is where its ENOSPC
+ * really comes from when the bytes are not the binding one.
+ *
+ * A tmpfs mounted without a size= is bounded by nothing but memory, so it
+ * reports half of the guest's RAM - which is what Linux's own default tmpfs
+ * reports, and here it is the same kind of true: the storage dies with a run
+ * that lives in that memory. */
+static void memfs_fill_statfs(struct statfs* st, rvvm_memfs_t* fs)
+{
+    rvvm_userland_t* ctx   = uctx();
+    uint64_t         limit = rvvm_memfs_size_limit(fs);
+    uint64_t         used  = rvvm_memfs_used(fs);
+    uint64_t         total = limit ? limit : (ctx ? ctx->machine->mem.size / 2 : 0);
+    const uint64_t   bsize = 4096;
+
+    memset(st, 0, sizeof(*st));
+    st->f_type   = RVVM_STATFS_TMPFS_MAGIC;
+    st->f_bsize  = (long)bsize;
+    st->f_blocks = total / bsize;
+    st->f_bfree  = (total > used) ? (total - used) / bsize : 0;
+    st->f_bavail = st->f_bfree;
+    st->f_files  = RVVM_MEMFS_MAX_NODES;
+    st->f_ffree  = (RVVM_MEMFS_MAX_NODES > rvvm_memfs_count(fs))
+                 ? RVVM_MEMFS_MAX_NODES - rvvm_memfs_count(fs) : 0;
+    {
+        /* Written as the two words it is rather than through the host struct's
+         * own spelling of f_fsid, which names its members differently per libc. */
+        int32_t fsid[2] = { (int32_t)RVVM_MEMFS_DEV, 0 };
+        memcpy(&st->f_fsid, fsid, sizeof(fsid));
+    }
+    st->f_namelen = RVVM_MEMFS_NAME_MAX - 1;
+    st->f_frsize  = (long)bsize;
+    /* The one flag a storage can enforce is the read-only one, and it is
+     * enforced: rvvm_memfs_set_read_only() turns the next write into EROFS. */
+    st->f_flags = rvvm_memfs_read_only(fs) ? 0x1 /* ST_RDONLY */ : 0;
+}
+
+/* statfs(2) for a row the core synthesizes - /proc, /dev, /dev/pts. Linux
+ * answers these with a superblock full of zeros beyond the magic and the block
+ * size: there is no storage behind a procfs, and saying so is the honest shape. */
+static void core_fill_statfs(struct statfs* st, const char* fstype)
+{
+    uint32_t magic = 0;
+
+    if (!strcmp(fstype, "proc")) {
+        magic = RVVM_STATFS_PROC_MAGIC;
+    } else if (!strcmp(fstype, "devtmpfs")) {
+        magic = RVVM_STATFS_DEVTMPFS_MAGIC;
+    } else if (!strcmp(fstype, "devpts")) {
+        magic = RVVM_STATFS_DEVPTS_MAGIC;
+    }
+    memset(st, 0, sizeof(*st));
+    st->f_type    = magic;
+    st->f_bsize   = 4096;
+    st->f_namelen = 255;
+    st->f_frsize  = 4096;
+}
+
+/* statfs(2)/fstatfs64(2) against the table.
+ *
+ * statfs is a question about a filesystem, and which filesystem answers is what
+ * the table says: the row covering the path replies out of its own state - a
+ * memfs from its storage, a core row from fixed superblock facts - and the
+ * caller falls through to the host only for a hostfs row, whose bytes really
+ * are the host's and whose statfs is therefore the true one. Returns false when
+ * the table has no answer and the host should be asked.
+ *
+ * The reference is taken under the namespace lock and the storage is asked
+ * after it, so an unmount on another thread cannot free what this call is
+ * still reading - the same shape memfs_mount_for() keeps. */
+static bool rvvm_sys_statfs_abs(const char* abs, struct statfs* st)
+{
+    rvvm_userland_t*      ctx = uctx();
+    rvvm_path_owner_t     owner;
+    rvvm_memfs_t*         fs = NULL;
+    char                  fstype[sizeof(ctx->mountns->mounts[0].fstype)];
+    bool                  answered = false;
+
+    fstype[0] = '\0';
+    spin_lock(&ctx->mountns->lock);
+    owner = rvvm_path_owner(ctx->mountns, abs);
+    if (owner.mount) {
+        rvvm_strlcpy(fstype, owner.mount->fstype, sizeof(fstype));
+        if (owner.provider == RVVM_MOUNT_MEMFS && owner.mount->memfs) {
+            fs = rvvm_memfs_ref(owner.mount->memfs);
+        }
+    }
+    spin_unlock(&ctx->mountns->lock);
+
+    if (fs) {
+        memfs_fill_statfs(st, fs);
+        rvvm_memfs_free(fs);
+        answered = true;
+    } else if (owner.mount && owner.provider == RVVM_MOUNT_CORE) {
+        core_fill_statfs(st, fstype);
+        answered = true;
+    }
+    return answered;
+}
+
 /* Is @path already where the guest's cwd should be? Called with the host's
  * getcwd() output, so this is a HOST path being asked about: one under the prefix
  * is already the guest's root, and one that no row maps is a cwd the guest named
@@ -7353,10 +7473,7 @@ static void memfs_rel_path(char* out, size_t size, const rvvm_mount_t* mount, co
 }
 
 /* What stat() reports for an inode of a memory filesystem, in the host form the
- * rest of the stat path converts from. The device is synthetic for the same
- * reason the shadow's is: the whole archive is one device in the guest's view. */
-#define RVVM_MEMFS_DEV 0x52564D46u
-
+ * rest of the stat path converts from. */
 static void memfs_info_to_stat(const rvvm_memfs_info_t* info, struct stat* st)
 {
     memset(st, 0, sizeof(*st));
@@ -15276,24 +15393,49 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 43: { // statfs64
                     struct statfs stfs = {0};
                     struct uapi_statfs64* out = to_ptr_sz_wr(a1, sizeof(*out));
+                    char abs[UAPI_PATH_MAX];
                     rvvm_info("sys_statfs64(%s, %lx, %lx)", to_str(a0), a1, a2);
                     if (!out) {
                         a0 = -UAPI_EFAULT;
                         break;
                     }
-                    a0 = errno_ret(statfs(wrap_guest_path(path_buf, UAPI_AT_FDCWD, to_str(a0)), &stfs));
+                    /* The filesystem the path belongs to answers first, and a
+                     * hostfs row (or no row at all) falls through to the host -
+                     * whose statfs is then the true one rather than the default. */
+                    if (guest_path_abs_of(UAPI_AT_FDCWD, to_str(a0), abs, sizeof(abs)) &&
+                        rvvm_sys_statfs_abs(abs, &stfs)) {
+                        a0 = 0;
+                    } else {
+                        a0 = errno_ret(statfs(wrap_guest_path(path_buf, UAPI_AT_FDCWD, to_str(a0)), &stfs));
+                    }
                     uapi_statfs64_convert(out, &stfs);
                     break;
                 }
                 case 44: { // fstatfs64
                     struct statfs stfs = {0};
                     struct uapi_statfs64* out = to_ptr_sz_wr(a1, sizeof(*out));
+                    rvvm_memfs_fd_t* mfd;
+                    int hfd;
+                    int dev = -1;
                     rvvm_info("sys_fstatfs64(%ld, %lx, %lx)", a0, a1, a2);
                     if (!out) {
                         a0 = -UAPI_EFAULT;
                         break;
                     }
-                    a0 = errno_ret(fstatfs(userland_fd_host(uctx(), (int)a0), &stfs));
+                    /* The descriptor's own filesystem answers, by the same
+                     * dispatch its read() and stat() use: a df on a descriptor
+                     * from /tmp is a question about the tmpfs. */
+                    hfd = userland_fd_host(uctx(), (int)a0);
+                    mfd = memfs_fd_for_guest(uctx(), (int)a0);
+                    if (mfd) {
+                        memfs_fill_statfs(&stfs, mfd->fs);
+                        a0 = 0;
+                    } else if (userland_proc_is_fd(hfd) || userland_dev_by_fd(hfd, &dev)) {
+                        core_fill_statfs(&stfs, userland_proc_is_fd(hfd) ? "proc" : "devtmpfs");
+                        a0 = 0;
+                    } else {
+                        a0 = errno_ret(fstatfs(hfd, &stfs));
+                    }
                     uapi_statfs64_convert(out, &stfs);
                     break;
                 }
