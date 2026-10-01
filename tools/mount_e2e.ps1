@@ -155,6 +155,21 @@ Check ($r.Trim() -eq '9fa0') "statfs on /proc reports the proc magic ('$($r.Trim
 $r = Client 'df -k /proc'
 Check ($r -match '(?m)^\S+\s+0\s+0\s+0\s') "df on /proc reports a filesystem with no storage ('$($r.Trim())')"
 
+# --- /sys is a generated view, not the host's ---------------------------------
+# The row said sysfs and reached through to whatever the host had there - on a
+# Windows host, nothing. Now the core generates the skeleton guests' tools
+# walk, read-only for its whole life; sysfs magic is Linux's 0x62656572.
+$r = Client 'ls /sys'
+Check ($r -match '(?m)^class') "/sys has the class skeleton ('$($r.Trim())')"
+$r = Client 'cat /sys/devices/system/cpu/online'
+Check ($r.Trim() -eq '0') "cpu/online reports the one hart ('$($r.Trim())')"
+$r = Client 'stat -f -c %t /sys'
+Check ($r.Trim() -eq '62656572') "statfs on /sys reports the sysfs magic ('$($r.Trim())')"
+$r = Client 'touch /sys/x'
+Check ($r -match 'Read-only') "a create on /sys is EROFS"
+$r = Client 'grep " /sys " /proc/mounts'
+Check ($r -match 'sysfs ro,') "/proc/mounts reports /sys read-only ('$($r.Trim())')"
+
 # --- the namespace is shared across sessions --------------------------------
 # /mnt in one session, read back from the next: this is the check the per-context
 # table failed, and it is the whole reason the table is a namespace.

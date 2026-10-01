@@ -154,6 +154,11 @@ uint64_t rvvm_memfs_size_limit(const rvvm_memfs_t* fs);
 uint64_t rvvm_memfs_used(rvvm_memfs_t* fs);
 uint32_t rvvm_memfs_count(rvvm_memfs_t* fs);
 
+/* The synthetic device number this filesystem answers stat() with: one per
+ * filesystem, so a guest's df matches a file to its own mount rather than to
+ * the first row in the table that shares the number. */
+uint32_t rvvm_memfs_dev(const rvvm_memfs_t* fs);
+
 /* Turn the whole mount read-only, or writable again. This is what MS_REMOUNT
  * with and without MS_RDONLY asks mount(2) for, and it is the one property of a
  * memfs that changes after creation.

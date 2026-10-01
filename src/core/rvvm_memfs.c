@@ -144,6 +144,12 @@ struct rvvm_memfs {
     bool        read_only;
     uint64_t    size_limit;
     uint64_t    used;
+    /* The synthetic device number this filesystem answers stat() with. One per
+     * filesystem, not one per kind: a guest's df matches a mount by device, and
+     * two filesystems sharing a number would have every tool that asks "which
+     * mount is this file on" name the first row in the table rather than the
+     * right one. */
+    uint32_t    dev;
     /* References. One is the mount that owns the storage; an open descriptor
      * takes its own, which is what lets a descriptor outlive the unmount of its
      * mount point - the descriptor names the filesystem, not the place it was
@@ -1192,6 +1198,16 @@ int rvvm_memfs_selftest_consistency(rvvm_memfs_t* fs, char* why, size_t whysize)
 
 /* --- lifetime ----------------------------------------------------------- */
 
+/* The brand every memfs device number carries ("RVMF" in the high three
+ * bytes), with the creation sequence in the low byte: the same shape every
+ * memfs answers with, and a different number for every filesystem. */
+#define RVVM_MEMFS_DEV_BASE 0x52564D00u
+
+/* The device-number counter: one filesystem, one number, handed out in create
+ * order. A run holds a handful of filesystems, so a 32-bit count never wraps
+ * anywhere a guest could notice. */
+static uint32_t memfs_dev_next;
+
 rvvm_memfs_t* rvvm_memfs_create(bool read_only, uint64_t size_limit)
 {
     rvvm_memfs_t* fs = calloc(1, sizeof(*fs));
@@ -1202,6 +1218,7 @@ rvvm_memfs_t* rvvm_memfs_create(bool read_only, uint64_t size_limit)
     rvvm_lock_init(&fs->lock);
     fs->read_only  = read_only;
     fs->size_limit = size_limit;
+    fs->dev        = RVVM_MEMFS_DEV_BASE + atomic_add_uint32(&memfs_dev_next, 1);
     fs->refs       = 1; /* the mount that asked for it holds the first reference */
     fs->next_ino   = 0;
     fs->root       = RVVM_MEMFS_NONE;
@@ -1301,6 +1318,8 @@ void rvvm_memfs_set_read_only(rvvm_memfs_t* fs, bool read_only)
 }
 
 uint64_t rvvm_memfs_size_limit(const rvvm_memfs_t* fs) { return fs ? fs->size_limit : 0; }
+
+uint32_t rvvm_memfs_dev(const rvvm_memfs_t* fs) { return fs ? fs->dev : 0; }
 
 uint64_t rvvm_memfs_used(rvvm_memfs_t* fs)
 {

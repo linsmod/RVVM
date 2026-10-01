@@ -1684,9 +1684,9 @@ typedef struct {
  *                      userland_proc_*, /dev is userland_dev_* and the pty pair.
  *                      No host file is involved, and prefixing one would aim at
  *                      a directory nobody made.
- *   RVVM_MOUNT_HOSTFS  the host's own tree, reached directly. The default /sys
- *                      row is this, and it is the reason a prefix is not simply
- *                      applied to everything.
+ *   RVVM_MOUNT_HOSTFS  the host's own tree, reached directly - a host directory
+ *                      mounted at a guest path of its own, and the reason a
+ *                      prefix is not simply applied to everything.
  *   RVVM_MOUNT_MEMFS   storage the core owns: a rvvm_memfs_t, private to the run
  *                      and bounded by whatever size= the mount asked for. What a
  *                      tmpfs mount becomes - a host directory would outlive the
@@ -1759,8 +1759,8 @@ typedef struct {
     /* Where a RVVM_MOUNT_HOSTFS row's bytes are, when they are not simply the
      * host's tree at the same path.
      *
-     * Empty means exactly that: the host's own /sys for /sys - the one default row
-     * that still reaches through rather than across. Non-empty is a
+     * Empty means exactly that: the host's own tree at the same path, which is
+     * what a HOSTFS row built by hand would be. Non-empty is a
      * host directory mounted at a guest path of its own, which is what
      * rvvm_user_mount_hostfs() and mount -t hostfs build: the WSL drvfs / MinGW /c
      * shape, where the guest's namespace says where and the host's says what.
@@ -1785,6 +1785,34 @@ typedef struct {
  * replaced: the defaults' build, mount_row_add() and the root's backing change. */
 static const rvvm_fs_ops_t* procfs_fs_ops(void);
 static const rvvm_fs_ops_t* devfs_fs_ops(void);
+
+/* The sysfs this core generates, built into a read-only storage at run start:
+ * the same moment Linux's kernel builds its own. The tree is the minimal set a
+ * guest's tools walk - the class and device skeletons, the one hart's online
+ * state - and it grows by being generated here, not by a guest writing into
+ * it: the storage stays read-only for the life of the mount, which is what
+ * makes "ro" in the row's options a report rather than a wish. */
+static void sysfs_populate(rvvm_memfs_t* fs)
+{
+    rvvm_fs_t view = rvvm_fs_view_memfs(fs);
+    size_t    done = 0;
+
+    /* The population is the generation: the kernel writes sysfs before the
+     * guest runs, and so does this. The storage is read-only again before
+     * anything can see the row. */
+    rvvm_memfs_set_read_only(fs, false);
+    rvvm_fs_mkdir(&view, "/class", 0755);
+    rvvm_fs_mkdir(&view, "/class/net", 0755);
+    rvvm_fs_mkdir(&view, "/devices", 0755);
+    rvvm_fs_mkdir(&view, "/devices/system", 0755);
+    rvvm_fs_mkdir(&view, "/devices/system/cpu", 0755);
+    rvvm_fs_mkdir(&view, "/devices/system/cpu/cpu0", 0755);
+    rvvm_fs_create_file(&view, "/devices/system/cpu/online", 0444);
+    rvvm_fs_write(&view, "/devices/system/cpu/online", 0, "0\n", 2, &done);
+    rvvm_fs_create_file(&view, "/devices/system/cpu/cpu0/online", 0444);
+    rvvm_fs_write(&view, "/devices/system/cpu/cpu0/online", 0, "1\n", 2, &done);
+    rvvm_memfs_set_read_only(fs, true);
+}
 
 static void mount_row_set_fs(rvvm_mount_t* m)
 {
@@ -1837,14 +1865,14 @@ static struct rvvm_mount_ns* userland_mountns_new(const char* root_host_dir)
 {
     /* SPINLOCK_INIT is a brace initializer, so the whole struct goes down in one
      * shot rather than field by field - and these come with it. Every row but the
-     * root is a constant: /dev and /proc the core synthesizes, /sys the host's own
-     * tree at the same path, /tmp and /var/tmp memory filesystems whose storage is
-     * built below - and none of them depends on where this run's root lives. The
-     * tmpfs rows' options are rewritten from their storage once it exists, so the
-     * string a guest reads in /proc/mounts is the one the storage wrote. */
+     * root is a constant: /dev and /proc the core synthesizes, /sys a generated
+     * read-only view, /tmp and /var/tmp memory filesystems whose storage is built
+     * below - and none of them depends on where this run's root lives. The memory
+     * rows' options are rewritten from their storage once it exists, so the string
+     * a guest reads in /proc/mounts is the one the storage wrote. */
     static const rvvm_mount_t defaults[] = {
         { "/dev",     "devtmpfs", "rw,nosuid,size=65536k,mode=755",         RVVM_MOUNT_CORE   },
-        { "/sys",     "sysfs",   "rw,nosuid,nodev,noexec,relatime",        RVVM_MOUNT_HOSTFS },
+        { "/sys",     "sysfs",   "ro,relatime",                            RVVM_MOUNT_MEMFS  },
         { "/proc",    "proc",    "rw,nosuid,nodev,noexec,relatime",        RVVM_MOUNT_CORE   },
         { "/tmp",     "tmpfs",   "rw,relatime",                            RVVM_MOUNT_MEMFS  },
         { "/var/tmp", "tmpfs",   "rw,relatime",                            RVVM_MOUNT_MEMFS  },
@@ -1896,15 +1924,28 @@ static struct rvvm_mount_ns* userland_mountns_new(const char* root_host_dir)
     for (i = 1; i < ns->count; ++i) {
         rvvm_mount_t* m = &ns->mounts[i];
         if (m->provider == RVVM_MOUNT_MEMFS && !m->memfs) {
-            m->memfs = rvvm_memfs_create(false, RVVM_TMPFS_DEFAULT_SIZE);
-            if (m->memfs) {
-                tmpfs_options(m->options, sizeof(m->options), m->memfs, false);
+            if (!strcmp(m->fstype, "sysfs")) {
+                /* A generated view, not a budget: read-only for its whole life,
+                 * and no size= because nothing a guest stores is bounded here -
+                 * there is nothing a guest stores at all. */
+                m->memfs = rvvm_memfs_create(true, 0);
+                if (m->memfs) {
+                    sysfs_populate(m->memfs);
+                    rvvm_strlcpy(m->options, "ro,relatime", sizeof(m->options));
+                }
             } else {
+                m->memfs = rvvm_memfs_create(false, RVVM_TMPFS_DEFAULT_SIZE);
+                if (m->memfs) {
+                    tmpfs_options(m->options, sizeof(m->options), m->memfs, false);
+                }
+            }
+            if (!m->memfs) {
                 rvvm_warn("no memory for the %s filesystem; it answers nothing", m->path);
             }
         }
         /* Every default row gets its dispatch pointed at whatever it owns - the
-         * tmpfs rows their storage, /proc its name operations. */
+         * tmpfs and sysfs rows their storage, /proc and /dev their name
+         * operations. */
         mount_row_set_fs(m);
     }
     return ns;
@@ -1929,7 +1970,7 @@ static void mount_row_release(rvvm_mount_t* m)
 }
 
 /* Whether @m is the run's own root row. By path rather than by provider, because
- * that is what actually distinguishes it: /sys is RVVM_MOUNT_HOSTFS too,
+ * that is what actually distinguishes it: a hostfs row is RVVM_MOUNT_HOSTFS too,
  * but the root is the row the prefix belongs to - the one whose host directory is
  * the rootfs, the one mount(2) may not replace and umount2(2) may not remove. */
 static bool mount_row_is_root(const rvvm_mount_t* m)
@@ -4917,7 +4958,9 @@ static rvvm_addr_t mount_row_add(rvvm_userland_t* ctx, const char* abs,
  *                                  was never expressed: /dev/pts holds the
  *                                  rvvm_session_pty_* pairs.
  *   tmpfs       RVVM_MOUNT_MEMFS.  A memory filesystem the mount owns.
- *   sysfs       RVVM_MOUNT_HOSTFS. As today.
+ *   sysfs       RVVM_MOUNT_MEMFS.  A generated read-only view, the procfs of
+ *                                  device and bus state: the same storage with
+ *                                  the write side off for its whole life.
  *   hostfs      RVVM_MOUNT_HOSTFS. A host directory the source names, mounted where
  *                                  the guest asks. This core's name for what WSL
  *                                  calls drvfs and MinGW spells /c - it is the same
@@ -4937,8 +4980,9 @@ static rvvm_addr_t mount_row_add(rvvm_userland_t* ctx, const char* abs,
  *
  * What is still refused is what would be a lie: MS_NODEV, MS_NOSUID and MS_NOEXEC
  * have nothing behind them for any filesystem here, and MS_RDONLY has nothing
- * behind it for a proc or sysfs row either, since those are served by code that
- * does not implement the check.
+ * behind it for a proc row, since those are served by code that does not
+ * implement the check. A sysfs needs no flag: it is read-only whatever the
+ * guest asks, because its content is generated rather than stored.
  */
 static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
                                    const char* fstype, unsigned long flags,
@@ -4992,15 +5036,24 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
                 rc = -UAPI_EINVAL;
             } else if (m->provider == RVVM_MOUNT_MEMFS && m->memfs) {
                 bool ro = (flags & UAPI_MS_RDONLY) != 0;
-                /* A remount is how a guest turns a mount read-only or writable
-                 * again - mount -o remount,ro is the ordinary way - and until now
-                 * it was answered with a success that changed nothing. It sets the
-                 * storage's flag and rewrites the row's options from it, so what
-                 * /proc/mounts says and what the storage does stay one thing. A
-                 * remount of anything else still changes nothing, and that is
-                 * honest: those rows have no writable state to turn off. */
-                rvvm_memfs_set_read_only(m->memfs, ro);
-                tmpfs_options(m->options, sizeof(m->options), m->memfs, ro);
+                if (!ro && !strcmp(m->fstype, "sysfs")) {
+                    /* Nothing in a sysfs becomes writable by being remounted:
+                     * the view is generated, and unlocking the storage would
+                     * let a guest add names to a tree that reports the core's
+                     * own state. EINVAL, the answer for a remount that cannot
+                     * mean what it says. */
+                    rc = -UAPI_EINVAL;
+                } else {
+                    /* A remount is how a guest turns a mount read-only or writable
+                     * again - mount -o remount,ro is the ordinary way - and until now
+                     * it was answered with a success that changed nothing. It sets the
+                     * storage's flag and rewrites the row's options from it, so what
+                     * /proc/mounts says and what the storage does stay one thing. A
+                     * remount of anything else still changes nothing, and that is
+                     * honest: those rows have no writable state to turn off. */
+                    rvvm_memfs_set_read_only(m->memfs, ro);
+                    tmpfs_options(m->options, sizeof(m->options), m->memfs, ro);
+                }
             }
         }
         spin_unlock(&ctx->mountns->lock);
@@ -5025,7 +5078,10 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
             { "proc",     RVVM_MOUNT_CORE   },
             { "devtmpfs", RVVM_MOUNT_CORE   },
             { "devpts",   RVVM_MOUNT_CORE   },
-            { "sysfs",    RVVM_MOUNT_HOSTFS },
+            /* sysfs is a generated view like procfs, carried by the same
+             * storage a tmpfs has - but read-only for its whole life, because
+             * a guest does not write sysfs, the core generates it. */
+            { "sysfs",    RVVM_MOUNT_MEMFS  },
             /* tmpfs is the one filesystem whose bytes the core owns: private,
              * dies with the run, and the only place a size= or a read-only
              * flag can have anything behind it. A host directory would
@@ -5068,14 +5124,20 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
     if (flags & (UAPI_MS_NOSUID | UAPI_MS_NODEV | UAPI_MS_NOEXEC)) {
         return -UAPI_EINVAL;
     }
-    /* MS_RDONLY is the one of them a tmpfs can honour, because a tmpfs is served
-     * by storage that owns the check. For anything else it stays refused: a proc
-     * or sysfs row served by code that never looks at the flag would be a mount
+    /* MS_RDONLY is the one of them a memory-backed row can honour, because it is
+     * served by storage that owns the check. For anything else it stays refused:
+     * a proc row served by code that never looks at the flag would be a mount
      * point that says ro while writing still works. */
     if ((flags & UAPI_MS_RDONLY) && provider != RVVM_MOUNT_MEMFS) {
         return -UAPI_EINVAL;
     }
     read_only = (flags & UAPI_MS_RDONLY) != 0;
+    if (!strcmp(fstype, "sysfs")) {
+        /* A sysfs is generated, not stored: no flag a guest passes makes it
+         * writable, so the storage is born read-only whatever mount(8) asked
+         * for - and the row reports ro, which is the report of a fact. */
+        read_only = true;
+    }
     if (provider == RVVM_MOUNT_HOSTFS && !strcmp(fstype, "hostfs")) {
         const char* done;
         /* Resolved against the host's working directory, because it is a host
@@ -5196,11 +5258,7 @@ static rvvm_addr_t rvvm_user_umount(const char* target, int flags)
 #define RVVM_STATFS_PROC_MAGIC     0x00009FA0u
 #define RVVM_STATFS_DEVTMPFS_MAGIC 0x64626774u
 #define RVVM_STATFS_DEVPTS_MAGIC   0x00001CD1u
-
-/* What stat() and statfs() report as the device of a memory filesystem. The
- * device is synthetic for the same reason the shadow's is: the whole filesystem
- * is one device in the guest's view. ("RVMF".) */
-#define RVVM_MEMFS_DEV 0x52564D46u
+#define RVVM_STATFS_SYSFS_MAGIC    0x62656572u
 
 /* statfs(2) for a memory filesystem, from the storage itself. The blocks are
  * the size= the mount asked for and the free ones are what is still unspent of
@@ -5232,8 +5290,10 @@ static void memfs_fill_statfs(struct statfs* st, rvvm_memfs_t* fs)
                  ? RVVM_MEMFS_MAX_NODES - rvvm_memfs_count(fs) : 0;
     {
         /* Written as the two words it is rather than through the host struct's
-         * own spelling of f_fsid, which names its members differently per libc. */
-        int32_t fsid[2] = { (int32_t)RVVM_MEMFS_DEV, 0 };
+         * own spelling of f_fsid, which names its members differently per libc.
+         * The fsid is the filesystem's own device number, so two memory
+         * filesystems never identify as the same one. */
+        int32_t fsid[2] = { (int32_t)rvvm_memfs_dev(fs), 0 };
         memcpy(&st->f_fsid, fsid, sizeof(fsid));
     }
     st->f_namelen = RVVM_MEMFS_NAME_MAX - 1;
@@ -5256,6 +5316,8 @@ static void core_fill_statfs(struct statfs* st, const char* fstype)
         magic = RVVM_STATFS_DEVTMPFS_MAGIC;
     } else if (!strcmp(fstype, "devpts")) {
         magic = RVVM_STATFS_DEVPTS_MAGIC;
+    } else if (!strcmp(fstype, "sysfs")) {
+        magic = RVVM_STATFS_SYSFS_MAGIC;
     }
     memset(st, 0, sizeof(*st));
     st->f_type    = magic;
@@ -5289,7 +5351,11 @@ static bool rvvm_sys_statfs_abs(const char* abs, struct statfs* st)
     owner = rvvm_path_owner(ctx->mountns, abs);
     if (owner.mount) {
         rvvm_strlcpy(fstype, owner.mount->fstype, sizeof(fstype));
-        if (owner.provider == RVVM_MOUNT_MEMFS && owner.mount->memfs) {
+        /* A sysfs row rides on the same storage a tmpfs does, but it is not a
+         * budget: nothing is stored there, so its statfs is the generated
+         * filesystem's, not the storage's. */
+        if (owner.provider == RVVM_MOUNT_MEMFS && owner.mount->memfs &&
+            strcmp(fstype, "sysfs")) {
             fs = rvvm_memfs_ref(owner.mount->memfs);
         }
     }
@@ -5299,7 +5365,8 @@ static bool rvvm_sys_statfs_abs(const char* abs, struct statfs* st)
         memfs_fill_statfs(st, fs);
         rvvm_memfs_free(fs);
         answered = true;
-    } else if (owner.mount && owner.provider == RVVM_MOUNT_CORE) {
+    } else if (owner.mount && (owner.provider == RVVM_MOUNT_CORE ||
+                               !strcmp(fstype, "sysfs"))) {
         core_fill_statfs(st, fstype);
         answered = true;
     }
@@ -7544,8 +7611,10 @@ static void memfs_rel_path(char* out, size_t size, const rvvm_mount_t* mount, co
 }
 
 /* What stat() reports for an inode of a memory filesystem, in the host form the
- * rest of the stat path converts from. */
-static void memfs_info_to_stat(const rvvm_memfs_info_t* info, struct stat* st)
+ * rest of the stat path converts from. The device is the filesystem's own
+ * number: a df matches a mount by device, and two filesystems sharing one would
+ * have every tool name the first row in the table rather than the right one. */
+static void memfs_info_to_stat(rvvm_memfs_t* fs, const rvvm_memfs_info_t* info, struct stat* st)
 {
     memset(st, 0, sizeof(*st));
     st->st_mode  = (info->kind == RVVM_MEMFS_DIR) ? S_IFDIR
@@ -7554,7 +7623,7 @@ static void memfs_info_to_stat(const rvvm_memfs_info_t* info, struct stat* st)
     st->st_nlink = (unsigned)info->nlink;
     st->st_size  = (off_t)info->size;
     st->st_ino   = (ino_t)info->ino;
-    st->st_dev   = (dev_t)RVVM_MEMFS_DEV;
+    st->st_dev   = (dev_t)rvvm_memfs_dev(fs);
     st->st_atime = st->st_mtime = st->st_ctime = (time_t)info->mtime;
     st->st_uid   = (unsigned)uctx()->fake_uid;
     st->st_gid   = (unsigned)uctx()->fake_gid;
@@ -7919,7 +7988,7 @@ static bool rvvm_sys_memfs_stat_abs(const char* abs, bool follow, struct stat* s
      * a caller like mv then acts on a stat buffer nothing wrote. */
     *rc = -memfs_errno(rvvm_memfs_stat(fs, rel, follow, &info));
     if (*rc == 0) {
-        memfs_info_to_stat(&info, st);
+        memfs_info_to_stat(fs, &info, st);
     }
     rvvm_memfs_free(fs);
     return true;
@@ -16892,7 +16961,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         rvvm_memfs_fd_t*  md = memfs_fd_for_guest(uctx(), (int)fd);
                         rvvm_memfs_info_t minfo;
                         if (rvvm_memfs_stat_ino(md->fs, md->ino, &minfo) == RVVM_MEMFS_OK) {
-                            memfs_info_to_stat(&minfo, &st);
+                            memfs_info_to_stat(md->fs, &minfo, &st);
                             a0 = 0;
                         } else {
                             a0 = -UAPI_EBADF;
