@@ -125,6 +125,16 @@ extern int __stdcall CreateHardLinkA(const char* link, const char* existing, voi
 #define HOSTFS_NO_SYMLINK 1
 #endif
 
+/* Binary, always. This host's open() defaults to text mode, which turns every \n
+ * into \r\n on the way out and the pair back into one on the way in - a quiet
+ * rewrite of the bytes a caller handed over. A filesystem does not get to do that:
+ * a guest's ELF, its tarball and its text file all come back different from how
+ * they were written, and the guest has no way to know. Every open() below carries
+ * this, including the ones that only read. */
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
+
 /* This host's mkdir() takes a path and drops the mode on the floor. */
 #if defined(_WIN32)
 #include <direct.h>
@@ -152,6 +162,189 @@ static int hf_stat_path(const char* path, struct stat* st, bool follow)
 #else
     return follow ? stat(path, st) : lstat(path, st);
 #endif
+}
+
+/* --- symlinks this module keeps itself ----------------------------------- */
+
+/* Where the host is not an option.
+ *
+ * A symlink is a name that holds a string, and a host directory can hold that
+ * only if the host has them. On Windows making one needs a privilege this process
+ * does not have (SeCreateSymbolicLinkPrivilege - asked directly, it is win32 1314,
+ * ERROR_PRIVILEGE_NOT_HELD), so there are hosts where the answer is simply no.
+ * Refusing is not useful: a guest rootfs without symlinks is a rootfs with no
+ * /bin/sh, and the shadow layer exists precisely to provide them another way.
+ *
+ * So this module keeps the link itself: a regular file whose contents are the
+ * magic line below, followed by the target verbatim.
+ *
+ * A FILE, and not a table beside the tree, because the tree outlives the run and
+ * an index of what is in it would have to as well. A sidecar index is a second
+ * source of truth that can disagree with the directory it describes - an entry
+ * whose file was deleted by something outside this module, a tree copied away
+ * without the index beside it. A link that IS a file cannot drift: deleting the
+ * file deletes the link, copying the directory copies the links, backing it up
+ * backs them up, and nothing has to be locked, rewritten or repaired.
+ *
+ * Cygwin and MSYS2 do the same thing on a filesystem with no symlinks, so the
+ * representation is not invented here.
+ *
+ * Two consequences, stated rather than left to be discovered:
+ *   - something that reads the directory without going through this module - the
+ *     host's own tools, or a core path that still maps straight to a host path -
+ *     sees a small ordinary file and not a link. That is what "the host cannot
+ *     hold one" means; the alternative is having no links at all.
+ *   - a real file whose first bytes happen to be the magic line reads back as a
+ *     link. The magic is long enough that this does not happen by accident, and
+ *     it is the same exposure Cygwin has.
+ */
+#define HOSTFS_LINK_MAGIC     "!<symlink>\n"
+#define HOSTFS_LINK_MAGIC_LEN 11
+
+/* Used by the link representation below, defined further down the file. The link
+ * representation sits above the struct it belongs to because it is the answer to a
+ * question about the host, and it takes the root as a string for that reason -
+ * resolution needs no more of the filesystem than where it is rooted. */
+static rvvm_hostfs_result_t hf_read_all(int fd, uint64_t off, void* buf,
+                                        size_t count, size_t* done);
+static rvvm_hostfs_result_t hf_write_all(int fd, uint64_t off, const void* buf,
+                                         size_t count, size_t* done);
+static rvvm_hostfs_result_t hf_errno(void);
+static rvvm_hostfs_result_t hf_normalize(const char* rel, char* out, size_t size);
+static rvvm_hostfs_result_t hf_host_path(rvvm_hostfs_t* fs, const char* rel,
+                                         char* out, size_t size);
+
+/* The target of a link this module keeps, or false when @host is not one.
+ * @out is terminated; @len, when given, is the target's length without it. */
+static bool hf_marker_read(const char* host, char* out, size_t size, size_t* len)
+{
+    char head[HOSTFS_LINK_MAGIC_LEN];
+    bool ok = false;
+    int  fd;
+
+    if (size < 2) {
+        return false;
+    }
+    fd = open(host, O_RDONLY | O_BINARY);
+    if (fd < 0) {
+        return false;
+    }
+    size_t got = 0;
+    /* The whole magic has to have been READ, not just compared. A file shorter
+     * than the magic - an empty one, most often - leaves @head holding whatever
+     * was in that stack last, which after a nearby call is the magic itself: an
+     * empty file then reads back as a link pointing at the previous one's target.
+     * The length is the fact; the comparison is only meaningful once it is there. */
+    if (hf_read_all(fd, 0, head, sizeof(head), &got) == RVVM_HOSTFS_OK &&
+        got == sizeof(head) && !memcmp(head, HOSTFS_LINK_MAGIC, sizeof(head))) {
+        /* Truncated rather than refused when the caller's buffer is small, which
+         * is what readlink(2) does with a target that will not fit. */
+        if (hf_read_all(fd, sizeof(head), out, size - 1, &got) == RVVM_HOSTFS_OK) {
+            out[got] = '\0';
+            if (len) {
+                *len = got;
+            }
+            ok = true;
+        }
+    }
+    close(fd);
+    return ok;
+}
+
+static rvvm_hostfs_result_t hf_marker_write(const char* host, const char* target)
+{
+    int                  fd;
+    rvvm_hostfs_result_t rc = RVVM_HOSTFS_OK;
+    int                  err = 0;
+
+    fd = open(host, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
+    if (fd < 0) {
+        return hf_errno();
+    }
+    if (hf_write_all(fd, 0, HOSTFS_LINK_MAGIC, HOSTFS_LINK_MAGIC_LEN, NULL) != RVVM_HOSTFS_OK) {
+        err = errno;
+        rc  = hf_errno();
+    } else if (!target[0] ||
+               hf_write_all(fd, HOSTFS_LINK_MAGIC_LEN, target, strlen(target), NULL) != RVVM_HOSTFS_OK) {
+        err = errno;
+        rc  = hf_errno();
+    }
+    close(fd);
+    if (rc != RVVM_HOSTFS_OK) {
+        errno = err;
+    }
+    return rc;
+}
+
+/* Follow the links on the way to @rel, both kinds - a real one by asking the host,
+ * one of ours by reading it - and give back the name that is really being named.
+ *
+ * @depth is what stops a cycle: two links pointing at each other would otherwise
+ * walk until the path ran out of room, and ELOOP is what Linux answers for that.
+ * A relative target is resolved against the directory the link sits in, as on
+ * Linux, and not against the mount root - a link in /d that says "x" means /d/x. */
+static rvvm_hostfs_result_t hf_resolve(const char* root, const char* rel,
+                                       char* out, size_t size, int depth)
+{
+    char         norm[RVVM_HOSTFS_PATH_MAX];
+    char         host[RVVM_HOSTFS_PATH_MAX];
+    char         target[RVVM_HOSTFS_PATH_MAX];
+    struct stat  st;
+    rvvm_hostfs_result_t rc;
+    int          want;
+
+    rc = hf_normalize(rel, norm, sizeof(norm));
+    if (rc != RVVM_HOSTFS_OK) {
+        return rc;
+    }
+    if (depth > 8) {
+        return RVVM_HOSTFS_ELOOP;
+    }
+    want = snprintf(host, sizeof(host), "%s%s", root, norm);
+    if (want < 0 || (size_t)want >= sizeof(host)) {
+        return RVVM_HOSTFS_EINVAL;
+    }
+    /* The host follows a real symlink here; one of ours is an ordinary file to it,
+     * and that is the case handled next. A name that is not there at all stops
+     * here with the host's ENOENT. */
+    if (hf_stat_path(host, &st, true)) {
+        return hf_errno();
+    }
+    if (hf_marker_read(host, target, sizeof(target), NULL)) {
+        char        next[RVVM_HOSTFS_PATH_MAX];
+        const char* slash  = strrchr(norm, '/');
+        size_t      parent = slash ? (size_t)(slash - norm) : 0;
+
+        if (target[0] == '/') {
+            snprintf(next, sizeof(next), "%s", target);
+        } else {
+            snprintf(next, sizeof(next), "%.*s/%s", (int)parent, norm, target);
+        }
+        return hf_resolve(root, next, out, size, depth + 1);
+    }
+    snprintf(out, size, "%s", norm[0] ? norm : "/");
+    return RVVM_HOSTFS_OK;
+}
+
+/* The name @rel really names, for the operations that follow a link. Not for the
+ * ones that act on the link itself - unlink and rename must not. */
+static rvvm_hostfs_result_t hf_follow(const char* root, const char* rel,
+                                      char* host, size_t size)
+{
+    char                resolved[RVVM_HOSTFS_PATH_MAX];
+    rvvm_hostfs_result_t rc = hf_resolve(root, rel, resolved, sizeof(resolved), 0);
+    int                  want;
+
+    if (rc != RVVM_HOSTFS_OK) {
+        return rc;
+    }
+    /* @resolved is mount-relative, and the root is "" for the mount's own root, so
+     * this is the same concatenation hf_host_path() does. */
+    want = snprintf(host, size, "%s%s", root, resolved);
+    if (want < 0 || (size_t)want >= size) {
+        return RVVM_HOSTFS_EINVAL;
+    }
+    return RVVM_HOSTFS_OK;
 }
 
 /* A host directory with nothing in it still has two entries, and they are not the
@@ -482,7 +675,7 @@ static bool hf_probe_link(rvvm_hostfs_t* fs)
         snprintf(to, sizeof(to), "%s/.rvvm_hostfs_link_probe2", fs->root) <= 0) {
         return false;
     }
-    fd = open(from, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    fd = open(from, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0600);
     if (fd >= 0) {
         close(fd);
 #if defined(_WIN32)
@@ -553,20 +746,36 @@ rvvm_hostfs_result_t rvvm_hostfs_stat(rvvm_hostfs_t* fs, const char* path,
                                       bool follow, rvvm_hostfs_info_t* out)
 {
     char                host[RVVM_HOSTFS_PATH_MAX];
+    char                target[RVVM_HOSTFS_PATH_MAX];
+    size_t              tlen = 0;
     struct stat         st;
     rvvm_hostfs_result_t rc;
 
     if (!fs || !out) {
         return RVVM_HOSTFS_EINVAL;
     }
-    rc = hf_host_path(fs, path, host, sizeof(host));
+    /* Following is resolution, and resolution is this module's job even where the
+     * host has no symlinks: a link kept as a file is an ordinary file to the host,
+     * so asking the host to follow it would answer about the file. */
+    rc = follow ? hf_follow(fs->root, path, host, sizeof(host))
+                : hf_host_path(fs, path, host, sizeof(host));
     if (rc != RVVM_HOSTFS_OK) {
         return rc;
     }
     if (hf_stat_path(host, &st, follow)) {
         return hf_errno();
     }
-    hf_info(host, &st, out);
+    /* Asked without following, a link this module keeps has to be reported as
+     * one: to the host it is a small ordinary file, and a caller that asked for
+     * lstat() is asking precisely what the name is. */
+    if (!follow && hf_marker_read(host, target, sizeof(target), &tlen)) {
+        hf_info(host, &st, out);
+        out->kind = RVVM_HOSTFS_LNK;
+        out->size = tlen;
+        out->mode = 0777;
+    } else {
+        hf_info(host, &st, out);
+    }
     /* The name a caller recognizes, not the host's spelling of it. */
     if (hf_normalize(path, out->path, sizeof(out->path)) != RVVM_HOSTFS_OK) {
         out->path[0] = '\0';
@@ -639,7 +848,7 @@ rvvm_hostfs_result_t rvvm_hostfs_create_file(rvvm_hostfs_t* fs, const char* path
     if (rc != RVVM_HOSTFS_OK) {
         return rc;
     }
-    fd = open(host, O_WRONLY | O_CREAT | O_TRUNC, (mode_t)(mode & 0777));
+    fd = open(host, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, (mode_t)(mode & 0777));
     if (fd < 0) {
         return hf_errno();
     }
@@ -736,22 +945,23 @@ rvvm_hostfs_result_t rvvm_hostfs_symlink(rvvm_hostfs_t* fs, const char* target, 
     if (!target) {
         return RVVM_HOSTFS_EINVAL;
     }
-    if (!rvvm_hostfs_can_symlink(fs)) {
-        return RVVM_HOSTFS_ENOTSUP;
-    }
     rc = hf_host_path(fs, path, host, sizeof(host));
     if (rc != RVVM_HOSTFS_OK) {
         return rc;
     }
     /* The target is stored verbatim: a symlink is the string, and resolving it is
-     * the lookup's job, not this one's. */
-#if defined(HOSTFS_NO_SYMLINK)
-    /* Unreachable - can_symlink() answered false above and that returned ENOTSUP -
-     * but the call has to be spelled here for the host that has it. */
-    return RVVM_HOSTFS_ENOTSUP;
-#else
-    return symlinkat(target, AT_FDCWD, host) ? hf_errno() : RVVM_HOSTFS_OK;
+     * the lookup's job, not this one's.
+     *
+     * Where the host can hold a real link, that is what is made - a rootfs built
+     * here stays readable by the host's own tools. Where it cannot (no privilege
+     * on Windows), this module keeps the link as a file instead, and symlink()
+     * succeeds on every host. */
+#if !defined(HOSTFS_NO_SYMLINK)
+    if (rvvm_hostfs_can_symlink(fs)) {
+        return symlinkat(target, AT_FDCWD, host) ? hf_errno() : RVVM_HOSTFS_OK;
+    }
 #endif
+    return hf_marker_write(host, target);
 }
 
 rvvm_hostfs_result_t rvvm_hostfs_readlink(rvvm_hostfs_t* fs, const char* path,
@@ -774,10 +984,15 @@ rvvm_hostfs_result_t rvvm_hostfs_readlink(rvvm_hostfs_t* fs, const char* path,
     if (hf_stat_path(host, &st, false)) {
         return hf_errno();
     }
-    if (!S_ISLNK(st.st_mode)) {
+    if (size == 0) {
         return RVVM_HOSTFS_EINVAL;
     }
-    if (size == 0) {
+    /* One of ours first: on a host that cannot hold a real link, S_ISLNK is never
+     * true and the call below does not exist. */
+    if (hf_marker_read(host, buf, size, NULL)) {
+        return RVVM_HOSTFS_OK;
+    }
+    if (!S_ISLNK(st.st_mode)) {
         return RVVM_HOSTFS_EINVAL;
     }
 #if defined(HOSTFS_NO_SYMLINK)
@@ -809,7 +1024,7 @@ rvvm_hostfs_result_t rvvm_hostfs_truncate(rvvm_hostfs_t* fs, const char* path, u
     if (rc != RVVM_HOSTFS_OK) {
         return rc;
     }
-    rc = hf_host_path(fs, path, host, sizeof(host));
+    rc = hf_follow(fs->root, path, host, sizeof(host));
     if (rc != RVVM_HOSTFS_OK) {
         return rc;
     }
@@ -817,7 +1032,7 @@ rvvm_hostfs_result_t rvvm_hostfs_truncate(rvvm_hostfs_t* fs, const char* path, u
      * but does not always implement. Opening for write is also what makes the
      * permission question the same one: a file that cannot be written cannot be
      * resized, and a directory is EISDIR either way. */
-    fd = open(host, O_WRONLY);
+    fd = open(host, O_WRONLY | O_BINARY);
     if (fd < 0) {
         return hf_errno();
     }
@@ -838,7 +1053,7 @@ rvvm_hostfs_result_t rvvm_hostfs_chmod(rvvm_hostfs_t* fs, const char* path, uint
     if (rc != RVVM_HOSTFS_OK) {
         return rc;
     }
-    rc = hf_host_path(fs, path, host, sizeof(host));
+    rc = hf_follow(fs->root, path, host, sizeof(host));
     if (rc != RVVM_HOSTFS_OK) {
         return rc;
     }
@@ -855,7 +1070,7 @@ rvvm_hostfs_result_t rvvm_hostfs_touch(rvvm_hostfs_t* fs, const char* path)
     if (rc != RVVM_HOSTFS_OK) {
         return rc;
     }
-    rc = hf_host_path(fs, path, host, sizeof(host));
+    rc = hf_follow(fs->root, path, host, sizeof(host));
     if (rc != RVVM_HOSTFS_OK) {
         return rc;
     }
@@ -956,11 +1171,12 @@ rvvm_hostfs_result_t rvvm_hostfs_read(rvvm_hostfs_t* fs, const char* path,
     if (!fs || !buf) {
         return RVVM_HOSTFS_EINVAL;
     }
-    rc = hf_host_path(fs, path, host, sizeof(host));
+    /* Follows: reading a link reads what it points at, on either representation. */
+    rc = hf_follow(fs->root, path, host, sizeof(host));
     if (rc != RVVM_HOSTFS_OK) {
         return rc;
     }
-    fd = open(host, O_RDONLY);
+    fd = open(host, O_RDONLY | O_BINARY);
     if (fd < 0) {
         return hf_errno();
     }
@@ -982,13 +1198,14 @@ rvvm_hostfs_result_t rvvm_hostfs_write(rvvm_hostfs_t* fs, const char* path,
     if (!buf) {
         return RVVM_HOSTFS_EINVAL;
     }
-    rc = hf_host_path(fs, path, host, sizeof(host));
+    /* Follows, as a write through a link does. */
+    rc = hf_follow(fs->root, path, host, sizeof(host));
     if (rc != RVVM_HOSTFS_OK) {
         return rc;
     }
     /* Writable, not created: a write to a name that is not there is ENOENT, as it
      * is in a filesystem where creating and writing are two operations. */
-    fd = open(host, O_WRONLY);
+    fd = open(host, O_WRONLY | O_BINARY);
     if (fd < 0) {
         return hf_errno();
     }
@@ -1010,11 +1227,14 @@ rvvm_hostfs_result_t rvvm_hostfs_pin(rvvm_hostfs_t* fs, const char* path,
     if (!fs || !out_ino) {
         return RVVM_HOSTFS_EINVAL;
     }
-    rc = hf_host_path(fs, path, host, sizeof(host));
+    /* Follows: opening a link opens what it points at. The handle then names the
+     * file itself, so a rename of the link afterwards does not change what it
+     * answers. */
+    rc = hf_follow(fs->root, path, host, sizeof(host));
     if (rc != RVVM_HOSTFS_OK) {
         return rc;
     }
-    fd = open(host, writable ? O_RDWR : O_RDONLY);
+    fd = open(host, (writable ? O_RDWR : O_RDONLY) | O_BINARY);
     if (fd < 0) {
         return hf_errno();
     }
@@ -1171,6 +1391,7 @@ static rvvm_hostfs_result_t hf_getdents(const char* host,
              * back from both. A child removed between the readdir and this stat is
              * ENOENT, and that is correct: it is not there any more. */
             char                child[RVVM_HOSTFS_PATH_MAX];
+            char                ltarget[RVVM_HOSTFS_PATH_MAX];
             struct stat         st;
             rvvm_hostfs_result_t rc;
             int                  want = snprintf(child, sizeof(child), "%s/%s", host, name);
@@ -1185,10 +1406,18 @@ static rvvm_hostfs_result_t hf_getdents(const char* host,
             }
             rc = RVVM_HOSTFS_OK;
             if (out_kind) {
-                *out_kind = S_ISDIR(st.st_mode) ? RVVM_HOSTFS_DIR
-                          : S_ISREG(st.st_mode) ? RVVM_HOSTFS_REG
-                          : S_ISLNK(st.st_mode) ? RVVM_HOSTFS_LNK
-                                                : RVVM_HOSTFS_OTHER;
+                /* A link this module keeps is a file to the host, so it is asked
+                 * for here rather than read off the mode - otherwise a listing
+                 * would show an ordinary small file where the guest made a link. */
+                if (S_ISREG(st.st_mode) &&
+                    hf_marker_read(child, ltarget, sizeof(ltarget), NULL)) {
+                    *out_kind = RVVM_HOSTFS_LNK;
+                } else {
+                    *out_kind = S_ISDIR(st.st_mode) ? RVVM_HOSTFS_DIR
+                              : S_ISREG(st.st_mode) ? RVVM_HOSTFS_REG
+                              : S_ISLNK(st.st_mode) ? RVVM_HOSTFS_LNK
+                                                    : RVVM_HOSTFS_OTHER;
+                }
             }
             if (out_ino) {
                 *out_ino = (uint64_t)st.st_ino;

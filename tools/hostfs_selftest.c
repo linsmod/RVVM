@@ -156,6 +156,21 @@ int main(int argc, char** argv)
     memset(buf, 0, sizeof(buf));
     ck_rc(rvvm_hostfs_read(fs, "/a/f", 3, buf, 5, &done), RVVM_HOSTFS_OK, "read past the end");
     ck(done == 2, "a read past the end is short, not an error");
+    /* The bytes come back as they went in. This is the check that catches a host
+     * opening files in text mode, which turns every \n into \r\n on the way out and
+     * back into one on the way in - silent, and invisible to any test whose data
+     * is a word with no newline in it. A filesystem does not get to rewrite what
+     * it was handed: a guest's ELF and its tarball are not text. */
+    ck_rc(rvvm_hostfs_write(fs, "/a/f", 0, "a\nb\rc\r\nd", 8, &done), RVVM_HOSTFS_OK,
+          "write bytes with newlines in them");
+    ck(done == 8, "all 8 landed");
+    ck_rc(rvvm_hostfs_stat(fs, "/a/f", true, &info), RVVM_HOSTFS_OK, "stat it");
+    ck(info.size == 8, "and it is 8 bytes long, not 10");
+    memset(buf, 0, sizeof(buf));
+    ck_rc(rvvm_hostfs_read(fs, "/a/f", 0, buf, 8, &done), RVVM_HOSTFS_OK, "read them back");
+    ck(done == 8 && !memcmp(buf, "a\nb\rc\r\nd", 8), "and they are the same bytes");
+    ck_rc(rvvm_hostfs_truncate(fs, "/a/f", 0), RVVM_HOSTFS_OK, "back to empty for the next stage");
+
     /* A write does not create: create and write are two operations. */
     ck_rc(rvvm_hostfs_write(fs, "/a/nothing", 0, "x", 1, &done), RVVM_HOSTFS_ENOENT,
           "write to a name that is not there is ENOENT");
@@ -223,35 +238,75 @@ int main(int argc, char** argv)
     stage("symlink");
     /* What this host can do is asserted, not skipped: if it cannot hold a link,
      * the module has to say so rather than return a bare failure. */
+    /* A link works on every host now, whichever of the two things it is made of -
+     * a real symlink where the host can hold one, a file this module keeps where
+     * it cannot. What is still reported is WHICH, because that is the difference
+     * between a rootfs the host's own tools can read and one only this module can.
+     * Reported with whether it was asked: a run that says "no" without having
+     * tried proves nothing about the host. */
     saw_link = rvvm_hostfs_can_symlink(fs);
-    /* Reported, and reported with whether it was asked. A run that says "cannot"
-     * without having tried proves nothing about the host, and the whole point of
-     * the capability is that a caller can act on it - so the difference between
-     * "the host refused" and "this build never asked" has to be visible. */
-    fprintf(stderr, "   (can_symlink() says %s", saw_link ? "yes" : "no");
+    fprintf(stderr, "   (the host %s hold a real symlink", saw_link ? "can" : "cannot");
 #if defined(_WIN32)
-    fprintf(stderr, ", decided without asking: this build makes no symlink call)\n");
+    fprintf(stderr, " - decided without asking, this build makes no symlink call)\n");
 #else
     fprintf(stderr, ", probed by making one)\n");
 #endif
-    if (saw_link) {
-        ck_rc(rvvm_hostfs_symlink(fs, "one", "/d/link"), RVVM_HOSTFS_OK, "symlink");
-        ck_rc(rvvm_hostfs_stat(fs, "/d/link", false, &info), RVVM_HOSTFS_OK, "lstat the link");
-        ck(info.kind == RVVM_HOSTFS_LNK, "lstat says it is a link");
-        ck_rc(rvvm_hostfs_stat(fs, "/d/link", true, &info), RVVM_HOSTFS_OK, "stat follows it");
-        ck(info.kind == RVVM_HOSTFS_REG, "stat says it is the file it points at");
-        memset(buf, 0, sizeof(buf));
-        ck_rc(rvvm_hostfs_readlink(fs, "/d/link", buf, sizeof(buf)), RVVM_HOSTFS_OK, "readlink");
-        ck(!strcmp(buf, "one"), "and it says what it points at");
-        ck_rc(rvvm_hostfs_readlink(fs, "/d/one", buf, sizeof(buf)), RVVM_HOSTFS_EINVAL,
-              "readlink of something that is not a link is EINVAL");
-        ck_rc(rvvm_hostfs_unlink(fs, "/d/link", false), RVVM_HOSTFS_OK, "unlink the link");
-    } else {
-        ck_rc(rvvm_hostfs_symlink(fs, "one", "/d/link"), RVVM_HOSTFS_ENOTSUP,
-              "symlink says this host cannot hold one");
-        ck_rc(rvvm_hostfs_stat(fs, "/d/link", false, &info), RVVM_HOSTFS_ENOENT,
-              "and nothing was made");
+
+    ck_rc(rvvm_hostfs_symlink(fs, "one", "/d/link"), RVVM_HOSTFS_OK, "symlink");
+    ck_rc(rvvm_hostfs_stat(fs, "/d/link", false, &info), RVVM_HOSTFS_OK, "lstat the link");
+    ck(info.kind == RVVM_HOSTFS_LNK, "lstat says it is a link");
+    ck(info.size == strlen("one"), "and its size is the length of the target");
+    ck_rc(rvvm_hostfs_stat(fs, "/d/link", true, &info), RVVM_HOSTFS_OK, "stat follows it");
+    ck(info.kind == RVVM_HOSTFS_REG, "stat says it is the file it points at");
+    memset(buf, 0, sizeof(buf));
+    ck_rc(rvvm_hostfs_readlink(fs, "/d/link", buf, sizeof(buf)), RVVM_HOSTFS_OK, "readlink");
+    ck(!strcmp(buf, "one"), "and it says what it points at");
+    ck_rc(rvvm_hostfs_readlink(fs, "/d/one", buf, sizeof(buf)), RVVM_HOSTFS_EINVAL,
+          "readlink of something that is not a link is EINVAL");
+    /* A listing has to show it as a link and not as the small file it is to the
+     * host - otherwise a guest walking the directory sees an ordinary file where
+     * it made a link. */
+    {
+        int found = 0;
+        pos  = 0;
+        kind = 0;
+        while (rvvm_hostfs_getdents(fs, "/d", &pos, name, sizeof(name), &kind, &ino) ==
+               RVVM_HOSTFS_OK) {
+            if (!strcmp(name, "link")) {
+                found = (kind == RVVM_HOSTFS_LNK);
+                break;
+            }
+        }
+        ck(found, "a listing reports it as a link");
     }
+    /* Reading through it reads the target, and a descriptor opened on it is a
+     * descriptor on the target. */
+    ck_rc(rvvm_hostfs_read(fs, "/d/link", 0, buf, 4, &done), RVVM_HOSTFS_OK, "read through it");
+    ck_rc(rvvm_hostfs_pin(fs, "/d/link", false, &hnd), RVVM_HOSTFS_OK, "open through it");
+    ck_rc(rvvm_hostfs_stat_ino(fs, hnd, &info), RVVM_HOSTFS_OK, "stat the descriptor");
+    ck(info.kind == RVVM_HOSTFS_REG, "it is the target, not the link");
+    rvvm_hostfs_unpin(fs, hnd);
+    /* A relative target is resolved against the directory the link is in, not
+     * against the mount root: a link in /d that says "one" means /d/one. */
+    ck_rc(rvvm_hostfs_mkdir(fs, "/d/sub", 0755), RVVM_HOSTFS_OK, "mkdir /d/sub");
+    ck_rc(rvvm_hostfs_symlink(fs, "../one", "/d/sub/up"), RVVM_HOSTFS_OK, "a relative link");
+    ck_rc(rvvm_hostfs_stat(fs, "/d/sub/up", true, &info), RVVM_HOSTFS_OK, "it resolves");
+    memset(buf, 0, sizeof(buf));
+    ck_rc(rvvm_hostfs_readlink(fs, "/d/sub/up", buf, sizeof(buf)), RVVM_HOSTFS_OK, "readlink it");
+    ck(!strcmp(buf, "../one"), "the target is stored verbatim, not rewritten");
+    /* A cycle is ELOOP and not a hang, and not a path that grows until it does
+     * not fit. */
+    ck_rc(rvvm_hostfs_symlink(fs, "/d/c2", "/d/c1"), RVVM_HOSTFS_OK, "first half of a cycle");
+    ck_rc(rvvm_hostfs_symlink(fs, "/d/c1", "/d/c2"), RVVM_HOSTFS_OK, "second half");
+    ck_rc(rvvm_hostfs_stat(fs, "/d/c1", true, &info), RVVM_HOSTFS_ELOOP, "a cycle is ELOOP");
+    ck_rc(rvvm_hostfs_read(fs, "/d/c1", 0, buf, 4, &done), RVVM_HOSTFS_ELOOP,
+          "and reading through it says so too");
+    /* Removing the link leaves the target alone. */
+    ck_rc(rvvm_hostfs_unlink(fs, "/d/c1", false), RVVM_HOSTFS_OK, "unlink one half");
+    ck_rc(rvvm_hostfs_unlink(fs, "/d/c2", false), RVVM_HOSTFS_OK, "and the other");
+    ck_rc(rvvm_hostfs_unlink(fs, "/d/link", false), RVVM_HOSTFS_OK, "unlink the link");
+    ck_rc(rvvm_hostfs_stat(fs, "/d/one", true, &info), RVVM_HOSTFS_OK, "the target is untouched");
+    ck_rc(rvvm_hostfs_stat(fs, "/d/link", true, &info), RVVM_HOSTFS_ENOENT, "the link is gone");
     ck_rc(rvvm_hostfs_readlink(fs, "/d/nope", buf, sizeof(buf)), RVVM_HOSTFS_ENOENT,
           "readlink of a name that is not there is ENOENT");
 

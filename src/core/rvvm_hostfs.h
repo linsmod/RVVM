@@ -118,15 +118,16 @@ void           rvvm_hostfs_free(rvvm_hostfs_t* fs);
 
 /* --- what this host directory can hold ---------------------------------- */
 
-/* Whether a symlink can be created here at all.
+/* Whether the HOST can hold a real symlink here - not whether this filesystem can
+ * provide one. It always can: see rvvm_hostfs_symlink() below.
  *
- * This is a question about the host, not about the filesystem: on Windows making
- * a real symlink needs a privilege (or Developer Mode) that a normal process does
- * not have, so an otherwise working host directory cannot hold one. That is the
- * fact the shadow layer exists to paper over, and it is why the answer is
- * reported here rather than swallowed: a caller that needs symlinks knows whether
- * it has to provide them some other way, and symlink() below can then say what
- * went wrong instead of returning a bare failure nobody can act on.
+ * This is the question "what will a link in this directory be made of". On Windows
+ * a real one needs a privilege (SeCreateSymbolicLinkPrivilege, or Developer Mode)
+ * that a normal process does not have - asked directly, that is win32 1314,
+ * ERROR_PRIVILEGE_NOT_HELD - so this answers false and this module keeps the link
+ * as a file instead. Where it answers true, a real symlink is made, so a rootfs
+ * built there stays readable by the host's own tools. Either way the guest sees a
+ * link, and no caller has to care which.
  *
  * Probed once, on first use, by actually making a link in the root and reading it
  * back - the only way to know, since the alternative is guessing from the host's
@@ -190,9 +191,11 @@ rvvm_hostfs_result_t rvvm_hostfs_rename(rvvm_hostfs_t* fs, const char* from, con
 rvvm_hostfs_result_t rvvm_hostfs_link(rvvm_hostfs_t* fs, const char* from, const char* to);
 
 /* symlink(2): @target is stored verbatim and is not resolved here - not against
- * this mount, and not against the host. ENOTSUP when this host directory cannot
- * hold a link at all, which is the Windows case and the answer a caller needs in
- * order to provide them another way. */
+ * this mount, and not against the host. It succeeds on every host: where the host
+ * can hold a real link one is made, and where it cannot (no privilege on Windows)
+ * this module keeps the link itself, as a file whose contents are the target. See
+ * rvvm_hostfs_can_symlink() for which, and the implementation comment for why a
+ * file rather than an index beside the tree. */
 rvvm_hostfs_result_t rvvm_hostfs_symlink(rvvm_hostfs_t* fs, const char* target, const char* path);
 
 /* The target of a symlink. ENOENT when the name is not there, EINVAL when it is
