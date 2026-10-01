@@ -157,6 +157,11 @@ static inline bool rvfile_stdio_overflow(uint64_t offset)
 struct blk_io_rvfile {
     uint64_t size;
     uint64_t pos;
+    // Non-NULL when this handle is over bytes in memory rather than over a host
+    // file: no descriptor is held, nothing is syncable, and every operation that
+    // would change the bytes is refused. Checked before the host branches below,
+    // so a memory handle works on every platform the same way.
+    const uint8_t* mem;
 #if defined(POSIX_FILE_IMPL)
     int fd;
 #elif defined(WIN32_FILE_IMPL)
@@ -406,9 +411,38 @@ rvfile_t* rvopen(const char* filepath, uint32_t filemode)
     return file;
 }
 
+rvfile_t* rvopen_mem(const void* data, size_t size)
+{
+    rvfile_t* file;
+
+    if (!data || !size) {
+        return NULL;
+    }
+    file = safe_calloc(sizeof(rvfile_t), 1);
+    if (!file) {
+        return NULL;
+    }
+    file->mem = safe_calloc(size, 1);
+    if (!file->mem) {
+        safe_free(file);
+        return NULL;
+    }
+    memcpy((void*)file->mem, data, size);
+    file->size = size;
+    return file;
+}
+
 void rvclose(rvfile_t* file)
 {
     if (likely(file)) {
+        if (file->mem) {
+            /* Bytes this handle owns, not a host file: there is nothing to sync
+             * and no descriptor to close. */
+            void* owned = (void*)file->mem;
+            safe_free(owned);
+            safe_free(file);
+            return;
+        }
         rvfsync(file);
 #if defined(POSIX_FILE_IMPL)
         close(file->fd);
@@ -432,6 +466,19 @@ uint64_t rvfilesize(rvfile_t* file)
 // Return value of -1 means "Try again", 0 means "IO error / EOF"
 static int32_t rvread_chunk(rvfile_t* file, void* dst, size_t size, uint64_t offset)
 {
+    if (file->mem) {
+        /* A read past the end is a short read, not an error: the same thing a
+         * host file does at EOF, and the only answer that lets a caller treat the
+         * two alike. */
+        if (offset >= file->size) {
+            return 0;
+        }
+        if (size > file->size - offset) {
+            size = (size_t)(file->size - offset);
+        }
+        memcpy(dst, file->mem + offset, size);
+        return (int32_t)size;
+    }
 #if defined(POSIX_FILE_IMPL)
     int32_t ret = pread(file->fd, dst, size, offset);
     if (ret < 0 && errno != EINTR) {
@@ -597,6 +644,12 @@ size_t rvwrite(rvfile_t* file, const void* src, size_t size, uint64_t offset)
 
     if (likely(file)) {
         uint64_t pos = (offset == RVFILE_POSITION) ? rvtell(file) : offset;
+        if (file->mem) {
+            /* Bytes in memory are read-only, and silently buffering a write to
+             * them would be worse than refusing: the caller's data would appear
+             * to have landed somewhere nothing else can see. */
+            return 0;
+        }
 #if defined(POSIX_FILE_IMPL)
         ret = rvwrite_unlocked(file, src, size, offset);
 #elif defined(WIN32_FILE_IMPL)
@@ -625,6 +678,10 @@ size_t rvwrite(rvfile_t* file, const void* src, size_t size, uint64_t offset)
 bool rvtrim(rvfile_t* file, uint64_t offset, uint64_t size)
 {
     if (likely(file)) {
+        /* Nothing to punch out of bytes in memory, and no host file to ask. */
+        if (file->mem) {
+            return false;
+        }
 #if defined(POSIX_FILE_IMPL) && defined(HOST_TARGET_LINUX) && defined(FALLOC_FL_PUNCH_HOLE)
         // Use fallocate(FALLOC_FL_PUNCH_HOLE) on Linux to punch holes
         return !fallocate(file->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size);
@@ -690,6 +747,11 @@ bool rvfsync(rvfile_t* file)
 {
     bool ret = false;
     if (likely(file)) {
+        /* Bytes in memory are already "synced" - there is no host file behind them
+         * for the data to be sitting unwritten in. */
+        if (file->mem) {
+            return true;
+        }
 #if defined(POSIX_FILE_IMPL)
 #if defined(HOST_TARGET_DARWIN) && defined(F_BARRIERFSYNC)
         // Barrier sync on MacOS, will fail on Darling and possibly elsewhere
@@ -727,6 +789,10 @@ bool rvtruncate(rvfile_t* file, uint64_t length)
         bool resized = false;
         if (length == rvfilesize(file)) {
             return true;
+        }
+        /* A memory handle is read-only and its size was fixed when it was made. */
+        if (file->mem) {
+            return false;
         }
 #if defined(POSIX_FILE_IMPL)
         resized = !ftruncate(file->fd, length);
@@ -786,6 +852,10 @@ bool rvfallocate(rvfile_t* file, uint64_t length)
         if (length <= rvfilesize(file)) {
             return true;
         }
+        /* Read-only, and there is nothing to allocate it against. */
+        if (file->mem) {
+            return false;
+        }
 #if defined(POSIX_FILE_IMPL)                                                                                           \
     && ((defined(HOST_TARGET_LINUX) && defined(FALLOC_FL_PUNCH_HOLE))                                                  \
         || (defined(HOST_TARGET_FREEBSD) && HOST_TARGET_FREEBSD >= 9)                                                  \
@@ -806,6 +876,10 @@ int rvfile_get_posix_fd(rvfile_t* file)
 {
     if (likely(file)) {
         UNUSED(file);
+        /* No descriptor: the bytes are here, not behind one. */
+        if (file->mem) {
+            return -1;
+        }
 #if defined(POSIX_FILE_IMPL)
         return file->fd;
 #elif !defined(WIN32_FILE_IMPL) && defined(HOST_TARGET_POSIX)
@@ -819,6 +893,10 @@ void* rvfile_get_win32_handle(rvfile_t* file)
 {
     if (likely(file)) {
         UNUSED(file);
+        /* No handle: the bytes are here, not behind one. */
+        if (file->mem) {
+            return NULL;
+        }
 #if defined(WIN32_FILE_IMPL)
         return (void*)file->handle;
 #elif !defined(POSIX_FILE_IMPL) && defined(HOST_TARGET_WINCE)

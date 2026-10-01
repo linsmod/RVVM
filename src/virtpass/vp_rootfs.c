@@ -560,6 +560,121 @@ size_t vp_rootfs_extract(vp_rootfs_t* rootfs, const char* dest_dir, const char**
     return written;
 }
 
+/* mkdir -p for the directories above @path, which the storage has no single call
+ * for. An archive does not have to name a parent before what is under it - tar
+ * order is the packing tool's business - and vp_rootfs_extract() does the same for
+ * a host tree (rootfs_mkdir_parents). EEXIST is the ordinary answer for a component
+ * that is already there, which is every one of them after the first layer. */
+static bool install_mkdir_parents(rvvm_memfs_t* fs, const char* path)
+{
+    char   buf[ROOTFS_MAX_PATH];
+    size_t len;
+
+    if (!path) {
+        return false;
+    }
+    len = strlen(path);
+    if (len >= sizeof(buf)) {
+        return false;
+    }
+    memcpy(buf, path, len + 1);
+    for (char* pos = buf + 1; *pos; ++pos) {
+        if (*pos == '/') {
+            char                saved = *pos;
+            rvvm_memfs_result_t rc;
+            *pos = '\0';
+            rc = rvvm_memfs_mkdir(fs, buf, 0755);
+            *pos = saved;
+            if (rc != RVVM_MEMFS_OK && rc != RVVM_MEMFS_EEXIST) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+size_t vp_rootfs_install(vp_rootfs_t* rootfs, rvvm_memfs_t* fs, const char** error)
+{
+    const char* local_error = NULL;
+    if (!error) {
+        error = &local_error;
+    }
+    *error = NULL;
+
+    if (!rootfs || !fs) {
+        *error = "no filesystem was named";
+        return 0;
+    }
+    {
+        size_t       written = 0;
+        const size_t count   = vp_shadow_count(rootfs->shadow);
+
+        for (uint32_t i = 0; i < count; ++i) {
+            const vp_shadow_entry_t* entry = vp_shadow_entry(rootfs->shadow, i);
+            if (!entry || entry->hidden) {
+                continue;
+            }
+            if (!install_mkdir_parents(fs, entry->path)) {
+                *error = "a directory from the archive could not be created";
+                return written;
+            }
+            if (entry->kind == VP_SHADOW_DIR) {
+                /* "/" is not something an install creates: the storage brings its
+                 * own root, and creating it is EINVAL there. The archive's shape
+                 * names it only to carry its mode, so it is simply passed over.
+                 * EEXIST on anything else is a directory a layer named twice,
+                 * which is ordinary in a tar and not a reason to fail. */
+                rvvm_memfs_result_t rc;
+                if (!strcmp(entry->path, "/")) {
+                    continue;
+                }
+                rc = rvvm_memfs_mkdir(fs, entry->path, entry->mode);
+                if (rc != RVVM_MEMFS_OK && rc != RVVM_MEMFS_EEXIST) {
+                    *error = "a directory from the archive could not be created";
+                    return written;
+                }
+                continue;
+            }
+            if (entry->kind == VP_SHADOW_LINK) {
+                if (rvvm_memfs_symlink(fs, entry->target ? entry->target : "",
+                                       entry->path) != RVVM_MEMFS_OK) {
+                    *error = "a symlink from the archive could not be created";
+                    return written;
+                }
+                continue;
+            }
+            if (entry->kind != VP_SHADOW_FILE) {
+                /* VP_SHADOW_OVERRIDE names a host path and a memory root has no
+                 * host tree behind it. */
+                continue;
+            }
+            if (rvvm_memfs_create_file(fs, entry->path, entry->mode) != RVVM_MEMFS_OK) {
+                *error = "a file from the archive could not be created";
+                return written;
+            }
+            if (entry->size) {
+                const uint8_t* bytes;
+                if (i >= rootfs->data_count || rootfs->data[i] == VP_ROOTFS_NO_DATA ||
+                    rootfs->data[i] + entry->size > rootfs->tar_size) {
+                    *error = "a file's contents are missing from the archive";
+                    return written;
+                }
+                bytes = rootfs->tar + rootfs->data[i];
+                {
+                    size_t done = 0;
+                    if (rvvm_memfs_write(fs, entry->path, 0, bytes, (size_t)entry->size,
+                                         &done) != RVVM_MEMFS_OK) {
+                        *error = "a file from the archive could not be written";
+                        return written;
+                    }
+                }
+            }
+            written++;
+        }
+        return written;
+    }
+}
+
 size_t vp_rootfs_read_entry(const vp_rootfs_t* rootfs, uint32_t idx, void* buffer, size_t size)
 {
     const vp_shadow_entry_t* entry;

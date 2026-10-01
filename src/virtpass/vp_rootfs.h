@@ -34,6 +34,8 @@ module at all, so it is excluded from librvvm and built into a host that links
 
 #include "virtpass/vp_shadow.h"
 
+#include "core/rvvm_memfs.h" /* the storage a memory root is installed into */
+
 // Bundle layout under the release root. Three archives, three roles:
 //
 //   rootfs.tar.gz   the guest's `/` (Alpine minirootfs) - the base layer
@@ -94,6 +96,26 @@ size_t vp_rootfs_count(const vp_rootfs_t* rootfs);
 // repeating an install is cheap and an updated bundle still lands. Returns the
 // number of files written; 0 with *error set means nothing could be installed.
 size_t vp_rootfs_extract(vp_rootfs_t* rootfs, const char* dest_dir, const char** error);
+
+// The same install, into a memory filesystem instead of a host directory: every
+// directory, regular file and *symlink* becomes a real entry in @fs.
+//
+// The symlinks are the whole difference. A host directory cannot have one (on
+// Windows creating one needs a privilege - see the top of this file), so
+// vp_rootfs_extract() skips them and the shadow index answers them afterwards; a
+// memory filesystem has no such limit, so one busybox is one file with its 300
+// names hanging off it rather than an index entry the core answers on the side.
+// Which is also why a memory root needs no shadow at all, and no hidden-store, and
+// no stamp: nothing outlives the run for any of them to describe.
+//
+// A later layer wins - a layer is flattened over the one before it, and a regular
+// file that already exists is truncated and rewritten - so the call order is the
+// archive order (rootfs, then system).
+//
+// mtime is not carried across: the storage keeps its own clock (see memfs_now()),
+// and an entry installed now is stamped now. Returns the number of regular files
+// written; 0 with *error set means nothing could be installed.
+size_t vp_rootfs_install(vp_rootfs_t* rootfs, rvvm_memfs_t* fs, const char** error);
 
 // Drop the inflated archive bytes, keeping the index (the shadow) and the entry
 // table. Call once the tree has been materialized: the guest's filesystem is

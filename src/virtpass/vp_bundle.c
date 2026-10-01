@@ -277,6 +277,73 @@ static bool bundle_install_layer(const char* tar_gz, const char* dest, const cha
     return true;
 }
 
+/* The install for a run whose root is memory: the bundle is released into that
+ * storage instead of onto the host (see rvvm_user_root_memfs()).
+ *
+ * What is missing here is as deliberate as what is here. No shadow, no stamp, no
+ * hidden store, no mode file: each of those exists to describe a tree that
+ * outlives the run - an index for the symlinks the host cannot make, a stamp so an
+ * unchanged archive is not re-extracted, a file so a deletion is remembered - and
+ * this tree dies with the run, so every one of them has nothing to describe.
+ *
+ * No apps either, and not for a good reason: vp_app installs a package into a host
+ * tree at <guest>/data/app/<id>, and there is no host tree here. An app
+ * provisioned for a memory root is the next piece rather than a permanent gap. */
+static bool bundle_mount_memory(rvvm_machine_t* machine, vp_rootfs_t* rootfs,
+                                const char* system_tar_gz, const char* apps_tar_gz,
+                                vp_bundle_stats_t* stats, const char** error)
+{
+    rvvm_memfs_t* memfs = rvvm_user_root_memfs(machine);
+    size_t        written;
+
+    (void)apps_tar_gz;
+    if (!memfs) {
+        *error = "the run has no memory root to install into";
+        return false;
+    }
+    written = vp_rootfs_install(rootfs, memfs, error);
+    if (!written) {
+        rvvm_memfs_free(memfs);
+        return false;
+    }
+    if (stats) {
+        stats->files = written;
+    }
+
+    /* The system layer over it, flattened the same way: the run boots the session
+     * server out of its own tree (sbin/vpsessiond), so a run with no rootfs is a
+     * run with no host directory behind it, not a run with nothing at all. */
+    if (system_tar_gz) {
+        size_t                layer_files = 0;
+        vp_rootfs_t*          layer = vp_rootfs_open(system_tar_gz, error);
+        bool                  ok;
+
+        if (!layer) {
+            rvvm_memfs_free(memfs);
+            return false;
+        }
+        layer_files = vp_rootfs_install(layer, memfs, error);
+        ok = (*error == NULL);
+        vp_rootfs_close(layer);
+        if (!ok) {
+            rvvm_memfs_free(memfs);
+            return false;
+        }
+        if (stats) {
+            stats->system_files = layer_files;
+        }
+    }
+    rvvm_memfs_free(memfs);
+
+    /* The bytes were only needed to write the entries; the storage is the tree. */
+    vp_rootfs_release_data(rootfs);
+    g_mounted = rootfs;
+    if (stats) {
+        stats->entries = vp_rootfs_count(rootfs);
+    }
+    return true;
+}
+
 bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz,
                      const char* system_tar_gz, const char* apps_tar_gz,
                      const char* dest, vp_bundle_stats_t* stats, const char** error)
@@ -295,7 +362,10 @@ bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz,
         stats->system_files = 0;
         stats->apps = 0;
     }
-    if (!machine || !rootfs_tar_gz || !dest) {
+    /* @dest is the host directory the rootfs is materialized into, and it is
+     * optional: a host that names none gets a run whose / is a memory filesystem
+     * (see rvvm_user_set_prefix), and the bundle goes into that. */
+    if (!machine || !rootfs_tar_gz) {
         *error = "no bundle was named";
         return false;
     }
@@ -306,6 +376,10 @@ bool vp_bundle_mount(rvvm_machine_t* machine, const char* rootfs_tar_gz,
     rootfs = vp_rootfs_open(rootfs_tar_gz, error);
     if (!rootfs) {
         return false;
+    }
+
+    if (!dest) {
+        return bundle_mount_memory(machine, rootfs, system_tar_gz, apps_tar_gz, stats, error);
     }
     /* Installed once: a run of the same archive leaves the tree as the guest
      * left it (that tree is the writable layer). An updated archive - a

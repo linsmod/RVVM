@@ -25,6 +25,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <rvvm/rvvm_base.h> /* rvvm_machine_t handle */
 #include "virtpass/vp_shadow.h" /* vp_shadow_t: the guest rootfs index */
+#include "core/rvvm_memfs.h" /* rvvm_memfs_t: the storage a memory root is */
 
 // Callback type for guest I/O redirection
 // Returns number of bytes written, or -1 on error
@@ -379,6 +380,22 @@ const char* rvvm_user_get_prefix(rvvm_machine_t* machine);
 // mount(2) is already giving it the run's own view of the host.
 int rvvm_user_mount_hostfs(rvvm_machine_t* machine, const char* guest_path,
                            const char* host_path);
+
+// The storage the run's "/" is backed by, when it is a memory filesystem. NULL
+// when the root is a host directory (where a bundle is installed with
+// vp_rootfs_extract() into the prefix, and its symlinks are answered from the
+// shadow index), and non-NULL when the root is memory - in which case a host
+// installs a bundle by writing into this instead: vp_rootfs_install().
+//
+// That is the whole of "this run has no rootfs": not a namespace that turns
+// translation off, but one whose root is a filesystem that dies with the run, and
+// which therefore needs the bundle released into it rather than onto the host.
+//
+// Takes a reference, so a caller that gets non-NULL must give it back with
+// rvvm_memfs_free(). An install does not own the storage - the run does - and the
+// reference is what lets a caller finish installing after an unmount on another
+// thread.
+rvvm_memfs_t* rvvm_user_root_memfs(rvvm_machine_t* machine);
 
 // root=: the guest directory that becomes "/". NULL, "" or "/" means no chroot,
 // which is the default and what every run did before the argument existed.

@@ -103,6 +103,11 @@ void win32_host_no_stdin(void);
  */
 void win32_host_set_cmdline(const char* str);
 
+// Release the bundle into the run's own memory filesystem instead of materializing
+// it on the host: the run's / is then a filesystem that dies with it, and nothing
+// is written outside the run. Set before win32_host_start_guest().
+void win32_host_set_volatile_rootfs(bool on);
+
 /*
  * Block until the guest exits and return its exit code. The console host's
  * equivalent of win32_host_message_loop(): with the guest, the stdin pump and

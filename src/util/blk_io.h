@@ -44,6 +44,18 @@ typedef struct blk_io_rvfile rvfile_t;
 // Open a binary file, returns NULL on failure
 rvfile_t* rvopen(const char* filepath, uint32_t filemode);
 
+// The same handle over bytes that are already in memory, which is what makes an
+// image the host has no file for readable by anything that takes an rvfile_t - an
+// ELF loader, a size query - unchanged. Read-only: a write, a truncate or an
+// allocate is refused rather than buffered somewhere nobody can see.
+//
+// The bytes are copied, so the caller's buffer is theirs to free the moment this
+// returns and the handle owns its own copy until rvclose(). That costs a copy of
+// the image and buys the one thing a borrowed pointer cannot: no question about
+// who outlives whom, which is a question an image loaded at exec time would
+// otherwise have to answer on every path out of the loader.
+rvfile_t* rvopen_mem(const void* data, size_t size);
+
 // Close a file handle
 void rvclose(rvfile_t* file);
 

@@ -222,6 +222,11 @@ static int    g_guest_rc     = -1;
  * /proc/cmdline empty, and a host that set an empty string gets the same thing.
  */
 static char g_guest_cmdline[RVVM_CMDLINE_MAX];
+/* Whether the bundle is released into the run's own memory filesystem instead of
+ * being materialized on the host. Off, because persisting is what a release has
+ * always done and what makes a second run cheap; on, it is a run that leaves
+ * nothing behind and whose / dies with it (see rvvm_user_root_memfs). */
+static bool g_volatile_rootfs = false;
 
 /* Host-side suspend/resume guards. The machine handle only exists while a guest
  * is booted, so every host control call goes through these instead of testing
@@ -1179,6 +1184,11 @@ static bool g_no_stdin_pump = false;
 void win32_host_no_stdin(void)
 {
     g_no_stdin_pump = true;
+}
+
+void win32_host_set_volatile_rootfs(bool on)
+{
+    g_volatile_rootfs = on;
 }
 
 void win32_host_set_cmdline(const char* str)
@@ -3094,17 +3104,31 @@ static void win32_guest_rootfs_mount(rvvm_machine_t* machine, const char* app_id
     snprintf(apps_archive, sizeof(apps_archive), "%s\\%s\\%s", exe_dir, VP_BUNDLE_DIR, VP_APPS_TAR_GZ);
     snprintf(dest, sizeof(dest), "%s\\runtime\\rootfs", exe_dir);
 
-    if (!vp_bundle_mount(machine, archive,
-                         GetFileAttributesA(system_archive) != INVALID_FILE_ATTRIBUTES ? system_archive : NULL,
-                         GetFileAttributesA(apps_archive) != INVALID_FILE_ATTRIBUTES ? apps_archive : NULL,
-                         dest, &stats, &error)) {
-        winhost_log("rootfs: %s could not be mounted (%s) - running without a guest rootfs",
-                    archive, error ? error : "?");
-        return;
+    /* NULL @dest when the run asked to keep the tree in memory: the bundle is then
+     * released into the run's own root filesystem rather than onto the host, and
+     * there is nothing here to name as a directory. */
+    {
+        const char* dest_dir = g_volatile_rootfs ? NULL : dest;
+
+        if (!vp_bundle_mount(machine, archive,
+                             GetFileAttributesA(system_archive) != INVALID_FILE_ATTRIBUTES ? system_archive : NULL,
+                             GetFileAttributesA(apps_archive) != INVALID_FILE_ATTRIBUTES ? apps_archive : NULL,
+                             dest_dir, &stats, &error)) {
+            winhost_log("rootfs: %s could not be mounted (%s) - running without a guest rootfs",
+                        archive, error ? error : "?");
+            return;
+        }
+        winhost_log("rootfs: %lu archive entries, %lu files, %lu system file(s), %lu app(s)%s",
+                    (unsigned long)stats.entries, (unsigned long)stats.files, (unsigned long)stats.system_files,
+                    (unsigned long)stats.apps,
+                    dest_dir ? " at " : " in the run's memory root");
+        if (!dest_dir) {
+            /* The apps need a host tree (vp_app installs into <guest>/data/app), so
+             * a memory root has none - said once rather than discovered from a
+             * missing directory. */
+            return;
+        }
     }
-    winhost_log("rootfs: %lu archive entries, %lu files, %lu system file(s), %lu app(s) at %s",
-                (unsigned long)stats.entries, (unsigned long)stats.files, (unsigned long)stats.system_files,
-                (unsigned long)stats.apps, dest);
 
     /* An app's own resources are its /assets tree. The app is already installed
      * (provisioned with the bundle); this only points the mount at it. */

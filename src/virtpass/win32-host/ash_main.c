@@ -91,6 +91,7 @@ int main(int argc, char** argv)
     bool        list     = false;
     bool        shutdown = false;
     bool        sockpath = false;
+    bool        memfs    = false;
     /* A client starts a core if none is listening, the way wsl does. A test
      * driver does not want that: it wants a dead core to say so. */
     bool        autostart = true;
@@ -123,6 +124,14 @@ int main(int argc, char** argv)
             dlog = argv[++i];
         } else if (!strncmp(a, "--dlog=", 7)) {
             dlog = a + 7;
+        } else if (!strcmp(a, "--memfs")) {
+            /* The bundle goes into the run's own memory filesystem rather than
+             * being materialized under <exe>\runtime\rootfs: a run that leaves
+             * nothing behind, whose / dies with it. The guest still gets the
+             * release's rootfs and system programs - installed into memory - so
+             * busybox and the session server are there; what is different is
+             * where. */
+            memfs = true;
         } else if (!strcmp(a, "--idle") && i + 1 < argc) {
             idle = atoi(argv[++i]);
         } else if (!strncmp(a, "--idle=", 7)) {
@@ -145,6 +154,11 @@ int main(int argc, char** argv)
      * that console is in raw mode, so a ^C is a byte to the guest rather than a
      * control event to this process. */
     ash_install_termination_handler();
+
+    /* Before any mode runs: it belongs to the run this process starts, not to one
+     * of the modes below, and a client that connects later is talking to a core
+     * somebody else started. */
+    win32_host_set_volatile_rootfs(memfs);
 
     if (list) {
         return ash_list();

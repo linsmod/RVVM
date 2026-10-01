@@ -5079,6 +5079,32 @@ static rvvm_addr_t rvvm_user_umount(const char* target, int flags)
  * is already the guest's root, and one that no row maps is a cwd the guest named
  * as a row's own tree - the host's /tmp for the /tmp row - which moving into the
  * prefix would take away from it. */
+PUBLIC rvvm_memfs_t* rvvm_user_root_memfs(rvvm_machine_t* machine)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+    rvvm_memfs_t*    fs  = NULL;
+
+    if (!ctx || !ctx->mountns) {
+        return NULL;
+    }
+    spin_lock(&ctx->mountns->lock);
+    {
+        unsigned i;
+        for (i = 0; i < ctx->mountns->count; ++i) {
+            const rvvm_mount_t* m = &ctx->mountns->mounts[i];
+            /* Only the root row, and only when it is memory: a host-backed root is
+             * the prefix directory, and that is not something a caller writes
+             * through a filesystem API. */
+            if (mount_row_is_root(m) && m->provider == RVVM_MOUNT_MEMFS && m->memfs) {
+                fs = rvvm_memfs_ref(m->memfs);
+                break;
+            }
+        }
+    }
+    spin_unlock(&ctx->mountns->lock);
+    return fs;
+}
+
 /* The host-facing half of `mount -t hostfs`: the same row, built before the run
  * rather than by the guest. A host that wants one of its own directories visible
  * mounts it here; a guest that mounts one goes through rvvm_user_mount(). Both end
@@ -17867,8 +17893,49 @@ static void guest_erase_image(elf_desc_t* elf)
  * fail is what lets execve() refuse a non-executable file *before* the image it
  * is replacing has been torn down - and ENOEXEC is what a kernel reports for a
  * file it cannot run. Returns NULL with errno set. */
-static rvfile_t* guest_open_image(const char* host_path)
+static rvfile_t* guest_open_image(const char* host_path, const char* guest_path)
 {
+    /* A memory root has no host path, so an image under it is opened out of the
+     * storage instead: the same bytes, reached through the guest's own filesystem
+     * rather than the host's. This is what lets a run whose / is memory boot a
+     * program at all - /sbin/vpsessiond installed into memory is a file the host
+     * has no name for, and rvopen() would answer ENOENT for a path that is really
+     * there.
+     *
+     * @guest_path is the name before the mapping, and it is what the mount table
+     * is asked about; @host_path is still needed for everything else. */
+    if (guest_path && guest_path[0] == '/') {
+        char         img_abs[UAPI_PATH_MAX];
+        rvvm_memfs_t* img_fs  = NULL;
+        char         img_rel[RVVM_MEMFS_PATH_MAX];
+
+        if (guest_path_absolutize(img_abs, sizeof(img_abs), guest_path) &&
+            memfs_mount_for(&img_fs, img_rel, sizeof(img_rel), img_abs)) {
+            rvvm_memfs_info_t   img_info;
+            rvvm_memfs_result_t img_rc = rvvm_memfs_stat(img_fs, img_rel, true, &img_info);
+            rvfile_t*           file   = NULL;
+
+            if (img_rc == RVVM_MEMFS_OK && img_info.kind == RVVM_MEMFS_REG && img_info.size) {
+                void*  bytes = safe_malloc(img_info.size);
+                size_t done  = 0;
+                img_rc = rvvm_memfs_read(img_fs, img_rel, 0, bytes, (size_t)img_info.size, &done);
+                if (img_rc == RVVM_MEMFS_OK) {
+                    file = rvopen_mem(bytes, (size_t)img_info.size);
+                }
+                safe_free(bytes); /* rvopen_mem took its own copy */
+            }
+            rvvm_memfs_free(img_fs);
+            if (file) {
+                return file;
+            }
+            /* The storage owns this name, so whatever it says is the answer: a
+             * host open of the mapped path would report on a directory that has
+             * nothing to do with the file the guest named. */
+            errno = ENOENT;
+            return NULL;
+        }
+    }
+
     rvfile_t* file = rvopen(host_path, 0);
     for (int retry = 0; !file && retry < 10; retry++) {
         sleep_ms(100);
@@ -17960,7 +18027,10 @@ static bool guest_load_image_file(rvvm_userland_t* ctx, const char* host_path, r
     const char* host_interp = map_abs_path(path_buf, elf->interp_path);
     rvvm_strlcpy(ctx->interp_elf_path, host_interp, sizeof(ctx->interp_elf_path));
 
-    rvfile_t* ifile = rvopen(host_interp, 0);
+    /* Opened the way the image itself is, and for the same reason: the interpreter
+     * is a guest path the host may have no name for - a memory root holds it and
+     * rvopen() would answer ENOENT for a file that is there. */
+    rvfile_t* ifile = guest_open_image(host_interp, elf->interp_path);
     if (ifile) {
         /* A relocatable interpreter needs a guest address picked upfront. Reserve
          * its full memory extent, not the file size: .bss counts too, and musl's
@@ -18180,11 +18250,12 @@ static void userland_finish_other_threads(rvvm_userland_t* ctx, rvvm_user_thread
  * touched and execve() fails like any other syscall.
  */
 static bool guest_exec(rvvm_userland_t* ctx, rvvm_hart_t* cpu, rvvm_user_thread_t* thread,
-                       const char* host_path, size_t argc, char** argv, char** envp)
+                       const char* host_path, const char* guest_path,
+                       size_t argc, char** argv, char** envp)
 {
     /* Opened first, so an image the guest cannot run leaves the running process
      * untouched - execve() has to be able to fail. */
-    rvfile_t* file = guest_open_image(host_path);
+    rvfile_t* file = guest_open_image(host_path, guest_path);
     if (!file) {
         return false;
     }
@@ -18407,7 +18478,7 @@ static bool rvvm_sys_execve(rvvm_hart_t* cpu, rvvm_user_thread_t* thread, char* 
             }
 
             replaced = guest_exec(uctx(), cpu, thread,
-                                  wrap_guest_path(host_path, UAPI_AT_FDCWD, interp),
+                                  wrap_guest_path(host_path, UAPI_AT_FDCWD, interp), interp,
                                   (size_t)xargs, xargv, envv);
             /* guest_exec() has built the new stack (or failed) - the strings
              * are ours to drop, borrowed originals included */
@@ -18419,7 +18490,7 @@ static bool rvvm_sys_execve(rvvm_hart_t* cpu, rvvm_user_thread_t* thread, char* 
     }
 
     replaced = guest_exec(uctx(), cpu, thread, wrap_guest_path(path_buf, UAPI_AT_FDCWD, guest_path),
-                          (size_t)args, argv, envv);
+                          guest_path, (size_t)args, argv, envv);
 
 done:
     guest_strvec_free(argv, args);
@@ -18841,7 +18912,7 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
     /* The image is opened before anything is torn down, so a program that cannot
      * be run reports the open's errno (guest_open_image() answers ENOEXEC for a
      * file that is not an ELF) instead of failing halfway through a load. */
-    rvfile_t* file = guest_open_image(host_elf);
+    rvfile_t* file = guest_open_image(host_elf, argv ? argv[0] : NULL);
     if (!file) {
         rvvm_error("Failed to open ELF file %s (errno %d)", argv[0], errno);
         rvvm_user_free(machine);
