@@ -1758,7 +1758,31 @@ typedef struct {
      * Last in the struct so the default rows' positional initializers - one
      * brace per row, four fields - keep meaning what they meant. */
     char                  host_path[RVVM_MOUNT_HOST_MAX];
+    /* The name operations of the filesystem this row is, with what they operate
+     * on - a view in the rvvm_fs.h shape, set from the storage when the row is
+     * built or its backing changes. Today a MEMFS row's view of its memfs; NULL
+     * for a row the core synthesizes (proc, dev) and for one that is a window
+     * onto the host tree, whose name operations are not this shape yet. The
+     * name syscalls dispatch on this field rather than on the provider column:
+     * "does the row answer names itself" is the question, and "which provider"
+     * is how it happens to be true. The view owns nothing - the storage above
+     * does - so mount_row_release() is unchanged by it. */
+    const rvvm_fs_ops_t*  ops;
+    void*                 priv;
 } rvvm_mount_t;
+
+/* Point a row's dispatch at its storage. Called wherever the storage is set or
+ * replaced: the defaults' build, mount_row_add() and the root's backing change. */
+static void mount_row_set_fs(rvvm_mount_t* m)
+{
+    m->ops  = NULL;
+    m->priv = NULL;
+    if (m->provider == RVVM_MOUNT_MEMFS && m->memfs) {
+        rvvm_fs_t view = rvvm_fs_view_memfs(m->memfs);
+        m->ops  = view.ops;
+        m->priv = view.priv;
+    }
+}
 
 /* The run's mount namespace: ONE of these per run, shared by every process in
  * it, refcounted because a child outlives the process that forked it.
@@ -1828,6 +1852,7 @@ static struct rvvm_mount_ns* userland_mountns_new(const char* root_host_dir)
         rvvm_strlcpy(ns->mounts[0].options, "rw,relatime", sizeof(ns->mounts[0].options));
         ns->mounts[0].provider = RVVM_MOUNT_MEMFS;
         ns->mounts[0].memfs    = rvvm_memfs_create(false, 0);
+        mount_row_set_fs(&ns->mounts[0]);
         if (!ns->mounts[0].memfs) {
             /* Nearly unreachable - safe_new_obj() above would already have aborted
              * on a machine this short of memory - and a namespace whose root has no
@@ -1850,6 +1875,7 @@ static struct rvvm_mount_ns* userland_mountns_new(const char* root_host_dir)
         rvvm_mount_t* m = &ns->mounts[i];
         if (m->provider == RVVM_MOUNT_MEMFS && !m->memfs) {
             m->memfs = rvvm_memfs_create(false, RVVM_TMPFS_DEFAULT_SIZE);
+            mount_row_set_fs(m);
             if (m->memfs) {
                 tmpfs_options(m->options, sizeof(m->options), m->memfs, false);
             } else {
@@ -1908,6 +1934,7 @@ static rvvm_memfs_t* mount_root_set_backing(struct rvvm_mount_ns* ns, bool host_
         old         = m->memfs;
         m->memfs    = fresh;
         m->provider = host_backed ? RVVM_MOUNT_HOSTFS : RVVM_MOUNT_MEMFS;
+        mount_row_set_fs(m);
         /* The type is what /proc/mounts reports as the filesystem, and the two
          * cases are not the same one: a root backed by a host directory is a
          * rootfs, a root backed by memory is a tmpfs. */
@@ -4832,6 +4859,7 @@ static rvvm_addr_t mount_row_add(rvvm_userland_t* ctx, const char* abs,
     rvvm_strlcpy(row->fstype, spec->fstype, sizeof(row->fstype));
     row->provider = spec->provider;
     row->memfs    = spec->memfs;
+    mount_row_set_fs(row);
     if (spec->host_path) {
         rvvm_strlcpy(row->host_path, spec->host_path, sizeof(row->host_path));
     }
@@ -4961,34 +4989,53 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
         return -UAPI_EFAULT;
     }
 
-    if (!strcmp(fstype, "proc")) {
-        provider = RVVM_MOUNT_CORE;
-    } else if (!strcmp(fstype, "devtmpfs") || !strcmp(fstype, "devpts")) {
-        provider = RVVM_MOUNT_CORE;
-    } else if (!strcmp(fstype, "sysfs")) {
-        provider = RVVM_MOUNT_HOSTFS;
-    } else if (!strcmp(fstype, "hostfs")) {
-        /* A host directory mounted at a guest path, named by the source - which is
-         * what mount(2)'s source argument is: host-side metadata about where the
-         * bytes are, not a path the guest resolves. A guest naming one is a guest
-         * asking to see part of the host, and that is a decision the run's owner
-         * makes by giving it a mount(2) at all - the same trust the /sys and /tmp
-         * rows already assume, and the reason a sandboxed run is a run with a
-         * rootfs rather than a run with a mount table. */
-        if (!source || !source[0]) {
-            return -UAPI_EINVAL;
+    {
+        /* The filesystems this core provides, as a table rather than a chain of
+         * string compares. mount(2) in Linux knows no filesystem by name either:
+         * it asks which one answers and dispatches. A new filesystem joins by
+         * being added here, not by being spelled into a branch. */
+        static const struct {
+            const char*           name;
+            rvvm_mount_provider_t provider;
+        } fstypes[] = {
+            { "proc",     RVVM_MOUNT_CORE   },
+            { "devtmpfs", RVVM_MOUNT_CORE   },
+            { "devpts",   RVVM_MOUNT_CORE   },
+            { "sysfs",    RVVM_MOUNT_HOSTFS },
+            /* tmpfs is the one filesystem whose bytes the core owns: private,
+             * dies with the run, and the only place a size= or a read-only
+             * flag can have anything behind it. A host directory would
+             * outlive the run and could not be bounded, so a tmpfs gets
+             * storage that belongs to the mount. */
+            { "tmpfs",    RVVM_MOUNT_MEMFS  },
+            { "hostfs",   RVVM_MOUNT_HOSTFS },
+        };
+        unsigned f;
+
+        provider = RVVM_MOUNT_ROOTFS;
+        for (f = 0; f < STATIC_ARRAY_SIZE(fstypes); ++f) {
+            if (!strcmp(fstype, fstypes[f].name)) {
+                provider = fstypes[f].provider;
+                break;
+            }
         }
-        provider = RVVM_MOUNT_HOSTFS;
-    } else if (!strcmp(fstype, "tmpfs")) {
-        /* The one filesystem whose bytes the core owns: private, dies with the
-         * run, and the only place a size= or a read-only flag can have anything
-         * behind it. A host directory would outlive the run and could not be
-         * bounded, so a tmpfs gets storage that belongs to the mount. */
-        provider = RVVM_MOUNT_MEMFS;
-    } else {
-        rvvm_info("mount(%s, %s, %s): %s is not a filesystem this core provides",
-                  source ? source : "(none)", abs, fstype, fstype);
-        return -UAPI_ENOSYS;
+        if (provider == RVVM_MOUNT_ROOTFS) {
+            rvvm_info("mount(%s, %s, %s): %s is not a filesystem this core provides",
+                      source ? source : "(none)", abs, fstype, fstype);
+            return -UAPI_ENOSYS;
+        }
+        if (provider == RVVM_MOUNT_HOSTFS && !strcmp(fstype, "hostfs")) {
+            /* A host directory mounted at a guest path, named by the source - which
+             * is what mount(2)'s source argument is: host-side metadata about where
+             * the bytes are, not a path the guest resolves. A guest naming one is a
+             * guest asking to see part of the host, and that is a decision the run's
+             * owner makes by giving it a mount(2) at all - the same trust the /sys
+             * row already assumes, and the reason a sandboxed run is a run with a
+             * rootfs rather than a run with a mount table. */
+            if (!source || !source[0]) {
+                return -UAPI_EINVAL;
+            }
+        }
     }
 
     /* A flag with nothing behind it is worse than a refusal: a guest that mounts
@@ -7703,6 +7750,45 @@ static bool memfs_mount_for(rvvm_memfs_t** fs_out, char* rel, size_t rel_size, c
     if (owner.provider == RVVM_MOUNT_MEMFS && owner.mount && owner.mount->memfs) {
         *fs_out = rvvm_memfs_ref(owner.mount->memfs);
         memfs_rel_path(rel, rel_size, owner.mount, abs);
+        ours = true;
+    }
+    spin_unlock(&ctx->mountns->lock);
+    return ours;
+}
+
+/* The name operations of the filesystem that owns @abs: the covering row's own
+ * ops table rather than a provider guessed from the provider column.
+ *
+ * This is the question the name syscalls dispatch on - "does the row answer
+ * names itself" - and the row's ops field is where the answer lives. For a
+ * memfs-backed row a reference on the storage is taken and returned through
+ * @ref_out for the caller to release (rvvm_memfs_free(), which takes NULL);
+ * a row whose operations need no release hands back NULL.
+ *
+ * The row is read under the namespace lock and the operations are used after
+ * it, for the same reason memfs_mount_for() keeps that shape: an unmount on
+ * another thread can free the row while this call is still working. */
+static bool mount_fs_for(rvvm_fs_t* fs_out, rvvm_memfs_t** ref_out,
+                         char* rel, size_t rel_size, const char* abs)
+{
+    rvvm_userland_t*  ctx = uctx();
+    rvvm_path_owner_t owner;
+    bool              ours = false;
+
+    fs_out->ops  = NULL;
+    fs_out->priv = NULL;
+    if (ref_out) {
+        *ref_out = NULL;
+    }
+    spin_lock(&ctx->mountns->lock);
+    owner = rvvm_path_owner(ctx->mountns, abs);
+    if (owner.mount && owner.mount->ops) {
+        fs_out->ops  = owner.mount->ops;
+        fs_out->priv = owner.mount->priv;
+        memfs_rel_path(rel, rel_size, owner.mount, abs);
+        if (ref_out && owner.mount->memfs) {
+            *ref_out = rvvm_memfs_ref(owner.mount->memfs);
+        }
         ours = true;
     }
     spin_unlock(&ctx->mountns->lock);
@@ -15244,19 +15330,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 34: { // mkdirat
                     char          mk_abs[UAPI_PATH_MAX];
-                    rvvm_memfs_t* mk_fs = NULL;
+                    rvvm_fs_t     mk_view;
+                    rvvm_memfs_t* mk_ref = NULL;
                     char          mk_rel[RVVM_MEMFS_PATH_MAX];
                     const char*   mpath;
                     uint32_t      mmode;
                     rvvm_info("sys_mkdirat(%ld, %s, %lx)", a0, to_str(a1), a2);
                     if (guest_path_abs_of((int)a0, to_str(a1), mk_abs, sizeof(mk_abs)) &&
-                        memfs_mount_for(&mk_fs, mk_rel, sizeof(mk_rel), mk_abs)) {
+                        mount_fs_for(&mk_view, &mk_ref, mk_rel, sizeof(mk_rel), mk_abs)) {
                         /* A tmpfs: the directory is made in the storage the mount
                          * owns, which is the only place it can be seen. */
-                        rvvm_fs_t mk_view = rvvm_fs_view_memfs(mk_fs);
                         a0 = -(rvvm_addr_t)rvvm_fs_errno(
                                  rvvm_fs_mkdir(&mk_view, mk_rel, guest_create_mode(a2)));
-                        rvvm_memfs_free(mk_fs);
+                        rvvm_memfs_free(mk_ref);
                         break;
                     }
                     mpath = wrap_guest_path_ex(path_buf, (int)a0, to_str(a1), false);
@@ -15272,7 +15358,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 35: { // unlinkat (guest rmdir is the same call with AT_REMOVEDIR)
                     char          unlink_abs[UAPI_PATH_MAX];
-                    rvvm_memfs_t* rm_fs = NULL;
+                    rvvm_fs_t     rm_view;
+                    rvvm_memfs_t* rm_ref = NULL;
                     char          rm_rel[RVVM_MEMFS_PATH_MAX];
                     bool          have_unlink_abs = false;
                     int           unlink_ret;
@@ -15281,15 +15368,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                         have_unlink_abs = guest_path_absolutize(unlink_abs, sizeof(unlink_abs), to_str(a1));
                     }
                     if (have_unlink_abs &&
-                        memfs_mount_for(&rm_fs, rm_rel, sizeof(rm_rel), unlink_abs)) {
+                        mount_fs_for(&rm_view, &rm_ref, rm_rel, sizeof(rm_rel), unlink_abs)) {
                         /* A tmpfs: one name goes, and the inode with it only if
                          * that was the last name. AT_REMOVEDIR is the guest's
                          * rmdir, and the module refuses it for a file. */
-                        rvvm_fs_t rm_view = rvvm_fs_view_memfs(rm_fs);
                         a0 = -(rvvm_addr_t)rvvm_fs_errno(
                                  rvvm_fs_unlink(&rm_view, rm_rel,
                                                 (a2 & RVVM_UAPI_AT_REMOVEDIR) != 0));
-                        rvvm_memfs_free(rm_fs);
+                        rvvm_memfs_free(rm_ref);
                         break;
                     }
                     unlink_ret = unlinkat(userland_fd_host(uctx(), (int)a0),
@@ -15316,20 +15402,20 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 36: { // symlinkat
                     char          sl_abs[UAPI_PATH_MAX];
-                    rvvm_memfs_t* sl_fs = NULL;
+                    rvvm_fs_t     sl_view;
+                    rvvm_memfs_t* sl_ref = NULL;
                     char          sl_rel[RVVM_MEMFS_PATH_MAX];
                     rvvm_info("sys_symlinkat(%s, %ld, %s)", to_str(a0), a1, to_str(a2));
                     if (guest_path_abs_of((int)a1, to_str(a2), sl_abs, sizeof(sl_abs)) &&
-                        memfs_mount_for(&sl_fs, sl_rel, sizeof(sl_rel), sl_abs)) {
+                        mount_fs_for(&sl_view, &sl_ref, sl_rel, sizeof(sl_rel), sl_abs)) {
                         /* A tmpfs: the target is stored verbatim, which is what a
                          * symlink is - not resolved now, not resolved against a
                          * cwd. This is also the reason a memfs root needs no
                          * shadow: the storage holds the link itself, where a host
                          * directory cannot. */
-                        rvvm_fs_t sl_view = rvvm_fs_view_memfs(sl_fs);
                         a0 = -(rvvm_addr_t)rvvm_fs_errno(
                                  rvvm_fs_symlink(&sl_view, to_str(a0), sl_rel));
-                        rvvm_memfs_free(sl_fs);
+                        rvvm_memfs_free(sl_ref);
                         break;
                     }
                     /* The target is stored verbatim by the kernel, so it is not
@@ -15343,30 +15429,31 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 37: { // linkat
                     char          lk_src[UAPI_PATH_MAX];
                     char          lk_dst[UAPI_PATH_MAX];
-                    rvvm_memfs_t* lk_sfs = NULL;
-                    rvvm_memfs_t* lk_dfs = NULL;
+                    rvvm_fs_t     lk_sview;
+                    rvvm_fs_t     lk_dview;
+                    rvvm_memfs_t* lk_sref = NULL;
+                    rvvm_memfs_t* lk_dref = NULL;
                     char          lk_srel[RVVM_MEMFS_PATH_MAX];
                     char          lk_drel[RVVM_MEMFS_PATH_MAX];
                     rvvm_info("sys_linkat(%ld, %s, %ld, %s, %lx)", a0, to_str(a1), a2, to_str(a3), a4);
                     if (guest_path_abs_of((int)a0, to_str(a1), lk_src, sizeof(lk_src)) &&
                         guest_path_abs_of((int)a2, to_str(a3), lk_dst, sizeof(lk_dst))) {
-                        bool s_on = memfs_mount_for(&lk_sfs, lk_srel, sizeof(lk_srel), lk_src);
-                        bool d_on = memfs_mount_for(&lk_dfs, lk_drel, sizeof(lk_drel), lk_dst);
+                        bool s_on = mount_fs_for(&lk_sview, &lk_sref, lk_srel, sizeof(lk_srel), lk_src);
+                        bool d_on = mount_fs_for(&lk_dview, &lk_dref, lk_drel, sizeof(lk_drel), lk_dst);
                         if (s_on || d_on) {
-                            if (s_on && d_on && lk_sfs == lk_dfs) {
+                            if (s_on && d_on && lk_sref == lk_dref) {
                                 /* Neither name is dereferenced: the new one is
                                  * created, and a link to a symlink is legal. */
-                                rvvm_fs_t lk_view = rvvm_fs_view_memfs(lk_sfs);
                                 a0 = -(rvvm_addr_t)rvvm_fs_errno(
-                                         rvvm_fs_link(&lk_view, lk_srel, lk_drel));
+                                         rvvm_fs_link(&lk_sview, lk_srel, lk_drel));
                             } else {
                                 /* A link cannot cross a mount, which is Linux's
                                  * EXDEV and the reason both sides are asked of
                                  * the table before either is asked of the host. */
                                 a0 = -UAPI_EXDEV;
                             }
-                            rvvm_memfs_free(lk_sfs);
-                            rvvm_memfs_free(lk_dfs);
+                            rvvm_memfs_free(lk_sref);
+                            rvvm_memfs_free(lk_dref);
                             break;
                         }
                     }
@@ -15441,15 +15528,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 45: { // truncate64
                     char          tr_abs[UAPI_PATH_MAX];
-                    rvvm_memfs_t* tr_fs = NULL;
+                    rvvm_fs_t     tr_view;
+                    rvvm_memfs_t* tr_ref = NULL;
                     char          tr_rel[RVVM_MEMFS_PATH_MAX];
                     rvvm_info("sys_truncate64(%s, %lx)", to_str(a0), a1);
                     if (guest_path_abs_of(UAPI_AT_FDCWD, to_str(a0), tr_abs, sizeof(tr_abs)) &&
-                        memfs_mount_for(&tr_fs, tr_rel, sizeof(tr_rel), tr_abs)) {
-                        rvvm_fs_t tr_view = rvvm_fs_view_memfs(tr_fs);
+                        mount_fs_for(&tr_view, &tr_ref, tr_rel, sizeof(tr_rel), tr_abs)) {
                         a0 = -(rvvm_addr_t)rvvm_fs_errno(
                                  rvvm_fs_truncate(&tr_view, tr_rel, a1));
-                        rvvm_memfs_free(tr_fs);
+                        rvvm_memfs_free(tr_ref);
                         break;
                     }
                     a0 = errno_ret(truncate(wrap_guest_path(path_buf, UAPI_AT_FDCWD, to_str(a0)), a1));
@@ -15477,17 +15564,17 @@ static void* rvvm_user_thread_wrap(void* arg)
 #endif
                 case 48: { // faccessat
                     char          ac_abs[UAPI_PATH_MAX];
-                    rvvm_memfs_t* ac_fs = NULL;
+                    rvvm_fs_t     ac_view;
+                    rvvm_memfs_t* ac_ref = NULL;
                     char          ac_rel[RVVM_MEMFS_PATH_MAX];
                     rvvm_info("sys_faccessat(%ld, %s, %lx)", a0, to_str(a1), a2);
                     if (guest_path_abs_of((int)a0, to_str(a1), ac_abs, sizeof(ac_abs)) &&
-                        memfs_mount_for(&ac_fs, ac_rel, sizeof(ac_rel), ac_abs)) {
+                        mount_fs_for(&ac_view, &ac_ref, ac_rel, sizeof(ac_rel), ac_abs)) {
                         /* Permissions are recorded and reported but not enforced
                          * (see the module header), so the only two questions with
                          * an answer here are "is it there" and "could a write
                          * land" - and the second is the mount's read-only flag
                          * rather than the inode's mode. */
-                        rvvm_fs_t         ac_view = rvvm_fs_view_memfs(ac_fs);
                         rvvm_fs_result_t  ac_rc   = RVVM_FS_OK;
                         if (a2 & 2 /* W_OK */) {
                             ac_rc = rvvm_fs_read_only(&ac_view) ? RVVM_FS_EROFS
@@ -15498,7 +15585,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                             ac_rc = rvvm_fs_stat(&ac_view, ac_rel, true, &ac_info);
                         }
                         a0 = -(rvvm_addr_t)rvvm_fs_errno(ac_rc);
-                        rvvm_memfs_free(ac_fs);
+                        rvvm_memfs_free(ac_ref);
                         break;
                     }
                     a0 = rvvm_sys_faccessat(userland_fd_host(uctx(), (int)a0), to_str(a1), a2, 0);
@@ -15531,21 +15618,21 @@ static void* rvvm_user_thread_wrap(void* arg)
                 }
                 case 53: { // fchmodat
                     char          cm_abs[UAPI_PATH_MAX];
-                    rvvm_memfs_t* cm_fs = NULL;
+                    rvvm_fs_t     cm_view;
+                    rvvm_memfs_t* cm_ref = NULL;
                     char          cm_rel[RVVM_MEMFS_PATH_MAX];
                     int           hdir = userland_fd_host(uctx(), (int)a0);
                     const char*   hpath = wrap_guest_path(path_buf, (int)a0, to_str(a1));
                     rvvm_info("sys_fchmodat(%ld, %s, %lx)", a0, to_str(a1), a2);
                     if (guest_path_abs_of((int)a0, to_str(a1), cm_abs, sizeof(cm_abs)) &&
-                        memfs_mount_for(&cm_fs, cm_rel, sizeof(cm_rel), cm_abs)) {
+                        mount_fs_for(&cm_view, &cm_ref, cm_rel, sizeof(cm_rel), cm_abs)) {
                         /* The inode's mode, which is where a tmpfs keeps the only
                          * copy there is. AT_SYMLINK_NOFOLLOW is not honoured:
                          * the module's chmod follows, which is the ordinary
                          * operation and the one this core has always served. */
-                        rvvm_fs_t cm_view = rvvm_fs_view_memfs(cm_fs);
                         a0 = -(rvvm_addr_t)rvvm_fs_errno(
                                  rvvm_fs_chmod(&cm_view, cm_rel, (uint32_t)a2));
-                        rvvm_memfs_free(cm_fs);
+                        rvvm_memfs_free(cm_ref);
                         break;
                     }
                     a0 = errno_ret(fchmodat(hdir, hpath, a2, 0));
@@ -16292,19 +16379,20 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
                 case 78: { // readlinkat
                     char          rl_abs[UAPI_PATH_MAX];
-                    rvvm_memfs_t* rl_fs = NULL;
+                    rvvm_fs_t     rl_view;
+                    rvvm_memfs_t* rl_ref = NULL;
                     char          rl_rel[RVVM_MEMFS_PATH_MAX];
                     char*         rl_out = to_ptr_wr(a2);
                     rvvm_info("sys_readlinkat(%ld, %s, %lx, %lx)", a0, to_str(a1), a2, a3);
                     if (rl_out && guest_path_abs_of((int)a0, to_str(a1), rl_abs, sizeof(rl_abs)) &&
-                        memfs_mount_for(&rl_fs, rl_rel, sizeof(rl_rel), rl_abs)) {
+                        mount_fs_for(&rl_view, &rl_ref, rl_rel, sizeof(rl_rel), rl_abs)) {
                         /* The link itself, never its target - which is the whole
                          * difference between readlink() and open(), and what the
                          * storage holds verbatim. */
-                        char                rl_buf[RVVM_MEMFS_PATH_MAX];
-                        rvvm_memfs_result_t rl_rc =
-                            rvvm_memfs_readlink(rl_fs, rl_rel, rl_buf, sizeof(rl_buf));
-                        if (rl_rc == RVVM_MEMFS_OK) {
+                        char               rl_buf[RVVM_MEMFS_PATH_MAX];
+                        rvvm_fs_result_t   rl_rc =
+                            rvvm_fs_readlink(&rl_view, rl_rel, rl_buf, sizeof(rl_buf));
+                        if (rl_rc == RVVM_FS_OK) {
                             /* Truncated rather than refused when the caller's
                              * buffer is small, and no terminator: readlink(2)
                              * reports a length, not a string. */
@@ -16315,9 +16403,9 @@ static void* rvvm_user_thread_wrap(void* arg)
                             memcpy(rl_out, rl_buf, rl_len);
                             a0 = (rvvm_addr_t)rl_len;
                         } else {
-                            a0 = -(rvvm_addr_t)memfs_errno(rl_rc);
+                            a0 = -(rvvm_addr_t)rvvm_fs_errno(rl_rc);
                         }
-                        rvvm_memfs_free(rl_fs);
+                        rvvm_memfs_free(rl_ref);
                         break;
                     }
                     a0 = rvvm_sys_readlinkat(userland_fd_host(uctx(), (int)a0), to_str(a1), to_ptr_wr(a2), a3);
@@ -16557,16 +16645,16 @@ static void* rvvm_user_thread_wrap(void* arg)
                     char        ut_abs[UAPI_PATH_MAX];
                     if (ut_path && (ut_path[0] == '/' || (int)a0 == UAPI_AT_FDCWD) &&
                         guest_path_absolutize(ut_abs, sizeof(ut_abs), ut_path)) {
-                        rvvm_memfs_t* ut_fs = NULL;
+                        rvvm_fs_t     ut_view;
+                        rvvm_memfs_t* ut_ref = NULL;
                         char          ut_rel[RVVM_MEMFS_PATH_MAX];
-                        if (memfs_mount_for(&ut_fs, ut_rel, sizeof(ut_rel), ut_abs)) {
+                        if (mount_fs_for(&ut_view, &ut_ref, ut_rel, sizeof(ut_rel), ut_abs)) {
                             /* A tmpfs keeps one time per inode, so a touch there is
                              * ENOENT for a name that is not present - which is what
                              * sends touch on to create it - and a fresh mtime for one
                              * that is. */
-                            rvvm_fs_t ut_view = rvvm_fs_view_memfs(ut_fs);
                             a0 = -(rvvm_addr_t)rvvm_fs_errno(rvvm_fs_touch(&ut_view, ut_rel));
-                            rvvm_memfs_free(ut_fs);
+                            rvvm_memfs_free(ut_ref);
                             break;
                         }
                         /* A host file keeps its own timestamps, and there is no shim
@@ -17563,8 +17651,10 @@ case 179: // sysinfo
                 case 276: { // renameat2
                     char          rn_src[UAPI_PATH_MAX];
                     char          rn_dst[UAPI_PATH_MAX];
-                    rvvm_memfs_t* rn_sfs = NULL;
-                    rvvm_memfs_t* rn_dfs = NULL;
+                    rvvm_fs_t     rn_sview;
+                    rvvm_fs_t     rn_dview;
+                    rvvm_memfs_t* rn_sref = NULL;
+                    rvvm_memfs_t* rn_dref = NULL;
                     char          rn_srel[RVVM_MEMFS_PATH_MAX];
                     char          rn_drel[RVVM_MEMFS_PATH_MAX];
                     const char*   from;
@@ -17572,25 +17662,24 @@ case 179: // sysinfo
                     rvvm_info("sys_renameat2(%ld, %s, %ld, %s, %lx)", a0, to_str(a1), a2, to_str(a3), a4);
                     if (guest_path_abs_of((int)a0, to_str(a1), rn_src, sizeof(rn_src)) &&
                         guest_path_abs_of((int)a2, to_str(a3), rn_dst, sizeof(rn_dst))) {
-                        bool s_on = memfs_mount_for(&rn_sfs, rn_srel, sizeof(rn_srel), rn_src);
-                        bool d_on = memfs_mount_for(&rn_dfs, rn_drel, sizeof(rn_drel), rn_dst);
+                        bool s_on = mount_fs_for(&rn_sview, &rn_sref, rn_srel, sizeof(rn_srel), rn_src);
+                        bool d_on = mount_fs_for(&rn_dview, &rn_dref, rn_drel, sizeof(rn_drel), rn_dst);
                         if (s_on || d_on) {
-                            if (s_on && d_on && rn_sfs == rn_dfs) {
+                            if (s_on && d_on && rn_sref == rn_dref) {
                                 /* The name moves and the inode it names does not:
                                  * one identity, one path rewritten - and the whole
                                  * subtree underneath, which is the O(subtree) the
                                  * module documents. */
-                                rvvm_fs_t rn_view = rvvm_fs_view_memfs(rn_sfs);
                                 a0 = -(rvvm_addr_t)rvvm_fs_errno(
-                                         rvvm_fs_rename(&rn_view, rn_srel, rn_drel));
+                                         rvvm_fs_rename(&rn_sview, rn_srel, rn_drel));
                             } else {
                                 /* A rename cannot cross a mount, which is Linux's
                                  * EXDEV - and the reason both sides are asked of
                                  * the table before either is asked of the host. */
                                 a0 = -UAPI_EXDEV;
                             }
-                            rvvm_memfs_free(rn_sfs);
-                            rvvm_memfs_free(rn_dfs);
+                            rvvm_memfs_free(rn_sref);
+                            rvvm_memfs_free(rn_dref);
                             break;
                         }
                     }
