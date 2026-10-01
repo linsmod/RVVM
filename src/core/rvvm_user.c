@@ -1876,6 +1876,10 @@ static struct rvvm_mount_ns* userland_mountns_new(const char* root_host_dir)
         { "/proc",    "proc",    "rw,nosuid,nodev,noexec,relatime",        RVVM_MOUNT_CORE   },
         { "/tmp",     "tmpfs",   "rw,relatime",                            RVVM_MOUNT_MEMFS  },
         { "/var/tmp", "tmpfs",   "rw,relatime",                            RVVM_MOUNT_MEMFS  },
+        /* POSIX shared memory lives here, and everything that names it
+         * (sem_open, shm_open, or a tool that lists the namespace) expects the
+         * directory to be a tmpfs mount rather than a plain directory. */
+        { "/dev/shm", "tmpfs",   "rw,relatime",                            RVVM_MOUNT_MEMFS  },
     };
     struct rvvm_mount_ns* ns = safe_new_obj(rvvm_mount_ns_t);
     unsigned              i;
@@ -11990,6 +11994,9 @@ static bool userland_pty_readable(struct userland_pty* pty, bool master)
  * is what init, getty and a login shell need, and there is no second terminal
  * for them to reach anyway. */
 #define DEV_CONSOLE       3
+/* /dev/full: reads as zeros, and every write is ENOSPC - the device a program
+ * that wants to know how its error path reports "no room" asks for. */
+#define DEV_FULL          4
 
 static bool userland_dev_by_fd(int fd, int* out_dev)
 {
@@ -11997,7 +12004,7 @@ static bool userland_dev_by_fd(int fd, int* out_dev)
         return false;
     }
     uint32_t dev = (uint32_t)fd - RVVM_DEV_FD_BASE;
-    if (dev > DEV_CONSOLE) {
+    if (dev > DEV_FULL) {
         return false;
     }
     if (out_dev) {
@@ -12019,6 +12026,7 @@ static int64_t userland_dev_read(int dev, void* buf, size_t count, bool block)
     switch (dev) {
         case DEV_NULL:  return 0;                       // EOF, always
         case DEV_ZERO:  memset(buf, 0, count); return (int64_t)count;
+        case DEV_FULL:  memset(buf, 0, count); return (int64_t)count;
         case DEV_RANDOM: rvvm_randombytes(buf, count); return (int64_t)count;
         /* The console's input half is the same ring fd 0 reads: the host pushes
          * keyboard bytes into it with rvvm_user_tty_input(). A guest that asked
@@ -12054,6 +12062,11 @@ static int64_t userland_dev_write(int dev, const void* buf, size_t count)
             return errno_ret(ctx->io_callback(1, buf, count));
         }
         return errno_ret(write(1, buf, count));
+    }
+    if (dev == DEV_FULL) {
+        /* The one thing /dev/full is for: every write is out of space, however
+         * much room anything else has. */
+        return -UAPI_ENOSPC;
     }
     (void)dev;   // /dev/null and /dev/zero both swallow everything
     return (int64_t)count;
@@ -12098,7 +12111,8 @@ static bool guest_dev_device(char* abs, size_t size, const char* path)
         return true;
     }
     return !strcmp(abs, "/dev/urandom") || !strcmp(abs, "/dev/random") ||
-           !strcmp(abs, "/dev/null")    || !strcmp(abs, "/dev/zero");
+           !strcmp(abs, "/dev/null")    || !strcmp(abs, "/dev/zero")  ||
+           !strcmp(abs, "/dev/full");
 }
 
 /* A host-made terminal pair: the host drives one end, a guest process is given
@@ -12243,6 +12257,9 @@ static int userland_dev_open(const char* abs, int flags)
     }
     if (!strcmp(abs, "/dev/zero")) {
         return userland_dev_fd(DEV_ZERO);
+    }
+    if (!strcmp(abs, "/dev/full")) {
+        return userland_dev_fd(DEV_FULL);
     }
     errno = ENOENT;
     return -1;
@@ -13285,7 +13302,8 @@ static bool userland_dev_stat_path(const char* abs, struct stat* st)
         memset(st, 0, sizeof(*st));
         st->st_mode  = S_IFDIR | 0755;
         st->st_nlink = 2;
-    } else if (!strcmp(abs, "/dev/null") || !strcmp(abs, "/dev/zero")) {
+    } else if (!strcmp(abs, "/dev/null") || !strcmp(abs, "/dev/zero") ||
+               !strcmp(abs, "/dev/full")) {
         userland_dev_fill_stat(DEV_NULL, st);
     } else if (!strcmp(abs, "/dev/urandom") || !strcmp(abs, "/dev/random")) {
         userland_dev_fill_stat(DEV_RANDOM, st);
@@ -13336,18 +13354,19 @@ static bool userland_dev_stat_path(const char* abs, struct stat* st)
 
 
 static const char* const userland_proc_root_names[] = {
-    "self", "thread-self", "mounts", "uptime", "stat", "meminfo",
+    "self", "thread-self", "mounts", "mountinfo", "uptime", "stat", "meminfo",
     "version", "cpuinfo", "loadavg", "filesystems", "cmdline",
 };
 static const char* const userland_proc_root_files[] = {
     "uptime", "stat", "meminfo", "version", "cpuinfo", "loadavg", "filesystems", "cmdline",
-    "mounts",
+    "mounts", "mountinfo",
 };
 static const char* const userland_proc_pid_names[] = {
     "stat", "status", "statm", "cmdline", "comm", "fd", "cwd", "exe", "root",
+    "mounts", "mountinfo",
 };
 static const char* const userland_proc_pid_files[] = {
-    "stat", "status", "statm", "cmdline", "comm",
+    "stat", "status", "statm", "cmdline", "comm", "mounts", "mountinfo",
 };
 static const char* const userland_proc_pid_links[] = {
     "cwd", "exe", "root",
@@ -14119,6 +14138,56 @@ static size_t userland_proc_gen_mounts(char* buf, size_t size)
     return len;
 }
 
+/*
+ * /proc/self/mountinfo: the same table in the format mount(8) and libmount
+ * actually parse - mount id, parent, device numbers, and the fstype/source pair
+ * after the separator - because a table with two spellings would be two tables
+ * to keep honest. The ids are the row's place in the table, stable within a run
+ * the way a mount id is; the device numbers are the filesystem's own where it
+ * has one, and 0:0 for a row the core synthesizes, which is what Linux reports
+ * for a filesystem without a backing device too.
+ */
+static size_t userland_proc_gen_mountinfo(char* buf, size_t size)
+{
+    rvvm_userland_t* ctx = uctx();
+    size_t len = 0;
+    unsigned i;
+
+    {
+        char line[RVVM_MOUNT_PATH_MAX + 128];
+        spin_lock(&ctx->mountns->lock);
+        for (i = 0; i < ctx->mountns->count; ++i) {
+            const rvvm_mount_t* m = &ctx->mountns->mounts[i];
+            /* One filesystem, one number (see rvvm_memfs_dev): a major:minor
+             * shared by every row would tell a reader that /tmp and /var/tmp
+             * are the same filesystem, which is the kind of lie this file is
+             * here to not tell. */
+            unsigned maj = 0, min = 0;
+            if (m->memfs) {
+                /* No backing device, like every filesystem the core carries:
+                 * major 0, and the filesystem's own sequence as the minor, so
+                 * two memory filesystems are still told apart. */
+                min = rvvm_memfs_dev(m->memfs) & 0xFF;
+            }
+            int n = snprintf(line, sizeof(line),
+                             "%u %u %u:%u / %s %s - %s %s %s\n",
+                             i + 1, mount_row_is_root(m) ? i + 1 : 1,
+                             maj, min, m->path, m->options,
+                             m->fstype,
+                             mount_row_is_root(m) ? "/dev/root" : m->fstype,
+                             m->options);
+            if (n > 0) {
+                size_t room = (len < size) ? (size - len) : 0;
+                size_t take = ((size_t)n < room) ? (size_t)n : room;
+                memcpy(buf + len, line, take);
+                len += take;
+            }
+        }
+        spin_unlock(&ctx->mountns->lock);
+    }
+    return len;
+}
+
 static size_t userland_proc_gen_root_file(const char* leaf, char* buf, size_t size)
 {
     if (!strcmp(leaf, "uptime"))    return userland_proc_gen_uptime(buf, size);
@@ -14129,6 +14198,7 @@ static size_t userland_proc_gen_root_file(const char* leaf, char* buf, size_t si
     if (!strcmp(leaf, "loadavg"))   return userland_proc_gen_loadavg(buf, size);
     if (!strcmp(leaf, "filesystems")) return userland_proc_gen_filesystems(buf, size);
     if (!strcmp(leaf, "mounts"))     return userland_proc_gen_mounts(buf, size);
+    if (!strcmp(leaf, "mountinfo"))  return userland_proc_gen_mountinfo(buf, size);
     if (!strcmp(leaf, "cmdline"))   return userland_proc_gen_root_cmdline(buf, size);
     return 0;
 }
@@ -14136,6 +14206,11 @@ static size_t userland_proc_gen_root_file(const char* leaf, char* buf, size_t si
 static size_t userland_proc_gen_pid_file(const char* leaf, rvvm_process_t* proc,
                                          rvvm_userland_t* home, char* buf, size_t size)
 {
+    /* The namespace files hang off every pid dir as well as the root - that is
+     * where a guest actually reads them from, /proc/self being the spelling
+     * tools use. They are answers about the mount table, not about @proc. */
+    if (!strcmp(leaf, "mounts"))     return userland_proc_gen_mounts(buf, size);
+    if (!strcmp(leaf, "mountinfo"))  return userland_proc_gen_mountinfo(buf, size);
     if (!strcmp(leaf, "stat"))    return userland_proc_gen_stat(proc, home, buf, size);
     if (!strcmp(leaf, "status"))  return userland_proc_gen_status(proc, home, buf, size);
     if (!strcmp(leaf, "statm")) {
