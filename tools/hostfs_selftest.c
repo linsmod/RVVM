@@ -224,7 +224,16 @@ int main(int argc, char** argv)
     /* What this host can do is asserted, not skipped: if it cannot hold a link,
      * the module has to say so rather than return a bare failure. */
     saw_link = rvvm_hostfs_can_symlink(fs);
-    fprintf(stderr, "   (this host can%s hold a symlink)\n", saw_link ? "" : "not");
+    /* Reported, and reported with whether it was asked. A run that says "cannot"
+     * without having tried proves nothing about the host, and the whole point of
+     * the capability is that a caller can act on it - so the difference between
+     * "the host refused" and "this build never asked" has to be visible. */
+    fprintf(stderr, "   (can_symlink() says %s", saw_link ? "yes" : "no");
+#if defined(_WIN32)
+    fprintf(stderr, ", decided without asking: this build makes no symlink call)\n");
+#else
+    fprintf(stderr, ", probed by making one)\n");
+#endif
     if (saw_link) {
         ck_rc(rvvm_hostfs_symlink(fs, "one", "/d/link"), RVVM_HOSTFS_OK, "symlink");
         ck_rc(rvvm_hostfs_stat(fs, "/d/link", false, &info), RVVM_HOSTFS_OK, "lstat the link");
@@ -247,6 +256,9 @@ int main(int argc, char** argv)
           "readlink of a name that is not there is ENOENT");
 
     stage("hard link");
+    /* Reported for the same reason as above. */
+    fprintf(stderr, "   (can_link() says %s, probed by making one)\n",
+            rvvm_hostfs_can_link(fs) ? "yes" : "no");
     if (rvvm_hostfs_can_link(fs)) {
         ck_rc(rvvm_hostfs_link(fs, "/d/one", "/d/hard"), RVVM_HOSTFS_OK, "link");
         ck_rc(rvvm_hostfs_stat(fs, "/d/one", true, &info), RVVM_HOSTFS_OK, "stat one name");
