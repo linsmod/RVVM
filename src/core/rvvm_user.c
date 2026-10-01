@@ -1736,6 +1736,10 @@ typedef enum {
  * hand the ops a mount-relative path, which the ops reconstruct into the
  * guest-absolute path the proc parser expects. */
 #define RVVM_PROC_MOUNT_POINT "/proc"
+
+/* The same for the /dev row, whose name operations are refusals too: the
+ * devices it serves are generated objects, not names a guest can change. */
+#define RVVM_DEV_MOUNT_POINT "/dev"
 /* Longest host directory a row can name. Longer than the guest-path bound because
  * a host path is the longer of the two (a build tree inside a user profile), and
  * a source longer than this is refused rather than truncated: a mount that quietly
@@ -1780,6 +1784,7 @@ typedef struct {
 /* Point a row's dispatch at its storage. Called wherever the storage is set or
  * replaced: the defaults' build, mount_row_add() and the root's backing change. */
 static const rvvm_fs_ops_t* procfs_fs_ops(void);
+static const rvvm_fs_ops_t* devfs_fs_ops(void);
 
 static void mount_row_set_fs(rvvm_mount_t* m)
 {
@@ -1791,10 +1796,13 @@ static void mount_row_set_fs(rvvm_mount_t* m)
         m->priv = view.priv;
     } else if (m->provider == RVVM_MOUNT_CORE &&
                !strcmp(m->path, RVVM_PROC_MOUNT_POINT)) {
-        /* The one core row whose name operations the shared shape can carry:
-         * the refusals. A proc mounted elsewhere is still a recorded, reported
-         * row that serves nothing - which is what mount_e2e pins. */
+        /* The core rows whose name operations the shared shape can carry:
+         * the refusals. A proc or dev mounted elsewhere is still a recorded,
+         * reported row that serves nothing - which is what mount_e2e pins. */
         m->ops = procfs_fs_ops();
+    } else if (m->provider == RVVM_MOUNT_CORE &&
+               !strcmp(m->path, RVVM_DEV_MOUNT_POINT)) {
+        m->ops = devfs_fs_ops();
     }
 }
 
@@ -14551,6 +14559,110 @@ static const rvvm_fs_ops_t* procfs_fs_ops(void)
     return &rvvm_fs_ops_procfs;
 }
 
+/* --- devfs through the shared operations shape ---------------------------- */
+
+/* The /dev row's name operations, the same refusals procfs's are and for the
+ * same reason: the devices are generated objects (a pty pair above all), not
+ * names a guest creates or destroys. Before the row had ops, a mkdir /dev/x
+ * fell through to the host, which answered ENOENT for a name that - the guest
+ * could see the directory - plainly existed; EPERM is what Linux's devtmpfs
+ * says, and it names the truth.
+ *
+ * readlink says EINVAL for everything: no /dev name is a link yet, and a name
+ * the row covers that is no link is exactly what Linux answers EINVAL to.
+ * The descriptor and listing slots stay NULL for the reason the procfs table
+ * gives - an open here generates or hands out a descriptor (guest_dev_device's
+ * branch in openat), a stat needs the device numbers userland_dev_stat_path()
+ * fills, and neither is a question this shape models. */
+
+static bool devfs_fs_read_only(void* priv)
+{
+    (void)priv;
+    return true;
+}
+
+static rvvm_fs_result_t devfs_fs_mkdir(void* priv, const char* rel, uint32_t mode)
+{
+    (void)priv; (void)rel; (void)mode;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t devfs_fs_create_file(void* priv, const char* rel, uint32_t mode)
+{
+    (void)priv; (void)rel; (void)mode;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t devfs_fs_unlink(void* priv, const char* rel, bool dir)
+{
+    (void)priv; (void)rel; (void)dir;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t devfs_fs_rename(void* priv, const char* from, const char* to)
+{
+    (void)priv; (void)from; (void)to;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t devfs_fs_link(void* priv, const char* from, const char* to)
+{
+    (void)priv; (void)from; (void)to;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t devfs_fs_symlink(void* priv, const char* target, const char* rel)
+{
+    (void)priv; (void)target; (void)rel;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t devfs_fs_truncate(void* priv, const char* rel, uint64_t size)
+{
+    (void)priv; (void)rel; (void)size;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t devfs_fs_chmod(void* priv, const char* rel, uint32_t mode)
+{
+    (void)priv; (void)rel; (void)mode;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t devfs_fs_touch(void* priv, const char* rel)
+{
+    (void)priv; (void)rel;
+    return RVVM_FS_EPERM;
+}
+
+static rvvm_fs_result_t devfs_fs_readlink(void* priv, const char* rel,
+                                          char* buf, size_t size)
+{
+    (void)priv; (void)rel; (void)buf; (void)size;
+    return RVVM_FS_EINVAL; /* no /dev name is a link */
+}
+
+static const rvvm_fs_ops_t rvvm_fs_ops_devfs = {
+    .name      = "devfs",
+    .read_only = devfs_fs_read_only,
+    .stat      = NULL, /* see userland_dev_stat_path() */
+    .mkdir     = devfs_fs_mkdir,
+    .create_file = devfs_fs_create_file,
+    .unlink    = devfs_fs_unlink,
+    .rename    = devfs_fs_rename,
+    .link      = devfs_fs_link,
+    .symlink   = devfs_fs_symlink,
+    .readlink  = devfs_fs_readlink,
+    .truncate  = devfs_fs_truncate,
+    .chmod     = devfs_fs_chmod,
+    .touch     = devfs_fs_touch,
+};
+
+static const rvvm_fs_ops_t* devfs_fs_ops(void)
+{
+    return &rvvm_fs_ops_devfs;
+}
+
 /* stat(2)/lstat(2) of a procfs path. False when @abs is not ours. */
 static bool userland_proc_path_stat(const char* abs, uint32_t self_pid, bool follow,
                                     struct stat* st)
@@ -15739,6 +15851,7 @@ static void* rvvm_user_thread_wrap(void* arg)
 #endif
                 case 48: { // faccessat
                     char          ac_abs[UAPI_PATH_MAX];
+                    char          dev_probe[UAPI_PATH_MAX];
                     rvvm_fs_t     ac_view;
                     rvvm_memfs_t* ac_ref = NULL;
                     char          ac_rel[RVVM_MEMFS_PATH_MAX];
@@ -15750,6 +15863,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                          * file says for a write probe is not the EROFS of a
                          * read-only mount, and that distinction is the
                          * filesystem's, not the caller's. */
+                        a0 = rvvm_sys_faccessat(userland_fd_host(uctx(), (int)a0),
+                                                to_str(a1), a2, 0);
+                        break;
+                    }
+                    if (guest_path_abs_of((int)a0, to_str(a1), ac_abs, sizeof(ac_abs)) &&
+                        guest_dev_device(dev_probe, sizeof(dev_probe), to_str(a1))) {
+                        /* A /dev name for the same reason: whether a device is
+                         * writable is the device's answer, not the row's. */
                         a0 = rvvm_sys_faccessat(userland_fd_host(uctx(), (int)a0),
                                                 to_str(a1), a2, 0);
                         break;
@@ -15886,7 +16007,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                              * The object's own number lives far above any host
                              * fd, so the *guest* number is an ordinary slot of
                              * the table, which is what makes close(2), fork(2)
-                             * and the reference counting work on it at all. */
+                             * and the reference counting work on it at all.
+                             *
+                             * This stays an open of its own rather than an ops
+                             * slot, for the procfs open's reason: a device open
+                             * GENERATES or hands out a descriptor, and the
+                             * shared shape deliberately has no open for it. */
                             int obj = userland_dev_open(abs, (int)a2);
                             if (obj >= 0) {
                                 int guest_fd = userland_fd_slot_alloc(uctx(), 0);
@@ -16650,7 +16776,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     /* A synthesized /dev node or directory: the guest can open
                      * it (and list it), so it must be able to stat() it too -
-                     * getty and every shell's tty check do. */
+                     * getty and every shell's tty check do. This keeps its own
+                     * branch rather than going through the row's ops, for the
+                     * procfs stat's reason: the device numbers the shared
+                     * info_t does not carry are the point of a device stat. */
                     if (path && (path[0] == '/' || (int)a0 == UAPI_AT_FDCWD)) {
                         char dev_abs[UAPI_PATH_MAX];
                         struct stat dev_st = {0};
