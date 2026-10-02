@@ -302,6 +302,45 @@ static void stage_env(void)
 }
 
 /* -------------------------------------------------------------------------
+ * A dup(2) does not change *what* a descriptor is, so both numbers must answer
+ * the same /proc/<pid>/fd link name: the name belongs to the open file
+ * description, not to the slot. The console was the case this got wrong - it
+ * was named only at 0/1/2, so a copy at 3+ read back ENOENT while fd 1 read
+ * /dev/tty (see userland_proc_fd_link_target in src/core/rvvm_user.c).
+ *
+ * The comparison is against the *source's* own name rather than a literal, so
+ * the check holds whether stdout is the run's console (/dev/tty) or a session's
+ * pty (/dev/pts/N) - both obey "a copy keeps the name".
+ * ---------------------------------------------------------------------- */
+static void check_fd_link_name(void)
+{
+    int cdup = dup(STDOUT_FILENO);
+    if (cdup < 0) {
+        skip("dup(2) of stdout keeps its /proc link name", strerror(errno));
+        return;
+    }
+    if (cdup <= STDERR_FILENO) {
+        /* The copy landed on the console's own slot, so there is no second
+         * number to compare against. 0/1/2 are in use here, so this cannot
+         * happen; it is only here to keep the check honest if that changes. */
+        close(cdup);
+        return;
+    }
+
+    char src_q[32], dup_q[32], src[64] = {0}, dup_name[64] = {0};
+    snprintf(src_q, sizeof(src_q), "/proc/self/fd/%d", STDOUT_FILENO);
+    snprintf(dup_q, sizeof(dup_q), "/proc/self/fd/%d", cdup);
+    ssize_t ns = readlink(src_q, src, sizeof(src) - 1);
+    ssize_t nd = readlink(dup_q, dup_name, sizeof(dup_name) - 1);
+
+    check(ns > 0 && nd > 0 && !strcmp(src, dup_name),
+          msgf("a dup(2) of stdout keeps its /proc link name (%d=\"%s\", %d=\"%s\")",
+               STDOUT_FILENO, ns > 0 ? src : "-",
+               cdup, nd > 0 ? dup_name : "-"));
+    close(cdup);
+}
+
+/* -------------------------------------------------------------------------
  * Stage 2: identity & path information syscalls
  * ---------------------------------------------------------------------- */
 static void stage_identity(void)
@@ -400,6 +439,9 @@ static void stage_identity(void)
     } else {
         check(0, msgf("sched_getaffinity failed (%s)", strerror(errno)));
     }
+
+    /* A descriptor's name says what it is, not where it sits. */
+    check_fd_link_name();
 }
 
 /* -------------------------------------------------------------------------
