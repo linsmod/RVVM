@@ -146,6 +146,11 @@ struct console_conn {
      * eviction in accept_loop and conn_destroy. */
     int             taken_over;
     int             finished;  /* the reader reached the end of the socket */
+    /* The session's guest end hung up - its shell is gone. Nothing more will
+     * arrive on this connection, so the writer ends the client's half of the
+     * stream once the ring drains (see conn_writer). 0 for a plain console
+     * connection, where a guest exit is announced in band instead. */
+    int             guest_gone;
     pthread_mutex_t lock;
     pthread_cond_t  cond;      /* room in the ring */
     pthread_cond_t  filled;    /* ring has something in it */
@@ -499,10 +504,19 @@ static void* conn_writer(void* arg)
     struct console_conn* c = (struct console_conn*)arg;
     for (;;) {
         pthread_mutex_lock(&c->lock);
-        if (c->dropped || c->len < CONSOLE_HDR_BYTES) {
-            int gone = c->dropped;
-            if (gone) {
+        if (c->dropped) {
+            pthread_mutex_unlock(&c->lock);
+            break;
+        }
+        if (c->len < CONSOLE_HDR_BYTES) {
+            if (c->guest_gone) {
+                /* The session's guest end hung up and its output is drained:
+                 * nothing more can arrive, so end our half of the stream and
+                 * let the client read EOF. It is not a close - whatever the
+                 * client is still sending is still read, and the client's own
+                 * close is still what ends the connection (see conn_serve). */
                 pthread_mutex_unlock(&c->lock);
+                shutdown(c->fd, SHUT_WR);
                 break;
             }
             pthread_cond_wait(&c->filled, &c->lock);
@@ -622,6 +636,15 @@ static void* conn_session_pump(void* arg)
         if (n < 0) {
             LOGI("session %s ended (%lld)", vp_core_session_path(c->session),
                  (long long)n);
+            /* The shell is gone: hand the writer the end of the stream so the
+             * client learns the session is over (see conn_writer). Handed over
+             * rather than closed here, because the client may still be reading
+             * its transcript and the writer is the only thing that owns the
+             * socket. */
+            pthread_mutex_lock(&c->lock);
+            c->guest_gone = 1;
+            pthread_cond_broadcast(&c->filled);
+            pthread_mutex_unlock(&c->lock);
             break;
         }
         if (n == 0) {
