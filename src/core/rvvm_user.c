@@ -135,7 +135,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <unistd.h>
 #endif
 
-#include "rvvm_user.h" // rvvm_user_io_callback typedef (this file's own public header)
+#include "rvvm_user.h" // rvvm_user_console_sink typedef (this file's own public header)
 #include "virtpass/vp_shadow.h" // guest rootfs "shape" index (rvvm_user_set_shadow)
 #include "core/rvvm_memfs.h"    // the memory filesystem a tmpfs mount is served by
 #include "core/rvvm_fs.h"       // ... and the shape both filesystems answer through
@@ -199,7 +199,7 @@ static inline int         win_socket_close(int fd)       { (void)fd; return -1; 
 #include <android/log.h>
 
 // Android-specific I/O callback using logcat
-ssize_t android_io_callback(int fd, const void* buf, size_t count)
+ssize_t android_console_sink(int fd, const void* buf, size_t count)
 {
     if (fd == 1 || fd == 2) { // stdout or stderr
         const char* data = (const char*)buf;
@@ -2032,7 +2032,7 @@ typedef struct rvvm_userland {
     rvvm_machine_t* machine;
 
     // --- Configuration & callbacks (group A) ---
-    rvvm_user_io_callback    io_callback;
+    rvvm_user_console_sink    console_sink;
     rvvm_user_exit_callback  exit_callback;
     // Opaque host context. The host puts whatever it needs to reach from a
     // guest's syscall path here (VirtPass: its vp_cmdpost_t); the core only
@@ -2788,7 +2788,7 @@ static size_t tty_cooked_push_front(rvvm_userland_t* ctx, const void* buf, size_
 // Feed guest output on fd 1/2 through libvterm. No-op unless a session exists -
 // either attached by the host via rvvm_tty_attach() or created on demand when a
 // host registered a tty callback. This only mirrors the bytes into the screen
-// matrix; the caller still forwards them to the host's io_callback / host fd,
+// matrix; the caller still forwards them to the host's console_sink / host fd,
 // so both sinks stay live.
 static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t count)
 {
@@ -3366,11 +3366,11 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
              * The notation goes to both sinks the guest's own console writes
              * use: the VTerm screen, and the raw console - a console host
              * (rvvm_ash) displays the raw one and never renders the screen.
-             * The raw leg mirrors the DEV_CONSOLE write: io_callback when the
+             * The raw leg mirrors the DEV_CONSOLE write: console_sink when the
              * host installed one, the host's stdout otherwise. */
             user_tty_vt_write(ctx, note, 4);
-            if (ctx->io_callback) {
-                ctx->io_callback(1, note, 4);
+            if (ctx->console_sink) {
+                ctx->console_sink(1, note, 4);
             } else {
                 ssize_t raw_echo = write(1, note, 4);
                 (void)raw_echo;
@@ -4011,10 +4011,10 @@ static rvvm_addr_t errno_ret(int64_t val)
     }
 }
 
-PUBLIC void rvvm_user_set_io_callback(rvvm_machine_t* machine, rvvm_user_io_callback callback)
+PUBLIC void rvvm_user_set_console_sink(rvvm_machine_t* machine, rvvm_user_console_sink callback)
 {
     rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
-    if (ctx) ctx->io_callback = callback;
+    if (ctx) ctx->console_sink = callback;
 }
 
 /* Bind/reach the host's own context for this machine. The core never looks
@@ -9386,7 +9386,7 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
      * console its parent was started on. Its bytes are not parsed into the
      * parent's console session: that session belongs to the run, and the child
      * is not the run. */
-    ctx->io_callback = parent->io_callback;
+    ctx->console_sink = parent->console_sink;
 
     /* Signal dispositions are inherited; a pending signal is not. */
     memcpy(ctx->siga, parent->siga, sizeof(ctx->siga));
@@ -12208,8 +12208,8 @@ static int64_t userland_dev_write(int dev, const void* buf, size_t count)
          * stdout on win32. */
         rvvm_userland_t* ctx = uctx();
         user_tty_write(ctx, 1, buf, count);
-        if (ctx->io_callback) {
-            return errno_ret(ctx->io_callback(1, buf, count));
+        if (ctx->console_sink) {
+            return errno_ret(ctx->console_sink(1, buf, count));
         }
         return errno_ret(write(1, buf, count));
     }
@@ -13167,10 +13167,10 @@ static int64_t userland_write_fd(struct rvvm_userland* ctx, int fd, const void* 
     if (userland_fd_is_console(ctx, fd)) {
         user_tty_write(ctx, fd, buf, count);
     }
-    if (ctx->io_callback) {
+    if (ctx->console_sink) {
         /* The sink recognizes the host's 1/2 and writes every other fd through
          * to the host itself, so it is handed the host number (see write(2)). */
-        return errno_ret(ctx->io_callback(host_fd, buf, count));
+        return errno_ret(ctx->console_sink(host_fd, buf, count));
     }
     ssize_t wr = write(host_fd, buf, count);
     return wr < 0 ? errno_ret(-1) : (int64_t)wr;
@@ -15308,8 +15308,13 @@ static const char* userland_proc_fd_link_target(uint32_t pid, uint32_t fd,
     rvvm_userland_t* home = NULL;
     rvvm_process_t*  proc = userland_proc_find_family(uctx(), pid, &home);
     int  hfd = (int)fd;
+    bool console = false;
     if (proc && home && (int)fd < USERLAND_FD_TABLE_MAX && home->fds[fd].used) {
         hfd = home->fds[fd].fd;
+        /* A console is an attach, not a descriptor: it is the same object
+         * whatever number a dup() moved it to (see userland_fd_is_console), so
+         * that - and not the slot number - is what its name is derived from. */
+        console = home->fds[fd].backend == FD_BACKEND_CONSOLE;
     }
     /* A descriptor opened from a path knows its own name, and that is the answer
      * this link exists to give. Read it before the registry reference goes. */
@@ -15351,9 +15356,17 @@ static const char* userland_proc_fd_link_target(uint32_t pid, uint32_t fd,
      * descriptor it holds; apk reads it to learn where the file it just wrote
      * went, builds a destination from the answer, and then reports the failure
      * against that invented path rather than against the link that could not
-     * answer. A caller handed ENOENT fails at the question. 0/1/2 are the
-     * console, and are named as such. */
-    return fd <= 2 ? "/dev/tty" : NULL;
+     * answer. A caller handed ENOENT fails at the question.
+     *
+     * The console is the one object named here that is not a descriptor: it is
+     * asked of the backend, so a console dup()ed onto 7 is the same terminal as
+     * fd 1 and answers the same name. A nameless *host* descriptor that happens
+     * to sit at 0/1/2 (a pipe a redirection left there) is now honestly
+     * nameless rather than dressed up as the console. */
+    if (console) {
+        return "/dev/tty";
+    }
+    return NULL;
 }
 
 /* readlink(2) of a procfs link. See the header for the return convention. */
@@ -16978,12 +16991,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                     if (console_out) {
                         // fd 1/2: feed the virtual TTY parser first (no-op unless a
                         // host injected a VTerm or registered a tty callback). The
-                        // bytes then continue to the host's io_callback / the host
+                        // bytes then continue to the host's console_sink / the host
                         // fd as usual, so the guest console also reaches whatever
                         // sink the host installed - logcat + the Java console on
                         // Android, stdout on win32. A host that wants the virtual
                         // TTY to be the only sink consumes the bytes in its own
-                        // io_callback instead of leaning on this path.
+                        // console_sink instead of leaning on this path.
                         user_tty_write(uctx(), a0, wbuf, a2);
                     }
                     {
@@ -16998,11 +17011,11 @@ static void* rvvm_user_thread_wrap(void* arg)
                                                                  userland_fd_write_blocks(uctx(), (int)a0));
                         } else if (userland_dev_by_fd(host_fd, &dev)) {
                             a0 = (rvvm_addr_t)userland_dev_write(dev, wbuf, a2);
-                        } else if (uctx()->io_callback) {
+                        } else if (uctx()->console_sink) {
                             /* The sink recognizes the host's 1/2 and writes
                              * every other fd through to the host itself, so it
                              * is handed the host number, not the guest's. */
-                            ssize_t ret = uctx()->io_callback(host_fd, wbuf, a2);
+                            ssize_t ret = uctx()->console_sink(host_fd, wbuf, a2);
                             a0 = errno_ret(ret);
                         } else {
                             a0 = errno_ret(write(host_fd, wbuf, a2));
@@ -17205,14 +17218,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                     } else if ((a0 == 1 || a0 == 2) && iov_console) {
                         /* stdout/stderr: mirror every segment into the virtual
                          * TTY parser (when one exists) and forward the same
-                         * bytes to the host's io_callback / host fd, exactly
+                         * bytes to the host's console_sink / host fd, exactly
                          * like the write() path above - the TTY must not
                          * swallow the guest console. */
                         ssize_t total = 0;
                         for (int i = 0; i < (int)a2; i++) {
                             user_tty_write(uctx(), a0, hiov[i].iov_base, hiov[i].iov_len);
-                            ssize_t r = uctx()->io_callback
-                                        ? uctx()->io_callback(iov_fd, hiov[i].iov_base, hiov[i].iov_len)
+                            ssize_t r = uctx()->console_sink
+                                        ? uctx()->console_sink(iov_fd, hiov[i].iov_base, hiov[i].iov_len)
                                         : writev(iov_fd, &hiov[i], 1);
                             if (r < 0) { total = r; break; }
                             total += r;
@@ -20144,8 +20157,8 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
     
 #if defined(ANDROID)
     /* Set Android I/O callback before initializing cmdpost */
-    extern ssize_t android_io_callback(int fd, const void* buf, size_t count);
-    rvvm_user_set_io_callback(machine, android_io_callback);
+    extern ssize_t android_console_sink(int fd, const void* buf, size_t count);
+    rvvm_user_set_console_sink(machine, android_console_sink);
 #endif
     
     /* Initialize Android NDK API proxy. The context is whatever this machine's
@@ -20260,9 +20273,9 @@ void rvvm_user_free(rvvm_machine_t* machine)
     UNUSED(machine);
 }
 
-void rvvm_user_set_io_callback(rvvm_machine_t* machine, rvvm_user_io_callback callback)
+void rvvm_user_set_console_sink(rvvm_machine_t* machine, rvvm_user_console_sink sink)
 {
-    UNUSED(machine); UNUSED(callback);
+    UNUSED(machine); UNUSED(sink);
 }
 
 void rvvm_user_set_host_ctx(rvvm_machine_t* machine, void* host_ctx)

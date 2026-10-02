@@ -750,7 +750,7 @@ static jmethodID  g_connect_client_mid = NULL;
  * compares (nativeTtySerial() / nativeTtySnapshot()). This bridge is left with
  * the JNI plumbing and nothing else - no libvterm calls, no machine pointer.
  * With a session attached rvvm_user routes fd 1/2 into the VTerm, so the old
- * io_callback console bridge no longer sees stdout: the TextureView console
+ * console sink bridge no longer sees stdout: the TextureView console
  * replaces the text overlay.
  *
  * That split is also why the rendering entries below keep working after the

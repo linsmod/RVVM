@@ -27,13 +27,20 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "virtpass/vp_shadow.h" /* vp_shadow_t: the guest rootfs index */
 #include "core/rvvm_memfs.h" /* rvvm_memfs_t: the storage a memory root is */
 
-// Callback type for guest I/O redirection
-// Returns number of bytes written, or -1 on error
-typedef ssize_t (*rvvm_user_io_callback)(int fd, const void* buf, size_t count);
+// Sink for the guest's console output: the raw bytes of fd 1/2 - and of any
+// other fd a guest writes, which it is expected to pass through to the host.
+// Called on the write(2) / writev(2) path with the *host* fd number, so 1/2 are
+// the console and everything else is an ordinary descriptor. Returns the bytes
+// written, or -1 with errno set, which fails the guest's write.
+//
+// This is the raw stream; rvvm_user_set_tty_callback() is the parsed screen of
+// the same bytes. A sink does not replace the TTY - both stay live unless the
+// sink itself consumes fd 1/2.
+typedef ssize_t (*rvvm_user_console_sink)(int fd, const void* buf, size_t count);
 
-// Set custom I/O callback for guest write syscalls
-// If callback returns -1, the syscall will fail with errno
-void rvvm_user_set_io_callback(rvvm_machine_t* machine, rvvm_user_io_callback callback);
+// Install a console sink for the machine, or NULL to write to the host fd
+// directly. The guest's syscall fails with errno when the sink returns -1.
+void rvvm_user_set_console_sink(rvvm_machine_t* machine, rvvm_user_console_sink sink);
 
 // Where the guest's permission bits are kept between runs. The host filesystem
 // cannot store them, so a guest chmod (and the mode an open(O_CREAT) arrives
@@ -80,11 +87,11 @@ void rvvm_user_set_exit_callback(rvvm_machine_t* machine, rvvm_user_exit_callbac
 // instead of depending on a real tty being attached.
 //
 // The TTY is not an alternative sink: the same bytes also continue to the
-// host's io_callback (rvvm_user_set_io_callback) or, without one, to the host
+// host's console sink (rvvm_user_set_console_sink) or, without one, to the host
 // fd. That is what keeps the guest console in the host log - logcat under the
 // RVVM-GUEST tag plus the Java console bridge on Android, host stdout on
 // win32. A host that wants the TTY to be the only sink can consume fd 1/2 in
-// its own io_callback.
+// its own console sink.
 //
 // The opaque `tty` pointer passed to the callback is a libvterm `VTerm*`; cast
 // it back after including <vterm.h>. Registering NULL disables TTY parsing.

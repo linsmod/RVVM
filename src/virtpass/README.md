@@ -114,7 +114,7 @@ backend behind each callback differs.
   `RVVM-GUEST` tag; GL calls trace under `RVVM-GL` with `RVVM_GL_TRACE`.
   The guest console is also parsed into the virtual TTY layer (the console
   tab), and keeps flowing to logcat / the Java console log file - the TTY and
-  the io_callback are complementary sinks, not alternatives. A guest can be
+  the console sink are complementary sinks, not alternatives. A guest can be
   launched directly with
   `am start -n com.rvvm.android/.MainActivity --es guest <name>.exe`.
 - Assets: the host mounts its asset tree at `/assets` (`rvvm_user_set_assets()`),
