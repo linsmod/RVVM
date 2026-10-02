@@ -41,6 +41,7 @@
 #include "util/utils.h"           /* RVVM_LOGx(): the one logger (see utils.h) */
 #include "virtpass/vp_rootfs.h"   /* bundle archives -> guest rootfs + shadow */
 #include "virtpass/vp_bundle.h"   /* what a host does with a bundle (mount/apps/assets) */
+#include "virtpass/vp_console.h"  /* the guest console as a socket (shared with the Android host) */
 #include "virtpass/vp_android.h"  /* guest ABI constants: APP_CMD_*, WINDOW_FORMAT_*, ASENSOR_TYPE_* */
 #include "virtpass/vp_session.h"  /* display geometry + console lines, shared with the Android host */
 #include "win32_gl_dispatch.h" /* on_egl_dispatch, on_gl_dispatch, g_gl_active */
@@ -2054,6 +2055,10 @@ static void host_guest_exit_cb(rvvm_machine_t* machine, int exit_code)
      * this callback is the only source of the real exit code. */
     g_guest_rc = exit_code;
     winhost_log("guest exit callback: code %d", exit_code);
+    /* The console's clients get the status in band, after everything the guest
+     * wrote - the same ordering the Android host sends it in. No-op with no
+     * console. */
+    vp_console_exit(exit_code);
 }
 
 /* TTY callback: rvvm_user fires this on every guest fd 1/2 write after feeding
@@ -2069,6 +2074,67 @@ static void host_tty_cb(void* userdata, int fd, void* tty)
     if (g_hwnd) {
         InvalidateRect(g_hwnd, NULL, FALSE);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* The guest console over a socket (src/virtpass/vp_console.c)          */
+/*                                                                     */
+/* The window is one way to read a run; a driver on the other side of  */
+/* a socket is another, and it is the one the `vp` client speaks - the */
+/* same adb-shaped byte pipe the Android host serves on 127.0.0.1. So  */
+/* this host serves it too, from the shared server, when               */
+/* RVVM_CONSOLE_PORT names a port. Off by default: a console reachable  */
+/* at all is a shell into the guest, and opt-in is the right default    */
+/* for the same reason the Android side binds loopback only.           */
+/* ------------------------------------------------------------------ */
+
+static int g_console_port = 0;   /* 0 = no console server this process */
+
+/* rvvm_user_console_sink: every guest write to fd 1/2, and the pass-through
+ * for any other descriptor. The console pipe is fed first, then the bytes go
+ * on to the host process's own stdout exactly as they did before a sink
+ * existed - a run's transcript on stdout is what makes a winhost run
+ * scriptable, so the sink must not swallow it. */
+static ssize_t win32_console_sink(int fd, const void* buf, size_t count)
+{
+    vp_console_tap(fd, buf, count);
+    return (ssize_t)_write(fd, buf, (unsigned)count);
+}
+
+/* Bring the console up for a run: the listener once, the machine binding and
+ * the sink per run. Called before the guest thread starts, because the guest's
+ * first write may be to fd 1/2. */
+static void console_host_start(rvvm_machine_t* machine)
+{
+    if (!g_console_port) {
+        const char* env = getenv("RVVM_CONSOLE_PORT");
+        int         port = (env && *env) ? atoi(env) : 0;
+        if (port <= 0 || port > 65535) {
+            return;
+        }
+        if (vp_console_start(port) != 0) {
+            winhost_log("console could not bind 127.0.0.1:%d", port);
+            return;
+        }
+        g_console_port = port;
+        winhost_log("console listening on 127.0.0.1:%d (vp -P %d)", port, port);
+    }
+    if (machine) {
+        vp_console_set_machine(machine);
+        rvvm_user_set_console_sink(machine, win32_console_sink);
+    }
+}
+
+/* Join the listener's threads while the process is still whole, and point the
+ * console away from a machine that is about to be freed. */
+static void console_host_stop(void)
+{
+    if (!g_console_port) {
+        return;
+    }
+    vp_console_set_machine(NULL);
+    vp_console_stop();
+    g_console_port = 0;
 }
 
 /* --- TTY cell rendering helpers (color + Unicode) ---
@@ -2467,6 +2533,11 @@ static DWORD WINAPI guest_thread_main(LPVOID arg)
     /* rvvm_user_linux_ex() owns and has just freed the machine: drop our
      * handle before the UI thread could touch it again. */
     g_guest_machine = NULL;
+
+    /* ...and the console must stop pointing at it: a tap from whichever guest
+     * writes next would type into freed memory. The clients were already told
+     * the run is over by vp_console_exit, from the exit callback above. */
+    vp_console_set_machine(NULL);
 
     if (g_guest_argv) {
         int i;
@@ -3267,6 +3338,11 @@ bool win32_host_start_guest(int argc, char** argv)
     rvvm_tty_attach(g_tty, g_guest_machine);
     rvvm_user_set_tty_callback(g_guest_machine, host_tty_cb, NULL);
 
+    /* The same bytes can also leave over a socket (see console_host_start):
+     * the sink tees them to the console pipe, and the machine is bound here,
+     * before the guest thread exists to write any. */
+    console_host_start(g_guest_machine);
+
     /* The guest's terminal is the host's own console, so adopt its geometry
      * before the guest can ask: a full-screen program reads the size once as it
      * starts up, and the session's 24x80 default would be a lie. Set through the
@@ -3432,4 +3508,7 @@ void win32_host_shutdown(void)
         DeleteCriticalSection(&g_surf_cs);
         g_cs_ready = false;
     }
+    /* The console listener outlives individual runs but not the process; its
+     * threads are joined here, while the process is still whole. */
+    console_host_stop();
 }

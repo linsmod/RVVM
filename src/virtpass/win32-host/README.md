@@ -451,6 +451,7 @@ Debug switches:
 | `RVVM_VERBOSE=1` | full syscall trace on stderr (winhost and the ash `--serve` core alike) |
 | `RVVM_TRACE=<cats>` | trace categories: `path fd pty job tty signal mmap sys dev wsock` |
 | `RVVM_DUMP_FRAME=1` | dump the first presented frames as `frame_NNN.bmp` |
+| `RVVM_CONSOLE_PORT=N` | serve the guest console on `127.0.0.1:N` (the same adb-shaped byte pipe the Android host serves; the `vp` client attaches once it knows a local target) |
 | `RVVM_USER_NO_THREADS` | force the guest single-threaded (clone -> EAGAIN) |
 
 An ash core is detached, so its stderr disappears with it: set the vars, then
