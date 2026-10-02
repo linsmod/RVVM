@@ -213,7 +213,7 @@ override lib_src_virtpass_guest := $(SRCDIR)/virtpass/vp_ndk_stub.c $(SRCDIR)/vi
 # instead of librvvm, which stays free of the dependency. vp_shadow.c is the
 # plain index the core queries and has no such dependency, so it does live in
 # librvvm.
-override lib_src_virtpass_nonhost := $(SRCDIR)/virtpass/guest-samples/% $(SRCDIR)/virtpass/android-host/% $(SRCDIR)/virtpass/win32-host/% $(SRCDIR)/virtpass/vp-sdk/% $(SRCDIR)/virtpass/vp_rootfs.c $(SRCDIR)/virtpass/vp_zip.c $(SRCDIR)/virtpass/vp_app.c $(SRCDIR)/virtpass/vp_bundle.c $(SRCDIR)/virtpass/vp_core.c
+override lib_src_virtpass_nonhost := $(SRCDIR)/virtpass/guest-samples/% $(SRCDIR)/virtpass/android-host/% $(SRCDIR)/virtpass/win32-host/% $(SRCDIR)/virtpass/vp-sdk/% $(SRCDIR)/virtpass/vp_rootfs.c $(SRCDIR)/virtpass/vp_zip.c $(SRCDIR)/virtpass/vp_app.c $(SRCDIR)/virtpass/vp_bundle.c $(SRCDIR)/virtpass/vp_core.c $(SRCDIR)/virtpass/vp_console.c
 
 # virtpass_stub bundles those guest-side stubs so guest programs can link them
 # against the virtpass passthrough. It is only buildable on a native riscv64

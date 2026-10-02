@@ -23,6 +23,12 @@ backend behind each callback differs.
   descriptors, owns the event queues with their bounded staging FIFO and the
   Looper wake fd, and exposes one `vp_sensor_ops_t` for a platform backend to
   implement. Guest-visible wire format: `virtpass/vp_sensor_abi.h`.
+- `vp_core.c/.h` + `vp_console.c/.h` — the console. `vp_core` is the session
+  layer (one pty per client out of one machine, shared with `rvvm_ash`);
+  `vp_console` is the byte pipe that carries it — an adb-ShellProtocol-shaped
+  loopback listener, the framing, and the ring that keeps the guest thread off
+  a blocking write. Both hosts build the same `vp_console.c`; only the log sink
+  differs (logcat on Android, stderr elsewhere).
 - Guest stubs: `vp_ndk_stub.c` (NDK APIs), `vp_gl_stub.c` (EGL/GLES), and
   `vp_aaudio_stub.c` (AAudio). GL calls are marshalled through
   `SYS_GL_CALL`/`SYS_EGL_CALL` with guest addresses in `args[]`.

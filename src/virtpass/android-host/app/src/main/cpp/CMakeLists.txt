@@ -172,7 +172,10 @@ add_library(rvvm_jni SHARED
     vp_aaudio_android.c
     # The console: listener, framing and the two blocking threads per client.
     # In C because a blocking push has no counterpart on the Java side of JNI.
-    vp_console.c
+    # Shared with the win32 host (src/virtpass/vp_console.c), not owned by this
+    # app: the framing and the session plumbing are the same on both hosts, and
+    # only the log sink (and, on win32, the socket flavour) differs.
+    ${RVVM_SRC}/virtpass/vp_console.c
     vp_sensor_android.c
     android_gl_host.c
     # Bundle archive reader (gzip + tar): host side, hence linked against zlib

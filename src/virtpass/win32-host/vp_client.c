@@ -71,8 +71,9 @@
 #define VP_SOCK_STREAM  SOCK_STREAM
 
 /* The packet ids, as adb's ShellProtocol has them. Spelled out here rather than
- * included: vp_console.h is in the android-host tree, and this program must
- * build without the device side. The two are checked against each other by
+ * included from src/virtpass/vp_console.h: this program speaks the wire, and
+ * pulling in the server's header would make a client depend on the host side it
+ * must build without. The two are checked against each other by
  * tools/android_console.ps1 -SelfTest, which encodes the same numbers. */
 enum {
     VP_ID_STDIN      = 0,

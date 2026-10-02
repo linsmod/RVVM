@@ -34,7 +34,7 @@
 /* Include vp_cmdpost API */
 #include "virtpass/vp_cmdpost.h"
 #include "virtpass/vp_session.h"
-#include "vp_console.h"
+#include "virtpass/vp_console.h"
 
 /* System EGL/GLES backend (marshalled GL dispatch) */
 #include "android_gl_host.h"

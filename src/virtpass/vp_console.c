@@ -33,12 +33,18 @@
  * status, and asking for it over a side channel afterwards is asking for a
  * race.
  *
- * Everything blocking lives on this side of the JNI boundary. The guest's
- * vCPU thread must never wait for a client: it drops bytes into a ring and
- * returns, and a writer thread does the blocking write. That is the whole
- * reason the listener is here rather than in Java - a blocking push has no
- * counterpart on the Java side of JNI, where there is no way to park a
- * thread on a native event.
+ * Everything blocking lives here, off the guest's thread. The guest's vCPU
+ * thread must never wait for a client: it drops bytes into a ring and returns,
+ * and a writer thread does the blocking write. On Android that is the whole
+ * reason the listener is native rather than in Java - a blocking push has no
+ * counterpart across JNI, where there is no way to park a thread on a native
+ * event.
+ *
+ * This file is shared by both hosts (it lives in src/virtpass, beside vp_core.c
+ * and vp_cmdpost.c), because the framing, the ring and the session plumbing are
+ * the same on each. What a host supplies is its log sink - logcat under Android,
+ * stderr elsewhere (see the LOGI/LOGW/LOGE block below) - and, before this can
+ * run on win32, the socket flavour behind the listener.
  */
 
 #include <errno.h>
@@ -55,15 +61,34 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <android/log.h>
-
 #include "vp_console.h"
 #include "rvvm_user.h"
 
-#define LOG_TAG "RVVM-Console"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+/* The console logs where its host logs, with the same lines either way: the
+ * server above is one implementation for both hosts, only the sink differs -
+ * logcat on Android, stderr elsewhere (which is where a console host such as
+ * rvvm_ash already writes). */
+#if defined(ANDROID)
+#include <android/log.h>
+#define CONSOLE_LOG_TAG "RVVM-Console"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  CONSOLE_LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  CONSOLE_LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, CONSOLE_LOG_TAG, __VA_ARGS__)
+#else
+#include <stdarg.h>
+static void vp_console_logf(const char* level, const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "vp-console: %s: ", level);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+#define LOGI(...) vp_console_logf("info",  __VA_ARGS__)
+#define LOGW(...) vp_console_logf("warn",  __VA_ARGS__)
+#define LOGE(...) vp_console_logf("error", __VA_ARGS__)
+#endif
 
 /* Loopback, never INADDR_ANY. This is a shell into every guest on the
  * device, and the whole point of adb forward is that it is reachable from
