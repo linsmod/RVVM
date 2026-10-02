@@ -2239,6 +2239,7 @@ char*                    guest_root_path;
     // with erase, ECHO) and the cooked result is what read(0, ...) returns.
     spinlock_t   tty_in_lock;      // guards the ring + pending line below
     rvvm_event_t tty_in_event;     // wakes a read(0) blocked with nothing to read
+    rvvm_event_t tty_room_event;   // wakes a parked keyboard once the guest reads
     uint8_t      tty_cooked[TTY_IN_RING];
     size_t       tty_cooked_head;  // read cursor into the ring
     size_t       tty_cooked_len;   // bytes waiting for the guest
@@ -2785,6 +2786,27 @@ static void user_tty_init(rvvm_userland_t* ctx)
 static size_t tty_cooked_push(rvvm_userland_t* ctx, const void* buf, size_t len);
 static size_t tty_cooked_push_front(rvvm_userland_t* ctx, const void* buf, size_t len);
 
+/* Whether this run's console is being served as a terminal.
+ *
+ * One fact behind three faces that have to agree: the termios answers that make
+ * isatty() true (the ioctl path), the output cooking and the screen for fd 1/2
+ * (user_tty_write), and the line discipline on the input side
+ * (rvvm_user_tty_input). A console nobody serves is a plain pipe to the host fd
+ * - and then it is honestly not a terminal on all three faces at once, which is
+ * what a driver piping a script into it wants back.
+ *
+ * Asked in one place because it is one question: two of the three faces tested
+ * ctx->tty and the third tested ctx->tty || ctx->tty_cb, so a host that had
+ * registered a callback but not yet produced output answered isatty() "no"
+ * while its own output was already being cooked - one fact, two answers, which
+ * is what "one state machine written twice" looks like from the guest's side.
+ * (The session can also be attached by the host through rvvm_tty_attach(), and
+ * then ctx->tty is set from the start.) */
+static bool userland_console_is_terminal(rvvm_userland_t* ctx)
+{
+    return ctx && (ctx->tty != NULL || ctx->tty_cb != NULL);
+}
+
 // Feed guest output on fd 1/2 through libvterm. No-op unless a session exists -
 // either attached by the host via rvvm_tty_attach() or created on demand when a
 // host registered a tty callback. This only mirrors the bytes into the screen
@@ -2792,7 +2814,7 @@ static size_t tty_cooked_push_front(rvvm_userland_t* ctx, const void* buf, size_
 // so both sinks stay live.
 static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t count)
 {
-    if (!ctx->tty && !ctx->tty_cb) {
+    if (!userland_console_is_terminal(ctx)) {
         return;
     }
     user_tty_init(ctx);
@@ -2848,6 +2870,12 @@ static void user_tty_write(rvvm_userland_t* ctx, int fd, const void* buf, size_t
         char reply[32];
         int  n = snprintf(reply, sizeof(reply), "\x1b[%d;%dR", cur.row + 1, cur.col + 1);
         spin_lock(&ctx->tty_in_lock);
+        /* Dropped rather than queued with back-pressure (tty_cooked_push_wait):
+         * this runs on the guest's own thread, which is the thread that would
+         * have to read the ring to make room - parking here would park the only
+         * reader. A full ring at this point means the guest has TTY_IN_RING
+         * bytes of typing it has not read yet, and the report is the smaller
+         * loss. */
         tty_cooked_push_front(ctx, reply, (size_t)n);
         spin_unlock(&ctx->tty_in_lock);
         rvvm_event_wake(&ctx->tty_in_event);
@@ -3181,6 +3209,59 @@ static size_t tty_cooked_pop(rvvm_userland_t* ctx, void* buf, size_t len)
     return len;
 }
 
+/* How long a parked keyboard waits before looking at the ring again. Only the
+ * timeout matters: it is what makes a run reset (which empties the ring) or a
+ * teardown visible without a wake. The same 5ms the pty end parks with. */
+#define TTY_ROOM_POLL_NS 5000000ULL
+
+/*
+ * Queue cooked bytes for the guest, waiting for room rather than dropping any.
+ *
+ * The pty end has the same rule for the same reason (see
+ * rvvm_session_pty_input): a client typing faster than a shell can read is a
+ * client whose keystrokes are about to be lost, and keystrokes are the one
+ * thing a terminal must not lose. Waiting is what back-pressure means here -
+ * the host's keyboard pump parks inside this call and stops reading its console,
+ * so the typing queues in that console's own buffer, which is where a terminal
+ * that has fallen behind puts it.
+ *
+ * The unit goes in whole, after waiting for all of it: a reader takes whatever
+ * is at the head of the ring, so a push in pieces would hand it half a line -
+ * or half an escape sequence, which is worse.
+ *
+ * The caller holds tty_in_lock, and it is dropped while waiting or the reader
+ * could never make room. The discipline's own state (the line under assembly,
+ * the ESC scan) is visible to another caller for that window; one keyboard
+ * calls this per run, the same single-caller assumption the read side makes
+ * about a single reader (see user_tty_read). Parking here is a host thread's
+ * business only - every caller of rvvm_user_tty_input() is one (the win32
+ * window, the console pipe, the Android input thread, rvvm_user's own pump),
+ * never a guest thread. A guest thread parking here would be the very reader
+ * that has to drain the ring, which is why the cursor report still pushes
+ * without waiting (see user_tty_write).
+ */
+static void tty_cooked_push_wait(rvvm_userland_t* ctx, const void* buf, size_t len)
+{
+    if (!len) {
+        return;
+    }
+    for (;;) {
+        if (ctx->tty_in_eof) {
+            return;   /* torn down: the run is over and nothing will read this */
+        }
+        if (TTY_IN_RING - ctx->tty_cooked_len >= len) {
+            tty_cooked_push(ctx, buf, len);
+            return;
+        }
+        /* Full: the guest has to read before there is room, so wake it (there
+         * is data waiting now) and wait for the room it makes. */
+        spin_unlock(&ctx->tty_in_lock);
+        rvvm_event_wake(&ctx->tty_in_event);
+        rvvm_event_wait(&ctx->tty_room_event, TTY_ROOM_POLL_NS);
+        spin_lock(&ctx->tty_in_lock);
+    }
+}
+
 /*
  * Columns of screen the character just echoed occupies.
  *
@@ -3384,15 +3465,23 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
             // A canonical scan caught mid-sequence cannot continue here: the
             // held bytes go over untouched, since the guest may well be the
             // one waiting for the report the scan was matching.
+            /* The held piece and this byte are one unit - a reader must not be
+             * handed half an escape sequence - so they are built here and
+             * queued in a single push. */
+            uint8_t piece[2 + sizeof(ctx->tty_esc_hold) + 1];
+            size_t  plen = 0;
             if (ctx->tty_esc_state == 1) {
-                tty_cooked_push(ctx, "\x1b", 1);
+                piece[plen++] = 0x1b;
             } else if (ctx->tty_esc_state == 2) {
-                tty_cooked_push(ctx, "\x1b[", 2);
-                tty_cooked_push(ctx, ctx->tty_esc_hold, ctx->tty_esc_hold_len);
+                piece[plen++] = 0x1b;
+                piece[plen++] = '[';
+                memcpy(piece + plen, ctx->tty_esc_hold, ctx->tty_esc_hold_len);
+                plen += ctx->tty_esc_hold_len;
             }
             ctx->tty_esc_state = 0;
             ctx->tty_esc_hold_len = 0;
-            tty_cooked_push(ctx, &c, 1);
+            piece[plen++] = c;
+            tty_cooked_push_wait(ctx, piece, plen);
             if (echo) {
                 user_tty_vt_write(ctx, (const char*)&c, 1);
             }
@@ -3514,7 +3603,7 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
             // Ctrl-D: deliver the pending line as-is; on an empty line it is
             // the classic end-of-file, which read(0) reports as 0.
             if (ctx->tty_line_len) {
-                tty_cooked_push(ctx, ctx->tty_line, ctx->tty_line_len);
+                tty_cooked_push_wait(ctx, ctx->tty_line, ctx->tty_line_len);
                 ctx->tty_line_len = 0;
             } else {
                 ctx->tty_eof_pending = 1;
@@ -3528,11 +3617,22 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
             if (echo) {
                 user_tty_vt_write(ctx, "\r\n", 2);
             }
-            if (ctx->tty_line_len) {
-                tty_cooked_push(ctx, ctx->tty_line, ctx->tty_line_len);
+            if (ctx->tty_line_len && ctx->tty_line_len < sizeof(ctx->tty_line)) {
+                /* The line and its newline go in as one unit: a canonical-mode
+                 * read(2) waits for a whole line, so a reader that could see the
+                 * line without the newline ending it would be handed half a
+                 * command. The buffer has room for the newline in every case but
+                 * a line already at its full width. */
+                ctx->tty_line[ctx->tty_line_len++] = '\n';
+                tty_cooked_push_wait(ctx, ctx->tty_line, ctx->tty_line_len);
                 ctx->tty_line_len = 0;
+            } else {
+                /* An empty line, or one at the full width: the one case that
+                 * hands the newline over on its own. */
+                tty_cooked_push_wait(ctx, ctx->tty_line, ctx->tty_line_len);
+                ctx->tty_line_len = 0;
+                tty_cooked_push_wait(ctx, "\n", 1);
             }
-            tty_cooked_push(ctx, "\n", 1);
             wake = true;
             continue;
         }
@@ -3606,6 +3706,9 @@ static int64_t user_tty_read(rvvm_userland_t* ctx, void* buf, size_t count, bool
         if (ctx->tty_cooked_len) {
             size_t n = tty_cooked_pop(ctx, buf, count);
             spin_unlock(&ctx->tty_in_lock);
+            /* Room appeared: a keyboard parked because the ring was full has to
+             * hear about it, or the rest of a paste waits out the poll. */
+            rvvm_event_wake(&ctx->tty_room_event);
                 /* What the guest's read(0) actually gets: the byte-level
                  * truth about control characters (0x03/0x04/DEL/ESC...) the
                  * guest's line editor has to make sense of. */
@@ -3675,7 +3778,7 @@ void rvvm_user_tty_input(rvvm_machine_t* machine, const void* buf, size_t len)
     if (!ctx || !buf || !len) {
         return;
     }
-    if (!ctx->tty && !ctx->tty_cb) {
+    if (!userland_console_is_terminal(ctx)) {
         return; // no virtual TTY attached: nowhere to echo and nothing to read
     }
     user_tty_init(ctx);
@@ -15558,28 +15661,37 @@ static int userland_pty_open_slave(uint32_t index)
  * through TIOCGWINSZ moves first, then SIGWINCH is delivered - a full-screen
  * program only re-lays itself out when it receives that signal.
  *
+ * The signal goes to the terminal's foreground group, the same set ^C and ^Z
+ * reach: a full-screen program is the child the shell put in the foreground,
+ * and it is the one that has to re-lay itself out. The run root would hear it
+ * and do nothing - which is what a resize used to do here, so `vi` never moved
+ * until it happened to ask again. With no member of that group left the signal
+ * is the caller's own, at its default disposition - "ignore" for SIGWINCH.
+ *
  * A size the session already has is a no-op, signal included, which is what
- * makes this safe to call from a polling thread. */
+ * makes this safe to call from a polling thread. So is a machine with no
+ * session: there is no terminal to resize. */
 PUBLIC void rvvm_user_tty_resize(rvvm_machine_t* machine, int rows, int cols)
 {
     rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
-    if (!ctx || rows < 1 || cols < 1) {
+    int cur_rows = 0, cur_cols = 0;
+
+    if (!ctx || !ctx->tty || rows < 1 || cols < 1) {
         return;
     }
-    if (ctx->tty) {
-        int cur_rows = 0, cur_cols = 0;
-        rvvm_tty_lock(ctx->tty);
-        rvvm_tty_get_size(ctx->tty, &cur_rows, &cur_cols);
-        rvvm_tty_unlock(ctx->tty);
-        if (cur_rows == rows && cur_cols == cols) {
-            return;
-        }
-        rvvm_tty_resize(ctx->tty, rows, cols);
+    rvvm_tty_lock(ctx->tty);
+    rvvm_tty_get_size(ctx->tty, &cur_rows, &cur_cols);
+    rvvm_tty_unlock(ctx->tty);
+    if (cur_rows == rows && cur_cols == cols) {
+        return;
     }
-    /* SIGWINCH's default disposition is "ignore", so a guest with no handler
-     * just observes the new size on its next query - which is why the delivery
-     * result is not acted on here (unlike SIGINT's, which terminates). */
-    (void)userland_deliver_signal(ctx, UAPI_SIGWINCH);
+    rvvm_tty_resize(ctx->tty, rows, cols);
+    /* SIGWINCH's default disposition is "ignore", so a member with no handler is
+     * simply left alone - which is why the result is not acted on here (unlike
+     * SIGINT's, which terminates the run). */
+    if (!userland_signal_group(ctx, userland_family_root(ctx)->tty_fg_pgid, UAPI_SIGWINCH)) {
+        (void)userland_deliver_signal(ctx, UAPI_SIGWINCH);
+    }
 }
 
 // Run the pending signal's handler on this vCPU: build the frame below the
@@ -16179,14 +16291,17 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 29: // ioctl
                     // TODO: I sure hope not many ioctl() interfaces need struct conversion...
                     rvvm_info("sys_ioctl(%ld, %lx, %lx)", a0, a1, a2);
-                    /* The console is answered from the VTerm, on whatever number it
+                    /* The console is answered by the core, on whatever number it
                      * is: a dup2() onto that number put a real descriptor there
-                     * and the termios probes are not for it. */
-                    if (uctx()->tty && userland_fd_is_console(uctx(), (int)a0)) {
-                        // Virtual TTY rendered by the host: answer the termios
-                        // probes guest libc makes for isatty() itself instead
-                        // of forwarding them to the host fd. fd 0 is included
-                        // because it is the same console, only the input half.
+                     * and the termios probes are not for it. Only while it is
+                     * served as a terminal, though - an unserved console is a
+                     * plain pipe and answers ENOTTY like any other pipe. */
+                    if (userland_console_is_terminal(uctx()) &&
+                        userland_fd_is_console(uctx(), (int)a0)) {
+                        // Served as a terminal: answer the termios probes guest
+                        // libc makes for isatty() itself rather than forwarding
+                        // them to the host fd. fd 0 is included because it is
+                        // the same console, only the input half.
                         a0 = user_tty_ioctl(a1, a2 ? to_ptr_ioctl(a2, a1) : NULL,
                                             (int32_t)(thread->proc ? thread->proc->pid : 0));
                         break;
