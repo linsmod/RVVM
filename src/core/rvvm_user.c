@@ -5737,18 +5737,26 @@ typedef enum {
     RVVM_PROC_NONE = 0,
     RVVM_PROC_ROOT_DIR,    // /proc
     RVVM_PROC_ROOT_FILE,   // /proc/uptime, /proc/stat, ...
-    RVVM_PROC_SELF_LINK,   // /proc/self / /proc/thread-self (open follows it)
+    RVVM_PROC_SELF_LINK,   // /proc/self (open follows it to /proc/<pid>)
+    RVVM_PROC_THREAD_SELF_LINK, // /proc/thread-self: the *thread* asking, not the
+                           // process - a link to <tgid>/task/<tid>
     RVVM_PROC_PID_DIR,     // /proc/<pid>
-    RVVM_PROC_PID_FILE,    // /proc/<pid>/stat, status, ...
+    RVVM_PROC_PID_FILE,    // /proc/<pid>/stat, status, ... (@tid set under /task)
     RVVM_PROC_PID_LINK,    // /proc/<pid>/cwd, exe, root
     RVVM_PROC_PID_FD_DIR,  // /proc/<pid>/fd
     RVVM_PROC_PID_FD_LINK, // /proc/<pid>/fd/<n>
+    RVVM_PROC_PID_TASK_DIR,// /proc/<pid>/task
+    RVVM_PROC_PID_TASK,    // /proc/<pid>/task/<tid>
 } rvvm_proc_kind_t;
 
 typedef struct {
     rvvm_proc_kind_t kind;
     uint32_t         pid;
     uint32_t         fd;      // RVVM_PROC_PID_FD_LINK: which descriptor
+    // The thread a /proc/<pid>/task/<tid>/... path names, or 0 for a process-
+    // level path. Only /stat answers differently for the two; everything else
+    // the task tree serves belongs to the process (see userland_proc_parse).
+    uint32_t         tid;
     char             leaf[RVVM_PROC_NAME_MAX];
 } rvvm_proc_path_t;
 
@@ -5762,6 +5770,105 @@ static bool guest_path_absolutize(char* out, size_t size, const char* path);
 static const char* userland_proc_fd_link_target(uint32_t pid, uint32_t fd,
                                                 char* buf, size_t size);
 static bool userland_proc_parse(const char* abs, uint32_t self_pid, rvvm_proc_path_t* out);
+
+/* /dev/fd, /dev/stdin, /dev/stdout and /dev/stderr are the same magic link as
+ * /proc/self/fd: Linux makes /dev/fd a symlink to that directory and the three
+ * std names a symlink to the descriptor at 0/1/2. This rewrites such a path into
+ * the /proc spelling, so the one layer that already answers a descriptor link
+ * answers this one too - a second implementation would be a second answer to
+ * "what does this descriptor point at", which is the kind of drift the
+ * /proc/mounts work exists to stop.
+ *
+ * The three answers are not the same, and a caller has to tell them apart:
+ *
+ *   DEV_FD_LINK     "/dev/fd" or "/dev/std*" - the link *name* itself. @out is
+ *                   what readlink(2) reports ("/proc/self/fd", ".../0"), and an
+ *                   lstat of it is a symlink.
+ *   DEV_FD_THROUGH  "/dev/fd/N...": a path that goes *through* the directory the
+ *                   link points at, so it equals "/proc/self/fd/N..." and every
+ *                   question about it - readlink, stat, open - is the question
+ *                   about descriptor N. @out is that /proc spelling.
+ *   DEV_FD_NONE     not one of these; @out is untouched.
+ *
+ * Only the exact /dev names are matched: /dev/fdfoo is a name this core never
+ * gave, and the guest's own /dev/fdX is left to whatever answers /dev. */
+typedef enum {
+    DEV_FD_NONE = 0,
+    DEV_FD_LINK,
+    DEV_FD_THROUGH,
+} dev_fd_alias_t;
+
+static dev_fd_alias_t dev_fd_alias(char* out, size_t size, const char* path)
+{
+    static const struct { const char* name; const char* fd; } std[3] = {
+        { "/dev/stdin",  "0" },
+        { "/dev/stdout", "1" },
+        { "/dev/stderr", "2" },
+    };
+    size_t i;
+
+    if (!path) {
+        return DEV_FD_NONE;
+    }
+    for (i = 0; i < STATIC_ARRAY_SIZE(std); ++i) {
+        if (!strcmp(path, std[i].name)) {
+            snprintf(out, size, "/proc/self/fd/%s", std[i].fd);
+            return DEV_FD_LINK;
+        }
+    }
+    if (!strcmp(path, "/dev/fd")) {
+        rvvm_strlcpy(out, "/proc/self/fd", size);
+        return DEV_FD_LINK;
+    }
+    /* Everything under it goes through: /dev/fd/N == /proc/self/fd/N. The tail is
+     * passed on verbatim - the /proc parser is the one that decides whether it is
+     * a descriptor number, and it already refuses a name that is not. */
+    if (!strncmp(path, "/dev/fd/", 8) && path[8]) {
+        int n = snprintf(out, size, "/proc/self/fd/%s", path + 8);
+        if (n < 0 || (size_t)n >= size) {
+            return DEV_FD_NONE;
+        }
+        return DEV_FD_THROUGH;
+    }
+    return DEV_FD_NONE;
+}
+
+/* What open("/dev/fd/...") means. Returns the descriptor number for the cases
+ * that are dup(2) under another name, DEV_FD_OPEN_DIR for the bare /dev/fd (the
+ * link to the directory itself, which opens as the /proc fd listing rather than
+ * as a descriptor), and DEV_FD_OPEN_NONE when @abs is not a /dev/fd name.
+ *
+ * A non-numeric or absurd tail is NONE rather than a number: the /proc parser
+ * refuses the same names, and the two must decline identically or the same path
+ * would be one thing through readlink and another through open. */
+#define DEV_FD_OPEN_DIR  (-1)
+#define DEV_FD_OPEN_NONE (-2)
+static int dev_fd_open_fd(const char* abs)
+{
+    uint64_t    n = 0;
+    const char* p;
+
+    if (!abs) {
+        return DEV_FD_OPEN_NONE;
+    }
+    if (!strcmp(abs, "/dev/fd"))     return DEV_FD_OPEN_DIR;
+    if (!strcmp(abs, "/dev/stdin"))  return 0;
+    if (!strcmp(abs, "/dev/stdout")) return 1;
+    if (!strcmp(abs, "/dev/stderr")) return 2;
+    if (strncmp(abs, "/dev/fd/", 8) || !abs[8]) {
+        return DEV_FD_OPEN_NONE;
+    }
+    for (p = abs + 8; *p; ++p) {
+        if (*p < '0' || *p > '9') {
+            return DEV_FD_OPEN_NONE;
+        }
+        n = n * 10 + (uint64_t)(*p - '0');
+        if (n > 0xFFFFFFFFull) {
+            return DEV_FD_OPEN_NONE;
+        }
+    }
+    return (int)n;
+}
 
 static const char* map_abs_path_ex(char* buffer, const char* path, bool follow_final)
 {
@@ -5798,9 +5905,15 @@ static const char* map_abs_path_ex(char* buffer, const char* path, bool follow_f
              * through one has to act on what it points at, because the directory
              * below would otherwise produce <prefix>/proc/self/fd/7 - a directory
              * that is not there - and the operation fails with ENOENT against a
-             * path the caller never wrote. */
+             * path the caller never wrote.
+             *
+             * /dev/fd/... is the same link under another name (see dev_fd_alias),
+             * so it is asked in the /proc spelling and reaches this one place. */
+            char        alias[UAPI_PATH_MAX];
+            const char* fd_name =
+                dev_fd_alias(alias, sizeof(alias), path) != DEV_FD_NONE ? alias : path;
             const char* fd_target =
-                userland_proc_fd_path_target(followed, sizeof(followed), path);
+                userland_proc_fd_path_target(followed, sizeof(followed), fd_name);
             if (fd_target) {
                 path = fd_target;
                 rest = path;
@@ -8185,6 +8298,43 @@ static int userland_fd_dup(rvvm_userland_t* ctx, int source_fd, int host_fd,
         userland_fd_set_path(ctx, guest_fd, ctx->fds[source_fd].path);
     }
     return guest_fd;
+}
+
+/* open("/dev/fd/N") and open("/dev/std*"), which are dup(2) under another name
+ * (see dev_fd_alias and dev_fd_open_fd). The copy is made exactly as dup(2)
+ * makes it - the own-fd path for a descriptor this userland serves, the host's
+ * own dup(2) otherwise - with the one difference that is why it is not simply
+ * dup(2): FD_CLOEXEC comes from the open() flags, where dup(2) clears it.
+ *
+ * The access mode is not re-asked: the copy reaches the same open file
+ * description and keeps the mode the original was opened with, which is what
+ * Linux's /dev/fd does too. Returns a guest fd or a negative UAPI errno. */
+static rvvm_addr_t userland_dev_fd_dup_open(int source_fd, int flags)
+{
+    rvvm_userland_t* ctx     = uctx();
+    bool             cloexec = (flags & UAPI_O_CLOEXEC) != 0;
+    int              own;
+    int              host_new;
+    int              guest_new;
+
+    /* Only a live slot of this table can be copied. An untracked number is not a
+     * descriptor the guest holds, and passing it to the host's dup(2) would let
+     * the emulator's own descriptor of that number answer instead - the very
+     * crossing this whole layer exists to prevent. */
+    if (source_fd < 0 || source_fd >= USERLAND_FD_TABLE_MAX ||
+        !userland_fd_tracked(ctx, source_fd)) {
+        return -UAPI_EBADF;
+    }
+    own = userland_own_fd_dup(ctx, source_fd, userland_fd_host(ctx, source_fd), 0, cloexec);
+    if (own != -2) {
+        return own >= 0 ? (rvvm_addr_t)own : -UAPI_EMFILE;
+    }
+    host_new = dup(userland_fd_host(ctx, source_fd));
+    if (host_new < 0) {
+        return errno_ret(-1);
+    }
+    guest_new = userland_fd_dup(ctx, source_fd, host_new, 0, cloexec);
+    return (rvvm_addr_t)(guest_new >= 0 ? guest_new : host_new);
 }
 
 /* F_GETFD / F_SETFD: the guest's FD_CLOEXEC, which the host fd does not carry. */
@@ -13239,6 +13389,12 @@ static void userland_dev_fill_stat(int dev, struct stat* st)
 static const char* const userland_dev_names[] = {
     "console", "tty", "tty1", "tty2", "tty3", "tty4", "tty5", "tty6",
     "null", "zero", "random", "urandom", "ptmx",
+    /* The /dev/fd family. On Linux these are symlinks into /proc/self/fd, and a
+     * tool reaches for /dev/stdin or /dev/fd/N without a /proc in sight, so they
+     * are listed for the same reason the rest are: a name a guest can use is a
+     * name it can see. They are answered by devfs_fs_readlink and the fstatat
+     * branch above, not by a storage. */
+    "fd", "stdin", "stdout", "stderr",
     /* "pts" is deliberately absent: the host materializes that directory (it is
      * a mount point), so it is already in the host's own listing and naming it
      * here would list it twice. Directories are the host's, nodes are ours. */
@@ -13363,7 +13519,7 @@ static const char* const userland_proc_root_files[] = {
 };
 static const char* const userland_proc_pid_names[] = {
     "stat", "status", "statm", "cmdline", "comm", "fd", "cwd", "exe", "root",
-    "mounts", "mountinfo",
+    "mounts", "mountinfo", "task",
 };
 static const char* const userland_proc_pid_files[] = {
     "stat", "status", "statm", "cmdline", "comm", "mounts", "mountinfo",
@@ -13380,6 +13536,15 @@ static uint32_t userland_current_pid(void)
     return (self && self->proc) ? self->proc->pid : 0;
 }
 
+/* The guest-visible tid of the thread on this host thread: what "/proc/thread-self"
+ * means to the syscall that is asking, and the identity /proc/<tid> reports. 0
+ * outside guest dispatch. */
+static uint32_t userland_current_tid(void)
+{
+    rvvm_user_thread_t* self = current_user_thread;
+    return self ? self->tid : 0;
+}
+
 static uint8_t userland_proc_name_type(bool is_root, const char* name)
 {
     if (is_root) {
@@ -13388,7 +13553,7 @@ static uint8_t userland_proc_name_type(bool is_root, const char* name)
         }
         return RVVM_DT_REG;
     }
-    if (!strcmp(name, "fd")) {
+    if (!strcmp(name, "fd") || !strcmp(name, "task")) {
         return RVVM_DT_DIR;
     }
     if (!strcmp(name, "cwd") || !strcmp(name, "exe") || !strcmp(name, "root")) {
@@ -13407,6 +13572,25 @@ static bool userland_proc_parse(const char* abs, uint32_t self_pid, rvvm_proc_pa
 
     if (!abs || !path_has_prefix(abs, "/proc")) {
         return false;
+    }
+    /* A path through /proc/thread-self names the calling thread's task. Linux
+     * makes it a link to <tgid>/task/<tid>, so the same spelling answers it -
+     * one grammar for the task tree, not a second. The bare link (no tail) is
+     * left to the first-component pass below, because readlink(2) has to report
+     * the link itself and not what it resolves to. */
+    {
+        static const char tself[] = "/proc/thread-self";
+        if (!strncmp(abs, tself, sizeof(tself) - 1) && abs[sizeof(tself) - 1] == '/') {
+            char     rewritten[UAPI_PATH_MAX];
+            uint32_t tgid = self_pid;
+            uint32_t tid  = userland_current_tid();
+            int      n    = snprintf(rewritten, sizeof(rewritten), "/proc/%u/task/%u%s",
+                                     (unsigned)tgid, (unsigned)tid, abs + sizeof(tself) - 1);
+            if (n < 0 || (size_t)n >= sizeof(rewritten)) {
+                return false;
+            }
+            return userland_proc_parse(rewritten, self_pid, out);
+        }
     }
     const char* rest = abs + 5;   /* past "/proc" */
     if (*rest == 0) {
@@ -13432,7 +13616,8 @@ static bool userland_proc_parse(const char* abs, uint32_t self_pid, rvvm_proc_pa
         tail = NULL;
     }
 
-    bool self = !strcmp(first, "self") || !strcmp(first, "thread-self");
+    bool self  = !strcmp(first, "self");
+    bool tself = !strcmp(first, "thread-self");
     bool numeric = first[0] != 0;
     uint32_t pid = 0;
     for (const char* p = first; *p; ++p) {
@@ -13443,17 +13628,125 @@ static bool userland_proc_parse(const char* abs, uint32_t self_pid, rvvm_proc_pa
         pid = pid * 10 + (uint32_t)(*p - '0');
     }
 
-    if (self || numeric) {
+    if (self || tself || numeric) {
         if (numeric && pid == 0) {
             return false;   /* pid 0 is not a process */
         }
-        if (self) {
+        if (self || tself) {
             pid = self_pid;
         }
         if (!tail) {
+            if (tself) {
+                out->kind = RVVM_PROC_THREAD_SELF_LINK;
+                out->pid  = pid;
+                out->tid  = userland_current_tid();
+                return true;
+            }
             out->kind = self ? RVVM_PROC_SELF_LINK : RVVM_PROC_PID_DIR;
             out->pid  = pid;
             return true;
+        }
+        /* /proc/<pid>/task and everything under it. The task tree is the thread
+         * view of the same process: only /stat answers differently (field 1 is
+         * the tid), so the leaves below parse into the pid kinds with @tid
+         * carried, and the fd tree is the process's own - threads share it. */
+        if (!strcmp(tail, "task")) {
+            out->kind = RVVM_PROC_PID_TASK_DIR;
+            out->pid  = pid;
+            return true;
+        }
+        if (!strncmp(tail, "task/", 5)) {
+            const char* t    = tail + 5;
+            const char* tsl  = strchr(t, '/');
+            size_t      tlen = tsl ? (size_t)(tsl - t) : rvvm_strlen(t);
+            uint32_t    tid  = 0;
+            const char* sub;
+            if (tlen == 0 || tlen >= RVVM_PROC_NAME_MAX) {
+                return false;
+            }
+            for (const char* p = t; p < t + tlen; ++p) {
+                if (*p < '0' || *p > '9') {
+                    return false;
+                }
+                tid = tid * 10 + (uint32_t)(*p - '0');
+            }
+            if (tid == 0) {
+                return false;   /* tid 0 is not a thread */
+            }
+            sub = tsl ? tsl + 1 : NULL;
+            if (sub && *sub == 0) {
+                sub = NULL;
+            }
+            if (!sub) {
+                out->kind = RVVM_PROC_PID_TASK;
+                out->pid  = pid;
+                out->tid  = tid;
+                return true;
+            }
+            /* A task directory mirrors the process one, so it carries a task
+             * entry of its own - the same threads again, which is what Linux
+             * shows and what keeps "a name that can be listed is a name that can
+             * be stat'd" true. Deeper levels are the same question asked again,
+             * so they are folded back into this parser rather than spelled out. */
+            if (!strcmp(sub, "task")) {
+                out->kind = RVVM_PROC_PID_TASK_DIR;
+                out->pid  = pid;
+                return true;
+            }
+            if (!strncmp(sub, "task/", 5)) {
+                char rewritten[UAPI_PATH_MAX];
+                int  n = snprintf(rewritten, sizeof(rewritten), "/proc/%u/%s",
+                                  (unsigned)pid, sub);
+                if (n < 0 || (size_t)n >= sizeof(rewritten)) {
+                    return false;
+                }
+                return userland_proc_parse(rewritten, self_pid, out);
+            }
+            if (!strcmp(sub, "fd")) {
+                out->kind = RVVM_PROC_PID_FD_DIR;
+                out->pid  = pid;
+                return true;
+            }
+            if (!strncmp(sub, "fd/", 3)) {
+                const char* num = sub + 3;
+                uint32_t    n   = 0;
+                if (!*num) {
+                    return false;
+                }
+                for (const char* p = num; *p; ++p) {
+                    if (*p < '0' || *p > '9') {
+                        return false;
+                    }
+                    n = n * 10 + (uint32_t)(*p - '0');
+                }
+                out->kind = RVVM_PROC_PID_FD_LINK;
+                out->pid  = pid;
+                out->fd   = n;
+                out->tid  = tid;
+                return true;
+            }
+            if (strchr(sub, '/') || rvvm_strlen(sub) >= RVVM_PROC_NAME_MAX) {
+                return false;
+            }
+            for (size_t i = 0; i < STATIC_ARRAY_SIZE(userland_proc_pid_files); i++) {
+                if (!strcmp(sub, userland_proc_pid_files[i])) {
+                    out->kind = RVVM_PROC_PID_FILE;
+                    out->pid  = pid;
+                    out->tid  = tid;
+                    rvvm_strlcpy(out->leaf, sub, sizeof(out->leaf));
+                    return true;
+                }
+            }
+            for (size_t i = 0; i < STATIC_ARRAY_SIZE(userland_proc_pid_links); i++) {
+                if (!strcmp(sub, userland_proc_pid_links[i])) {
+                    out->kind = RVVM_PROC_PID_LINK;
+                    out->pid  = pid;
+                    out->tid  = tid;
+                    rvvm_strlcpy(out->leaf, sub, sizeof(out->leaf));
+                    return true;
+                }
+            }
+            return false;
         }
         if (!strcmp(tail, "fd")) {
             out->kind = RVVM_PROC_PID_FD_DIR;
@@ -13829,7 +14122,7 @@ static unsigned long long userland_proc_vsize(rvvm_userland_t* home)
 }
 
 static size_t userland_proc_gen_stat(rvvm_process_t* proc, rvvm_userland_t* home,
-                                     char* buf, size_t size)
+                                     uint32_t tid, char* buf, size_t size)
 {
     char  state      = proc->exited ? 'Z' : (proc->stopped ? 'T' : 'S');
     unsigned long long tty = 0;
@@ -13850,7 +14143,11 @@ static size_t userland_proc_gen_stat(rvvm_process_t* proc, rvvm_userland_t* home
         " %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu"     /* 25..34 */
         " %llu %llu %llu %llu %llu %llu %llu %llu"               /* 35..42 */
         " %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n", /* 43..52 */
-        (unsigned)proc->pid, proc->comm[0] ? proc->comm : "?", (int)state,
+        /* Field 1 is the tid a /task/<tid> view is asked about, or the pid for
+         * the process view. Everything after it is the process's: this core does
+         * not track per-thread CPU time, and inventing one would be the kind of
+         * lie the procfs work exists to stop telling. */
+        (unsigned)(tid ? tid : proc->pid), proc->comm[0] ? proc->comm : "?", (int)state,
         /*  4 ppid     */ (unsigned long long)proc->ppid,
         /*  5 pgrp     */ (unsigned long long)proc->pgid,
         /*  6 session  */ (unsigned long long)proc->sid,
@@ -14204,14 +14501,15 @@ static size_t userland_proc_gen_root_file(const char* leaf, char* buf, size_t si
 }
 
 static size_t userland_proc_gen_pid_file(const char* leaf, rvvm_process_t* proc,
-                                         rvvm_userland_t* home, char* buf, size_t size)
+                                         rvvm_userland_t* home, uint32_t tid,
+                                         char* buf, size_t size)
 {
     /* The namespace files hang off every pid dir as well as the root - that is
      * where a guest actually reads them from, /proc/self being the spelling
      * tools use. They are answers about the mount table, not about @proc. */
     if (!strcmp(leaf, "mounts"))     return userland_proc_gen_mounts(buf, size);
     if (!strcmp(leaf, "mountinfo"))  return userland_proc_gen_mountinfo(buf, size);
-    if (!strcmp(leaf, "stat"))    return userland_proc_gen_stat(proc, home, buf, size);
+    if (!strcmp(leaf, "stat"))    return userland_proc_gen_stat(proc, home, tid, buf, size);
     if (!strcmp(leaf, "status"))  return userland_proc_gen_status(proc, home, buf, size);
     if (!strcmp(leaf, "statm")) {
         unsigned long long vsize = userland_proc_vsize(home);
@@ -14315,6 +14613,53 @@ static rvvm_addr_t userland_proc_opendir_fd(uint32_t pid, int flags, bool cloexe
     return gfd;
 }
 
+/* /proc/<pid>/task: the threads of @pid, by tid. A process's threads are
+ * registered in the same context its descriptors live in - which is what
+ * find_family() hands back as @home - so the listing is that context's thread
+ * registry filtered by process, taken under its lock and copied out. The copy is
+ * the same discipline the fd listing uses: a tid that goes away between two
+ * getdents calls is simply not visited, which is the answer a directory that
+ * changed underneath the reader is allowed to give.
+ *
+ * The numbers are rendered with the directory type (fds_as_links stays false),
+ * because each is a /proc/<pid>/task/<tid> directory and not a link. */
+static rvvm_addr_t userland_proc_opendir_task(uint32_t pid, int flags, bool cloexec)
+{
+    if ((flags & 3) != 0) {
+        return -UAPI_EACCESS;
+    }
+    rvvm_userland_t* home = NULL;
+    rvvm_process_t*  proc = userland_proc_find_family(uctx(), pid, &home);
+    if (!proc) {
+        return -UAPI_ENOENT;
+    }
+    rvvm_proc_fd_t* s = userland_proc_slot_alloc();
+    if (!s) {
+        userland_proc_unref(proc);
+        return -UAPI_EMFILE;
+    }
+    s->is_dir     = true;
+    s->names      = NULL;
+    s->name_count = 0;
+    if (home) {
+        spin_lock(&home->userland_threads_lock);
+        vector_foreach(home->userland_threads, i) {
+            rvvm_user_thread_t* t = vector_at(home->userland_threads, i);
+            if (t->proc == proc && s->pid_count < RVVM_PROC_PID_MAX) {
+                s->pids[s->pid_count++] = t->tid;
+            }
+        }
+        spin_unlock(&home->userland_threads_lock);
+    }
+    userland_proc_unref(proc);
+
+    rvvm_addr_t gfd = userland_proc_install(s, cloexec);
+    if ((int64_t)gfd < 0) {
+        userland_proc_fd_release(s->fd);
+    }
+    return gfd;
+}
+
 static rvvm_addr_t userland_proc_open_file(const rvvm_proc_path_t* pp, uint32_t self_pid,
                                            int flags, bool cloexec)
 {
@@ -14326,7 +14671,7 @@ static rvvm_addr_t userland_proc_open_file(const rvvm_proc_path_t* pp, uint32_t 
 /* A link (cwd/exe/root, /proc/self, /proc/<pid>/fd/<n>): served by
      * readlink(2), not by open. */
     if (pp->kind == RVVM_PROC_PID_LINK || pp->kind == RVVM_PROC_SELF_LINK ||
-        pp->kind == RVVM_PROC_PID_FD_LINK) {
+        pp->kind == RVVM_PROC_THREAD_SELF_LINK || pp->kind == RVVM_PROC_PID_FD_LINK) {
         return -UAPI_EACCESS;
     }
 
@@ -14347,7 +14692,7 @@ static rvvm_addr_t userland_proc_open_file(const rvvm_proc_path_t* pp, uint32_t 
             safe_free(buf);
             return -UAPI_ENOENT;
         }
-        len = userland_proc_gen_pid_file(pp->leaf, proc, home, buf, RVVM_PROC_BUF_MAX);
+        len = userland_proc_gen_pid_file(pp->leaf, proc, home, pp->tid, buf, RVVM_PROC_BUF_MAX);
         userland_proc_unref(proc);
     }
     s->data = buf;
@@ -14369,12 +14714,17 @@ static rvvm_addr_t userland_proc_open_path(const char* abs, uint32_t self_pid,
     if (!userland_proc_parse(abs, self_pid, &pp) || pp.kind == RVVM_PROC_NONE) {
         return -UAPI_ENOENT;
     }
-    if (pp.kind == RVVM_PROC_ROOT_DIR || pp.kind == RVVM_PROC_PID_DIR) {
+    if (pp.kind == RVVM_PROC_ROOT_DIR || pp.kind == RVVM_PROC_PID_DIR ||
+        pp.kind == RVVM_PROC_PID_TASK) {
         return userland_proc_opendir(pp.kind == RVVM_PROC_ROOT_DIR, flags, cloexec);
     }
-    /* /proc/self opens as the pid's directory (the link is followed). */
-    if (pp.kind == RVVM_PROC_SELF_LINK) {
+    /* /proc/self and /proc/thread-self open as a directory (the link is
+     * followed); for the latter it is the calling thread's own task directory. */
+    if (pp.kind == RVVM_PROC_SELF_LINK || pp.kind == RVVM_PROC_THREAD_SELF_LINK) {
         return userland_proc_opendir(false, flags, cloexec);
+    }
+    if (pp.kind == RVVM_PROC_PID_TASK_DIR) {
+        return userland_proc_opendir_task(pp.pid, flags, cloexec);
     }
     if (pp.kind == RVVM_PROC_PID_FD_DIR) {
         return userland_proc_opendir_fd(pp.pid, flags, cloexec);
@@ -14779,11 +15129,62 @@ static rvvm_fs_result_t devfs_fs_touch(void* priv, const char* rel)
     return RVVM_FS_EPERM;
 }
 
+/* The /dev row's links are the /dev/fd family: /dev/fd itself, the three std
+ * names, and the /dev/fd/N that go through the directory the first one points
+ * at. They are the same magic link as /proc/self/fd (see dev_fd_alias), and the
+ * descriptor questions behind them are answered by the proc layer - so this is a
+ * translator and not a second implementation, and a second answer to "what does
+ * this descriptor point at" is exactly what it avoids.
+ *
+ * Everything else under /dev is no link, which is EINVAL - what Linux answers
+ * for a name that is not one. */
 static rvvm_fs_result_t devfs_fs_readlink(void* priv, const char* rel,
                                           char* buf, size_t size)
 {
-    (void)priv; (void)rel; (void)buf; (void)size;
-    return RVVM_FS_EINVAL; /* no /dev name is a link */
+    char           abs[UAPI_PATH_MAX];
+    char           alias[UAPI_PATH_MAX];
+    dev_fd_alias_t a;
+    int            n;
+
+    (void)priv;
+    if (size == 0) {
+        return RVVM_FS_EINVAL;
+    }
+    n = snprintf(abs, sizeof(abs), "%s%s", RVVM_DEV_MOUNT_POINT, rel);
+    if (n < 0 || (size_t)n >= sizeof(abs)) {
+        return RVVM_FS_EINVAL;
+    }
+    a = dev_fd_alias(alias, sizeof(alias), abs);
+    if (a == DEV_FD_LINK) {
+        /* The link name's own target, which is the /proc spelling verbatim. */
+        size_t len = rvvm_strlen(alias);
+        if (len > size - 1) {
+            len = size - 1;
+        }
+        memcpy(buf, alias, len);
+        buf[len] = '\0';
+        return RVVM_FS_OK;
+    }
+    if (a == DEV_FD_THROUGH) {
+        /* Same three words the proc link answers in, mapped the same way (see
+         * procfs_fs_readlink): a length, EINVAL for a name that is no link,
+         * ENOENT for one with no name to give. */
+        rvvm_addr_t out = 0;
+        int         rc  = userland_proc_readlink(alias, userland_current_pid(), buf, size, &out);
+        if (rc == 1) {
+            size_t len = (size_t)out;
+            if (len >= size) {
+                len = size - 1;
+            }
+            buf[len] = '\0';
+            return RVVM_FS_OK;
+        }
+        if (rc == 2) {
+            return RVVM_FS_ENOENT;
+        }
+        return RVVM_FS_EINVAL;
+    }
+    return RVVM_FS_EINVAL; /* no other /dev name is a link */
 }
 
 static const rvvm_fs_ops_t rvvm_fs_ops_devfs = {
@@ -14818,7 +15219,7 @@ static bool userland_proc_path_stat(const char* abs, uint32_t self_pid, bool fol
     /* A pid that is not in the registry has no /proc entry: let the caller fall
      * through to the host, which reports the usual ENOENT. */
     if (pp.kind != RVVM_PROC_ROOT_DIR && pp.kind != RVVM_PROC_ROOT_FILE &&
-        pp.kind != RVVM_PROC_SELF_LINK) {
+        pp.kind != RVVM_PROC_SELF_LINK && pp.kind != RVVM_PROC_THREAD_SELF_LINK) {
         rvvm_process_t* p = userland_proc_find_family(uctx(), pp.pid, NULL);
         if (!p) {
             return false;
@@ -14834,6 +15235,8 @@ static bool userland_proc_path_stat(const char* abs, uint32_t self_pid, bool fol
     switch (pp.kind) {
         case RVVM_PROC_ROOT_DIR:
         case RVVM_PROC_PID_DIR:
+        case RVVM_PROC_PID_TASK_DIR:
+        case RVVM_PROC_PID_TASK:
         case RVVM_PROC_PID_FD_DIR:
             st->st_mode  = S_IFDIR | 0555;
             st->st_nlink = 2;
@@ -14855,6 +15258,20 @@ static bool userland_proc_path_stat(const char* abs, uint32_t self_pid, bool fol
                 st->st_mode  = S_IFLNK | 0777;
                 st->st_nlink = 1;
                 st->st_size  = (off_t)snprintf(num, sizeof(num), "%u", pp.pid);
+            } else {
+                st->st_mode  = S_IFDIR | 0555;
+                st->st_nlink = 2;
+            }
+            return true;
+        case RVVM_PROC_THREAD_SELF_LINK:
+            if (!follow) {
+                char num[32];
+                /* Its target is "<tgid>/task/<tid>", the same spelling readlink
+                 * reports, so the size a reader sees is that name's length. */
+                st->st_mode  = S_IFLNK | 0777;
+                st->st_nlink = 1;
+                st->st_size  = (off_t)snprintf(num, sizeof(num), "%u/task/%u",
+                                               pp.pid, pp.tid);
             } else {
                 st->st_mode  = S_IFDIR | 0555;
                 st->st_nlink = 2;
@@ -14958,10 +15375,17 @@ static int userland_proc_readlink(const char* abs, uint32_t self_pid, char* buff
     const char* target = NULL;
     char pidstr[16];
     char fdbuf[32];
+    char taskbuf[40];
 
     if (pp.kind == RVVM_PROC_SELF_LINK) {
         snprintf(pidstr, sizeof(pidstr), "%u", pp.pid);
         target = pidstr;
+    } else if (pp.kind == RVVM_PROC_THREAD_SELF_LINK) {
+        /* Not the process: the *thread* asking. Linux spells the link
+         * "<tgid>/task/<tid>", and that is what a reader has to be able to
+         * follow - /proc/thread-self is a link into the task tree. */
+        snprintf(taskbuf, sizeof(taskbuf), "%u/task/%u", pp.pid, pp.tid);
+        target = taskbuf;
     } else if (pp.kind == RVVM_PROC_PID_FD_LINK) {
         target = userland_proc_fd_link_target(pp.pid, pp.fd, fdbuf, sizeof(fdbuf));
         if (!target) {
@@ -16121,6 +16545,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         bool have_abs = false;
                         rvvm_memfs_t* mfs = NULL;
                         char mrel[RVVM_MEMFS_PATH_MAX];
+                        int  dev_fd = DEV_FD_OPEN_NONE;
                         /* The asset mount is matched on the guest's own absolute
                          * path, before the prefix mapping - the host's asset tree
                          * is not a path in any file system, so there is nothing
@@ -16129,6 +16554,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                             guest_path_absolutize(abs, sizeof(abs), path)) {
                             have_abs = true;
                             asset = asset_mount_name(abs);
+                            dev_fd = dev_fd_open_fd(abs);
                         }
                         if (asset) {
                             /* O_DIRECTORY, or the mount root itself, is a
@@ -16142,6 +16568,20 @@ static void* rvvm_user_thread_wrap(void* arg)
                             /* Not tracked: the mount sweeps its own descriptors
                              * when the run ends (see the note on
                              * rvvm_asset_ops_t). */
+                        } else if (dev_fd != DEV_FD_OPEN_NONE) {
+                            /* /dev/fd/N and /dev/std* open as a dup(2) of the
+                             * descriptor they name, and the bare /dev/fd as the
+                             * fd directory it links to. Both are answered here
+                             * because both GENERATE a descriptor - the same
+                             * reason the device and procfs opens below keep their
+                             * own branches rather than an ops slot. */
+                            if (dev_fd == DEV_FD_OPEN_DIR) {
+                                a0 = userland_proc_open_path("/proc/self/fd",
+                                                             userland_current_pid(),
+                                                             (int)a2, (a2 & UAPI_O_CLOEXEC) != 0);
+                            } else {
+                                a0 = userland_dev_fd_dup_open(dev_fd, (int)a2);
+                            }
                         } else if (path && guest_dev_device(abs, sizeof(abs), path)) {
                             /* /dev is one of the paths that bypass the prefix
                              * mapping entirely, so on a host with no /dev of its
@@ -16906,16 +17346,41 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * This keeps its own branch rather than going through the
                      * row's ops: the guest's stat needs the dev and uid words
                      * the shared info_t does not carry, and userland_proc_path_
-                     * stat() fills them. */
+                     * stat() fills them.
+                     *
+                     * /dev/fd and the std names are the same magic link under
+                     * another name (see dev_fd_alias), and this is the branch
+                     * that knows @a3 - so they are answered here, in the /proc
+                     * spelling, rather than in the /dev branch below. */
                     if (path && (path[0] == '/' || (int)a0 == UAPI_AT_FDCWD)) {
-                        char proc_abs[UAPI_PATH_MAX];
+                        char        proc_abs[UAPI_PATH_MAX];
+                        char        alias[UAPI_PATH_MAX];
                         struct stat proc_st = {0};
-                        if (guest_path_absolutize(proc_abs, sizeof(proc_abs), path) &&
-                            userland_proc_path_stat(proc_abs, userland_current_pid(),
-                                                    (a3 & AT_SYMLINK_NOFOLLOW) == 0, &proc_st)) {
-                            a0 = 0;
-                            uapi_stat_convert(out, &proc_st);
-                            break;
+                        bool        follow  = (a3 & AT_SYMLINK_NOFOLLOW) == 0;
+                        if (guest_path_absolutize(proc_abs, sizeof(proc_abs), path)) {
+                            dev_fd_alias_t a = dev_fd_alias(alias, sizeof(alias), proc_abs);
+                            if (a == DEV_FD_LINK && !follow) {
+                                /* The link itself. The proc layer has no name for
+                                 * "the /dev/fd link", only for what it points at,
+                                 * so lstat() of it is filled here. */
+                                proc_st.st_dev   = (dev_t)RVVM_SHADOW_DEV;
+                                proc_st.st_ino   = (ino_t)userland_dev_ino(proc_abs);
+                                proc_st.st_uid   = (unsigned)uctx()->fake_uid;
+                                proc_st.st_gid   = (unsigned)uctx()->fake_gid;
+                                proc_st.st_mode  = S_IFLNK | 0777;
+                                proc_st.st_nlink = 1;
+                                proc_st.st_size  = (off_t)rvvm_strlen(alias);
+                                a0 = 0;
+                                uapi_stat_convert(out, &proc_st);
+                                break;
+                            }
+                            if (userland_proc_path_stat(a == DEV_FD_NONE ? proc_abs : alias,
+                                                        userland_current_pid(),
+                                                        follow, &proc_st)) {
+                                a0 = 0;
+                                uapi_stat_convert(out, &proc_st);
+                                break;
+                            }
                         }
                     }
                     /* A synthesized /dev node or directory: the guest can open
