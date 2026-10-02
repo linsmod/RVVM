@@ -553,6 +553,14 @@ android-assets: guest-assets
 # on the caller's side. A mingw-w64 toolchain installs it as libbacktrace-0.dll,
 # which dlib.c's probe now also looks for.
 #
+# libbacktrace is itself a mingw-w64 DLL, so it imports libgcc_s_seh-1.dll and
+# libwinpthread-1.dll - and the loader resolves those by the standard search
+# order, whose last entry is PATH. A PATH directory holding a wrong-architecture
+# copy (the Android SDK's platform-tools ship a 32-bit libwinpthread-1.dll) turns
+# an optional debug aid into a hard loader dialog - "machine type mismatch" -
+# that aborts the run at startup. Staging the imports next to the binary keeps
+# the loader in the build directory, which it searches before PATH.
+#
 # Skipped with a note when it is not there. An optional debug aid is never a
 # reason for a build to fail.
 #
@@ -560,10 +568,13 @@ android-assets: guest-assets
 #   make bin TOOLCHAIN_BIN=/path/to/mingw64/bin
 override TOOLCHAIN_BIN ?= $(firstword $(wildcard C:/msys64/mingw64/bin) $(wildcard /mingw64/bin) /usr/bin)
 
+# What libbacktrace-0.dll imports, and therefore what has to sit beside it.
+override BACKTRACE_DEPS := libgcc_s_seh-1.dll libwinpthread-1.dll
+
 .PHONY: debug-deps       # Stage the optional libraries the host loads by name
 debug-deps:
 	$(if $(wildcard $(TOOLCHAIN_BIN)/libbacktrace-0.dll),\
-	  $(call install_file,$(TOOLCHAIN_BIN)/libbacktrace-0.dll,$(BUILDDIR)/libbacktrace-0.dll,0644),\
+	  $(foreach lib,libbacktrace-0.dll $(BACKTRACE_DEPS),$(if $(wildcard $(TOOLCHAIN_BIN)/$(lib)),$(call install_file,$(TOOLCHAIN_BIN)/$(lib),$(BUILDDIR)/$(lib),0644))),\
 	  $(call log_info,libbacktrace-0.dll not under $(TOOLCHAIN_BIN) - stacktraces stay unavailable))
 
 # The APK ships the same two archives a release bundle carries. The host unpacks
@@ -694,6 +705,7 @@ override DIST_DIR ?= $(BUILDDIR)/dist
 dist: bin pack-apps pack-system fetch-rootfs
 	$(call create_dirs,$(DIST_DIR)/$(VP_BUNDLE_DIR))
 	$(foreach bin,$(BIN_TARGETS),$(call install_file,$(bin),$(DIST_DIR)/$(notdir $(bin)),0755))
+	$(foreach lib,libbacktrace-0.dll $(BACKTRACE_DEPS),$(if $(wildcard $(BUILDDIR)/$(lib)),$(call install_file,$(BUILDDIR)/$(lib),$(DIST_DIR)/$(lib),0644)))
 	$(call install_file,$(ROOTFS_TAR),$(DIST_DIR)/$(VP_BUNDLE_DIR)/$(notdir $(ROOTFS_TAR)),0644)
 	$(call install_file,$(SYSTEM_TAR),$(DIST_DIR)/$(VP_BUNDLE_DIR)/$(notdir $(SYSTEM_TAR)),0644)
 	$(call install_file,$(APPS_TAR),$(DIST_DIR)/$(VP_BUNDLE_DIR)/$(notdir $(APPS_TAR)),0644)
