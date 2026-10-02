@@ -9,8 +9,8 @@
 
 #include <stddef.h>
 
-#include "rvvm_user.h"
-#include "virtpass/vp_core.h"
+#include <core/rvvm_user.h>
+#include <virtpass/vp_core.h>
 
 struct console_conn;
 

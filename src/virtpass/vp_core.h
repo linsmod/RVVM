@@ -50,7 +50,7 @@
 
 #include <stddef.h>
 
-#include "rvvm_user.h"
+#include <core/rvvm_user.h>
 
 #ifdef __cplusplus
 extern "C" {

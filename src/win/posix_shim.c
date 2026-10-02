@@ -48,6 +48,8 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include <netinet/in.h>
+
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -2689,6 +2691,52 @@ int shmdt(const void* shmaddr)
     (void)shmaddr;
     errno = ENOSYS;
     return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Byte order and dotted-quad parsing (netinet/in.h)                   */
+/*                                                                     */
+/* The guest ABI is big-endian on the wire while this host is little-  */
+/* endian, so each helper pair is a byte swap. inet_addr returns the   */
+/* address already in network order, which is the whole reason it is   */
+/* not a plain parse of the octets.                                    */
+/*                                                                     */
+/* These are unprefixed on purpose - that is their POSIX name, and a   */
+/* byte swap is not guest-numbered like the rest of the bridge. They   */
+/* are strong definitions, so the ws2_32 import symbols of the same    */
+/* name lose to them; the semantics are identical either way.          */
+/* ------------------------------------------------------------------ */
+
+uint16_t htons(uint16_t v)
+{
+    return __builtin_bswap16(v);
+}
+
+uint16_t ntohs(uint16_t v)
+{
+    return __builtin_bswap16(v);
+}
+
+uint32_t htonl(uint32_t v)
+{
+    return __builtin_bswap32(v);
+}
+
+uint32_t ntohl(uint32_t v)
+{
+    return __builtin_bswap32(v);
+}
+
+in_addr_t inet_addr(const char* cp)
+{
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    char     tail = 0;
+
+    if (!cp || sscanf(cp, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4 ||
+        a > 255 || b > 255 || c > 255 || d > 255) {
+        return INADDR_NONE;
+    }
+    return htonl((a << 24) | (b << 16) | (c << 8) | d);
 }
 
 /* ------------------------------------------------------------------ */

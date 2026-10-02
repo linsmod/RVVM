@@ -62,7 +62,7 @@
 #include <unistd.h>
 
 #include "vp_console.h"
-#include "rvvm_user.h"
+#include <core/rvvm_user.h>
 
 /* The console logs where its host logs, with the same lines either way: the
  * server above is one implementation for both hosts, only the sink differs -

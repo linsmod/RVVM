@@ -371,7 +371,9 @@ override bin_src_rvvm_winhost  := $(SRCDIR)/virtpass/win32-host/win32_main.c \
                                   $(SRCDIR)/virtpass/vp_rootfs.c \
                                   $(SRCDIR)/virtpass/vp_zip.c \
                                   $(SRCDIR)/virtpass/vp_app.c \
-                                  $(SRCDIR)/virtpass/vp_bundle.c
+                                  $(SRCDIR)/virtpass/vp_bundle.c \
+                                  $(SRCDIR)/virtpass/vp_console.c \
+                                  $(SRCDIR)/virtpass/vp_core.c
 # zlib: vp_rootfs.c inflates the bundle archives (pkg-config module name is
 # "zlib", not "z")
 override bin_libs_rvvm_winhost := rvvm zlib
