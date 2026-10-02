@@ -90,6 +90,31 @@ enum {
 static const char* g_serial = NULL;  /* -s, NULL = the only device attached */
 static int         g_port   = VP_DEFAULT_PORT;
 static int         g_long   = 0;     /* -l on devices */
+/* A local target: a win host's console on this machine, reached with no adb in
+ * the path at all. 0 = none; set by --local (which uses the -P port) or
+ * VP_LOCAL_PORT, and named "local" or "local:<port>" like any other serial. */
+static int         g_local_port = 0;
+
+/* Whether @serial names the local win host rather than a device adb owns.
+ * @port receives the console port (the -P one when the serial carries none). */
+static bool serial_is_local(const char* serial, int* port)
+{
+    if (!serial) {
+        return false;
+    }
+    if (!strcmp(serial, "local")) {
+        *port = g_port;
+        return true;
+    }
+    if (!strncmp(serial, "local:", 6)) {
+        int p = atoi(serial + 6);
+        if (p > 0 && p <= 65535) {
+            *port = p;
+            return true;
+        }
+    }
+    return false;
+}
 
 /* ------------------------------------------------------------------ */
 /* running adb                                                          */
@@ -270,10 +295,15 @@ static void devices_load(void)
     if (rc != 0 || !out[0]) {
         /* adb's own words, because "no devices" and "adb is not on PATH" and
          * "the daemon is not running" are three different problems and
-         * vp: no devices does not distinguish any of them. */
-        fprintf(stderr, "vp: `adb devices` did not answer (exit %d)%s%s\n",
-                rc, out[0] ? ": " : "", out);
-        return;
+         * vp: no devices does not distinguish any of them. Not fatal when a
+         * local host is the target: that one is reached without adb at all. */
+        int lp = 0;
+        if (!g_local_port && !serial_is_local(g_serial, &lp)) {
+            fprintf(stderr, "vp: `adb devices` did not answer (exit %d)%s%s\n",
+                    rc, out[0] ? ": " : "", out);
+            return;
+        }
+        out[0] = '\0';
     }
     char* line = out;
     bool first = true;
@@ -302,6 +332,42 @@ static void devices_load(void)
         }
         line = nl ? nl + 1 : NULL;
     }
+
+    /* The local win host, if one is named: a device as far as every verb is
+     * concerned, only reached without adb. Listed after the adb devices, so an
+     * explicit -s still disambiguates. */
+    {
+        int lp = 0;
+        if ((g_local_port || serial_is_local(g_serial, &lp)) &&
+            g_device_count < VP_MAX_DEVICES) {
+            int port = g_local_port ? g_local_port : lp;
+            vp_device* d = &g_devices[g_device_count++];
+            snprintf(d->serial, sizeof(d->serial), "local:%d", port);
+            snprintf(d->state, sizeof(d->state), "device");
+            snprintf(d->detail, sizeof(d->detail), "local winhost");
+        }
+    }
+}
+
+/* Can 127.0.0.1:@port be connected to right now? One attempt: a local host's
+ * listener is either open or it is not, and unlike an adb forward there is no
+ * relay to wait behind. */
+static bool console_probe(int port)
+{
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family      = VP_AF_INET;
+    sa.sin_port        = htons((uint16_t)port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    wsa_start();
+    int fd = socket(VP_AF_INET, VP_SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = connect(fd, (struct sockaddr*)&sa, sizeof(sa)) == 0;
+    closesocket(fd);
+    return ok;
 }
 
 /* Whether this device's RVVM host is listening: forward the port and try to
@@ -311,6 +377,13 @@ static void devices_load(void)
  * relay answers with end-of-stream at once. */
 static bool host_listening(const char* serial)
 {
+    /* A local host skips the relay: the listener is either open or it is not. */
+    {
+        int lp = 0;
+        if (serial_is_local(serial, &lp)) {
+            return console_probe(lp);
+        }
+    }
     /* tcp: on both ends. A bare number is not a socket specification and adb
      * says so only after it has already agreed there were two arguments. */
     char  spec[16];
@@ -472,8 +545,18 @@ static int cmd_wait_for_device(void)
 static int cmd_forward(int argc, char** argv)
 {
     devices_load();
-    if (!pick_device()) {
+    vp_device* dev = pick_device();
+    if (!dev) {
         return 1;
+    }
+    {
+        int lp = 0;
+        if (serial_is_local(dev->serial, &lp)) {
+            fprintf(stderr,
+                    "vp: forward is adb's, and there is no adb in a local target -\n"
+                    "    127.0.0.1:%d is already this machine's own port.\n", lp);
+            return 2;
+        }
     }
     int  extra = 0;
     bool remove = false;
@@ -539,27 +622,36 @@ static int console_fd = -1;
 #define VP_CONNECT_TRIES   30
 #define VP_CONNECT_WAIT_MS 300
 
-static bool console_connect(void)
+static bool console_connect(const char* serial)
 {
-    char  spec[16];
-    snprintf(spec, sizeof(spec), "tcp:%d", g_port);
-    char* args[4];
-    int n = 0;
-    args[n++] = (char*)"forward";
-    args[n++] = spec;
-    args[n++] = spec;
-    args[n] = NULL;
-    char reply[512];
-    if (run_adb(g_serial, args, reply, sizeof(reply)) != 0) {
-        fprintf(stderr, "vp: adb forward %s failed%s%s\n", spec,
-                reply[0] ? ": " : "", reply);
-        return false;
+    /* A local target has no adb in the path: the win host on this machine is
+     * already listening (it is the thing that started the run), so there is
+     * nothing to forward and nothing to start. */
+    int  local_port = 0;
+    bool local      = serial_is_local(serial, &local_port);
+    int  port       = local ? local_port : g_port;
+
+    if (!local) {
+        char  spec[16];
+        snprintf(spec, sizeof(spec), "tcp:%d", port);
+        char* args[4];
+        int n = 0;
+        args[n++] = (char*)"forward";
+        args[n++] = spec;
+        args[n++] = spec;
+        args[n] = NULL;
+        char reply[512];
+        if (run_adb(serial, args, reply, sizeof(reply)) != 0) {
+            fprintf(stderr, "vp: adb forward %s failed%s%s\n", spec,
+                    reply[0] ? ": " : "", reply);
+            return false;
+        }
     }
 
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.sin_family      = VP_AF_INET;
-    sa.sin_port        = htons((uint16_t)g_port);
+    sa.sin_port        = htons((uint16_t)port);
     sa.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     wsa_start();
@@ -595,6 +687,16 @@ static bool console_connect(void)
         }
         closesocket(fd);
         Sleep(VP_CONNECT_WAIT_MS);
+    }
+    /* A local host's failure is the whole diagnosis: the listener was not
+     * there. An adb device needs the longer story below. */
+    if (local) {
+        fprintf(stderr,
+                "vp: nothing is listening on 127.0.0.1:%d.\n"
+                "    Start the host with RVVM_CONSOLE_PORT=%d (see the win32\n"
+                "    README), or point -P at the port it is using.\n",
+                port, port);
+        return false;
     }
     /* Say what to do, because the fact alone is a dead end. "Nothing is
      * listening" names a symptom; every way of getting here has an action, and
@@ -764,6 +866,14 @@ static void send_winsize(void)
  * guest path. */
 static bool boot_core(const char* serial, const char* cmd)
 {
+    /* A local host is already up: the client attaches to the run this machine
+     * started, it does not boot one over adb. */
+    {
+        int lp = 0;
+        if (serial_is_local(serial, &lp)) {
+            return console_connect(serial) && await_ready();
+        }
+    }
     char* gs[12];
     int   gn = 0;
     gs[gn++] = (char*)"shell";
@@ -791,7 +901,7 @@ static bool boot_core(const char* serial, const char* cmd)
      * otherwise the connect below is what starts it: the run is held until a
      * client is on the socket, which is the point of holding it. So there is no
      * wait here - connecting *is* the start. */
-    if (!console_connect() || !await_ready()) {
+    if (!console_connect(serial) || !await_ready()) {
         return false;
     }
     /* Typed after READY, never before. The session's shell issues a cursor
@@ -811,6 +921,13 @@ static bool boot_core(const char* serial, const char* cmd)
 
 static bool boot_guest(const char* serial, const char* app, const char* cmd)
 {
+    /* See boot_core: a local host is attached to, not booted. */
+    {
+        int lp = 0;
+        if (serial_is_local(serial, &lp)) {
+            return console_connect(serial) && await_ready();
+        }
+    }
     /* argv travels base64'd, NUL-joined: `--esa` is a multi-value option and
      * multi-value options are where shells disagree (a ColorOS build takes one
      * value and reads a leading dash as the next option). */
@@ -874,7 +991,7 @@ static bool boot_guest(const char* serial, const char* app, const char* cmd)
                 told[0] ? ": " : "", told);
         return false;
     }
-    return console_connect() && await_ready();
+    return console_connect(serial) && await_ready();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1231,7 +1348,9 @@ static void usage(FILE* f)
         "  version\n"
         "\n"
         "The global options are adb's: -s SERIAL picks the device, -P PORT\n"
-        "picks the console port (%d by default).\n"
+        "picks the console port (%d by default), and --local (or\n"
+        "VP_LOCAL_PORT=N) targets a host on this machine instead - a\n"
+        "rvvm_winhost run started with RVVM_CONSOLE_PORT, reached with no adb.\n"
         "\n"
         "The guest's console is a byte pipe framed as adb frames a shell, so\n"
         "`adb forward` plus a client that speaks that framing also works.\n",
@@ -1246,17 +1365,34 @@ int main(int argc, char** argv)
      * reason it was killed is exactly what got lost. */
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    int i = 1;
+    int  i     = 1;
+    bool local = false;
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "-s") && i + 1 < argc) {
             g_serial = argv[++i];
         } else if (!strcmp(argv[i], "-P") && i + 1 < argc) {
             g_port = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--local")) {
+            local = true;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(stdout);
             return 0;
         } else {
             break;
+        }
+    }
+    /* Resolve the local target once -P has been read: --local uses that port,
+     * and VP_LOCAL_PORT names one outright for a driver that would rather not
+     * pass a flag. */
+    if (local) {
+        g_local_port = g_port;
+    } else {
+        const char* lp = getenv("VP_LOCAL_PORT");
+        if (lp && *lp) {
+            int p = atoi(lp);
+            if (p > 0 && p <= 65535) {
+                g_local_port = p;
+            }
         }
     }
     if (i >= argc) {
