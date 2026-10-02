@@ -864,6 +864,25 @@ static void send_winsize(void)
  * So the flag is not a mode of the same thing, it is a different thing, and the
  * app name is not used: idle is a system program with no manifest, named here by
  * guest path. */
+/* A local host is already running: attach, and type @cmd into the session if
+ * there is one. This is where a local command goes - the guest was started by
+ * the operator, so there is no `am start` intent to carry an argv through and
+ * nothing to boot. */
+static bool local_attach(const char* serial, const char* cmd)
+{
+    if (!console_connect(serial) || !await_ready()) {
+        return false;
+    }
+    if (cmd && *cmd) {
+        char line[2048];
+        int  n = snprintf(line, sizeof(line), "%s\n", cmd);
+        if (n > 0 && (size_t)n < sizeof(line)) {
+            send_packet(VP_ID_STDIN, line, (size_t)n);
+        }
+    }
+    return true;
+}
+
 static bool boot_core(const char* serial, const char* cmd)
 {
     /* A local host is already up: the client attaches to the run this machine
@@ -871,7 +890,7 @@ static bool boot_core(const char* serial, const char* cmd)
     {
         int lp = 0;
         if (serial_is_local(serial, &lp)) {
-            return console_connect(serial) && await_ready();
+            return local_attach(serial, cmd);
         }
     }
     char* gs[12];
@@ -921,11 +940,12 @@ static bool boot_core(const char* serial, const char* cmd)
 
 static bool boot_guest(const char* serial, const char* app, const char* cmd)
 {
-    /* See boot_core: a local host is attached to, not booted. */
+    /* See boot_core: a local host is attached to, not booted, and the command
+     * (if any) is typed into the running guest. */
     {
         int lp = 0;
         if (serial_is_local(serial, &lp)) {
-            return console_connect(serial) && await_ready();
+            return local_attach(serial, cmd);
         }
     }
     /* argv travels base64'd, NUL-joined: `--esa` is a multi-value option and
@@ -1268,8 +1288,11 @@ static int cmd_exec_out(int argc, char** argv)
     if (core) {
         /* A core's shell is interactive and does not exit with the command, so
          * there is no exit packet coming and no exit code to report. Typed into
-         * a session like any other input, and the transcript ends when the
-         * connection does. */
+         * a session like any other input; the command then closes the session's
+         * stdin, which is the EOF that makes the shell exit - and the session
+         * ending is what ends the connection (see vp_console.c conn_writer), so
+         * the transcript below drains and ends instead of streaming forever. */
+        send_packet(VP_ID_CLOSESTDIN, NULL, 0);
         char* body = NULL;
         size_t blen = 0;
         for (;;) {
