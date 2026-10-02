@@ -29,6 +29,7 @@ PUSH_OPTIMIZATION_SIZE
 #include <errno.h>  // For errno
 #include <fcntl.h>  // For struct flock, open(), fcntl(), posix_fallocate(), fallocate(), fspacectl(), fdiscard()
 #include <unistd.h> // For close(), lseek(), pread(), pwrite(), fdatasync(), ftruncate()
+#include <string.h> // For memcpy()
 
 #if defined(HOST_TARGET_NETBSD)
 #include <sys/param.h> // For __NetBSD_Version__

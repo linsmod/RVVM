@@ -94,6 +94,8 @@ add_library(rvvm_core STATIC
 ${RVVM_SRC}/core/rvvm.c
 ${RVVM_SRC}/core/rvvm_user.c
 ${RVVM_SRC}/core/rvvm_memfs.c
+${RVVM_SRC}/core/rvvm_fs.c
+${RVVM_SRC}/core/rvvm_hostfs.c
 ${RVVM_SRC}/core/rvvm_irq.c
     ${RVVM_SRC}/core/rvvm_region.c
     ${RVVM_SRC}/core/rvvm_isolation.c
