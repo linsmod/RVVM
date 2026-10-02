@@ -29,6 +29,13 @@
                   provider column distinguishes what /proc/mounts says from what
                   resolves, and only the first is wired up. This check pins that
                   so the day it changes, it changes on purpose.
+      breadth     what a guest's tooling expects of the table: /sys is the
+                  generated read-only sysfs with Linux's magic, /dev/full reads as
+                  zeros and is out of space on every write, /proc/self/mountinfo
+                  is the same table in the libmount format, /dev/shm is a tmpfs
+                  mount, and /dev/fd and the std names are the /proc/self/fd link
+                  - readlink reports the link, an open() is a dup(2) of the
+                  descriptor, and an open() of a number that is not one fails.
 
     Every `-c` client is a separate session and therefore a separate process, so
     the namespace checks are also the cross-process ones.
@@ -176,6 +183,23 @@ $r = Client 'dd if=/dev/full bs=1k count=1 2>/dev/null | wc -c'
 Check ($r.Trim() -match '1024') "a read of /dev/full is zeros ('$($r.Trim())')"
 $r = Client 'dd if=/dev/zero of=/dev/full bs=1k count=1 2>&1'
 Check ($r -match 'No space left') "a write to /dev/full is ENOSPC ('$($r.Trim())')"
+# /dev/fd and the three std names are the same magic link as /proc/self/fd: Linux
+# makes /dev/fd a symlink to that directory. readlink reports the link, a path
+# through it reaches the descriptor, and open() is a dup(2) of one.
+$r = Client 'readlink /dev/fd'
+Check ($r.Trim() -eq '/proc/self/fd') "/dev/fd readlinks to /proc/self/fd ('$($r.Trim())')"
+$r = Client 'readlink /dev/stdin'
+Check ($r.Trim() -eq '/proc/self/fd/0') "/dev/stdin readlinks to /proc/self/fd/0 ('$($r.Trim())')"
+$r = Client 'readlink /dev/fd/1'
+Check ($r -match '/dev/pts/\d+') "/dev/fd/1 names the session terminal ('$($r.Trim())')"
+$r = Client 'echo hi > /dev/fd/1'
+Check ($r -match 'hi') "open(/dev/fd/1) is a dup of stdout ('$($r.Trim())')"
+$r = Client 'echo x | cat /dev/stdin'
+Check ($r.Trim() -eq 'x') "cat /dev/stdin reads the duped stdin ('$($r.Trim())')"
+$rc = ClientRc 'cat /dev/fd/99 2>/dev/null'
+Check ($rc -ne 0) "open(/dev/fd/99) fails, it is no descriptor (rc $rc)"
+$r = Client 'ls /dev'
+Check ($r -match '(^|\s)fd(\s|$)' -and $r -match '(^|\s)stdin(\s|$)') "/dev lists the fd family"
 # /proc/self/mountinfo: the format mount(8) and libmount parse, generated from
 # the same table as /proc/mounts - two spellings, one table.
 $r = Client 'head -1 /proc/self/mountinfo'

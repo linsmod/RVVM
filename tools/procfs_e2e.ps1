@@ -15,6 +15,10 @@
       per-pid     /proc/<pid>/{stat,status,statm,cmdline,comm} read back, and
                   /proc/self resolves to a pid.
       links       /proc/self, /proc/self/cwd and /proc/self/fd/<n> readlink.
+      task        /proc/<pid> lists a task tree; /proc/self/task names the calling
+                  thread; /proc/thread-self readlinks to its own <tgid>/task/<tid>
+                  and a read through it works; and that task's stat reports the
+                  tid where the process view reports the pid.
       ps          `ps` shows real rows (pid, user, argv), including a running
                   background job.
       system      /proc/{uptime,stat,meminfo,version} answer sane content.
@@ -104,6 +108,30 @@ Check ($r -match '^\s*/\s*$') "/proc/self/cwd readlinks to /"
 
 $r = Client 'ls -l /proc/self/fd'
 Check ($r -match '/dev/pts/\d+') "/proc/self/fd names the session terminal"
+
+# --- the task tree --------------------------------------------------------
+# /proc/<pid>/task is the thread view of the same process, and /proc/thread-self
+# is the calling *thread* rather than the process it runs in - it readlinks to
+# its own task under the process that owns it.
+$r = Client 'ls /proc/self'
+Check ($r -match '\btask\b') "/proc/<pid> lists the task tree"
+
+$r = Client 'ls /proc/self/task'
+Check ($r.Trim() -match '^\d+$') "/proc/self/task lists the calling thread ('$($r.Trim())')"
+
+$r = Client 'readlink /proc/thread-self'
+Check ($r.Trim() -match '^(\d+)/task/\1$') "/proc/thread-self readlinks to its own task ('$($r.Trim())')"
+
+# The tid is field 1 of the thread's stat - the one field that differs from the
+# process view, and the reason the task tree is generated rather than copied. The
+# shell execs the trailing cat, so $$ and the cat share one pid.
+$r = Client 'p=$$; echo $p; cat /proc/$p/task/$p/stat'
+$ln = @(($r -split "`n") | Where-Object { $_ -match '\S' })
+Check (($ln.Count -ge 2) -and ($ln[0].Trim() -eq (($ln[1].Trim() -split '\s+')[0]))) `
+      "task/<tid>/stat reports the tid where the pid is"
+
+$r = Client 'cat /proc/thread-self/stat'
+Check ($r -match '^\s*\d+ \([^)]+\) [RSDTZ] ') "/proc/thread-self/stat reads through the link"
 
 # --- ps -------------------------------------------------------------------
 $r = Client 'ps'
