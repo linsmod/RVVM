@@ -12669,29 +12669,48 @@ static struct rvvm_host_pty* vps_lookup(uint32_t index)
  * Windows a session's terminal and a guest program's terminal are then the same
  * kind of object, reached the same way, instead of two pty systems that disagree
  * about line discipline, ^C and window size. */
-static int vps_openpt(int flags)
-{
-    (void)flags;   /* O_NOCTTY has no meaning here: no process claims it */
-    return userland_pty_open_master();
-}static int vps_grantpt(int master)
-{
-    (void)master;
-    return 0;     /* done by vps_openpt */
-}
-static int vps_unlockpt(int master)
-{
-    (void)master;
-    return 0;
-}
 /* The pair's index, which is the N of /dev/pts/N. Recovered from the number
  * rather than kept alongside it, because the number is the only thing
- * userland_pty_open_master() hands back. */
+ * userland_pty_open_master() hands back. Declared first: unlockpt() below needs
+ * it, and it is the one piece every other helper is built on. */
 static uint32_t vps_index(int master)
 {
     if (master < RVVM_PTY_FD_BASE) {
         return 0;
     }
     return (uint32_t)(((size_t)master - RVVM_PTY_FD_BASE) / 2);
+}
+static int vps_openpt(int flags)
+{
+    (void)flags;   /* O_NOCTTY has no meaning here: no process claims it */
+    return userland_pty_open_master();
+}
+static int vps_grantpt(int master)
+{
+    (void)master;
+    return 0;     /* the pair is granted when it is allocated */
+}
+static int vps_unlockpt(int master)
+{
+    /* unlockpt(), in the table the guest's own TIOCSPTLCK writes: a slave may
+     * not be opened before it (see userland_pty_open_slave), and
+     * userland_pty_open_master() deliberately leaves the pair locked. A real
+     * pty's unlockpt() *is* that ioctl; this is the shim's, and leaving it a
+     * no-op is what made every host-side session fail to open its slave. */
+    uint32_t index = vps_index(master);
+    struct userland_pty* pty;
+
+    spin_lock(&userland_pty_lock);
+    pty = (index < USERLAND_PTY_MAX) ? userland_ptys[index] : NULL;
+    spin_unlock(&userland_pty_lock);
+    if (!pty) {
+        errno = ENOENT;
+        return -1;
+    }
+    spin_lock(&pty->lock);
+    pty->locked = false;
+    spin_unlock(&pty->lock);
+    return 0;
 }
 static int vps_slave(int master)
 {
@@ -12819,6 +12838,15 @@ PUBLIC struct rvvm_host_pty* rvvm_session_pty_new(rvvm_machine_t* machine)
         free(p);
         return NULL;
     }
+    /* The host has no use for the slave here: the guest opens it by name, and
+     * rvvm_session_pty_attach - which is what injects the number into a guest
+     * fd table - is not built on this host. Holding it would keep the pair's
+     * slave reference above zero for the life of the session, and that count
+     * is exactly how a session learns its shell is gone (userland_pty_read's
+     * master path answers EIO when refs[1] reaches zero), so every session
+     * would wait forever for output that can no longer come. */
+    vps_close_slave(p->slave);
+    p->slave = -1;
 #else
     (void)machine;
 #endif
