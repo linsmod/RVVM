@@ -109,6 +109,24 @@ void win32_host_set_cmdline(const char* str);
 void win32_host_set_volatile_rootfs(bool on);
 
 /*
+ * The next run is a core: a machine kept up for clients rather than a one-shot
+ * command, serving a session per client (see vp_core.h). The control terminal a
+ * core needs is created when the machine appears, and its path is appended to
+ * the guest's argv as `--control <path>` before the guest thread starts - so
+ * the guest program must be one that reads it (the bundle's /sbin/idle).
+ *
+ * Call before win32_host_start_guest().
+ */
+void win32_host_arm_core(void);
+
+/*
+ * Serve the guest console on 127.0.0.1:@port over this run, instead of taking
+ * the port from RVVM_CONSOLE_PORT. This is how a core names the port a `vp`
+ * client attaches to. Pass 0 to clear. Call before win32_host_start_guest().
+ */
+void win32_host_set_console_port(int port);
+
+/*
  * Block until the guest exits and return its exit code. The console host's
  * equivalent of win32_host_message_loop(): with the guest, the stdin pump and
  * the console geometry poller all on threads of their own, there is no message

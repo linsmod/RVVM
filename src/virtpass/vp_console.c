@@ -335,6 +335,27 @@ void vp_console_set_machine(rvvm_machine_t* machine)
     vp_console_set_core(machine);
 }
 
+/* Give @c a terminal if a core is up and it has none yet. This is the one place
+ * a connection becomes a session, and it runs at the two moments that can
+ * happen: when the machine appears (a run held until a client arrived) and when
+ * a client arrives at a core that is already up (a long-lived one serves
+ * whoever comes). Caller holds g_console.lock; the connection lock guards
+ * session/session_tried, so a connection racing the two cannot be given two. */
+static void conn_take_session(struct console_conn* c)
+{
+    if (!g_core) {
+        return;
+    }
+    pthread_mutex_lock(&c->lock);
+    if (c->session || c->session_tried) {
+        pthread_mutex_unlock(&c->lock);
+        return;
+    }
+    c->session_tried = 1;
+    pthread_mutex_unlock(&c->lock);
+    conn_open_session(c);
+}
+
 static void vp_console_open_pending_sessions(rvvm_machine_t* machine)
 {
     if (!machine || !g_core) {
@@ -345,13 +366,7 @@ static void vp_console_open_pending_sessions(rvvm_machine_t* machine)
      * handed to one that has just gone would be a terminal nobody holds: the
      * shell would be forked onto it and its output read by nobody. */
     for (struct console_conn* c = g_console.conns; c; c = c->next) {
-        if (c->session || c->session_tried) {
-            continue;
-        }
-        pthread_mutex_lock(&c->lock);
-        c->session_tried = 1;
-        pthread_mutex_unlock(&c->lock);
-        conn_open_session(c);
+        conn_take_session(c);
     }
     pthread_mutex_unlock(&g_console.lock);
 }
@@ -876,6 +891,13 @@ static void* conn_serve(void* arg)
     if (hook) {
         hook(hud);
     }
+
+    /* A core that is already up hands this client its terminal here; when no
+     * machine exists yet - a run held until its first client - vp_console_set_core
+     * does it instead (see conn_take_session). */
+    pthread_mutex_lock(&g_console.lock);
+    conn_take_session(c);
+    pthread_mutex_unlock(&g_console.lock);
 
     /* Wait for the reader to reach the end of the socket, then reap both
      * threads. A condvar, not a sleep: this thread owns this client and the

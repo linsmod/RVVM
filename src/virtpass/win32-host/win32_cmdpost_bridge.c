@@ -2088,7 +2088,8 @@ static void host_tty_cb(void* userdata, int fd, void* tty)
 /* for the same reason the Android side binds loopback only.           */
 /* ------------------------------------------------------------------ */
 
-static int g_console_port = 0;   /* 0 = no console server this process */
+static int  g_console_port = 0;      /* 0 = no console server this process */
+static bool g_console_announced = false;
 
 /* rvvm_user_console_sink: every guest write to fd 1/2, and the pass-through
  * for any other descriptor. The console pipe is fed first, then the bytes go
@@ -2103,26 +2104,48 @@ static ssize_t win32_console_sink(int fd, const void* buf, size_t count)
 
 /* Bring the console up for a run: the listener once, the machine binding and
  * the sink per run. Called before the guest thread starts, because the guest's
- * first write may be to fd 1/2. */
+ * first write may be to fd 1/2.
+ *
+ * The port comes from win32_host_set_console_port() when a caller named one (a
+ * core serving `vp`), and otherwise from RVVM_CONSOLE_PORT. vp_console_start()
+ * is idempotent, so calling this per run is how a later run re-binds the
+ * listener to a machine that has just been replaced. */
 static void console_host_start(rvvm_machine_t* machine)
 {
     if (!g_console_port) {
         const char* env = getenv("RVVM_CONSOLE_PORT");
         int         port = (env && *env) ? atoi(env) : 0;
-        if (port <= 0 || port > 65535) {
-            return;
+        if (port > 0 && port <= 65535) {
+            g_console_port = port;
         }
-        if (vp_console_start(port) != 0) {
-            winhost_log("console could not bind 127.0.0.1:%d", port);
-            return;
-        }
-        g_console_port = port;
-        winhost_log("console listening on 127.0.0.1:%d (vp -P %d)", port, port);
+    }
+    if (!g_console_port) {
+        return;
+    }
+    if (vp_console_start(g_console_port) != 0) {
+        winhost_log("console could not bind 127.0.0.1:%d", g_console_port);
+        g_console_port = 0;
+        return;
+    }
+    if (!g_console_announced) {
+        g_console_announced = true;
+        winhost_log("console listening on 127.0.0.1:%d (vp -P %d)",
+                    g_console_port, g_console_port);
     }
     if (machine) {
         vp_console_set_machine(machine);
         rvvm_user_set_console_sink(machine, win32_console_sink);
     }
+}
+
+void win32_host_arm_core(void)
+{
+    vp_console_arm_core();
+}
+
+void win32_host_set_console_port(int port)
+{
+    g_console_port = (port > 0 && port <= 65535) ? port : 0;
 }
 
 /* Join the listener's threads while the process is still whole, and point the
@@ -3373,7 +3396,7 @@ bool win32_host_start_guest(int argc, char** argv)
      * Registered per run like the rest of the host context. */
     rvvm_user_set_assets(g_guest_machine, vp_bundle_assets(), NULL);
 
-    g_guest_argv = (char**)calloc((size_t)argc + 1, sizeof(char*));
+    g_guest_argv = (char**)calloc((size_t)argc + 3, sizeof(char*));
     if (!g_guest_argv) {
         rvvm_user_free(g_guest_machine);
         g_guest_machine = NULL;
@@ -3391,6 +3414,21 @@ bool win32_host_start_guest(int argc, char** argv)
         }
     }
     g_guest_argc = argc;
+
+    /* A core's control terminal, appended here rather than by the caller: this
+     * is the first moment the path exists - the terminal belongs to the machine
+     * created above (vp_console_set_core, from console_host_start) - and idle
+     * opens it as its first act, so it has to be in argv before the thread
+     * below starts. A run that is not a core has no path, and gets nothing. */
+    {
+        const char* ctl = vp_console_control_path();
+        if (ctl && ctl[0]) {
+            g_guest_argv[g_guest_argc++] = _strdup("--control");
+            g_guest_argv[g_guest_argc++] = _strdup(ctl);
+            g_guest_argv[g_guest_argc]   = NULL;
+            winhost_log("core control terminal: %s", ctl);
+        }
+    }
 
     g_guest_thread = CreateThread(NULL, 0, guest_thread_main, NULL, 0, NULL);
     if (!g_guest_thread) {

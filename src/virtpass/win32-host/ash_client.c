@@ -49,8 +49,10 @@ The wire protocol is the session server's, not a new one:
 #define ASH_FRAME_HEAD   "\x1b]999;"
 #define ASH_FRAME_END    0x07
 
-/* AF_UNIX / SOCK_STREAM, in the Linux numbering win_socket.c translates from. */
+/* AF_UNIX / AF_INET / SOCK_STREAM, in the Linux numbering win_socket.c
+ * translates from. */
 #define ASH_AF_UNIX      1
+#define ASH_AF_INET      2
 #define ASH_SOCK_STREAM  1
 #define ASH_SUN_PATH_MAX 108
 
@@ -62,12 +64,16 @@ static void ash_send_frame(int fd, const char* body);
 /* The core: --serve                                                   */
 /* ------------------------------------------------------------------ */
 
-/* The guest program a core boots: the host-owned system program
- * /sbin/vpsessiond, installed from the bundle's system layer. A core program is
- * not selectable - it is part of the system, not an app. */
+/* The guest program a core boots: the host-owned system program /sbin/idle,
+ * installed from the bundle's system layer. idle holds the machine open and
+ * spawns a session per client on a pty the *host* hands it (see vp_core.h) -
+ * the host owns the terminal, which is what lets a `vp` client attach over the
+ * same adb-shaped byte pipe the Android host serves. A core program is not
+ * selectable - it is part of the system, not an app - though `init=` can still
+ * boot the legacy guest-side model (see ash_serve). */
 static const char* ash_default_core_shell(void)
 {
-    return VP_GUEST_SESSIOND;
+    return VP_GUEST_IDLE;
 }
 
 /* The full path of this executable. CreateProcess wants the program itself
@@ -294,9 +300,13 @@ static void ash_core_register(int port, const char* shell)
     }
     /* The endpoint is written down beside the pid rather than left for a reader to
      * derive: a client that wants to connect should have to know which port a core
-     * owns, not where that core decided to put its socket. It is the same file that
-     * says whether the core is alive, so there is one place to ask both. */
-    if (!ash_session_sock_path(port, endpoint, sizeof(endpoint))) {
+     * owns, not where that core decided to listen. It is the same file that says
+     * whether the core is alive, so there is one place to ask both. The idle core
+     * listens on the loopback console port; only the legacy guest-side model binds
+     * an AF_UNIX socket. */
+    if (!strcmp(shell, VP_GUEST_IDLE)) {
+        snprintf(endpoint, sizeof(endpoint), "tcp:127.0.0.1:%d", port);
+    } else if (!ash_session_sock_path(port, endpoint, sizeof(endpoint))) {
         endpoint[0] = '\0';
     }
     f = fopen(path, "w");
@@ -340,14 +350,50 @@ static bool ash_core_up(int port)
     return false;
 }
 
-/* Does a core's endpoint answer right now? The socket is the contract, and it
- * lives in the *guest*: a core whose guest trapped before it bound has a live
- * pid, a registration, and nothing listening. So this is the only question that
- * separates a core a client can use from one it cannot. */
+/* Does the console TCP port answer right now? This is the endpoint the idle core
+ * this host now runs publishes: vp_console.c listens on it for `vp`. */
+static bool ash_tcp_serving(int port)
+{
+    uint8_t sa[16];
+    int     fd;
+    bool    ok;
+
+    win_socket_init();
+    fd = win_socket_create(ASH_AF_INET, ASH_SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    /* The guest ABI's sockaddr_in - family, big-endian port, 127.0.0.1 - hand
+     * packed for the same reason ash_sockaddr_unix is: this file carries no
+     * socket headers, and win_socket_connect() translates from exactly this. */
+    memset(sa, 0, sizeof(sa));
+    sa[0] = ASH_AF_INET;
+    sa[1] = 0;
+    sa[2] = (uint8_t)(port >> 8);
+    sa[3] = (uint8_t)(port & 0xff);
+    sa[4] = 127;
+    sa[5] = 0;
+    sa[6] = 0;
+    sa[7] = 1;
+    ok = win_socket_connect(fd, sa, sizeof(sa)) == 0;
+    win_socket_close(fd);
+    return ok;
+}
+
+/* Does a core answer right now? The socket is the contract: a core whose guest
+ * trapped before it bound has a live pid, a registration, and nothing listening
+ * - so this is the only question that separates a core a client can use from one
+ * it cannot. The idle core answers on the console TCP port; the legacy
+ * guest-side model (init=/sbin/vpsessiond) answers on its AF_UNIX endpoint, so
+ * that is tried second. */
 static bool ash_core_serving(int port)
 {
-    int fd = ash_connect(port);
+    int fd;
 
+    if (ash_tcp_serving(port)) {
+        return true;
+    }
+    fd = ash_connect(port);
     if (fd < 0) {
         return false;
     }
@@ -616,21 +662,33 @@ int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline)
 
     snprintf(port_buf, sizeof(port_buf), "%d", port);
     snprintf(idle_buf, sizeof(idle_buf), "%d", idle_s > 0 ? idle_s : 0);
-    /* argv[3]: the daemon's log, as a guest path, only when one was asked for.
-     * NULL (no --dlog) leaves vpsessiond on its own default, which is what the
-     * plain "ash --serve" wants: one well-known file in the run's /tmp. A driver
-     * that runs several cores, or wants to find its own log without reading a
-     * shared one, names it here. The count follows, because the guest's argv is
-     * what carries it - a fixed count would drop it on the floor. */
-    int  guest_argc = 3;
+
+    /* Two core models, told apart by the program init= chose. The default is
+     * idle, whose terminal the host drives (vp_core.c): the host appends
+     * `--control <path>` itself, so there is nothing to pass on this command
+     * line. Anything else (init=/sbin/vpsessiond) is the legacy guest-side
+     * model, where the program takes the port and the idle timeout itself. */
+    bool vp_core = !strcmp(shell, VP_GUEST_IDLE);
+    int  guest_argc = 1;
     guest[0] = (char*)shell;
-    guest[1] = port_buf;
-    guest[2] = idle_buf;
-    if (dlog && *dlog) {
-        guest[3] = (char*)dlog;
-        guest_argc = 4;
+    guest[1] = NULL;
+    if (!vp_core) {
+        /* argv[3]: the legacy daemon's log, as a guest path, only when one was
+         * asked for. The count follows, because the guest's argv is what
+         * carries it - a fixed count would drop it on the floor. */
+        guest_argc = 3;
+        guest[1] = port_buf;
+        guest[2] = idle_buf;
+        if (dlog && *dlog) {
+            guest[3] = (char*)dlog;
+            guest_argc = 4;
+        }
+        guest[4] = NULL;
     }
-    guest[4] = NULL;
+    if (vp_core && idle_s > 0) {
+        fprintf(stderr, "ash --serve: --idle is not honoured by the idle core; "
+                        "it belongs to the legacy model (init=/sbin/vpsessiond)\n");
+    }
 
     /* Same switch as rvvm_winhost (win32_main.c): RVVM_VERBOSE=1 lifts the log
      * to LOG_INFO so the per-syscall lines (sys_openat etc.) reach stderr.
@@ -659,6 +717,14 @@ int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline)
         if (ash_mode_store_path(modes, sizeof(modes))) {
             rvvm_user_set_mode_store(modes);
         }
+    }
+
+    if (vp_core) {
+        /* The core's port is the console's, and the control terminal has to
+         * exist before the guest starts - idle opens it as its first act (see
+         * win32_host_start_guest). */
+        win32_host_arm_core();
+        win32_host_set_console_port(port);
     }
 
     if (!win32_host_init_console(0, 0, 0)) {
