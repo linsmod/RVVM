@@ -2126,6 +2126,12 @@ char*                    guest_root_path;
     // without the right image resolves frames into the wrong program entirely.
     char                  main_elf_path[UAPI_PATH_MAX];
     char                  interp_elf_path[UAPI_PATH_MAX];
+    // The main image as the *guest* spells it: argv[0] of the launch, or the
+    // path an execve() replaced the image with. This - not main_elf_path - is
+    // what /proc/self/exe reports. The host path names a file the guest has no
+    // way to open, and anything deriving its installation directory from the
+    // link (zig does exactly that) then fails on a path it cannot resolve.
+    char                  main_guest_path[UAPI_PATH_MAX];
 
     // --- Thread registry & lifecycle (group D) ---
     spinlock_t                    userland_threads_lock;
@@ -9535,6 +9541,7 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
      * them against the child's own window. */
     rvvm_strlcpy(ctx->main_elf_path, parent->main_elf_path, sizeof(ctx->main_elf_path));
     rvvm_strlcpy(ctx->interp_elf_path, parent->interp_elf_path, sizeof(ctx->interp_elf_path));
+    rvvm_strlcpy(ctx->main_guest_path, parent->main_guest_path, sizeof(ctx->main_guest_path));
 
     /* The child is running from the moment it is spawned. */
     atomic_store_uint32(&ctx->userland_started, 1);
@@ -15551,7 +15558,13 @@ static int userland_proc_readlink(const char* abs, uint32_t self_pid, char* buff
              * has no way to spell what is outside it. */
             target = uctx()->guest_root_path ? uctx()->guest_root_path : "/";
         } else if (!strcmp(pp.leaf, "exe")) {
-            target = uctx()->main_elf_path[0] ? uctx()->main_elf_path : "unknown";
+            /* The guest's spelling of its own image. A host path here would be
+             * a file the guest cannot open - zig derives its installation
+             * directory from this link - so main_elf_path (the host path, kept
+             * for the symbolizer) is only the fallback for a run that never had
+             * a guest spelling to begin with. */
+            target = uctx()->main_guest_path[0] ? uctx()->main_guest_path
+                     : (uctx()->main_elf_path[0] ? uctx()->main_elf_path : "unknown");
         }
     }
     if (!target) {
@@ -19373,7 +19386,8 @@ static rvfile_t* guest_open_image(const char* host_path, const char* guest_path)
  *
  * Returns false when the image does not load. The previous image is already
  * erased by then - both callers treat that as fatal for the process. */
-static bool guest_load_image_file(rvvm_userland_t* ctx, const char* host_path, rvfile_t* file)
+static bool guest_load_image_file(rvvm_userland_t* ctx, const char* host_path,
+                                  const char* guest_path, rvfile_t* file)
 {
     elf_desc_t* elf    = &ctx->elf;
     elf_desc_t* interp = &ctx->interp;
@@ -19388,8 +19402,13 @@ static bool guest_load_image_file(rvvm_userland_t* ctx, const char* host_path, r
     elf_unload_file(elf);
 
     /* Host paths of the images, for crash symbolization (proc_symbolize()):
-     * with the image they describe replaced, they are replaced too. */
+     * with the image they describe replaced, they are replaced too. The guest
+     * spelling is kept beside them because the two name different things: the
+     * host path is for the symbolizer, the guest path is what /proc/self/exe
+     * answers (see main_guest_path). */
     rvvm_strlcpy(ctx->main_elf_path, host_path, sizeof(ctx->main_elf_path));
+    rvvm_strlcpy(ctx->main_guest_path, guest_path && guest_path[0] ? guest_path : host_path,
+                 sizeof(ctx->main_guest_path));
     ctx->interp_elf_path[0] = 0;
 
     elf->guest_window = guest_window(ctx->machine);
@@ -19665,7 +19684,7 @@ static bool guest_exec(rvvm_userland_t* ctx, rvvm_hart_t* cpu, rvvm_user_thread_
      * reported back as an errno - there is no old program left to return to.
      * End the run the way a shell whose execve() failed would: it exits 127. */
     guest_vm_init();
-    if (!guest_load_image_file(ctx, host_path, file)) {
+    if (!guest_load_image_file(ctx, host_path, guest_path, file)) {
         rvclose(file);
         rvvm_error("execve(): cannot load %s", host_path);
         userland_process_exit(ctx, 127, thread);
@@ -20319,7 +20338,7 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
         rvvm_user_free(machine);
         return -1;
     }
-    if (!guest_load_image_file(ctx, host_elf, file)) {
+    if (!guest_load_image_file(ctx, host_elf, argv ? argv[0] : host_elf, file)) {
         rvclose(file);
         rvvm_error("Failed to load ELF %s (fixed VMA collision?)", argv[0]);
         // Dump the host memory map to find what occupies the guest region
