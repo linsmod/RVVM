@@ -36,6 +36,11 @@
 !/.github
 !/.gitlab-ci.yml
 
+# Explicitly track agent/项目文档（issues/ 按 AGENTS.md 约定不入 Git）
+!/AGENTS.md
+!/docs/
+!/workflows/
+
 # Explicitly track repository metadata
 !/README*
 !/LICENSE*
