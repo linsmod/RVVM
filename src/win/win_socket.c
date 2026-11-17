@@ -1192,6 +1192,36 @@ int win_socket_ioctl(int fd, unsigned long request, void* arg)
 /* Data path                                                                 */
 /* ------------------------------------------------------------------------ */
 
+/* Is there a byte waiting on the socket behind @fd? 1 yes, 0 after @timeout_ms
+ * with nothing, -1 on error (errno set).
+ *
+ * The userland calls this in front of a blocking recv() so the wait can be
+ * sliced: the host recv() blocks inside the emulator, and the emulator's guest
+ * signals cannot reach it there (see userland_wait_socket_readable()). A
+ * readiness probe is the portable way to give that loop a heartbeat - Winsock
+ * select() takes the SOCKET, not the CRT anchor the guest's number stands for. */
+int win_socket_wait_readable(int fd, int timeout_ms)
+{
+    SOCKET s = wsock_fd_get(fd);
+    fd_set rf;
+    struct timeval tv;
+
+    if (s == INVALID_SOCKET) {
+        errno = ENOTSOCK;
+        return -1;
+    }
+    FD_ZERO(&rf);
+    FD_SET(s, &rf);
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    int rc = select(0, &rf, NULL, NULL, &tv);
+    if (rc == SOCKET_ERROR) {
+        wsock_set_errno();
+        return -1;
+    }
+    return rc > 0 ? 1 : 0;
+}
+
 long win_socket_read(int fd, void* buf, size_t len)
 {
     SOCKET s = wsock_fd_get(fd);

@@ -152,6 +152,9 @@ uint64_t win_socket_anchor_gen(int fd);
 void win_socket_anchor_ref(int fd);
 void win_socket_anchor_unref(int fd);
 int  win_socket_close(int fd);
+/* Readiness of a socket anchor, for the slice-wise wait behind a blocking read
+ * (see userland_wait_socket_readable). 1 = readable, 0 = timed out, -1 = error. */
+int  win_socket_wait_readable(int fd, int timeout_ms);
 #else
 /* Not a WinSock build, so the anchors do not exist - and a guest socket here is
  * a real host socket, with no anchor table, no generation and no reference to
@@ -171,6 +174,7 @@ int  win_socket_close(int fd);
  * anchor_gen field stays in the struct and stays 0 here, which is precisely the
  * "no generation" the stale-anchor check above it looks for. */
 static inline int         win_socket_is_fd(int fd)       { (void)fd; return 0; }
+static inline int         win_socket_wait_readable(int fd, int timeout_ms) { (void)fd; (void)timeout_ms; return -1; }
 static inline const char* win_socket_peer_str(int fd)    { (void)fd; return "?"; }
 static inline uint64_t    win_socket_anchor_gen(int fd)  { (void)fd; return 0; }
 static inline void        win_socket_anchor_ref(int fd)  { (void)fd; }
@@ -7674,6 +7678,47 @@ static bool userland_fd_write_blocks(rvvm_userland_t* ctx, int fd)
     return (userland_fd_flags(ctx, fd) & UAPI_O_NONBLOCK) == 0;
 }
 
+/* Wait for a blocking read on the host descriptor behind guest @fd to become
+ * ready, in short slices, and give up with EINTR when a signal is pending.
+ *
+ * Why this exists: a host recv() on a win32 socket anchor blocks inside the
+ * emulator, and the emulator's own signal delivery only sets ctx->sig_pending
+ * and wakes the *console* read (user_tty_read). Nothing would ever bring a
+ * guest parked there back to the delivery boundary, so ^C - or a kill(2) from
+ * another session - could not end it: the shell never regained the terminal.
+ * A TLS handshake against a peer that stops answering is exactly that state
+ * (observed with apk fetching over a dead proxy).
+ *
+ * Slicing rather than an event: it needs nothing from the descriptor that a
+ * readiness probe does not already give, and 50 ms of latency on ^C is not
+ * worth a second wake-up path to maintain. Every other host descriptor answers
+ * its readiness immediately, so the callers only pay for this on a socket.
+ *
+ * Returns 0 when the read may proceed, -EINTR when the guest has a signal to
+ * deliver (or its thread was ended). */
+static int userland_wait_socket_readable(rvvm_userland_t* ctx, int fd, int host_fd)
+{
+    if (!userland_fd_read_blocks(ctx, fd) || !win_socket_is_fd(host_fd)) {
+        /* Non-blocking guest descriptor, or not a socket: the host call either
+         * does not block or returns at once, so there is nothing to slice. */
+        return 0;
+    }
+    for (;;) {
+        if (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished()) {
+            return -UAPI_EINTR;
+        }
+        int rc = win_socket_wait_readable(host_fd, 50);
+        if (rc > 0) {
+            return 0;
+        }
+        if (rc < 0) {
+            /* The probe failed (the peer is gone, the anchor is stale). Let the
+             * read itself report it rather than inventing an errno here. */
+            return 0;
+        }
+    }
+}
+
 /* close(2) for a tracked descriptor. Returns false when it is not one of ours,
  * so the caller falls back to the host close (and its error reporting).
  *
@@ -10383,6 +10428,12 @@ static int rvvm_sys_select_time32(int nfds, rvvm_addr_t rfds, rvvm_addr_t wfds, 
     }
 
     for (;;) {
+        /* Same rule as poll() below: a pending signal ends the wait with EINTR,
+         * or a guest parked in select() could never be interrupted. */
+        if (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished()) {
+            ret = -UAPI_EINTR;
+            break;
+        }
         struct timeval wait = {0};
         int own = uapi_own_set_ready(ctx, nfds, rfds, false) +
                   uapi_own_set_ready(ctx, nfds, wfds, true) +
@@ -10451,6 +10502,15 @@ static int rvvm_sys_poll_time32(rvvm_addr_t pfds, size_t npfds, const struct uap
     int            ret   = 0;
 
     for (;;) {
+        /* A signal pending means the wait is over: poll(2)/select(2) return
+         * EINTR on Linux, and without this a guest parked here (nc, sshd, apk
+         * between two reads) could never be interrupted - the emulator's
+         * delivery only sets sig_pending, which nothing else in this loop
+         * looks at. */
+        if (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished()) {
+            ret = -UAPI_EINTR;
+            break;
+        }
         size_t hn = 0;
         int    own = 0;
 
@@ -17093,7 +17153,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                         } else {
                             /* A host descriptor: its O_NONBLOCK is the host's,
                              * set through fcntl(2) like any Linux guest expects
-                             * (see posix_shim.c's fcntl/read). */
+                             * (see posix_shim.c's fcntl/read). A socket is
+                             * waited for here, in slices, so a signal can end
+                             * the wait - see userland_wait_socket_readable(). */
+                            int wr = a2 ? userland_wait_socket_readable(uctx(), (int)a0, hfd) : 0;
+                            if (wr < 0) {
+                                a0 = (rvvm_addr_t)wr;
+                                break;
+                            }
                             a0 = errno_ret(read(hfd, buf, a2));
                         }
                     }
@@ -18415,6 +18482,11 @@ case 179: // sysinfo
                     void*      sa = to_ptr_wr(a1);
                     socklen_t* lp = to_ptr_wr(a2);
                     rvvm_info("sys_accept(guest %ld, host %d, %lx, %lx)", a0, listen_fd, a1, a2);
+                    int wr202 = userland_wait_socket_readable(uctx(), (int)a0, listen_fd);
+                    if (wr202 < 0) {
+                        a0 = (rvvm_addr_t)wr202;
+                        break;
+                    }
                     a0 = errno_ret(accept(listen_fd, sa, lp));
                     rvvm_info("  accept -> %ld (errno %d)", (long)a0, (long)a0 < 0 ? errno : 0);
                     if ((int64_t)a0 >= 0) {
@@ -18525,12 +18597,19 @@ case 179: // sysinfo
                     a0 = errno_ret(sendto(userland_fd_host(uctx(), (int)a0),
                                           to_ptr(a1), a2, a3, to_ptr(a4), a5));
                     break;
-                case 207: // recvfrom
+                case 207: { // recvfrom
                     // TODO: struct conversion(?)
                     rvvm_info("sys_recvfrom(%ld, %lx, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4, a5);
-                    a0 = errno_ret(recvfrom(userland_fd_host(uctx(), (int)a0),
-                                            to_ptr_wr(a1), a2, a3, to_ptr_wr(a4), to_ptr_wr(a5)));
+                    int hfd207 = userland_fd_host(uctx(), (int)a0);
+                    int wr207  = a2 ? userland_wait_socket_readable(uctx(), (int)a0, hfd207) : 0;
+                    if (wr207 < 0) {
+                        a0 = (rvvm_addr_t)wr207;
+                        break;
+                    }
+                    a0 = errno_ret(recvfrom(hfd207, to_ptr_wr(a1), a2, a3,
+                                            to_ptr_wr(a4), to_ptr_wr(a5)));
                     break;
+                }
                 case 208: // setsockopt
                     rvvm_info("sys_setsockopt(%ld, %lx, %lx, %lx, %lx)", a0, a1, a2, a3, a4);
                     a0 = errno_ret(setsockopt(userland_fd_host(uctx(), (int)a0), a1, a2, to_ptr(a3), a4));
@@ -18580,7 +18659,15 @@ case 179: // sysinfo
                     if (a7 == 211) {
                         a0 = errno_ret(sendmsg(userland_fd_host(uctx(), (int)a0), &hmsg, a2));
                     } else {
-                        a0 = errno_ret(recvmsg(userland_fd_host(uctx(), (int)a0), &hmsg, a2));
+                        int hfd212 = userland_fd_host(uctx(), (int)a0);
+                        int wr212  = gmsg->iovlen
+                                   ? userland_wait_socket_readable(uctx(), (int)a0, hfd212) : 0;
+                        if (wr212 < 0) {
+                            rvvm_iovec_release(hiov, stack_iov);
+                            a0 = (rvvm_addr_t)wr212;
+                            break;
+                        }
+                        a0 = errno_ret(recvmsg(hfd212, &hmsg, a2));
                     }
                     rvvm_iovec_release(hiov, stack_iov);
                     break;
@@ -18678,7 +18765,13 @@ case 179: // sysinfo
                     int flags = (int)a3;
                     /* Same as socket(): the ABI's flags are taken off the host
                      * call and applied here. */
-                    a0 = errno_ret(accept4(userland_fd_host(uctx(), (int)a0), to_ptr_wr(a1), to_ptr_wr(a2),
+                    int lsock242 = userland_fd_host(uctx(), (int)a0);
+                    int wr242    = userland_wait_socket_readable(uctx(), (int)a0, lsock242);
+                    if (wr242 < 0) {
+                        a0 = (rvvm_addr_t)wr242;
+                        break;
+                    }
+                    a0 = errno_ret(accept4(lsock242, to_ptr_wr(a1), to_ptr_wr(a2),
                                            a3 & ~UAPI_SOCK_TYPE_MASK));
                     if ((int64_t)a0 >= 0) {
                         int host_fd  = (int)a0;
