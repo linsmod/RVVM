@@ -7698,6 +7698,15 @@ static bool userland_fd_write_blocks(rvvm_userland_t* ctx, int fd)
  * deliver (or its thread was ended). */
 static int userland_wait_socket_readable(rvvm_userland_t* ctx, int fd, int host_fd)
 {
+    /* Escape hatch for bisecting a guest that a sliced wait upsets: the same
+     * shape as RVVM_USER_NO_THREADS. */
+    static int disabled = -1;
+    if (disabled < 0) {
+        disabled = getenv("RVVM_NO_SOCK_WAIT") != NULL;
+    }
+    if (disabled) {
+        return 0;
+    }
     if (!userland_fd_read_blocks(ctx, fd) || !win_socket_is_fd(host_fd)) {
         /* Non-blocking guest descriptor, or not a socket: the host call either
          * does not block or returns at once, so there is nothing to slice. */
@@ -10430,7 +10439,8 @@ static int rvvm_sys_select_time32(int nfds, rvvm_addr_t rfds, rvvm_addr_t wfds, 
     for (;;) {
         /* Same rule as poll() below: a pending signal ends the wait with EINTR,
          * or a guest parked in select() could never be interrupted. */
-        if (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished()) {
+        if (!getenv("RVVM_NO_SOCK_WAIT") &&
+            (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished())) {
             ret = -UAPI_EINTR;
             break;
         }
@@ -10507,7 +10517,8 @@ static int rvvm_sys_poll_time32(rvvm_addr_t pfds, size_t npfds, const struct uap
          * between two reads) could never be interrupted - the emulator's
          * delivery only sets sig_pending, which nothing else in this loop
          * looks at. */
-        if (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished()) {
+        if (!getenv("RVVM_NO_SOCK_WAIT") &&
+            (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished())) {
             ret = -UAPI_EINTR;
             break;
         }
