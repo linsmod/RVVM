@@ -35,7 +35,31 @@ mingw32-make release.windows.x86_64/rvvm_winhost_x86_64.exe -j8
 # 4. 跑：guest 只作为 bundle 里的 app 包启动
 ./release.windows.x86_64/rvvm_winhost_x86_64.exe --app test_cli
 printf 'ls /\nexit\n' | ./release.windows.x86_64/rvvm_winhost_x86_64.exe --app test_cli
+
+# 5. 诊断开关（trace 走 stderr，不是 guest stdout）
+$env:RVVM_TRACE='path'          # 或 'fd' | 'sys' | 'all'
+$env:RVVM_VERBOSE='1'           # loglevel 提升到 INFO
+$env:RVVM_LOG_FILE="$env:TEMP\run.log"
+$env:RVVM_LOG_RING_DUMP="$env:TEMP\ring.log"
+
+# 6. 内存看增量（commit=泄漏指标，ws=驻留）
+$m = Get-Process rvvm_ash_x86_64
+'{0:N1} MiB commit, {1:N1} MiB ws' -f ($m.PrivateMemorySize64/1MB), ($m.WorkingSet64/1MB)
 ```
+
+guest 是 bundle 里的 app 包（`apps.tar.gz -> apps/<id>.vapp`，入口与参数取自 `meta.json`）；
+`--guest` / `--direct` / `RVVM_ASH_SHELL` 这类按路径跑 ELF 的门已不存在。现状见 `../docs/arch-virtpass.md`。
+
+## 非交互驱动
+
+`rvvm_winhost` 是 console 应用，stdin 会泵进 guest 控制台（等 guest 真正启动后才开始读），
+guest stdout = 进程 stdout，guest 退出码 = 进程退出码，所以普通场景用管道即可。
+
+**例外**：需要「命令运行中按键」时序的作业控制（`^C`/`^Z`/`jobs`/`fg`）管道复现不了，
+用 `tools/jobctl_e2e.ps1 -Scenario {sigint,sigtstp,fg-resume,fg-again,bg,killpg,killpg-cont,wait-bg,wait-int}`。
+该驱动是 **output-event driven**：增量读 socket，用 `Expect-Pattern`/`Expect-Newlines`/`Expect-Offset`/`Expect-Quiet`
+推进，取代固定 sleep；裸 `sleep`/`wait` 无输出时用 `Expect-Quiet` settle。`-ShowRate` 打印每秒到达字符数直方图，
+失败时 dump 换行 offset。旧的固定间隔 `Process.StandardInput` 模式已弃用。
 
 ## 验证
 
@@ -61,7 +85,7 @@ printf 'ls /\nexit\n' | ./release.windows.x86_64/rvvm_winhost_x86_64.exe --app t
 - guest 相对路径相对**进程 cwd**，不是 exe 目录 ⇒ 用工具的 `workdir` / 绝对路径。
 - 脚本按进程名 `Stop-Process` ⇒ 不能并发，也不要和手工跑的 ash 用例混在一起。
 - `-c` 客户端会连到**已存在**的 core，环境变量传不进去 ⇒ 要 trace 就显式起一个带 trace 的 core 并把 stderr 重定向到文件。
-- trace 在 stderr，不在 guest stdout；`--direct` 的 guest 输出进窗口。
+- trace 在 stderr，不在 guest stdout（guest 自己的输出才是 stdout）。
 - host 侧只准用 `rvvm_log()`/`RVVM_LOGx()`，写 stdout 会污染 e2e 正在读的 transcript。
 
 ## 退出条件
@@ -72,6 +96,7 @@ printf 'ls /\nexit\n' | ./release.windows.x86_64/rvvm_winhost_x86_64.exe --app t
 
 ## 执行经验与改进意见
 
-- 2026-11-17 bootstrap：本文命令来自 `build_virtpass.ps1` 的 `.SYNOPSIS`、`../DEV.md` 与 `../dev_debug_notes.md`；
+- 2026-11-17 bootstrap：本文命令来自 `build_virtpass.ps1` 的 `.SYNOPSIS` 与原根目录 `DEV.md`（已拆入
+  `../docs/arch-virtpass.md` 与本文件）、`../docs/hist-lessons.md`；
   **本轮未实际执行构建或 e2e**，首次执行后请把实际耗时与失败点补进来。
 - 待补：把这些驱动收进一个 `test-all` 目标（AGENTS「测试」条款要求），并记录到 `../docs/test-timing.md`。
