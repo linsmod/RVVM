@@ -45,6 +45,8 @@
 #include <winsock2.h>
 
 #include <errno.h>
+#include <fcntl.h>   /* _O_BINARY: the console pipe is bytes, not text */
+#include <io.h>      /* _setmode/_isatty/_fileno */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1387,6 +1389,21 @@ int main(int argc, char** argv)
      * words with it, fully buffered in a pipe that never gets flushed, and the
      * reason it was killed is exactly what got lost. */
     setvbuf(stderr, NULL, _IONBF, 0);
+
+#if defined(_WIN32)
+    /* The console is a byte pipe, not text. A redirected stdout is opened in
+     * text mode by the CRT, which turns every '\n' the guest wrote into CRLF -
+     * and the guest already wrote CRLF (the pty's ONLCR), so each line break
+     * arrived doubled ("\r\r\n") and every line of output was followed by a
+     * blank one. Only for streams that are not a console: a console handle is
+     * written through the console API and must keep the mode it has. */
+    if (!_isatty(_fileno(stdout))) {
+        _setmode(_fileno(stdout), _O_BINARY);
+    }
+    if (!_isatty(_fileno(stdin))) {
+        _setmode(_fileno(stdin), _O_BINARY);
+    }
+#endif
 
     int  i     = 1;
     bool local = false;
