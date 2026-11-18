@@ -152,6 +152,9 @@ uint64_t win_socket_anchor_gen(int fd);
 void win_socket_anchor_ref(int fd);
 void win_socket_anchor_unref(int fd);
 int  win_socket_close(int fd);
+/* A second handle on the same connection, at a fresh anchor (a fork() gives the
+ * child its own: see userland_fd_table_inherit). */
+int  win_socket_dup(int fd);
 /* Readiness of a socket anchor, for the slice-wise wait behind a blocking read
  * (see userland_wait_socket_readable). 1 = readable, 0 = timed out, -1 = error. */
 int  win_socket_wait_readable(int fd, int timeout_ms);
@@ -180,6 +183,7 @@ static inline uint64_t    win_socket_anchor_gen(int fd)  { (void)fd; return 0; }
 static inline void        win_socket_anchor_ref(int fd)  { (void)fd; }
 static inline void        win_socket_anchor_unref(int fd) { (void)fd; }
 static inline int         win_socket_close(int fd)       { (void)fd; return -1; }
+static inline int         win_socket_dup(int fd)         { (void)fd; return -1; }
 #endif
 #include "elf_load.h"
 #include "mem_ops.h"
@@ -8615,18 +8619,37 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
                                parent->fds[fd].flags, "inherit_console");
             continue;
         }
-        /* Copy the slot wholesale through the unified write. A socket anchor is
-         * named by both tables, so the child takes a reference of its own - that
-         * is what keeps the number out of the CRT table for as long as it lives.
-         * The slot records that it did, which is what close() later consults. */
-        bool child_anchored = win_socket_is_fd(parent->fds[fd].fd);
-        if (child_anchored) {
+        if (win_socket_is_fd(parent->fds[fd].fd)) {
+            /* A socket is dup'd, never shared by number: WSADuplicateSocket()
+             * makes a second handle on the same connection, so one side closing
+             * leaves the other named. Sharing the anchor number instead is what
+             * took a session down - the child's close() of its copy closed the
+             * socket the server was still using, and the number came back round
+             * on the next dup(), landing a pipe where a socket was expected. */
+            int sock_fd = win_socket_dup(parent->fds[fd].fd);
+            if (sock_fd >= 0) {
+                win_socket_anchor_ref(sock_fd);
+                userland_fds_write(child, fd, true, sock_fd, parent->fds[fd].cloexec,
+                                   false, parent->fds[fd].backend,
+                                   parent->fds[fd].flags, "inherit_socket");
+                child->fds[fd].holds_anchor_ref = true;
+                continue;
+            }
+            /* Out of anchors: the parent's number has to do, and the child may
+             * not close it - shared=1 is what close() consults. */
             win_socket_anchor_ref(parent->fds[fd].fd);
+            userland_fds_write(child, fd, true, parent->fds[fd].fd,
+                               parent->fds[fd].cloexec, true,
+                               parent->fds[fd].backend, parent->fds[fd].flags,
+                               "inherit_socket_shared");
+            child->fds[fd].holds_anchor_ref = true;
+            continue;
         }
+        /* Copy the slot wholesale through the unified write. */
         userland_fds_write(child, fd, parent->fds[fd].used, parent->fds[fd].fd,
                            parent->fds[fd].cloexec, parent->fds[fd].shared,
                            parent->fds[fd].backend, parent->fds[fd].flags, "inherit");
-        child->fds[fd].holds_anchor_ref = child_anchored;
+        child->fds[fd].holds_anchor_ref = false;
         if (memfs_fd_number(parent->fds[fd].fd)) {
             /* A tmpfs descriptor: the child gets a slot on the same inode, one
              * pin and one storage reference of its own, so its close releases
@@ -16281,8 +16304,13 @@ static void* rvvm_user_thread_wrap(void* arg)
                         break;
                     }
                     /* The copy is made first: a failing dup2(2) must leave
-                     * whatever sits on @newfd alone. */
-                    int host_new = dup(host_old);
+                     * whatever sits on @newfd alone. A socket is duplicated by
+                     * the socket layer, which makes a second handle on the same
+                     * connection at a fresh anchor - a plain dup() here would
+                     * copy the "NUL" device the anchor rides on and leave the
+                     * new number pointing at nothing. */
+                    int host_new = win_socket_is_fd(host_old) ? win_socket_dup(host_old)
+                                                              : dup(host_old);
                     if (host_new < 0) {
                         a0 = errno_ret(-1);
                         break;
