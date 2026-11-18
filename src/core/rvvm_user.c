@@ -10704,6 +10704,9 @@ static int rvvm_sys_poll_time32(rvvm_addr_t pfds, size_t npfds, const struct uap
          * looks at. */
         if (!getenv("RVVM_NO_SOCK_WAIT") &&
             (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished())) {
+            RVVM_TRC(RVVM_TRC_SIGNAL, "sig: poll -> EINTR (pending %u, handler on stack %u)",
+                      atomic_load_uint32(&ctx->sig_pending),
+                      atomic_load_uint32(&ctx->sig_inflight_sig));
             ret = -UAPI_EINTR;
             break;
         }
@@ -15993,6 +15996,9 @@ static void userland_siginject(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
     // A handler already on the stack blocks the same signal: leave the
     // pending slot queued, it delivers when the handler returns.
     if (atomic_load_uint32(&ctx->sig_inflight)) {
+        RVVM_TRC(RVVM_TRC_SIGNAL, "sig: %u stays queued, handler %u still on the stack",
+                  atomic_load_uint32(&ctx->sig_pending),
+                  atomic_load_uint32(&ctx->sig_inflight_sig));
         return;
     }
     uint32_t sig = atomic_swap_uint32(&ctx->sig_pending, 0);
@@ -16029,6 +16035,8 @@ static void userland_siginject(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
     }
     memcpy(host_frame, &frame, sizeof(frame));
     atomic_store_uint64(&ctx->sig_frame, frame_addr);
+    RVVM_TRC(RVVM_TRC_SIGNAL, "sig: inject %u, handler %llx, frame %llx",
+              sig, (unsigned long long)handler, (unsigned long long)frame_addr);
 
     // Handler context: SP on the frame, the signal number as its first
     // argument, RA on the return trampoline.
@@ -18425,6 +18433,8 @@ static void* rvvm_user_thread_wrap(void* arg)
                             bool unblocked = (how == UAPI_SIG_UNBLOCK && in_set) ||
                                              (how == UAPI_SIG_SETMASK && !in_set);
                             if (unblocked) {
+                                RVVM_TRC(RVVM_TRC_SIGNAL, "sig: %u unblocked by the guest: handler gate released",
+                                          inflight);
                                 atomic_store_uint32(&ctx->sig_inflight, 0);
                                 atomic_store_uint32(&ctx->sig_inflight_sig, 0);
                             }
