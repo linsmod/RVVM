@@ -65,8 +65,14 @@ ssh -p 7900 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL 127.0.0.1 "ech
 
 ## 进度
 
-- [ ] P1 fork 私有化
+- [x] P1 fork 私有化
 - [ ] P2 锚号独立 + poll 归类
 - [ ] P3 删除 `host_fd_refs` 与 stale 判定
 
-（每步完成后在此追加一行：日期、提交 hash、实际验证结果，包括失败。）
+### 2026-11-18 P1 实测
+
+- 会话不再以 111 退出（此前子进程 `dup(ch[i]) != i`），日志变为 `session 102 exited 0`
+- 子进程拿到独立管道号：父 8/9/10 → 子 16/17/18，证明 `inherit_dup` 生效
+- **P1 暴露了一个既有缺口**：`inherit` 原本没有 `/dev` 分支。`/dev` 是合成号（`RVVM_DEV_FD_BASE 0x7C000000`），以前靠 `dup` 失败后的 `shared` 兜底才「能用」，改成 drop 后子进程直接丢了 stderr（101/103 的 fd=2），`channel_fork` 因此 111。已补 `userland_dev_by_fd` 分支（只复制号，无需持有）
+- **仍未通过**：sh 的 `sys_write(fd=1)` 第一次成功 6 字节，紧接着第二次 EBADF；父进程早于 sh 退出（102 比 104 早 25ms）。子 `dup(ch[1])` 拿到的宿主号 10，正是父刚释放的号——父的 `close(ch[i])` 与子的 `dup(ch[i])` 仍落在同一 CRT 号上
+- 结论：P1 是净改进（111 消失、子侧不再 shared），但不闭合；剩余竞争要等 P2 的号段隔离，或对 fork 后父侧的 close 与子侧 dup 做串行化

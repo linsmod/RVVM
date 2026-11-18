@@ -1407,9 +1407,10 @@ static int userland_proc_readlink(const char* abs, uint32_t self_pid, char* buff
  * and which host fd a guest fd actually is - because two guest processes in one
  * host process cannot both own host fd 1.
  *
- * A slot inherited without its own copy (see userland_fd_table_inherit) is
- * marked shared: it rides on the parent's host fd, so closing it here would
- * take the descriptor away from the parent too. */
+ * Every slot owns the host number it names: a fork()ed child gets its own copy
+ * of each descriptor (see userland_fd_table_inherit), so closing one side never
+ * takes the number away from the other. What is shared is the *open file
+ * description*, not the number. */
 /* What a slot's number is a name of. The console used to be a slot like the
  * others, holding the host's own 0/1/2 - which is how two number spaces came
  * to share one set of numbers: a plain file the host handed out number 0 (a core
@@ -1429,8 +1430,6 @@ typedef struct {
     int  fd;       // The host fd (HOST) or this layer's own number (SIM); unused
                    // by CONSOLE, which is an attach rather than a handle
     bool cloexec;  // FD_CLOEXEC: execve() closes this slot
-    bool shared;   // HOST only: rides on another address space's host fd, never
-                   // closed here (see userland_fd_table_inherit)
     bool used;     // The slot holds a descriptor
     // What the number is a name of. A console is the run's screen, not a
     // descriptor: reads come from the keyboard (rvvm_user_tty_input) and writes
@@ -7520,7 +7519,7 @@ static void host_fd_release(int host_fd)
 
 static void userland_fds_write(rvvm_userland_t* ctx, int fd,
                                bool used, int host_fd, bool cloexec,
-                               bool shared, rvvm_fd_backend_t backend,
+                               rvvm_fd_backend_t backend,
                                uint32_t flags, const char* op)
 {
     /* The old number gives its reference back and the new one takes its own,
@@ -7542,7 +7541,6 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
     ctx->fds[fd].used    = used;
     ctx->fds[fd].fd      = host_fd;
     ctx->fds[fd].cloexec = cloexec;
-    ctx->fds[fd].shared  = shared;
     ctx->fds[fd].backend = backend;
     ctx->fds[fd].flags   = flags;
     /* An anchor-backed slot remembers *which* socket its number meant when it was
@@ -7556,10 +7554,10 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
         host_fd_acquire(host_fd);
     }
     if (fd >= FD_TRACE_LO && fd <= FD_TRACE_HI) {
-        RVVM_TRC(RVVM_TRC_FD, "fd_wr[%s] pid=%u fd=%d used=%d host=%d gen=%llu clo=%d sh=%d be=%d fl=%x",
+        RVVM_TRC(RVVM_TRC_FD, "fd_wr[%s] pid=%u fd=%d used=%d host=%d gen=%llu clo=%d be=%d fl=%x",
                   op, (unsigned)ctx->pid, fd, (int)used, host_fd,
                   (unsigned long long)ctx->fds[fd].anchor_gen,
-                  (int)cloexec, (int)shared, (int)backend, flags);
+                  (int)cloexec, (int)backend, flags);
     }
 }
 
@@ -7569,9 +7567,9 @@ static void userland_fd_dump(rvvm_userland_t* ctx, const char* tag)
     RVVM_TRC(RVVM_TRC_FD, "fd_dump[%s] ctx=%p uctx=%p", tag, (void*)ctx, (void*)uctx());
     for (int fd = FD_TRACE_LO; fd <= FD_TRACE_HI; ++fd) {
         if (ctx->fds[fd].used) {
-            RVVM_TRC(RVVM_TRC_FD, "fd_dump[%s]: fd=%d host=%d clo=%d sh=%d",
+            RVVM_TRC(RVVM_TRC_FD, "fd_dump[%s]: fd=%d host=%d clo=%d",
                       tag, fd, ctx->fds[fd].fd,
-                      (int)ctx->fds[fd].cloexec, (int)ctx->fds[fd].shared);
+                      (int)ctx->fds[fd].cloexec);
         }
     }
 }
@@ -7642,7 +7640,7 @@ static void userland_fd_install(rvvm_userland_t* ctx, int guest_fd, int host_fd,
         if (anchored) {
             win_socket_anchor_ref(host_fd);
         }
-        userland_fds_write(ctx, guest_fd, true, host_fd, cloexec, false,
+        userland_fds_write(ctx, guest_fd, true, host_fd, cloexec,
                            userland_own_fd(host_fd) ? FD_BACKEND_SIM : FD_BACKEND_HOST,
                            0, "install");
         ctx->fds[guest_fd].holds_anchor_ref = anchored;
@@ -7742,7 +7740,7 @@ static void userland_fd_set_flags(rvvm_userland_t* ctx, int fd, uint32_t flags)
 {
     if (userland_fd_tracked(ctx, fd)) {
         userland_fds_write(ctx, fd, true, ctx->fds[fd].fd, ctx->fds[fd].cloexec,
-                           ctx->fds[fd].shared, ctx->fds[fd].backend, flags, "setfl");
+                           ctx->fds[fd].backend, flags, "setfl");
     }
 }
 
@@ -8003,11 +8001,10 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
      * allocator, so it is what tells you *which connection* just died - and
      * "the parent dropped the connection it had just accepted" is a bug
      * visible in a single line, where the bare fd_wr[close] below is not. */
-    RVVM_TRC(RVVM_TRC_FD, "fd_drop pid=%u fd=%d host=%d%s", (unsigned)ctx->pid,
-             fd, ctx->fds[fd].fd, ctx->fds[fd].shared ? " shared(kept)" : "");
-    /* The name goes with the slot. A shared slot keeps the descriptor alive but
-     * not this string: the child that inherited it holds its own copy, and
-     * nothing outlives the slot. */
+    RVVM_TRC(RVVM_TRC_FD, "fd_drop pid=%u fd=%d host=%d", (unsigned)ctx->pid,
+             fd, ctx->fds[fd].fd);
+    /* The name goes with the slot. The child that inherited a copy of this
+     * descriptor holds its own string, and nothing outlives the slot. */
     safe_free(ctx->fds[fd].path);
     ctx->fds[fd].path = NULL;
     if (win_socket_is_fd(ctx->fds[fd].fd)) {
@@ -8033,7 +8030,7 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
         /* A procfs descriptor rides on a generated object, not a host fd: the
          * object is released here rather than closed. */
         userland_proc_fd_release(ctx->fds[fd].fd);
-    } else if (!ctx->fds[fd].shared && !userland_dev_by_fd(ctx->fds[fd].fd, NULL)) {
+    } else if (!userland_dev_by_fd(ctx->fds[fd].fd, NULL)) {
         /* A device descriptor is just a number: nothing was opened for it. */
         /* Whether *this slot* names an anchor is a question only the slot can
          * answer: the anchor and CRT numbers are separate spaces that happen to
@@ -8059,16 +8056,9 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
                 ctx->fds[fd].holds_anchor_ref = false;
             }
         }
-    } else if (ctx->fds[fd].shared) {
-        /* Rides on another address space's anchor: give back the reference this
-         * slot took, so the parent's own copy keeps the number alive. */
-        if (ctx->fds[fd].holds_anchor_ref) {
-            win_socket_anchor_unref(ctx->fds[fd].fd);
-            ctx->fds[fd].holds_anchor_ref = false;
-        }
     }
     userland_fds_write(ctx, fd, false, ctx->fds[fd].fd, ctx->fds[fd].cloexec,
-                       ctx->fds[fd].shared, ctx->fds[fd].backend, ctx->fds[fd].flags,
+                       ctx->fds[fd].backend, ctx->fds[fd].flags,
                        "close");
     return true;
 }
@@ -8464,7 +8454,7 @@ static int userland_own_fd_dup(rvvm_userland_t* ctx, int source_fd, int host_fd,
         if (guest_fd < 0) {
             return -1;
         }
-        userland_fds_write(ctx, guest_fd, true, host_fd, cloexec, false,
+        userland_fds_write(ctx, guest_fd, true, host_fd, cloexec,
                            FD_BACKEND_CONSOLE, ctx->fds[source_fd].flags, "own_dup_console");
         return guest_fd;
     }
@@ -8600,7 +8590,7 @@ static void userland_fd_set_cloexec(rvvm_userland_t* ctx, int fd, bool cloexec)
 {
     if (userland_fd_tracked(ctx, fd)) {
         userland_fds_write(ctx, fd, true, ctx->fds[fd].fd, cloexec,
-                           ctx->fds[fd].shared, ctx->fds[fd].backend, ctx->fds[fd].flags,
+                           ctx->fds[fd].backend, ctx->fds[fd].flags,
                            "setclo");
     }
 }
@@ -8646,13 +8636,13 @@ static void userland_fd_table_free(rvvm_userland_t* ctx)
  * 0/1/2 are the guest's console and are not this table's to open or close - they
  * ride on the emulator's own stdio - but they are descriptors all the same, and
  * a table that does not know they are taken hands out 0 to the next dup(2).
- * Reserving them (as shared slots, so nothing here closes them) is what makes
+ * Reserving them (as console attaches, so nothing here closes them) is what makes
  * dup(2) start at 3 the way the guest expects; close(2) still releases the
  * number, which is all a guest closing its stdin is asking for. */
 static void userland_fd_table_init(rvvm_userland_t* ctx)
 {
     for (int fd = 0; fd < USERLAND_FD_TABLE_MAX; ++fd) {
-        userland_fds_write(ctx, fd, false, 0, false, false, FD_BACKEND_HOST, 0, "init");
+        userland_fds_write(ctx, fd, false, 0, false, FD_BACKEND_HOST, 0, "init");
     }
     for (int fd = 0; fd <= 2; ++fd) {
         /* 0/1/2 start out as the run's console - the one place in the table where
@@ -8668,7 +8658,7 @@ static void userland_fd_table_init(rvvm_userland_t* ctx)
          * attach falls back to for the bytes a host with no sink still wants to
          * see (see userland_fd_console_host); it is not a descriptor the guest
          * can dup, which is what FD_BACKEND_CONSOLE says. */
-        userland_fds_write(ctx, fd, true, fd, false, false, FD_BACKEND_CONSOLE,
+        userland_fds_write(ctx, fd, true, fd, false, FD_BACKEND_CONSOLE,
                            fd ? UAPI_O_WRONLY : UAPI_O_RDONLY, "console");
     }
 }
@@ -8684,8 +8674,9 @@ static void userland_fd_table_init(rvvm_userland_t* ctx)
  * The guest numbers stay the parent's: fork(2) copies the table, and a shell
  * that redirects fd 1 counts on the child seeing the redirect at fd 1.
  *
- * Only when the host cannot make a copy (descriptors exhausted) does the child
- * ride on the parent's host fd instead - marked shared, so it never closes it. */
+ * When the host cannot make a copy (descriptors exhausted) the child does not
+ * get that descriptor at all: a slot either owns its number or is absent, and
+ * two address spaces never name one number. */
 static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* parent)
 {
     struct userland_pty* child_pty = NULL;
@@ -8693,15 +8684,14 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
 
     for (int fd = 0; fd < USERLAND_FD_TABLE_MAX; ++fd) {
         if (!parent->fds[fd].used) {
-            userland_fds_write(child, fd, false, 0, false, false, FD_BACKEND_HOST, 0, "inherit");
+            userland_fds_write(child, fd, false, 0, false, FD_BACKEND_HOST, 0, "inherit");
             continue;
         }
         /* A console is an attach, not a descriptor: the child is handed the same
-         * one outright. There is no host handle to copy - and none to close,
-         * which is why this never had to be the "shared" case it used to be. */
+         * one outright. There is no host handle to copy and none to close. */
         if (parent->fds[fd].backend == FD_BACKEND_CONSOLE) {
             userland_fds_write(child, fd, true, parent->fds[fd].fd,
-                               parent->fds[fd].cloexec, false, FD_BACKEND_CONSOLE,
+                               parent->fds[fd].cloexec, FD_BACKEND_CONSOLE,
                                parent->fds[fd].flags, "inherit_console");
             continue;
         }
@@ -8716,24 +8706,22 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
             if (sock_fd >= 0) {
                 win_socket_anchor_ref(sock_fd);
                 userland_fds_write(child, fd, true, sock_fd, parent->fds[fd].cloexec,
-                                   false, parent->fds[fd].backend,
+                                   parent->fds[fd].backend,
                                    parent->fds[fd].flags, "inherit_socket");
                 child->fds[fd].holds_anchor_ref = true;
-                continue;
+            } else {
+                /* Out of anchors: the child does not get this descriptor. Handing
+                 * it the parent's number would leave two address spaces naming one
+                 * anchor - the case this design removes. A slot either owns its
+                 * number or is absent. */
+                userland_fds_write(child, fd, false, 0, false, FD_BACKEND_HOST, 0,
+                                   "inherit_socket_dropped");
             }
-            /* Out of anchors: the parent's number has to do, and the child may
-             * not close it - shared=1 is what close() consults. */
-            win_socket_anchor_ref(parent->fds[fd].fd);
-            userland_fds_write(child, fd, true, parent->fds[fd].fd,
-                               parent->fds[fd].cloexec, true,
-                               parent->fds[fd].backend, parent->fds[fd].flags,
-                               "inherit_socket_shared");
-            child->fds[fd].holds_anchor_ref = true;
             continue;
         }
         /* Copy the slot wholesale through the unified write. */
         userland_fds_write(child, fd, parent->fds[fd].used, parent->fds[fd].fd,
-                           parent->fds[fd].cloexec, parent->fds[fd].shared,
+                           parent->fds[fd].cloexec,
                            parent->fds[fd].backend, parent->fds[fd].flags, "inherit");
         child->fds[fd].holds_anchor_ref = false;
         if (memfs_fd_number(parent->fds[fd].fd)) {
@@ -8761,7 +8749,7 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
                      * so the child is not handed a number naming storage it does
                      * not hold. */
                     rvvm_memfs_free(fs);
-                    userland_fds_write(child, fd, false, 0, false, false,
+                    userland_fds_write(child, fd, false, 0, false,
                                        FD_BACKEND_HOST, 0, "inherit_memfs_fail");
                 }
             }
@@ -8773,7 +8761,7 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
              * the pair outlives both of them). */
             userland_pty_ref(child_pty, child_master);
             userland_fds_write(child, fd, true, parent->fds[fd].fd,
-                               parent->fds[fd].cloexec, false,
+                               parent->fds[fd].cloexec,
                                FD_BACKEND_SIM, parent->fds[fd].flags,
                                "inherit_pty");
             continue;
@@ -8785,9 +8773,11 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
             userland_proc_fd_ref(parent->fds[fd].fd);
             continue;
         }
-        if (parent->fds[fd].shared) {
-            /* A descriptor the parent itself did not own (descriptors exhausted
-             * when it was inherited): nothing here to copy. */
+        if (userland_dev_by_fd(parent->fds[fd].fd, NULL)) {
+            /* A /dev entry is a number this layer answers for, not a host
+             * handle: there is nothing to copy or to hold. The slot was already
+             * copied above with the same number - that number is the run's, and
+             * closing it on one side closes nothing on the other. */
             continue;
         }
         int host_fd = dup(parent->fds[fd].fd);
@@ -8800,26 +8790,16 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
                 win_socket_anchor_ref(host_fd);
             }
             userland_fds_write(child, fd, true, host_fd, parent->fds[fd].cloexec,
-                               false, FD_BACKEND_HOST, parent->fds[fd].flags,
+                               FD_BACKEND_HOST, parent->fds[fd].flags,
                                "inherit_dup");
             child->fds[fd].holds_anchor_ref = dup_anchored;
         } else {
-            /* No copy: the parent's host fd has to do, and the child may not
-             * close it (see userland_fd_close). The child still names the anchor,
-             * so it holds a reference of its own - that is what keeps the number
-             * out of the CRT table while this process lives. */
-            bool shared_anchored = win_socket_is_fd(parent->fds[fd].fd);
-            if (shared_anchored) {
-                win_socket_anchor_ref(parent->fds[fd].fd);
-            }
-            userland_fds_write(child, fd, true, parent->fds[fd].fd,
-                               parent->fds[fd].cloexec, true,
-                               FD_BACKEND_HOST, parent->fds[fd].flags,
-                               "inherit_shared");
-            /* This is the slot the old close side released unconditionally while
-             * the reference here was taken conditionally - the surplus release
-             * that handed a number back to the CRT under a live slot. */
-            child->fds[fd].holds_anchor_ref = shared_anchored;
+            /* No copy: the child does not get this descriptor. Handing it the
+             * parent's host number would leave two address spaces naming one
+             * number - the case this design removes. A slot either owns its
+             * number or is absent, so the child's open() can take the number. */
+            userland_fds_write(child, fd, false, 0, false, FD_BACKEND_HOST, 0,
+                               "inherit_dropped");
         }
         /* The name travels with the descriptor: a child's /proc/<pid>/fd/<n> has
          * to answer for the file its parent opened. Each slot owns its own copy,
@@ -16345,7 +16325,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                                     nd->pos   = sd->pos;
                                     nd->kind  = sd->kind;
                                     userland_fds_write(uctx(), newfd, true, nd->fd,
-                                                       (a2 & UAPI_O_CLOEXEC) != 0, false,
+                                                       (a2 & UAPI_O_CLOEXEC) != 0,
                                                        FD_BACKEND_SIM, keep_flags, "dup3_memfs");
                                     userland_fd_set_path(uctx(), newfd, uctx()->fds[oldfd].path);
                                     a0 = newfd;
@@ -16384,7 +16364,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         rvvm_fd_backend_t keep_be = uctx()->fds[oldfd].backend;
                         userland_fd_close(uctx(), newfd);
                         userland_fds_write(uctx(), newfd, true, host_old,
-                                           (a2 & UAPI_O_CLOEXEC) != 0, false,
+                                           (a2 & UAPI_O_CLOEXEC) != 0,
                                            keep_be, keep_flags, "dup3_own");
                         userland_fd_set_path(uctx(), newfd, uctx()->fds[oldfd].path);
                         a0 = newfd;
