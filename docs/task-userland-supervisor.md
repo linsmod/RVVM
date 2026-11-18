@@ -58,3 +58,14 @@
 1. 构建：`mingw32-make bin CFLAGS=-g`
 2. 起 daemon：`Start-Process python -ArgumentList 'tools/supervisor/supervisor.py','--bind','127.0.0.1:7911'`
 3. `python tools/supervisor/us.py health` → list/start/exec/rm
+
+## 本机部署（traycmd 托盘，2026-11-18）
+
+daemon 已注册为托盘命令（webui-demo 实例在 daemon 换手后由 reconcile 无缝保留）：
+
+- 托盘「网站」分区「userland supervisor」（proj rvvm，short id `7aec2859`），
+  URL 固定 `http://127.0.0.1:7911/`（仅本机可访问，非公网）
+- 启动：托盘点菜单项，或 `quickcmd run-job 7aec2859`；停止：托盘「结束任务」或
+  `quickcmd kill <实例ID>`；日志：`quickcmd logs 7aec2859`
+- daemon 自身跨手是安全的：实例真值在 `runtime/cores/*.core` + pid，新 daemon 起来
+  即 reconcile（本次验证：webui-demo 保留为 running）
