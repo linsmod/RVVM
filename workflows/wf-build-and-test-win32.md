@@ -89,6 +89,7 @@ guest stdout = 进程 stdout，guest 退出码 = 进程退出码，所以普通�
 
 ## 坑（都是实际踩过的）
 
+- `third_party/tinyssh` 显示 193 个 `T`（typechange）不是真改动：upstream 的 symlink（`120000`，如根目录 `int*_optblocker.c -> cryptoint/…`、`tests/* -> ../…`）被当初的克隆工具解引用成了实体文件，diff 形态是「1 行链接目标 → 整文件内容」。2026-11-18 已修复：本机可建 symlink（Dev Mode）且子模块 `core.symlinks=true`，对这批路径 `git checkout --` 恢复成真 symlink 后，子模块状态 0 行；tinysshd 按显式清单直接编译这些路径，重建产物逐字节同尺寸、会话链路验证通过。若在无 symlink 权限的环境遇到同一噪音，用 `git ls-files -s` 过滤 `120000` 后 `update-index --skip-worktree` 遮罩（不重建 checkout，保留解引用内容）。
 - relink 报 `Permission denied` ⇒ 有 exe 在跑，先 `--shutdown` / `Stop-Process`。
 - `runtime/ash-core.lock` 被残留 core 持有 ⇒ guest sample 退出码 `-1`、无输出。先想环境（锁、端口、残留进程），再想代码。
 - guest 相对路径相对**进程 cwd**，不是 exe 目录 ⇒ 用工具的 `workdir` / 绝对路径。
