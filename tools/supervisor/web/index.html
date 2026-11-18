@@ -204,7 +204,9 @@ function renderDetail(port) {
   } else {
     $("detail").innerHTML = `
       <div class="detail">
-        <div class="muted">实例 ${port} · 交互终端（密钥认证的 ssh 会话）</div>
+        <div class="muted">实例 ${port} · 交互终端（密钥认证的 ssh 会话）·
+          选中后 Ctrl+C 复制（无选中才是 ^C 中断）· Ctrl+Shift+C 复制 ·
+          Ctrl+V / 右键 粘贴</div>
         <div class="termbox" id="term-${port}"></div>
         <button onclick="closeDetail()">关闭终端</button>
       </div>`;
@@ -279,9 +281,67 @@ function openTerminal(port) {
   ws.onmessage = (e) => term.write(new Uint8Array(e.data));
   ws.onclose = () => term.write("\r\n\x1b[90m[连接已关闭]\x1b[0m");
   ws.onerror = () => term.write("\r\n\x1b[31m[连接错误]\x1b[0m");
-  term.onData((d) => {
-    if (ws.readyState === 1) ws.send(new TextEncoder().encode(d));
+
+  const send = (s) => {
+    if (ws.readyState === 1) ws.send(new TextEncoder().encode(s));
+  };
+  term.onData((d) => send(d));
+
+  // --- clipboard -------------------------------------------------------
+  // Nothing here is wired by default: without a selection-aware Ctrl+C the
+  // keypress reaches the shell as ^C and kills whatever is running, and the
+  // browser's paste path never reaches the pty on its own.
+  const copySel = () => {
+    const sel = term.getSelection();
+    if (!sel) return false;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(sel).catch(() => {});
+      return true;
+    }
+    return false;
+  };
+  const pasteText = () => {
+    if (!(navigator.clipboard && navigator.clipboard.readText)) {
+      toast("此浏览器不提供剪贴板读取，请用 Ctrl+V", true);
+      return;
+    }
+    navigator.clipboard.readText().then((t) => {
+      // A pasted newline must be CR: the pty's line discipline wants \r.
+      send((t || "").replace(/\r?\n/g, "\r"));
+    }).catch(() => toast("剪贴板读取被拒绝，请用 Ctrl+V", true));
+  };
+  term.attachCustomKeyEventHandler((ev) => {
+    if (ev.type !== "keydown") return true;
+    const c = ev.ctrlKey, s = ev.shiftKey;
+    if (c && !s && (ev.key === "c" || ev.key === "C") && term.hasSelection()) {
+      return !copySel();      // selection present: copy, do not send ^C
+    }
+    if (c && s && (ev.key === "c" || ev.key === "C")) {
+      copySel();
+      return false;
+    }
+    if ((c && ev.key === "v") || (c && s && (ev.key === "v" || ev.key === "V")) ||
+        (s && ev.key === "Insert")) {
+      pasteText();
+      return false;
+    }
+    return true;
   });
+  // The browser's own paste event (Ctrl+V on the focused textarea) also
+  // carries the text - route it, or a permitted paste would go nowhere.
+  term.onPaste((d) => send(d.replace(/\r?\n/g, "\r")));
+  // Windows-console convention: right-click pastes, right-click with a
+  // selection copies. A denied clipboard read falls back to Ctrl+V.
+  container.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    if (term.hasSelection()) {
+      if (!copySel()) toast("复制失败", true);
+      term.clearSelection();
+    } else {
+      pasteText();
+    }
+  });
+
   termState = { port, term, fit, ws };
   term.focus();
 }
