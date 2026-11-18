@@ -83,6 +83,36 @@
 - **watch 包装吞输出**：多命令拼接的输出只剩第一行，且后续命令实际都执行了（一次起了
   4 个实例）。判据看落盘文件，一条命令一个文件。
 
+## S3 v3：终端剪贴板键位（2026-11-18 第三轮）
+
+目标：Linux 习惯为主、控制台习惯兜底，只走 xterm.js 的公开扩展点，不手搓协议细节。
+
+| 键 / 鼠标 | 行为 |
+|---|---|
+| `Ctrl+Shift+C`，或有选区时的 `Ctrl+C` | 复制选区 |
+| `Ctrl+C`（无选区） | 送 `^C`（SIGINT） |
+| `Ctrl+V` / `Ctrl+Shift+V`（浏览器映射时 `Shift+Insert`） | 粘贴 |
+| 右键 | 复制 / 粘贴 / 全选 菜单（替代页面菜单的 Inspect 之类） |
+
+依据（`xtermjs/xterm.js` master 源码，非压缩码）：
+
+- `src/common/input/Keyboard.ts` 的 default 分支把 `Ctrl+字母` 变成 `keyCode-64`，即
+  `Ctrl+V` = `0x16`、`Ctrl+C` = `0x03`；`Ctrl+Shift+字母` 走
+  `else if (ev.key && ev.ctrlKey && ev.shiftKey)`，只识别 `Minus/Digit2/Digit6`，
+  其余不产生键。
+- `src/browser/CoreBrowserTerminal.ts` 的 `_keyDown` 在 `triggerDataEvent` 之后对
+  `ctrlKey` 一律 `preventDefault`；自定义键处理返回 `false` 时直接早退，**不**取消默认动作。
+- 所以：`Ctrl+V` 必须显式丢弃键事件，浏览器原生 paste 才会落到
+  `handlePasteEvent`；`Ctrl+Shift+V` 不用写代码（xterm 不产生键、不拦默认）。
+- 粘贴一律交给 `Clipboard.paste()` / `Terminal.paste()`：CRLF→CR、ESC 消毒、
+  远端开了 bracketed paste 时加 `\x1b[200~ … \x1b[201~`。上一版右键粘贴手写
+  `replace(/\r?\n/g,"\r")` + `send()` 绕过了这些，已删除。
+- 右键菜单的粘贴没有 paste 事件，才读剪贴板后交给 `term.paste()`；读被拒时提示改按
+  `Ctrl+V`（零权限路径）。
+
+未验证：浏览器侧 `document.execCommand`/权限弹窗行为未实测（按用户要求不做 web 测试），
+当前实现刻意不依赖它——复制用 `navigator.clipboard.writeText`，粘贴主路径走浏览器 paste。
+
 ## 本机部署（traycmd 托盘，2026-11-18）
 
 daemon 已注册为托盘命令（webui-demo 实例在 daemon 换手后由 reconcile 无缝保留）：
