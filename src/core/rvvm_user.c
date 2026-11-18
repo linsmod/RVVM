@@ -13685,14 +13685,27 @@ static int64_t userland_pty_ioctl(struct userland_pty* pty, bool master, uint64_
 }
 
 /* fstat(2) and stat() on either end: a character device, which is what makes
- * S_ISCHR() - and therefore isatty()-style checks in a guest libc - true. */
+ * S_ISCHR() - and therefore isatty()-style checks in a guest libc - true.
+ *
+ * (st_dev, st_ino) answer the same values a stat() of the fd's *name* does:
+ * musl's ttyname() reads /proc/self/fd/N and then compares the two stats, so a
+ * pair that disagrees makes a perfectly good terminal read as "not this one"
+ * (ENODEV inside channel_openpty, tinysshd's pty-req rejected). The master's
+ * name is /dev/ptmx, the slave's is /dev/pts/N - the same names the device
+ * table's path stat answers (see userland_dev_stat_path). */
+static uint32_t userland_dev_ino(const char* path);   // defined with the device table below
 static void userland_pty_fill_stat(struct userland_pty* pty, bool master, struct stat* st)
 {
+    char name[24];
     memset(st, 0, sizeof(*st));
     st->st_mode    = S_IFCHR | (master ? 0620 : 0666);
     st->st_rdev    = (136ULL << 8) | (pty ? (pty->index & 0xFF) : 0);  // Linux's /dev/pts major
     st->st_nlink   = 1;
     st->st_blksize = 4096;
+    snprintf(name, sizeof(name), master || !pty ? "/dev/ptmx" : "/dev/pts/%u",
+             pty ? (unsigned)pty->index : 0u);
+    st->st_dev = (dev_t)RVVM_SHADOW_DEV;
+    st->st_ino = (ino_t)userland_dev_ino(name);
 }
 
 /* The same shape for /dev/null, /dev/zero and /dev/urandom: character devices
@@ -16499,9 +16512,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     break;
                 }
-                case 29: // ioctl
+                case 29: { // ioctl
                     // TODO: I sure hope not many ioctl() interfaces need struct conversion...
-                    rvvm_info("sys_ioctl(%ld, %lx, %lx)", a0, a1, a2);
+                    /* The kernel takes the request as unsigned int: a guest libc
+                     * passes it as int, so a request with the high bit set
+                     * (musl's TIOCGPTN, 0x80045430) arrives sign-extended in a1
+                     * and would never match its case label. Truncate first. */
+                    uint32_t req = (uint32_t)a1;
+                    rvvm_info("sys_ioctl(%ld, %x, %lx)", (long)a0, req, (unsigned long)a2);
                     /* The console is answered by the core, on whatever number it
                      * is: a dup2() onto that number put a real descriptor there
                      * and the termios probes are not for it. Only while it is
@@ -16513,7 +16531,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         // libc makes for isatty() itself rather than forwarding
                         // them to the host fd. fd 0 is included because it is
                         // the same console, only the input half.
-                        a0 = user_tty_ioctl(a1, a2 ? to_ptr_ioctl(a2, a1) : NULL,
+                        a0 = user_tty_ioctl(req, a2 ? to_ptr_ioctl(a2, a1) : NULL,
                                             (int32_t)(thread->proc ? thread->proc->pid : 0));
                         break;
                     }
@@ -16523,20 +16541,21 @@ static void* rvvm_user_thread_wrap(void* arg)
                         bool master = false;
                         int idev = -1;
                         if (userland_pty_by_fd(hfd, &pty, &master)) {
-                            a0 = (rvvm_addr_t)userland_pty_ioctl(pty, master, a1, a2 ? to_ptr_ioctl(a2, a1) : NULL,
+                            a0 = (rvvm_addr_t)userland_pty_ioctl(pty, master, req, a2 ? to_ptr_ioctl(a2, a1) : NULL,
                                                                  thread);
                         } else if (userland_dev_by_fd(hfd, &idev) && idev == DEV_CONSOLE) {
                             /* /dev/console or /dev/ttyN: the termios and window
                              * size of the run's session, exactly as for an
                              * untracked fd 0/1/2 above. getty asks for both
                              * before it reads a login name. */
-                            a0 = user_tty_ioctl(a1, a2 ? to_ptr_ioctl(a2, a1) : NULL,
+                            a0 = user_tty_ioctl(req, a2 ? to_ptr_ioctl(a2, a1) : NULL,
                                                 (int32_t)(thread->proc ? thread->proc->pid : 0));
                         } else {
-                            a0 = errno_ret(ioctl(hfd, a1, a2));
+                            a0 = errno_ret(ioctl(hfd, req, a2));
                         }
                     }
                     break;
+                }
                 case 32: // flock
                     rvvm_info("sys_flock(%ld, %lx)", a0, a1);
                     a0 = errno_ret(flock(userland_fd_host(uctx(), (int)a0), a1));
