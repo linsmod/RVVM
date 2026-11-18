@@ -36,6 +36,15 @@ mingw32-make release.windows.x86_64/rvvm_winhost_x86_64.exe -j8
 ./release.windows.x86_64/rvvm_winhost_x86_64.exe --app test_cli
 printf 'ls /\nexit\n' | ./release.windows.x86_64/rvvm_winhost_x86_64.exe --app test_cli
 
+# 4b. 会话模式：起 core 监听 7900，再用 ssh 连（tinyssh 链路）
+#     清 rootfs 与 run 下的日志，否则上一轮的会话状态会干扰观察
+Remove-Item -Recurse -Force release.windows.x86_64/runtime/rootfs -ErrorAction SilentlyContinue
+Remove-Item release.windows.x86_64/runtime/run/*.log -ErrorAction SilentlyContinue
+Start-Process .\release.windows.x86_64\rvvm_ash_x86_64.exe -ArgumentList '--serve' `
+  -RedirectStandardError "$env:TEMP\core.err" -WindowStyle Hidden
+Start-Sleep 25
+ssh -p 7900 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL 127.0.0.1 "echo HELLO"
+
 # 5. 诊断开关（trace 走 stderr，不是 guest stdout）
 $env:RVVM_TRACE='path'          # 或 'fd' | 'sys' | 'all'
 $env:RVVM_VERBOSE='1'           # loglevel 提升到 INFO
@@ -70,7 +79,7 @@ guest stdout = 进程 stdout，guest 退出码 = 进程退出码，所以普通�
 | procfs / `ps` / `top` | `pwsh ./tools/procfs_e2e.ps1` |
 | 挂表 / `mount(2)` | `pwsh ./tools/mount_e2e.ps1` |
 | memfs 字节路径 | `pwsh ./tools/memfs_e2e.ps1`、`tools/memfs_root_e2e.ps1` |
-| 会话 / 控制台 | `pwsh ./tools/session_e2e.ps1`、`tools/ash_e2e.ps1` |
+| 会话 / 控制台 | `pwsh ./tools/session_e2e.ps1`、`tools/ash_e2e.ps1`（**2026-11-18 当前离线环境 22 项全 FAIL，`git stash` 后基线同样，见 `../issues/INDEX.md`**） |
 | 作业控制（信号/时序） | `pwsh ./tools/jobctl_e2e.ps1 -Scenario all`（`-NoJit` 走解释器） |
 | socket/fork 重载 | `pwsh ./tools/openssh_e2e.ps1` |
 | fs 抽象层 | `pwsh ./tools/fs_selftest.ps1`；纯结构用 `memfs_selftest.ps1` |
@@ -87,6 +96,8 @@ guest stdout = 进程 stdout，guest 退出码 = 进程退出码，所以普通�
 - `-c` 客户端会连到**已存在**的 core，环境变量传不进去 ⇒ 要 trace 就显式起一个带 trace 的 core 并把 stderr 重定向到文件。
 - trace 在 stderr，不在 guest stdout（guest 自己的输出才是 stdout）。
 - host 侧只准用 `rvvm_log()`/`RVVM_LOGx()`，写 stdout 会污染 e2e 正在读的 transcript。
+- `--serve` 起 core 前不清理 `runtime/rootfs` ⇒ 读到上一轮残留的会话状态；清理 `runtime/run/*.log` 才能看新一轮日志。
+- e2e 大面积 FAIL 且 console / daemon log 全空 ⇒ 先怀疑 core 根本没起来。用 `git stash` 跑一次基线对照，能区分「自己的改动」与「环境问题」，不要直接改代码。
 
 ## 退出条件
 
@@ -99,4 +110,9 @@ guest stdout = 进程 stdout，guest 退出码 = 进程退出码，所以普通�
 - 2026-11-17 bootstrap：本文命令来自 `build_virtpass.ps1` 的 `.SYNOPSIS` 与原根目录 `DEV.md`（已拆入
   `../docs/arch-virtpass.md` 与本文件）、`../docs/hist-lessons.md`；
   **本轮未实际执行构建或 e2e**，首次执行后请把实际耗时与失败点补进来。
+- 2026-11-18 实测（fd 所有权相关改动）：`mingw32-make bin`、`mingw32-make system-assets pack-system` 可用；
+  `--serve` + `ssh -p 7900` 能复现会话链路；`pwsh ./tools/session_e2e.ps1` 在本环境 22 项全 FAIL，
+  与 `git stash` 后的基线完全一致（core 未起来）——**该脚本在本环境不具备回归能力**，已登记 `../issues/INDEX.md`。
+  耗时未记录：端到端未能跑通。
 - 待补：把这些驱动收进一个 `test-all` 目标（AGENTS「测试」条款要求），并记录到 `../docs/test-timing.md`。
+- 会话链路的 fd 层定位方法见 `wf-debug-userland-fd.md`，不要在本文件里重复。
