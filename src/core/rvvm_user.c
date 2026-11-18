@@ -1683,6 +1683,57 @@ typedef struct {
 #define TTY_IN_RING 4096
 #define TTY_IN_LINE 1024
 
+/*
+ * c_cc: the control characters a terminal's line discipline acts on, indexed the
+ * way the guest ABI does (asm-generic). A zero entry is _POSIX_VDISABLE: the key
+ * is data, not a control character.
+ *
+ * Those values are not decoration. An interactive line editor runs the terminal
+ * in raw mode - ICANON, ECHO and ISIG all off - and then has to recognise its own
+ * keys from the bytes it reads, comparing them against the c_cc it got from
+ * TCGETS. busybox's ash does exactly that (libbb/lineedit.c, the default branch:
+ * "initial_settings.c_cc[VINTR] != 0 && ic_raw == initial_settings.c_cc[VINTR]"),
+ * so a TCGETS that reports VINTR = 0 leaves ^C at an idle prompt as a dead key:
+ * the shell never sees a signal (ISIG is off) and never matches the byte either.
+ */
+#define TTY_CC_VINTR   0
+#define TTY_CC_VERASE  2
+#define TTY_CC_VEOF    4
+#define TTY_CC_VSUSP   10
+#define TTY_CC_NCCS    32
+
+/* What a Linux tty answers before the guest changes anything (asm-generic
+ * defaults). VMIN/VTIME stay in the array because the guest reads them back, but
+ * the emulated read never blocks on a count. */
+static void tty_cc_init(uint8_t cc[TTY_CC_NCCS])
+{
+    memset(cc, 0, TTY_CC_NCCS);
+    cc[0]  = 0x03;   // VINTR     ^C
+    cc[1]  = 0x1C;   // VQUIT     ^backslash
+    cc[2]  = 0x7F;   // VERASE    DEL
+    cc[3]  = 0x15;   // VKILL     ^U
+    cc[4]  = 0x04;   // VEOF      ^D
+    cc[6]  = 0x01;   // VMIN      1
+    cc[8]  = 0x11;   // VSTART    ^Q
+    cc[9]  = 0x13;   // VSTOP     ^S
+    cc[10] = 0x1A;   // VSUSP     ^Z
+    cc[12] = 0x12;   // VREPRINT  ^R
+    cc[13] = 0x0F;   // VDISCARD  ^O
+    cc[14] = 0x17;   // VWERASE   ^W
+    cc[15] = 0x16;   // VLNEXT    ^V
+}
+
+/* ECHOCTL's notation for a control character: "^X" (and "^?" for DEL), then
+ * CRLF because that is what a terminal echoes. The key can be any byte the guest
+ * put in VINTR/VSUSP - "stty intr ^X" has to echo ^X, not the default ^C. */
+static void tty_caret_note(uint8_t c, char out[4])
+{
+    out[0] = '^';
+    out[1] = (char)(c == 0x7F ? '?' : (c + 0x40));
+    out[2] = '\r';
+    out[3] = '\n';
+}
+
 /* ============================================================
  * Mounts
  *
@@ -2231,6 +2282,7 @@ char*                    guest_root_path;
     volatile uint32_t sig_pending;    // signal number awaiting delivery, 0 = none
     volatile uint32_t sig_return;     // rt_sigreturn seen: restore at the boundary
     volatile uint32_t sig_inflight;   // handler on the stack (same-number re-entry queues instead)
+    volatile uint32_t sig_inflight_sig; // which signal that handler is for, 0 = none
     volatile uint64_t sig_frame;      // guest address of the in-flight frame
 
     // --- Guest virtual TTY (libvterm, optional) ---
@@ -2267,6 +2319,7 @@ char*                    guest_root_path;
     uint8_t      tty_esc_hold_len;
     uint32_t     tty_lflag;        // c_lflag from the last TCGETS/TCSETS
     uint32_t     tty_iflag;        // c_iflag from the last TCSETS (ICRNL is acted on)
+    uint8_t      tty_cc[TTY_CC_NCCS];  // c_cc from the last TCSETS (VINTR, VERASE, VEOF, VSUSP)
     uint32_t     tty_eof_pending;  // Ctrl-D delivered: next read returns 0
     bool         tty_in_eof;       // teardown: unblock reads that are waiting
 
@@ -2995,6 +3048,11 @@ static void* to_ptr_ioctl(rvvm_addr_t addr, uint64_t cmd)
 #define UAPI_SIGURG     23
 #define UAPI_SIGWINCH   28
 
+/* rt_sigprocmask(how) - asm-generic, the guest ABI's. */
+#define UAPI_SIG_BLOCK    0
+#define UAPI_SIG_UNBLOCK  1
+#define UAPI_SIG_SETMASK  2
+
 /*
  * Termios bits the virtual TTY's input path acts on (asm-generic values, the
  * guest ABI's, not the host's). TTY_*_DEFAULT is the state TCGETS reports
@@ -3012,11 +3070,6 @@ static void* to_ptr_ioctl(rvvm_addr_t addr, uint64_t cmd)
 #define TTY_LFLAG_IEXTEN   0x8000
 #define TTY_LFLAG_DEFAULT  (TTY_LFLAG_ISIG | TTY_LFLAG_ICANON | TTY_LFLAG_ECHO | \
                             TTY_LFLAG_ECHOE | TTY_LFLAG_ECHOK | TTY_LFLAG_IEXTEN)
-
-#define TTY_CC_VINTR  0x03  // Ctrl-C, the default VINTR
-#define TTY_CC_ERASE  0x7F  // DEL, the default VERASE
-#define TTY_CC_VEOF   0x04  // Ctrl-D
-#define TTY_CC_VSUSP  0x1A  // Ctrl-Z, the default VSUSP
 
 // asm-generic struct termios: 4 flag words + c_line + c_cc[32] + 2 speeds
 typedef struct __attribute__((packed)) {
@@ -3051,7 +3104,7 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg, int32_t pid)
             t.c_oflag = 0x1 | 0x4;          // OPOST | ONLCR (matches user_tty_write LF->CRLF)
             t.c_cflag = 0x30 | 0x80 | 0xF;  // CS8 | CREAD | B38400
             t.c_lflag = uctx()->tty_lflag;
-            t.c_cc[6] = 1;                  // VMIN
+            memcpy(t.c_cc, uctx()->tty_cc, TTY_CC_NCCS);
             t.c_ispeed = t.c_ospeed = 0xF;  // B38400
             memcpy(arg, &t, sizeof(t));
             /* isatty() is exactly this probe succeeding; without the trace a
@@ -3088,18 +3141,24 @@ static int64_t user_tty_ioctl(uint64_t cmd, void* arg, int32_t pid)
         case UAPI_TCSETS:
         case UAPI_TCSETSW:
         case UAPI_TCSETSF:
-            // The guest's terminal modes are honoured for the flags that shape
-            // the input path (ICANON / ECHO / ECHOE): that is what lets a
-            // full-screen app turn off canonical mode and receive raw keys.
-            // The remaining words stay fixed, matching TCGETS above.
+            // The guest's terminal modes are honoured for what shapes the input
+            // path: ICANON / ECHO / ECHOE / ISIG and the c_cc characters the
+            // line discipline acts on (VINTR, VERASE, VEOF, VSUSP). That is what
+            // lets a full-screen app turn off canonical mode and receive raw
+            // keys - and what lets a line editor in raw mode tell its own ^C
+            // from a typed byte. The remaining words stay fixed, matching
+            // TCGETS above.
             if (arg) {
                 const uapi_termios_t* t = arg;
                 uctx()->tty_lflag = t->c_lflag;
                 uctx()->tty_iflag = t->c_iflag;
-                    RVVM_TRC(RVVM_TRC_TTY, "tty:  syscall %ld TCSETS lflag=%lx (canon=%d echo=%d)",
+                memcpy(uctx()->tty_cc, t->c_cc, TTY_CC_NCCS);
+                    RVVM_TRC(RVVM_TRC_TTY, "tty:  syscall %ld TCSETS lflag=%lx (canon=%d echo=%d isig=%d vintr=%02x)",
                               (long)tls_cur_syscall, (unsigned long)t->c_lflag,
                               (int)!!(t->c_lflag & TTY_LFLAG_ICANON),
-                              (int)!!(t->c_lflag & TTY_LFLAG_ECHO));
+                              (int)!!(t->c_lflag & TTY_LFLAG_ECHO),
+                              (int)!!(t->c_lflag & TTY_LFLAG_ISIG),
+                              (unsigned)t->c_cc[TTY_CC_VINTR]);
             }
             return 0;
         case UAPI_TIOCSWINSZ:
@@ -3427,6 +3486,10 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
 
     uint32_t lflag = ctx->tty_lflag;
     uint32_t iflag = ctx->tty_iflag;
+    uint8_t  vintr = ctx->tty_cc[TTY_CC_VINTR];
+    uint8_t  vsusp = ctx->tty_cc[TTY_CC_VSUSP];
+    uint8_t  verase = ctx->tty_cc[TTY_CC_VERASE];
+    uint8_t  veof   = ctx->tty_cc[TTY_CC_VEOF];
     bool canon = (lflag & TTY_LFLAG_ICANON) != 0;
     bool icrnl = (iflag & TTY_IFLAG_ICRNL) != 0;
     bool echo  = (lflag & TTY_LFLAG_ECHO)   != 0;
@@ -3448,10 +3511,13 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
         // ISIG: Ctrl-C and Ctrl-Z are not data. A real tty signals the
         // foreground process group, drops the pending line and never hands the
         // byte over. Which signal that is, and what its default disposition
-        // does to the group, is decided after the loop.
-        if (isig && (c == TTY_CC_VINTR || c == TTY_CC_VSUSP)) {
-            const bool  ctrl_c = (c == TTY_CC_VINTR);
-            const char* note   = ctrl_c ? "^C\r\n" : "^Z\r\n";
+        // does to the group, is decided after the loop. The keys come from the
+        // guest's own c_cc, so "stty intr ^X" means what it says, and a zero
+        // entry (_POSIX_VDISABLE) leaves the byte as ordinary input.
+        if (isig && ((vintr && c == vintr) || (vsusp && c == vsusp))) {
+            const bool  ctrl_c = (vintr && c == vintr);
+            char        note[4];
+            tty_caret_note(c, note);
             interrupt |= ctrl_c;
             susp      |= !ctrl_c;
             ctx->tty_line_len = 0;
@@ -3602,7 +3668,7 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
             }
         }
 
-        if (c == TTY_CC_ERASE) {
+        if (verase && c == verase) {
             // Erase the last character, whole: one Backspace takes one
             // character the user typed, however many bytes of UTF-8 that is,
             // out of the line the guest will read and off the screen.
@@ -3616,7 +3682,7 @@ static void user_tty_input(rvvm_userland_t* ctx, const void* buf, size_t len)
             continue;
         }
 
-        if (c == TTY_CC_VEOF) {
+        if (veof && c == veof) {
             // Ctrl-D: deliver the pending line as-is; on an empty line it is
             // the classic end-of-file, which read(0) reports as 0.
             if (ctx->tty_line_len) {
@@ -12023,6 +12089,7 @@ struct userland_pty {
     uint32_t     lflag;            // c_lflag: ICANON, ECHO
     uint32_t     iflag;            // c_iflag: ICRNL
     uint32_t     oflag;            // c_oflag: ONLCR
+    uint8_t      cc[TTY_CC_NCCS];  // c_cc: VINTR, VERASE, VEOF, VSUSP, VMIN
     uint32_t     rows;
     uint32_t     cols;
     bool         locked;           // TIOCSPTLCK: a slave may not be opened yet
@@ -12116,6 +12183,7 @@ static int userland_pty_alloc(void)
     pty->lflag       = TTY_LFLAG_DEFAULT;
     pty->iflag       = TTY_IFLAG_DEFAULT;
     pty->oflag       = UAPI_TTY_OPOST | UAPI_TTY_ONLCR;
+    tty_cc_init(pty->cc);
     pty->rows        = 24;
     pty->cols        = 80;
     pty->locked      = true;   // a slave is opened only after TIOCSPTLCK
@@ -12287,24 +12355,30 @@ static size_t userland_pty_master_put(struct userland_pty* pty, const uint8_t* s
     bool icrnl = (pty->iflag & TTY_IFLAG_ICRNL) != 0;
     bool echo_on = (pty->lflag & TTY_LFLAG_ECHO) != 0;
     bool isig = (pty->lflag & TTY_LFLAG_ISIG) != 0;
+    const uint8_t vintr = pty->cc[TTY_CC_VINTR];
+    const uint8_t vsusp = pty->cc[TTY_CC_VSUSP];
+    const uint8_t verase = pty->cc[TTY_CC_VERASE];
+    const uint8_t veof = pty->cc[TTY_CC_VEOF];
 
     for (size_t i = 0; i < len; ++i) {
         uint8_t c = src[i];
         if (icrnl && c == '\r') {
             c = '\n';
         }
-        if ((c == TTY_CC_VINTR || c == TTY_CC_VSUSP)) {
+        if ((vintr && c == vintr) || (vsusp && c == vsusp)) {
             RVVM_TRC(RVVM_TRC_PTY, "pty: %s from the master (lflag %lx isig %d fg_pgid %u)",
-                      c == TTY_CC_VINTR ? "INTR" : "SUSP", (unsigned long)pty->lflag, (int)isig,
+                      (vintr && c == vintr) ? "INTR" : "SUSP", (unsigned long)pty->lflag, (int)isig,
                       pty->fg_pgid);
         }
-        if (isig && (c == TTY_CC_VINTR || c == TTY_CC_VSUSP)) {
+        if (isig && ((vintr && c == vintr) || (vsusp && c == vsusp))) {
             /* ^C / ^Z: the byte is consumed by the line discipline, the pending
              * line is dropped, and the notation is echoed the way ECHOCTL makes
              * a real tty do it - independent of the guest's ECHO, which is off
              * in exactly the raw-mode editors that care. */
-            const char* note = (c == TTY_CC_VINTR) ? "^C\r\n" : "^Z\r\n";
-            sig = (c == TTY_CC_VINTR) ? UAPI_SIGINT : UAPI_SIGTSTP;
+            const bool  ctrl_c = (vintr && c == vintr);
+            char        note[4];
+            tty_caret_note(c, note);
+            sig = ctrl_c ? UAPI_SIGINT : UAPI_SIGTSTP;
             pty->slave_line_len = 0;
             if (echo_len + 4 <= sizeof(echo)) {
                 memcpy(echo + echo_len, note, 4);
@@ -12324,7 +12398,7 @@ static size_t userland_pty_master_put(struct userland_pty* pty, const uint8_t* s
             ++done;
             continue;
         }
-        if (c == TTY_CC_ERASE) {
+        if (verase && c == verase) {
             /* One Backspace takes one character out of the line under
              * construction, however many bytes of UTF-8 it took to type. */
             if (pty->slave_line_len) {
@@ -12342,7 +12416,7 @@ static size_t userland_pty_master_put(struct userland_pty* pty, const uint8_t* s
             ++done;
             continue;
         }
-        if (c == TTY_CC_VEOF) {
+        if (veof && c == veof) {
             /* Ctrl-D: the pending line goes as it stands; on an empty line it
              * is end-of-file, which read() reports as 0. */
             if (pty->slave_line_len) {
@@ -13547,9 +13621,9 @@ static int64_t userland_pty_ioctl(struct userland_pty* pty, bool master, uint64_
             t.c_iflag = pty->iflag;
             t.c_oflag = pty->oflag;
             t.c_lflag = pty->lflag;
+            memcpy(t.c_cc, pty->cc, TTY_CC_NCCS);
             spin_unlock(&pty->lock);
             t.c_cflag = 0x30 | 0x80 | 0xF;  // CS8 | CREAD | B38400, as the console reports
-            t.c_cc[6] = 1;                  // VMIN
             t.c_ispeed = t.c_ospeed = 0xF;  // B38400
             memcpy(arg, &t, sizeof(t));
             return 0;
@@ -13558,14 +13632,16 @@ static int64_t userland_pty_ioctl(struct userland_pty* pty, bool master, uint64_
         case UAPI_TCSETSW:
         case UAPI_TCSETSF:
             /* The guest's modes are honoured for the flags that shape both
-             * directions: ICANON / ECHO / ECHOE on input, ONLCR on output. The
-             * rest is fixed, matching TCGETS above. */
+             * directions (ICANON / ECHO / ECHOE / ISIG on input, ONLCR on
+             * output) and for the c_cc characters the line discipline acts on.
+             * The rest is fixed, matching TCGETS above. */
             if (arg) {
                 const uapi_termios_t* t = arg;
                 spin_lock(&pty->lock);
                 pty->lflag = t->c_lflag;
                 pty->iflag = t->c_iflag;
                 pty->oflag = t->c_oflag;
+                memcpy(pty->cc, t->c_cc, TTY_CC_NCCS);
                 spin_unlock(&pty->lock);
             }
             return 0;
@@ -15928,6 +16004,7 @@ static void userland_siginject(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
         return;   // disposition changed behind our back; nothing to run
     }
     atomic_store_uint32(&ctx->sig_inflight, 1);
+    atomic_store_uint32(&ctx->sig_inflight_sig, sig);
 
     struct vp_sigframe frame;
     frame.magic = VP_SIGFRAME_MAGIC;
@@ -15947,6 +16024,7 @@ static void userland_siginject(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
         // rather than corrupting anything.
         rvvm_warn("Signal %u dropped: stack frame %llx outside guest RAM", sig, (long long)frame_addr);
         atomic_store_uint32(&ctx->sig_inflight, 0);
+        atomic_store_uint32(&ctx->sig_inflight_sig, 0);
         return;
     }
     memcpy(host_frame, &frame, sizeof(frame));
@@ -15976,6 +16054,7 @@ static void userland_sigrestore(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
     }
     rvvm_write_cpu_reg(cpu, RVVM_REGID_PC, frame->pc);
     atomic_store_uint32(&ctx->sig_inflight, 0);
+    atomic_store_uint32(&ctx->sig_inflight_sig, 0);
 }
 
 /*
@@ -18320,10 +18399,40 @@ static void* rvvm_user_thread_wrap(void* arg)
                     }
                     break;
                 }
-                case 135: // rt_sigprocmask
-                    rvvm_info("sys_rt_sigprocmask(%ld, %lx, %lx, %lx)", a0, a1, a2, a3);
-                    a0 = errno_ret(sigprocmask(a0, to_ptr(a1), to_ptr_wr(a2)));
+                case 135: { // rt_sigprocmask
+                    /* The mask itself is not modelled - except for one thing it
+                     * decides: a handler that longjmps out instead of returning
+                     * through the frame's rt_sigreturn (busybox ash's SIGINT
+                     * handler does exactly that, via raise_interrupt()) leaves
+                     * sig_inflight set, and on a real kernel the thread's mask
+                     * would stay blocked with it. What clears it there is the
+                     * guest unblocking the signal itself - ash's INT_ON, which
+                     * wraps every read_line_input(). Without that, the next ^C
+                     * would sit in sig_pending forever and turn every poll() in
+                     * the session into an instant EINTR: a shell that answers no
+                     * more keys, with the whole session spinning. */
+                    rvvm_userland_t* ctx = uctx();
+                    int how = (int)a0;
+                    const uint64_t* set = (a1 && a3 >= sizeof(uint64_t)) ? to_ptr(a1) : NULL;
+                    rvvm_info("sys_rt_sigprocmask(%ld, %lx, %lx, %lx)", (long)a0, (unsigned long)a1,
+                              (unsigned long)a2, (unsigned long)a3);
+                    int host_ret = sigprocmask(how, to_ptr(a1), to_ptr_wr(a2));
+                    if (set && atomic_load_uint32(&ctx->sig_inflight)) {
+                        uint32_t inflight = atomic_load_uint32(&ctx->sig_inflight_sig);
+                        if (inflight) {
+                            bool in_set = (set[(inflight - 1) >> 6] &
+                                           (1ULL << ((inflight - 1) & 63))) != 0;
+                            bool unblocked = (how == UAPI_SIG_UNBLOCK && in_set) ||
+                                             (how == UAPI_SIG_SETMASK && !in_set);
+                            if (unblocked) {
+                                atomic_store_uint32(&ctx->sig_inflight, 0);
+                                atomic_store_uint32(&ctx->sig_inflight_sig, 0);
+                            }
+                        }
+                    }
+                    a0 = errno_ret(host_ret);
                     break;
+                }
                 case 137: { // rt_sigtimedwait_time32
                     /* The one process-wide pending slot is the whole signal
                      * queue here (see userland_deliver_signal), so this waits
@@ -19308,6 +19417,7 @@ static void jump_start(size_t entry, size_t stack_top, const char* image_path,
     ctx->tty_in_eof      = false;
     ctx->tty_lflag       = TTY_LFLAG_DEFAULT;
     ctx->tty_iflag       = TTY_IFLAG_DEFAULT;
+    tty_cc_init(ctx->tty_cc);
     spin_unlock(&ctx->tty_in_lock);
 
     // Past the reset above, so a host may feed this guest's console from now
@@ -19975,6 +20085,7 @@ static bool guest_exec(rvvm_userland_t* ctx, rvvm_hart_t* cpu, rvvm_user_thread_
      * the wrap loop consumes it before dispatching any syscall.) */
     memset(ctx->siga, 0, sizeof(ctx->siga));
     atomic_store_uint32(&ctx->sig_inflight, 0);
+    atomic_store_uint32(&ctx->sig_inflight_sig, 0);
     ctx->sig_frame = 0;
 
     rvvm_addr_t sp = guest_setup_stack(ctx, argc, argv, envp);
@@ -20235,6 +20346,7 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
     // Terminal state before the guest changes it - must match the TCGETS
     // answer in user_tty_ioctl(): canonical, echoing, line editing.
     ctx->tty_lflag    = TTY_LFLAG_DEFAULT;
+    tty_cc_init(ctx->tty_cc);
     machine->userdata = ctx;
 
     /* The default prefix, through the setter and here rather than among the field

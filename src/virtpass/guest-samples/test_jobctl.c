@@ -21,6 +21,11 @@
  *      with tcsetpgrp(), and ^C written to the *master* is what the pty's ISIG
  *      delivers - the notation is echoed back and the job dies with
  *      128+SIGINT. This is the shape a session of `rvvm_ash --serve` will use.
+ *   3b. the c_cc table: TCGETS has to report the control characters (VINTR ^C,
+ *      VEOF ^D, VERASE DEL, VMIN 1) and a changed one has to be what the
+ *      discipline acts on. A line editor in raw mode recognises its own keys by
+ *      the c_cc it read (busybox's ash does for ^C), so a tty answering VINTR =
+ *      0 would make ^C at an idle prompt a dead key: no signal, no newline.
  *   4. the same session resized: TIOCSWINSZ on the master must raise SIGWINCH
  *      in the foreground group (a full-screen program only re-lays itself out
  *      when it receives it), and the new size must be what the slave reads.
@@ -261,6 +266,109 @@ static void on_winch(int sig)
     (void)sig;
     ssize_t n = write(1, "WINCH\n", 6);
     (void)n;
+}
+
+/* --- 3b: the c_cc table is part of the contract ---
+ *
+ * An interactive line editor runs the terminal raw - ICANON, ECHO and ISIG all
+ * off - and then has to recognise its own keys from the bytes it reads, by
+ * comparing them with the c_cc it got from TCGETS. busybox's ash does exactly
+ * that for ^C (libbb/lineedit.c, default branch: "initial_settings.c_cc[VINTR]
+ * != 0 && ic_raw == initial_settings.c_cc[VINTR]"), so a tty that answers
+ * VINTR = 0 leaves ^C at an idle prompt as a dead key: no signal (ISIG is off),
+ * no match either, no newline. This is the check that keeps that from coming
+ * back, and the proof that the key the guest sets is the key the discipline
+ * acts on. */
+static void test_pty_cc(void)
+{
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    check(master >= 0, "posix_openpt() for the c_cc checks");
+    if (master < 0) {
+        return;
+    }
+    grantpt(master);
+    unlockpt(master);
+    const char* name = ptsname(master);
+    if (!name) {
+        check(0, "ptsname() for the c_cc checks");
+        close(master);
+        return;
+    }
+    char slave_path[64];
+    snprintf(slave_path, sizeof(slave_path), "%s", name);
+    int slave = open(slave_path, O_RDWR);
+    check(slave >= 0, "open() the slave for the c_cc checks");
+    if (slave < 0) {
+        close(master);
+        return;
+    }
+
+    /* What a fresh terminal answers. VINTR is the one a raw-mode line editor
+     * matches ^C against; VMIN is what a guest reads back and acts on. */
+    struct termios t;
+    memset(&t, 0, sizeof(t));
+    check(tcgetattr(slave, &t) == 0, "tcgetattr() on a fresh pty");
+    check(t.c_cc[VINTR] == 0x03 && t.c_cc[VEOF] == 0x04
+          && t.c_cc[VERASE] == 0x7F && t.c_cc[VMIN] == 1,
+          "TCGETS reports the control characters (VINTR ^C, VEOF ^D, VERASE DEL, VMIN 1)");
+
+    t.c_cc[VINTR] = 0x18;   /* ^X */
+    check(tcsetattr(slave, TCSANOW, &t) == 0, "tcsetattr() with VINTR = ^X");
+    struct termios back;
+    memset(&back, 0, sizeof(back));
+    check(tcgetattr(slave, &back) == 0 && back.c_cc[VINTR] == 0x18,
+          "TCGETS reads the changed VINTR back");
+
+    pid_t child = fork();
+    if (child == 0) {
+        close(master);
+        setsid();
+        ioctl(slave, TIOCSCTTY, 0);
+        dup2(slave, 0);
+        dup2(slave, 1);
+        dup2(slave, 2);
+        if (slave > 2) {
+            close(slave);
+        }
+        delay_ms(5000);
+        _exit(7);
+    }
+    if (child < 0) {
+        check(0, "fork() for the c_cc checks");
+        close(slave);
+        close(master);
+        return;
+    }
+    delay_ms(300);
+    int fg = (int)child;
+    check(ioctl(slave, TIOCSPGRP, &fg) == 0, "tcsetpgrp() for the c_cc checks");
+
+    struct pollfd pfd = { master, POLLIN, 0 };
+
+    /* ^C is no longer the interrupt key: the byte is data, so what comes back is
+     * the byte itself, not the "^C" notation, and nothing is signalled. */
+    const char ctrl_c = 0x03;
+    check(write(master, &ctrl_c, 1) == 1, "write ^C to the master; VINTR is ^X now");
+    char raw[16] = {0};
+    int got = (poll(&pfd, 1, 500) > 0) ? (int)read(master, raw, sizeof(raw)) : -1;
+    check(got == 1 && raw[0] == ctrl_c,
+          "with VINTR = ^X the ^C byte is data (echoed verbatim, no ^C notation)");
+    int st = 9;
+    check(waitpid(child, &st, WNOHANG) == 0, "and the job is still running");
+
+    /* The key the guest set is the one that interrupts now. */
+    const char ctrl_x = 0x18;
+    check(write(master, &ctrl_x, 1) == 1, "write the new VINTR (^X) to the master");
+    char echo[32] = {0};
+    got = (poll(&pfd, 1, 1000) > 0) ? (int)read(master, echo, sizeof(echo) - 1) : -1;
+    check(got > 0 && strstr(echo, "^X") != NULL,
+          "the line discipline echoes the new notation");
+    check(waitpid(child, &st, 0) == child && WIFEXITED(st)
+          && WEXITSTATUS(st) == 128 + SIGINT,
+          "and ^X is what kills the job (128+SIGINT)");
+
+    close(slave);
+    close(master);
 }
 
 /* --- 4: a resize on the terminal reaches the session's foreground group ---
@@ -504,6 +612,7 @@ int main(void)
     test_identity();
     test_group_stop();
     test_pty_sigint();
+    test_pty_cc();
     test_pty_winch();
     test_ctty();
 
