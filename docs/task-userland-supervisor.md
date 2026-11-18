@@ -75,10 +75,11 @@
 
 ### 过程坑（本轮新增）
 
-- **双 daemon 脑裂**：两个 `supervisor.py` 同时声称绑 7911（SO_REUSEADDR 语义），请求按
-  连接分落到两个进程、两个 DB——`rm` 时好时坏（RemoteDisconnected）。托盘 daemon 还持有
-  删库前的旧文件句柄（Windows 上打开着的文件删不掉），一直答旧库。处置：只留托盘登记的
-  一个；已登记 issues（daemon 应检测端口已占即退出）。
+- **双 daemon 脑裂**：两个 `supervisor.py` 同时声称绑 7911（SO_REUSEADDR 在 Windows 上
+  允许绑正在 LISTEN 的端口），请求按连接分落到两个进程——`rm` 时好时坏
+  （RemoteDisconnected）。已确证两者答的 DB 内容不同（杀其一后 list 由 4 行变空），
+  即两者持有的不是同一文件实例；具体机制待证（候选与矛盾见 issues 条目）。
+  处置：只留托盘登记的一个；已登记 issues（daemon 应检测端口已占即退出）。
 - **watch 包装吞输出**：多命令拼接的输出只剩第一行，且后续命令实际都执行了（一次起了
   4 个实例）。判据看落盘文件，一条命令一个文件。
 
