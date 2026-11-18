@@ -48,6 +48,7 @@ static void print_usage(const char* self)
     fprintf(stderr,
             "usage: %s --serve [--idle S] [--dlog <guest-path>] [--memfs]\n"
             "          [--cmdline <linux-args>] [--port N]\n"
+            "          [--rootfs <dir>]\n"
             "       %s --list\n"
             "\n"
             "  %s --serve          run the core: one run (one machine, one rootfs)\n"
@@ -93,6 +94,7 @@ int main(int argc, char** argv)
     bool        memfs   = false;
     const char* dlog    = NULL;
     const char* cmdline = NULL;
+    const char* rootfs  = NULL;
     int         idle    = 0;
     int         port    = ash_port();
     int         i       = 1;
@@ -131,6 +133,10 @@ int main(int argc, char** argv)
             port = atoi(argv[++i]);
         } else if (!strncmp(a, "--port=", 7)) {
             port = atoi(a + 7);
+        } else if (!strcmp(a, "--rootfs") && i + 1 < argc) {
+            rootfs = argv[++i];
+        } else if (!strncmp(a, "--rootfs=", 9)) {
+            rootfs = a + 9;
         } else if (!strcmp(a, "--shutdown") || !strcmp(a, "--sock-path") ||
                    !strcmp(a, "--no-autostart")) {
             /* Verbs (and a flag) of the client era. The AF_UNIX endpoint and
@@ -155,6 +161,11 @@ int main(int argc, char** argv)
     ash_install_termination_handler();
 
     /* Before any mode runs: it belongs to the run this process starts. */
+    if (rootfs && memfs) {
+        fprintf(stderr, "%s: --rootfs and --memfs are mutually exclusive\n",
+                argv[0]);
+        return ASH_EXIT_USAGE;
+    }
     win32_host_set_volatile_rootfs(memfs);
 
     if (list) {
@@ -180,5 +191,5 @@ int main(int argc, char** argv)
      * from --cmdline on top, which has to be the later of the two or a run
      * asked to be loud would not be. */
     rvvm_set_loglevel(getenv("RVVM_VERBOSE") ? LOG_INFO : LOG_WARN);
-    return ash_serve(port, idle, dlog, cmdline);
+    return ash_serve(port, idle, dlog, cmdline, rootfs);
 }

@@ -73,7 +73,8 @@ void ash_install_termination_handler(void);
  * process's logging, which is set below and would be undone by a caller that set
  * it earlier. root= is passed on to the machine.
  */
-int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline);
+int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline,
+              const char* rootfs_dir);
 int ash_client(int port, const char* one_cmd, bool autostart);
 int ash_list(void);
 int ash_shutdown(int port);

@@ -12,6 +12,9 @@
 | `design-fd-ownership.md` | 设计 | **不是现状**：宿主号按 address space 私有的所有权模型——号私有、对象共享、不变量、改造前后对比、两阶段落地顺序。冻结于 2026-11-18 |
 | `todo-fd-ownership.md` | 待办 | P1 fork 私有化 / P2 锚号独立 + poll 归类 / P3 删除剩余防御机制，含优先级、依赖与验收标准 |
 | `task-fd-ownership.md` | 执行 | fd 所有权改造的恢复点：起点状态、P1 精确改动点、验证命令、进度勾选。分支 `fd-ownership` |
+| `design-userland-supervisor.md` | 设计 | **不是现状**：userland supervisor（实例管理 daemon + SQLite + CLI）的架构、事实源与 reconcile、API 面、验收线。冻结于 2026-11-18 |
+| `todo-userland-supervisor.md` | 待办 | S1 daemon / S2 CLI（已完成）/ S3 web 后台，含风险与全局验收 |
+| `task-userland-supervisor.md` | 执行 | supervisor 预览的执行记录：交付物、验收结果、过程坑与遗留 |
 | `arch-virtpass.md` | 现状 | 宿主侧：VirtPass 抽象层与 ABI 跟随规则、代码位置、bundle `--app` 启动面、console attach、vpsessiond 日志、日志 sink + ring。最后核对 2026-11-17（源自原根目录 `DEV.md`） |
 | `hist-lessons.md` | 教训 | 大 C 单文件改动、Windows 构建/运行、合成 VFS、外部工具的数据质量反噬、调试方法、测试纪律、设计推演、内存泄漏排查方法（源自原根目录 `dev_debug_notes.md`） |
 | `fix-userland-hart-registration.md` | 修复史 | userland hart 未入 `machine->harts` → 每次 fork 漏 16 MiB RVJIT 堆：现象 / 根因 / 修法 / 验证 |

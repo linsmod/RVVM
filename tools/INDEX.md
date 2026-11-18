@@ -40,6 +40,13 @@
 | `axis_android_sources.ps1` | NDK 构建与 make 构建编译的是否同一批 RVVM 源码 |
 | `axis_android_sources_selftest.ps1` | 上述门禁的自测 |
 
+## 管理面（userland as service 预览）
+
+| 脚本 | 内容 |
+|---|---|
+| `supervisor/supervisor.py` | userland supervisor daemon：`rvvm_ash --serve` 实例的起停/清单/日志/审计，SQLite 状态机 + reconcile。**仅标准库**。设计与用法见 `../docs/design-userland-supervisor.md` |
+| `supervisor/us.py` | 上面的 CLI：`us list/start/stop/rm/logs/exec/health`（thin HTTP client） |
+
 ## 打包 / 生成 / 安装
 
 | 脚本 | 内容 |

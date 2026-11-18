@@ -229,6 +229,12 @@ static char g_guest_cmdline[RVVM_CMDLINE_MAX];
  * nothing behind and whose / dies with it (see rvvm_user_root_memfs). */
 static bool g_volatile_rootfs = false;
 
+/* The directory the bundle is materialized into, when a run asked for one
+ * (--rootfs): one rootfs per instance is what lets several cores live
+ * beside each other, each behind its own lock. NULL = the release default. */
+static char g_rootfs_dir[MAX_PATH];
+static bool g_rootfs_dir_set = false;
+
 /* Host-side suspend/resume guards. The machine handle only exists while a guest
  * is booted, so every host control call goes through these instead of testing
  * g_guest_machine at each call site. */
@@ -1190,6 +1196,16 @@ void win32_host_no_stdin(void)
 void win32_host_set_volatile_rootfs(bool on)
 {
     g_volatile_rootfs = on;
+}
+
+void win32_host_set_rootfs_dir(const char* dir)
+{
+    if (dir && dir[0]) {
+        snprintf(g_rootfs_dir, sizeof(g_rootfs_dir), "%s", dir);
+        g_rootfs_dir_set = true;
+    } else {
+        g_rootfs_dir_set = false;
+    }
 }
 
 void win32_host_set_cmdline(const char* str)
@@ -3200,9 +3216,12 @@ static void win32_guest_rootfs_mount(rvvm_machine_t* machine, const char* app_id
 
     /* NULL @dest when the run asked to keep the tree in memory: the bundle is then
      * released into the run's own root filesystem rather than onto the host, and
-     * there is nothing here to name as a directory. */
+     * there is nothing here to name as a directory. A --rootfs directory replaces
+     * the release default - one rootfs per instance is what lets several cores
+     * run beside each other. */
     {
-        const char* dest_dir = g_volatile_rootfs ? NULL : dest;
+        const char* dest_dir = g_volatile_rootfs ? NULL :
+                               (g_rootfs_dir_set ? g_rootfs_dir : dest);
 
         if (!vp_bundle_mount(machine, archive,
                              GetFileAttributesA(system_archive) != INVALID_FILE_ATTRIBUTES ? system_archive : NULL,

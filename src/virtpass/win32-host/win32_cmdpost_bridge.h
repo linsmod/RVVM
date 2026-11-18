@@ -108,6 +108,12 @@ void win32_host_set_cmdline(const char* str);
 // is written outside the run. Set before win32_host_start_guest().
 void win32_host_set_volatile_rootfs(bool on);
 
+// Materialize the bundle into this directory instead of <exe>\runtime\rootfs:
+// one rootfs per instance is what lets several cores run beside each other.
+// Cleared by NULL. Ignored when the volatile (memory) rootfs is asked for.
+// Set before win32_host_start_guest().
+void win32_host_set_rootfs_dir(const char* dir);
+
 /*
  * The next run is a core: a machine kept up for clients rather than a one-shot
  * command, serving a session per client (see vp_core.h). The control terminal a

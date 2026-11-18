@@ -428,17 +428,40 @@ static bool ash_core_starting(int port)
 /* ------------------------------------------------------------------ */
 /* The rootfs lock                                                     */
 /*                                                                    */
-/* `runtime/rootfs` is the persisted writable layer, and its state is  */
-/* not safe for two machines at once - two cores on different ports    */
-/* would still share it. One lock file beside the tree (with the pid)  */
-/* serializes them, the same way the port registry does for a port.    */
+/* The rootfs a run materializes is not safe for two machines at once - */
+/* two cores sharing one directory would corrupt each other's writes.  */
+/* One lock file beside the rootfs (with the pid) serializes them, the  */
+/* same way the port registry does for a port. The default rootfs keeps */
+/* its historical lock name; a per-instance rootfs (--rootfs <dir>)     */
+/* carries the lock inside its own directory, so instances on distinct  */
+/* directories never contend.                                           */
 /* ------------------------------------------------------------------ */
+
+/* The rootfs directory this run materializes, or NULL for the release's
+ * default (<exe>\runtime\rootfs). Set from --rootfs. */
+static char ash_rootfs_dir[MAX_PATH];
+static bool ash_rootfs_dir_set = false;
+
+static bool ash_rootfs_dir_path(char* out, size_t size)
+{
+    if (!ash_rootfs_dir_set) {
+        return false;
+    }
+    snprintf(out, size, "%s", ash_rootfs_dir);
+    return true;
+}
 
 static bool ash_lock_path(char* out, size_t size)
 {
     char exe_dir[MAX_PATH];
     char runtime[MAX_PATH];
 
+    if (ash_rootfs_dir_set) {
+        /* A per-instance rootfs locks inside its own directory: the lock
+         * lives and dies with the tree it guards. */
+        CreateDirectoryA(ash_rootfs_dir, NULL);
+        return snprintf(out, size, "%s\\.ash.lock", ash_rootfs_dir) < (int)size;
+    }
     if (!ash_exe_directory(exe_dir, sizeof(exe_dir))) {
         return false;
     }
@@ -449,12 +472,17 @@ static bool ash_lock_path(char* out, size_t size)
 }
 
 /* Where a run keeps the permission bits the host filesystem cannot hold:
- * beside the persisted rootfs, so the two live and are cleared together. */
+ * beside the persisted rootfs, so the two live and are cleared together.
+ * A per-instance rootfs keeps its modes inside its own directory. */
 static bool ash_mode_store_path(char* out, size_t size)
 {
     char exe_dir[MAX_PATH];
     char runtime[MAX_PATH];
 
+    if (ash_rootfs_dir_set) {
+        return snprintf(out, size, "%s\\rootfs.modes", ash_rootfs_dir) <
+               (int)size;
+    }
     if (!ash_exe_directory(exe_dir, sizeof(exe_dir))) {
         return false;
     }
@@ -611,8 +639,16 @@ void ash_install_termination_handler(void)
     }
 }
 
-int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline)
+int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline,
+              const char* rootfs_dir)
 {
+    if (rootfs_dir && rootfs_dir[0]) {
+        /* The bundle is materialized here instead of the release's own
+         * runtime\rootfs: one directory per instance is what lets several
+         * cores live beside each other, each behind its own lock. */
+        snprintf(ash_rootfs_dir, sizeof(ash_rootfs_dir), "%s", rootfs_dir);
+        ash_rootfs_dir_set = true;
+    }
     const char* shell = ash_default_core_shell();
     const char* init_arg;
     char        port_buf[16];
@@ -708,6 +744,7 @@ int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline)
      * root= is applied inside win32_host_start_guest(), after the bundle mount,
      * so that a command line overrides the image rather than the other way
      * round. */
+    win32_host_set_rootfs_dir(ash_rootfs_dir_set ? ash_rootfs_dir : NULL);
     win32_host_set_cmdline(cmdline);
 
     /* The guest's permission bits outlive this process: the host filesystem
