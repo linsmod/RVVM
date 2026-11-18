@@ -200,6 +200,10 @@ ssh 客户端 ──TCP 7900──> vpshhd ──> tinysshd(会话主, 如 pid 1
 
 后果与候选方案见 `../issues/fork-shared-crt-fd-space.md`。
 
+## 12. 下一步（非现状）
+
+第 10、11 节描述的是现状，其中三条约束的解法不在本文范围：目标是**宿主号按 address space 私有**——每个槽独占自己的号，共享只发生在对象层（inode / pty / SOCKET），于是「号会不会被别人关掉」这个问题不再需要回答。目标形态、不变量与改造前后对比见 `design-fd-ownership.md`；实施阶段与验收见 `../issues/fork-shared-crt-fd-space.md`。
+
 ## 相关文件
 
 - `src/core/rvvm_user.c` —— 槽表、`userland_fd_host`、`userland_fd_slot_alloc`、`userland_fds_write`、`userland_fd_close`、`userland_fd_table_inherit`、`host_fd_acquire/release`、`sys_read`/`sys_write`（case 63/64）
