@@ -7453,11 +7453,85 @@ static bool userland_parent_alive(rvvm_process_t* proc)
 #define FD_TRACE_LO 0
 #define FD_TRACE_HI 12
 
+/* ---- host descriptor references ---------------------------------------- *
+ * A fork() is served in-process, so a parent and its child are two address
+ * spaces sharing one host CRT table. Each slot files the host number it rides
+ * on, and more than one slot can name the same number: a fork that could not
+ * make a copy, and - the case that matters - a slot that is closed in one
+ * address space while the number has already been handed out again in another.
+ * Closing on the strength of "my slot said 8" then takes the descriptor out
+ * from under whoever owns 8 now, and the symptom is a pipe write that answers
+ * EBADF with a slot that still reads host=8.
+ *
+ * So a host number is not closed by whoever happens to name it last, but only
+ * when the last *reference* to it goes: every slot that files the number takes
+ * one, every slot that stops filing it gives one back, and the CRT close()
+ * happens exactly once, when the count reaches zero. Anchor numbers are not
+ * counted here - win_socket_anchor_ref/unref already own that number space,
+ * and a synthetic (memfs/pty/proc/dev) number never reaches the CRT. */
+#define HOST_FD_REF_MAX 4096
+
+static int        host_fd_refs[HOST_FD_REF_MAX];
+static spinlock_t host_fd_ref_lock = SPINLOCK_INIT;
+
+static bool host_fd_counted(int host_fd, rvvm_fd_backend_t backend)
+{
+    /* An anchor keeps its own reference (win_socket_anchor_ref/unref), and the
+     * live-anchor test is the generation the slot files, not "some socket
+     * object answers to this number": an anchor number that has been given back
+     * still sits in the CRT table until its NUL fd is closed, and reading that
+     * as a live anchor would leave the pipe filed under the same number
+     * uncounted - the surplus release that closed a sibling's descriptor. */
+    return backend == FD_BACKEND_HOST && host_fd >= 0 &&
+           host_fd < HOST_FD_REF_MAX && win_socket_anchor_gen(host_fd) == 0;
+}
+
+static void host_fd_acquire(int host_fd)
+{
+    if (host_fd < 0 || host_fd >= HOST_FD_REF_MAX) {
+        return;
+    }
+    spin_lock(&host_fd_ref_lock);
+    host_fd_refs[host_fd]++;
+    spin_unlock(&host_fd_ref_lock);
+}
+
+/* Hand one reference back. Only the one that takes the count to zero closes
+ * the host descriptor - and a slot that gives back a reference it never took
+ * (count already zero) closes nothing: that is the repeated close of a slot
+ * whose number already went round the CRT allocator once. */
+static void host_fd_release(int host_fd)
+{
+    bool last = false;
+
+    if (host_fd < 0 || host_fd >= HOST_FD_REF_MAX) {
+        return;
+    }
+    spin_lock(&host_fd_ref_lock);
+    if (host_fd_refs[host_fd] > 0) {
+        last = host_fd_refs[host_fd] == 1;
+        host_fd_refs[host_fd]--;
+    }
+    spin_unlock(&host_fd_ref_lock);
+    if (last) {
+        close(host_fd);
+    }
+}
+
 static void userland_fds_write(rvvm_userland_t* ctx, int fd,
                                bool used, int host_fd, bool cloexec,
                                bool shared, rvvm_fd_backend_t backend,
                                uint32_t flags, const char* op)
 {
+    /* The old number gives its reference back and the new one takes its own,
+     * both after the rewrite below (host_fd_acquire/release). The same number
+     * on both sides is a re-filing of one slot, not a hand-over, so neither
+     * happens - that is what keeps a fork's double write of one slot honest. */
+    int  old_host    = ctx->fds[fd].fd;
+    bool old_counted = ctx->fds[fd].used &&
+                       host_fd_counted(old_host, ctx->fds[fd].backend);
+    bool new_counted = used && host_fd_counted(host_fd, backend);
+
     /* The slot is rewritten wholesale; the anchor reference it holds is *not*
      * adjusted here. This function is also called to re-file a slot that keeps
      * naming the same anchor (fork() copies a slot through it and then again for
@@ -7475,6 +7549,12 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
      * filed; a slot riding on no anchor records 0, which never matches a live one
      * (so a console and a plain host fd are never treated as recycled). */
     ctx->fds[fd].anchor_gen = used ? win_socket_anchor_gen(host_fd) : 0;
+    if (old_counted && (!new_counted || old_host != host_fd)) {
+        host_fd_release(old_host);
+    }
+    if (new_counted && (!old_counted || old_host != host_fd)) {
+        host_fd_acquire(host_fd);
+    }
     if (fd >= FD_TRACE_LO && fd <= FD_TRACE_HI) {
         RVVM_TRC(RVVM_TRC_FD, "fd_wr[%s] pid=%u fd=%d used=%d host=%d gen=%llu clo=%d sh=%d be=%d fl=%x",
                   op, (unsigned)ctx->pid, fd, (int)used, host_fd,
@@ -7955,19 +8035,25 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
         userland_proc_fd_release(ctx->fds[fd].fd);
     } else if (!ctx->fds[fd].shared && !userland_dev_by_fd(ctx->fds[fd].fd, NULL)) {
         /* A device descriptor is just a number: nothing was opened for it. */
-        if (win_socket_is_fd(ctx->fds[fd].fd)) {
+        /* Whether *this slot* names an anchor is a question only the slot can
+         * answer: the anchor and CRT numbers are separate spaces that happen to
+         * share digits, so asking win_socket_is_fd() here turns a plain file's
+         * descriptor 5 into the listener's anchor the moment an anchor 5 exists
+         * - and the close below then shuts the listener down. anchor_gen is
+         * recorded when the number is filed, so it is zero for a file that
+         * landed on 5 before any anchor did. */
+        if (ctx->fds[fd].anchor_gen != 0) {
             /* A socket anchor: the socket goes now, the CRT number only once
              * nothing names it (this call drops this slot's reference). */
             win_socket_close(ctx->fds[fd].fd);
             ctx->fds[fd].holds_anchor_ref = false;
         } else {
-            close(ctx->fds[fd].fd);
-            /* A reference is only given back if this slot took one. Asking
-             * whether the number looks like an anchor instead is what let the
-             * two sides disagree: a slot can name a number whose anchor has
-             * since been recycled, and then "drop a reference" either closes a
-             * stranger's descriptor or refuses a reference that was never
-             * there. The slot already knows. */
+            /* The CRT number is not closed here: the slot gives its reference
+             * on it back through the write below, and only the last reference
+             * closes it (see host_fd_release). Closing because this slot names
+             * the number is what took a descriptor out from under a fork
+             * sibling that had already been handed the same number - the pipe
+             * write that answered EBADF with a slot still reading host=8. */
             if (ctx->fds[fd].holds_anchor_ref) {
                 win_socket_anchor_unref(ctx->fds[fd].fd);
                 ctx->fds[fd].holds_anchor_ref = false;
@@ -8742,6 +8828,7 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
             userland_fd_set_path(child, fd, parent->fds[fd].path);
         }
     }
+
 }
 
 /* Drop every record and restart the id space: a new run on this machine must not
