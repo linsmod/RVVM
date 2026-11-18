@@ -1255,6 +1255,15 @@ static int cmd_shell(int argc, char** argv)
     return exit_code;
 }
 
+/* The line this client types behind an exec-out command on a session, to learn
+ * that the command finished: a shell that cannot be ended by EOF can still be
+ * asked a question. Spelled long enough not to collide with ordinary output, and
+ * the status digits follow it with nothing in between (see cmd_exec_out). */
+#define VP_RC_TAG  "__vp_rc__"
+/* How much of the transcript to hold back so the status line is never printed,
+ * even when it is split across two packets. */
+#define VP_RC_KEEP 32
+
 static int cmd_exec_out(int argc, char** argv)
 {
     bool core = false;
@@ -1287,46 +1296,94 @@ static int cmd_exec_out(int argc, char** argv)
     if (!ok) {
         return 1;
     }
-    if (core) {
-        /* A core's shell is interactive and does not exit with the command, so
-         * there is no exit packet coming and no exit code to report. Typed into
-         * a session like any other input; the command then closes the session's
-         * stdin, which is the EOF that makes the shell exit - and the session
-         * ending is what ends the connection (see vp_console.c conn_writer), so
-         * the transcript below drains and ends instead of streaming forever. */
-        send_packet(VP_ID_CLOSESTDIN, NULL, 0);
-        char* body = NULL;
-        size_t blen = 0;
-        for (;;) {
-            int id = recv_packet(&body, &blen);
-            if (id < 0) {
-                break;
-            }
-            if (id == VP_ID_STDOUT || id == VP_ID_STDERR) {
-                fwrite(body ? body : "", 1, blen, stdout);
-                fflush(stdout);
-            }
-            free(body);
-            body = NULL;
+    /* A session on a core is not a command with an end: it is a shell sitting at
+     * a prompt, in a machine built to outlive this client. Neither half of what
+     * the loop below waits for ever happens there:
+     *
+     *   - no exit packet is coming, because nothing ends the run;
+     *   - and the connection does not close either. That would need the shell to
+     *     leave, and ^D does not make it: the shell asks the terminal where the
+     *     cursor is (ESC[6n) as it paints each prompt, and a byte delivered
+     *     inside that question is parsed as the answer to it and dropped.
+     *     Measured, not guessed - close-stdin, then silence, forever.
+     *
+     * What a shell does read is a line, so the completion signal is made one:
+     * the command is followed by a line that prints its status, and that line is
+     * where this client stops reading. Which also gives exec-out the exit code it
+     * never had on a core, and that is the half a driver needs.
+     */
+    int  local_port = 0;
+    bool session    = core || serial_is_local(d->serial, &local_port);
+    (void)local_port;
+    if (session) {
+        char rc_cmd[64];
+        int  n = snprintf(rc_cmd, sizeof(rc_cmd), "echo " VP_RC_TAG "$?\n");
+        if (n > 0 && (size_t)n < sizeof(rc_cmd)) {
+            send_packet(VP_ID_STDIN, rc_cmd, (size_t)n);
         }
-        free(body);
-        closesocket(console_fd);
-        console_fd = -1;
-        return 0;
     }
-    char* body = NULL;
-    size_t blen = 0;
+
+    /* Held back by VP_RC_KEEP, so the status line is never printed even when a
+     * packet boundary falls inside it, and so a tag at the very end of a packet
+     * can still wait for the digits that follow. */
+    char   acc[1024];
+    size_t acc_len   = 0;
+    bool   got_rc    = false;
     int    exit_code = 0;
+    char*  body      = NULL;
+    size_t blen      = 0;
     for (;;) {
         int id = recv_packet(&body, &blen);
         if (id < 0) {
             break;
         }
         if (id == VP_ID_STDOUT || id == VP_ID_STDERR) {
-            /* Raw to our own stdout, which is what exec-out means: the
-             * command's output and nothing else, so it can be redirected. */
-            fwrite(body ? body : "", 1, blen, stdout);
-            fflush(stdout);
+            if (!session) {
+                /* Raw to our own stdout, which is what exec-out means: the
+                 * command's output and nothing else, so it can be redirected. */
+                fwrite(body ? body : "", 1, blen, stdout);
+                fflush(stdout);
+            } else {
+                const char* chunk = body ? body : "";
+                size_t      left  = blen;
+                while (left && !got_rc) {
+                    size_t room = sizeof(acc) - acc_len;
+                    if (!room) {
+                        /* Full with no tag in it: print all but a tail that could
+                         * still be the first bytes of one. */
+                        size_t emit = acc_len - VP_RC_KEEP;
+                        fwrite(acc, 1, emit, stdout);
+                        memmove(acc, acc + emit, acc_len - emit);
+                        acc_len -= emit;
+                        room = sizeof(acc) - acc_len;
+                    }
+                    size_t take = left < room ? left : room;
+                    memcpy(acc + acc_len, chunk, take);
+                    acc_len += take;
+                    chunk   += take;
+                    left    -= take;
+
+                    size_t tag_len = sizeof(VP_RC_TAG) - 1;
+                    for (size_t i = 0; i + tag_len < acc_len; i++) {
+                        if (memcmp(acc + i, VP_RC_TAG, tag_len)) {
+                            continue;
+                        }
+                        /* The digit after the tag is what makes this the status
+                         * line rather than output that happens to contain the
+                         * tag: with the tag at the very end, wait for the next
+                         * packet instead of guessing. */
+                        if (acc[i + tag_len] < '0' || acc[i + tag_len] > '9') {
+                            continue;
+                        }
+                        fwrite(acc, 1, i, stdout);
+                        fflush(stdout);
+                        exit_code = atoi(acc + i + tag_len);
+                        got_rc    = true;
+                        acc_len   = 0;
+                        break;
+                    }
+                }
+            }
         } else if (id == VP_ID_EXIT) {
             exit_code = body ? atoi(body) : 0;
             while (sock_wait(console_fd, 0) > 0) {
@@ -1342,8 +1399,15 @@ static int cmd_exec_out(int argc, char** argv)
         }
         free(body);
         body = NULL;
+        if (got_rc) {
+            break;
+        }
     }
     free(body);
+    if (acc_len) {
+        fwrite(acc, 1, acc_len, stdout);
+        fflush(stdout);
+    }
     closesocket(console_fd);
     console_fd = -1;
     return exit_code;

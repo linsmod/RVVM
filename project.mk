@@ -474,7 +474,10 @@ override android_build_type := $(call capitalize,$(ANDROID_VARIANT))
 
 # Samples to build: every guest program found in guest-samples/, so dropping a new
 # <name>.c there is enough to get it built and packed into the apps archive.
-override guest_samples := $(notdir $(basename $(filter %.c,$(call ls_dir,$(SRCDIR)/virtpass/guest-samples))))
+# vpshhd is the exception: it lives in that directory because it is guest source,
+# but it is a system program (SYSTEM_SAMPLES below), and the two build trees are
+# separate so neither packer ever has to know the other's names.
+override guest_samples := $(filter-out vpshhd,$(notdir $(basename $(filter %.c,$(call ls_dir,$(SRCDIR)/virtpass/guest-samples)))))
 GUEST_SAMPLES ?= $(guest_samples)
 
 # The APK's assets/ directory carries exactly two things: the tree an app's own
@@ -483,6 +486,11 @@ GUEST_SAMPLES ?= $(guest_samples)
 # tree that is also the APK's package.
 override ANDROID_ASSETS_DIR := $(ANDROID_HOST)/app/src/main/assets
 override GUEST_ASSETS_DIR   := $(BUILDDIR)/guest-assets
+# System programs get their own output tree. They are not apps (no manifest, no
+# per-id directory, they land at a fixed guest path in system.tar.gz), and keeping
+# them in a different directory from the samples is what lets pack-apps and
+# pack-system each be pointed at their own source and never at the other's.
+override SYSTEM_ASSETS_DIR  := $(BUILDDIR)/system-assets
 override GUEST_OBJ_DIR      := $(BUILDDIR)/guest-obj
 override GUEST_ZIG          := zig cc
 override GUEST_AR           := zig ar
@@ -495,10 +503,73 @@ override GUEST_HEADS := $(filter %.h,$(call ls_dir,$(INCDIR)/virtpass))
 override GUEST_LIBS  := $(GUEST_OBJ_DIR)/libandroid_stubs.a $(GUEST_OBJ_DIR)/libgles_stubs.a
 override guest_assets := $(addprefix $(GUEST_ASSETS_DIR)/,$(addsuffix .exe,$(GUEST_SAMPLES)))
 
+# System programs: guest ELFs the guest names at a fixed path and the host never
+# sees as an app. vpshhd is the SSH listener; tinysshd is built from the submodule
+# below (its own rule, its own flags).
+override SYSTEM_SAMPLES := vpshhd
+override system_assets  := $(addprefix $(SYSTEM_ASSETS_DIR)/,$(addsuffix .exe,$(SYSTEM_SAMPLES)))
+
+# tinysshd: the guest's SSH server, from the third_party submodule. It is a
+# *system* program (pack_system.py lays it out at /sbin/tinysshd), not a sample,
+# so it is built here and kept out of the app list on purpose.
+#
+# One multicall ELF: tinysshd.c dispatches on argv[0], which is why the "no
+# authentication" mode is a link named tinysshnoneauthd and not a second build.
+#
+# Two of its sources are replaced by copies in tinyssh-config/: the feature
+# probes (has*.c) are inputs to tryfeature.sh whose answers are fixed there, and
+# main_tinysshd.c / packet_auth.c carry the none-auth change described in
+# tinyssh-config/README.md. Everything else is the submodule verbatim.
+# third_party/ sits beside src/ and not under it: the host build collects its
+# sources with a recursive wildcard over SRCDIR, and a submodule in there would be
+# compiled into the host as well.
+override TINYSSH_DIR    := third_party/tinyssh
+override TINYSSH_CONFIG := third_party/tinyssh-config
+# The source set is listed, not wildcarded. Three kinds of file in this directory
+# are deliberately not built: has*.c are tryfeature.sh probes whose answers are
+# fixed in TINYSSH_CONFIG, _tinysshd-speed.c is a benchmark, and main_tinysshd.c
+# / packet_auth.c are replaced by the overlay copies below. A wildcard would have
+# to re-state those three exclusions in a form that silently breaks when upstream
+# adds a file; this list is what the build actually consumes, and a bump of the
+# submodule that adds a source is meant to be a visible edit here.
+override tinyssh_files := blocking.c buf.c byte.c channel.c channel_drop.c\
+	channel_fork.c channel_forkpty.c channel_subsystem.c cleanup.c coe.c\
+	connectioninfo.c crypto_dh_x25519.c crypto_hash_sha256.c\
+	crypto_hash_sha512_lib25519.c crypto_hash_sha512_tinyssh.c\
+	crypto_kem_sntrup761_libntruprime.c crypto_kem_sntrup761_tinyssh.c\
+	crypto_kem_sntrup761x25519.c crypto_onetimeauth_poly1305_lib1305.c\
+	crypto_onetimeauth_poly1305_tinyssh.c crypto_scalarmult_curve25519.c\
+	crypto_sign_ed25519_lib25519.c crypto_sign_ed25519_tinyssh.c\
+	crypto_sort_uint32.c crypto_stream_chacha20.c crypto_verify_16.c\
+	crypto_verify_32.c die.c dropuidgid.c e.c env.c fe.c fe25519.c ge25519.c\
+	getln.c global.c int16_optblocker.c int32_optblocker.c int64_optblocker.c\
+	int8_optblocker.c iptostr.c load.c log.c loginshell.c logsys.c\
+	main_tinysshd_makekey.c main_tinysshd_printkey.c newenv.c numtostr.c open.c\
+	p_closefrom.c p_login_tty.c p_openpty.c packet.c packet_channel_open.c\
+	packet_channel_recv.c packet_channel_request.c packet_channel_send.c\
+	packet_get.c packet_global_request.c packet_hello.c packet_kex.c\
+	packet_kexdh.c packet_put.c packet_recv.c packet_send.c\
+	packet_unimplemented.c packetparser.c porttostr.c randombytes.c randommod.c\
+	readall.c savesync.c sc25519.c sig.c ssh.c sshcrypto.c\
+	sshcrypto_cipher.c sshcrypto_cipher_chachapoly.c sshcrypto_kex.c\
+	sshcrypto_kex_curve25519.c sshcrypto_kex_sntrup761x25519.c\
+	sshcrypto_key.c sshcrypto_key_ed25519.c str.c stringparser.c\
+	subprocess_auth.c subprocess_sign.c tinysshd.c trymlock.c\
+	uint16_optblocker.c uint32_optblocker.c uint64_optblocker.c\
+	uint8_optblocker.c writeall.c
+override tinyssh_srcs := $(addprefix $(TINYSSH_DIR)/,$(tinyssh_files))\
+	$(TINYSSH_CONFIG)/main_tinysshd.c $(TINYSSH_CONFIG)/packet_auth.c
+# -O2 -w: upstream is written in an older dialect and warns where it does not
+# matter; -s: the release carries no debug info for guest programs.
+override TINYSSH_CFLAGS := -target riscv64-linux-musl -O2 -w -fno-sanitize=undefined\
+	-I$(TINYSSH_CONFIG) -I$(TINYSSH_DIR) -I$(TINYSSH_DIR)/cryptoint
+override TINYSSH_OUT    := $(SYSTEM_ASSETS_DIR)/tinysshd.exe
+
 # Guest ELFs left behind by samples that no longer exist. Both launchers can
 # enumerate a directory of them, and a stale file stays listed forever and then
 # fails to launch. Computed before the build so it only ever names orphans.
 override guest_assets_stale := $(filter-out $(guest_assets),$(filter %.exe,$(call ls_dir,$(GUEST_ASSETS_DIR))))
+override system_assets_stale := $(filter-out $(system_assets) $(TINYSSH_OUT),$(filter %.exe,$(call ls_dir,$(SYSTEM_ASSETS_DIR))))
 
 # Cross-compile flags are data, not a file, so they are not prerequisites of
 # the objects they affect. Keep them in a stamp and depend on it: the stamp is
@@ -540,10 +611,30 @@ $(GUEST_ASSETS_DIR)/%.exe: $(SRCDIR)/virtpass/guest-samples/%.c $(GUEST_LIBS) $(
 	$(call println,$(TEXT)[$(GREEN)LD$(TEXT)] $@ $(RESET))
 	@$(call shell_esc,$(GUEST_ZIG) $(GUEST_CFLAGS) -static -L$(GUEST_OBJ_DIR) $< -landroid_stubs -lgles_stubs -o $@)
 
+# The server is linked in one go: 97 translation units with no useful partial
+# rebuild (a change to any tinyssh header rebuilds most of them anyway), and one
+# command keeps the dependency list honest - the whole source set plus the
+# overlay copies, the fixed probe answers, and the cross-compile stamp.
+$(TINYSSH_OUT): $(tinyssh_srcs) $(wildcard $(TINYSSH_CONFIG)/*.h) $(GUEST_STAMP)
+	$(call create_dirs,$(dir $@))
+	$(call println,$(TEXT)[$(GREEN)CC$(TEXT)] $@ $(RESET))
+	@$(call shell_esc,$(GUEST_ZIG) $(TINYSSH_CFLAGS) -static -s -o $@ $(tinyssh_srcs))
+
+# System programs are linked exactly like samples, just into another tree.
+$(SYSTEM_ASSETS_DIR)/%.exe: $(SRCDIR)/virtpass/guest-samples/%.c $(GUEST_LIBS) $(GUEST_HEADS) $(GUEST_STAMP)
+	$(call create_dirs,$(dir $@))
+	$(call println,$(TEXT)[$(GREEN)LD$(TEXT)] $@ $(RESET))
+	@$(call shell_esc,$(GUEST_ZIG) $(GUEST_CFLAGS) -static -L$(GUEST_OBJ_DIR) $< -landroid_stubs -lgles_stubs -o $@)
+
 .PHONY: guest-assets # Cross-compile the guest samples into the build tree
 guest-assets: $(guest_assets)
 	$(if $(guest_assets_stale),$(call log_info,Removing stale guests: $(notdir $(guest_assets_stale))))
 	$(if $(guest_assets_stale),$(if $(HOST_POSIX),$(call shell_ex,rm -f $(call path_shell,$(guest_assets_stale))),$(call shell_ex,del /F /Q $(call path_shell,$(subst /,\,$(guest_assets_stale))))))
+
+.PHONY: system-assets # Cross-compile the system programs (SSH daemon, listener)
+system-assets: $(system_assets) $(TINYSSH_OUT)
+	$(if $(system_assets_stale),$(call log_info,Removing stale system programs: $(notdir $(system_assets_stale))))
+	$(if $(system_assets_stale),$(if $(HOST_POSIX),$(call shell_ex,rm -f $(call path_shell,$(system_assets_stale))),$(call shell_ex,del /F /Q $(call path_shell,$(subst /,\,$(system_assets_stale))))))
 
 .PHONY: android-assets # Old name of guest-assets, kept for existing scripts
 android-assets: guest-assets
@@ -672,20 +763,21 @@ override APPS_ASSET_DIRS ?= fonts
 override APPS_ONLY       ?=
 
 .PHONY: pack-system # Pack the system programs into the bundle's system.tar.gz
-pack-system: guest-assets
+pack-system: system-assets
 	$(call create_dirs,$(BUNDLE_DIR))
 	$(call println,$(TEXT)[$(GREEN)PACK$(TEXT)] $(SYSTEM_TAR) $(RESET))
-	@$(call shell_esc,$(SYSTEM_PACKER) --src $(call path_shell,$(GUEST_ASSETS_DIR))\
+	@$(call shell_esc,$(SYSTEM_PACKER) --src $(call path_shell,$(SYSTEM_ASSETS_DIR))\
 		--out $(call path_shell,$(SYSTEM_TAR)))
 
+# No --exclude-from: the two packers read two different trees, so a system
+# program cannot appear in the app archive in the first place.
 .PHONY: pack-apps # Pack the guest programs into the bundle's apps.tar.gz
-pack-apps: guest-assets pack-system
+pack-apps: guest-assets
 	$(call create_dirs,$(BUNDLE_DIR))
 	$(call println,$(TEXT)[$(GREEN)PACK$(TEXT)] $(APPS_TAR) $(RESET))
 	@$(call shell_esc,$(APPS_PACKER) --src $(call path_shell,$(APPS_SRC_DIR))\
 		$(foreach name,$(APPS_ASSET_DIRS),$(if $(wildcard $(APPS_ASSET_ROOT)/$(name)),--asset $(name)=$(call path_shell,$(APPS_ASSET_ROOT)/$(name))))\
 		$(if $(APPS_ONLY),--only $(APPS_ONLY))\
-		--exclude-from $(call path_shell,$(SYSTEM_TAR))\
 		--out $(call path_shell,$(APPS_TAR)))
 
 #

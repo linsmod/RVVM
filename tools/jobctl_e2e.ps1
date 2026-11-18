@@ -137,7 +137,7 @@ function Check([bool]$ok, [string]$what) {
 # Always leave the port/rootfs free, even when a scenario throws mid-session:
 # a lingering core would hold the one-core-per-rootfs lock and the endpoint.
 function Stop-Core {
-    & $exe --port $Port --shutdown 2>$null | Out-Null
+    [void](Stop-AshCores -Exe $exe -GraceMs 1000)
     Start-Sleep -Milliseconds 500
     if ($script:core -and -not $script:core.HasExited) {
         if (-not $script:core.WaitForExit(3000)) { try { $script:core.Kill() } catch { } }
@@ -168,7 +168,7 @@ foreach ($sc in $run) {
 
     Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($exe)) -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -eq $exe } | Stop-Process -Force -ErrorAction SilentlyContinue
-    & $exe --port $Port --shutdown 2>$null | Out-Null
+    [void](Stop-AshCores -Exe $exe -GraceMs 1000)
     Start-Sleep -Milliseconds 300
 
     $coreLog = Join-Path ([IO.Path]::GetTempPath()) "jobctl_core_${Port}_$sc.log"

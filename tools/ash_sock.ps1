@@ -1,34 +1,33 @@
 #Requires -Version 5.1
 <#
-    Shared AF_UNIX plumbing for the ash e2e drivers.
+    Shared console plumbing for the ash e2e drivers.
 
-    The core no longer listens on a TCP port: vpsessiond binds a filesystem
-    socket at /run/vpsessiond/<port>.sock, a guest path the host mounts a
-    directory of its own at, and `ash --sock-path` is the single source of truth
-    for where that lands on the host - the core writes the same path into its
-    registry file, so the client asks rather than derives. These helpers turn
-    that path into a connected System.Net.Sockets.Socket / NetworkStream, so no
-    driver re-derives the layout. Dot-source this file to use them.
+    A core serves the guest console on a loopback TCP port and speaks adb's
+    ShellProtocol over it: a 5-byte header (id, then length as four little-endian
+    bytes) and one id per logical stream - 0 stdin, 1 stdout, 2 stderr, 3 exit,
+    4 close stdin, 5 window size, 6 ready. There is no socket file and no
+    `--sock-path` any more: those went with the guest-side session server, and
+    the port the core was started with *is* the endpoint, so the driver derives
+    it instead of asking. The framing itself lives in ash_drive.ps1; these
+    helpers only answer "where is the core, and how do I connect to it".
 #>
 
-# The host endpoint for the core on @Port, as printed by `ash --sock-path`.
+# The host endpoint for the core on @Port.
 function Get-AshSockPath {
     param([Parameter(Mandatory)][string]$Exe, [Parameter(Mandatory)][int]$Port)
-    return (& $Exe --sock-path --port $Port | Select-Object -First 1).Trim()
+    return "127.0.0.1:$Port"
 }
 
-# A connected AF_UNIX stream socket to @Path (throws if nothing is listening).
+# A connected TCP stream socket to @Path (throws if nothing is listening).
 function New-AshSocket {
     param([Parameter(Mandatory)][string]$Path)
-    $s = [System.Net.Sockets.Socket]::new(
-        [System.Net.Sockets.AddressFamily]::Unix,
-        [System.Net.Sockets.SocketType]::Stream,
-        [System.Net.Sockets.ProtocolType]::Unspecified)
-    $s.Connect([System.Net.Sockets.UnixDomainSocketEndPoint]::new($Path))
-    return $s
+    $hostName, $portText = $Path -split ':', 2
+    $s = [System.Net.Sockets.TcpClient]::new()
+    $s.Connect($hostName, [int]$portText)
+    return $s.Client
 }
 
-# A connected session: the raw Socket (for Poll) and a NetworkStream over it.
+# A connected session: the raw Socket and a NetworkStream over it.
 function Connect-AshSession {
     param([Parameter(Mandatory)][string]$Exe, [Parameter(Mandatory)][int]$Port)
     $path = Get-AshSockPath -Exe $Exe -Port $Port
@@ -40,8 +39,104 @@ function Connect-AshSession {
     }
 }
 
-# Readiness probe: the endpoint answers right now. A stale socket file (crashed
-# core) fails the connect and reads as down.
+# Send one framed packet to a raw console socket.
+function Send-AshPacketTo {
+    param([Parameter(Mandatory)]$Sock, [Parameter(Mandatory)][int]$Id, [byte[]]$Payload)
+    $len = if ($Payload) { $Payload.Length } else { 0 }
+    $frame = New-Object byte[] (5 + $len)
+    $frame[0] = [byte]$Id
+    $frame[1] = [byte]($len -band 0xff)
+    $frame[2] = [byte](($len -shr 8) -band 0xff)
+    $frame[3] = [byte](($len -shr 16) -band 0xff)
+    $frame[4] = [byte](($len -shr 24) -band 0xff)
+    if ($len) { [Array]::Copy($Payload, 0, $frame, 5, $len) }
+    $sent = 0
+    while ($sent -lt $frame.Length) {
+        $sent += $Sock.Send($frame, $sent, $frame.Length - $sent, [System.Net.Sockets.SocketFlags]::None)
+    }
+}
+
+# Run one command in a fresh session and return its output - the job `ash -c`
+# used to do, now over the console pipe the way a client does it: the text goes
+# in as stdin, then close-stdin, so the shell sees EOF, runs it and exits. The
+# connection closing is the end of the output; the timeout is only there for a
+# command that neither prints nor ends.
+# Run one command in a fresh session and return its output - the job `ash -c`
+# used to do, now over the console pipe the way a client does it.
+#
+# Two things the protocol requires, and both are why this is not "write, read":
+# the server sends a READY packet before it will take stdin (a client that sends
+# first is writing into a session that does not exist yet), and the command has
+# to be closed with a close-stdin packet or the shell waits for more input
+# instead of running it. Everything the session says in between is stdout/stderr
+# frames.
+function Invoke-AshCommand {
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$Command,
+        [int]$TimeoutMs = 20000
+    )
+    $s = Connect-AshSession -Exe $Exe -Port $Port
+    $sock = $s.Socket
+    try {
+        $sock.ReceiveTimeout = 300
+        $sb    = New-Object System.Text.StringBuilder
+        $dec   = [Text.Encoding]::UTF8.GetDecoder()
+        $rx    = New-Object 'System.Collections.Generic.List[byte]'
+        $chars = New-Object char[] 8192
+        $sent  = $false
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            $tmp = New-Object byte[] 4096
+            try {
+                $n = $sock.Receive($tmp, 0, $tmp.Length, [System.Net.Sockets.SocketFlags]::None)
+            } catch {
+                $code = $_.Exception.SocketErrorCode
+                if ($code -eq [System.Net.Sockets.SocketError]::TimedOut -or
+                    $code -eq [System.Net.Sockets.SocketError]::WouldBlock) { continue }
+                break
+            }
+            if ($n -le 0) { break }
+            for ($i = 0; $i -lt $n; $i++) { $rx.Add($tmp[$i]) }
+            while ($rx.Count -ge 5) {
+                $len = [int]$rx[1] -bor ([int]$rx[2] -shl 8) -bor ([int]$rx[3] -shl 16) -bor ([int]$rx[4] -shl 24)
+                if ($rx.Count -lt 5 + $len) { break }
+                $id = [int]$rx[0]
+                if ($len -gt 0) {
+                    $payload = $rx.GetRange(5, $len).ToArray()
+                    if ($id -eq 1 -or $id -eq 2) {
+                        $c = $dec.GetChars($payload, 0, $payload.Length, $chars, 0)
+                        if ($c -gt 0) { [void]$sb.Append($chars, 0, $c) }
+                    } elseif ($id -eq 6 -and -not $sent) {
+                        # Ready: a terminal has a size, then the command, then
+                        # the end of its input.
+                        Send-AshPacketTo -Sock $sock -Id 5 -Payload ([Text.Encoding]::ASCII.GetBytes('24:80'))
+                        Send-AshPacketTo -Sock $sock -Id 0 -Payload ([Text.Encoding]::ASCII.GetBytes($Command + "`n"))
+                        Send-AshPacketTo -Sock $sock -Id 4 -Payload $null
+                        $sent = $true
+                    }
+                }
+                $rx.RemoveRange(0, 5 + $len)
+            }
+        }
+
+        # The session is a terminal, and a terminal echoes what is typed: the
+        # transcript starts with the prompt and the command itself. `ash -c`
+        # hid that; a driver asserting on the answer should not have to know it.
+        $text = $sb.ToString()
+        $at = $text.IndexOf($Command, [StringComparison]::Ordinal)
+        if ($at -ge 0) {
+            $nl = $text.IndexOf("`n", $at)
+            if ($nl -ge 0) { $text = $text.Substring($nl + 1) }
+        }
+        return $text
+    } finally {
+        try { $s.Stream.Close() } catch { }
+        try { $sock.Close() } catch { }
+    }
+}
+
 function Test-AshUp {
     param([Parameter(Mandatory)][string]$Exe, [Parameter(Mandatory)][int]$Port)
     try {
@@ -115,10 +210,10 @@ function Get-AshCorePid {
 # stopped on its own, $null when it had to be killed - a killed process has no
 # exit status worth reading, and reporting the kill as a code would be a lie.
 #
-# The code is the core's own vocabulary (see src/virtpass/win32-host/ash_core.h):
-# 0 for a clean stop, 64/65 for the two refusals that want different remedies. It
-# never carries the guest program's status, which the core prints on its own
-# stderr instead - separating the two is the whole point.
+# There is no `--shutdown` verb any more (it belonged to the ash client, which
+# went with the guest-side session server), so the request is what the docs say
+# a core answers to: ending the process. It is killed, not asked, and the answer
+# is therefore $null.
 function Stop-AshCore {
     param(
         [Parameter(Mandatory)][string]$Exe,
@@ -126,17 +221,8 @@ function Stop-AshCore {
         [Parameter(Mandatory)][Diagnostics.Process]$Process,
         [int]$TimeoutMs = 5000
     )
-    $exePath = (Resolve-Path -LiteralPath $Exe).Path
-    $ask = Start-Process -FilePath $exePath `
-        -ArgumentList '--no-autostart', '--port', "$Port", '--shutdown' `
-        -WorkingDirectory ([IO.Path]::GetDirectoryName($exePath)) -PassThru -NoNewWindow `
-        -RedirectStandardOutput (Join-Path $env:TEMP 'ash_stop_out.txt') `
-        -RedirectStandardError  (Join-Path $env:TEMP 'ash_stop_err.txt')
-    $ask.WaitForExit(3000) | Out-Null
-    if (-not $ask.HasExited) { try { $ask.Kill() } catch { } }
-    if ($Process.WaitForExit($TimeoutMs)) { return $Process.ExitCode }
     try { $Process.Kill() } catch { }
-    $Process.WaitForExit(2000) | Out-Null
+    $Process.WaitForExit($TimeoutMs) | Out-Null
     return $null
 }
 

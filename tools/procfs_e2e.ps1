@@ -51,8 +51,8 @@ function Check($ok, $what) {
 # One client run: attach to the core, ask for the command, return its output with
 # the terminal escapes stripped.
 function Client([string]$cmd) {
-    $r = & $exe --port $Port -c $cmd 2>$null
-    ($r -join "`n") -replace "`e\[[0-9;?]*[A-Za-z]", ''
+    $r = Invoke-AshCommand -Exe $exe -Port $Port -Command $cmd
+    ($r -replace "`e\[[0-9;?]*[A-Za-z]", '').Trim()
 }
 
 $out = Join-Path $env:TEMP 'procfs_e2e_core_out.txt'

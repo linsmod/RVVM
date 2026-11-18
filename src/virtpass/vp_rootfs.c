@@ -6,10 +6,13 @@ See vp_rootfs.h. Two passes over the same bytes, deliberately:
   - the index pass records every entry's shape (rvvm/vp_shadow.h) plus, for a
     regular file, where its content starts in the inflated archive. It is what
     the guest's lstat()/readlink()/getdents64() are answered from.
-  - the extract pass writes directories and regular files under a host
-    directory. Symlinks are skipped on purpose: the shadow index answers them,
-    which is how one busybox covers ~300 names without a privilege and without
-    300 copies.
+  - the extract pass writes directories, regular files and links under a host
+    directory. For a memory root, symlinks are answered by the shadow index and
+    need no on-disk name (that is how one busybox covers ~300 applets without a
+    privilege and without 300 copies). A root backed by a host directory has no
+    shadow in front of it - the guest's path reaches the filesystem directly - so
+    there the link has to exist, and it is made as a hard link (same inode, no
+    privilege, no extra bytes).
 
 The inflated archive is held in memory while it is being lifted out (a minirootfs
 expands to ~7 MB), which is what lets a caller pull one entry out by index. Once
@@ -31,10 +34,14 @@ bytes.)
 
 #if defined(_WIN32)
 #include <direct.h>
+#include <windows.h> /* CreateHardLinkA: a symlink needs a privilege, a hard link not */
 #define vp_mkdir_one(path) _mkdir(path)
+#define vp_hardlink(target, link) (CreateHardLinkA((link), (target), NULL) != 0)
 #else
 #include <sys/types.h>
+#include <unistd.h>
 #define vp_mkdir_one(path) mkdir((path), 0755)
+#define vp_hardlink(target, link) (link((target), (link)) == 0)
 #endif
 
 #define TAR_BLOCK_SIZE  512
@@ -514,6 +521,91 @@ bool vp_rootfs_extract_to(const vp_rootfs_t* rootfs, uint32_t idx, const char* d
     return ok;
 }
 
+/* A symlink from the archive, materialized under a host directory.
+ *
+ * A memory root answers lstat()/readlink() from the shadow index and never needs
+ * the name on disk. A root that the guest reaches through a host directory has
+ * no shadow in front of it, so the name has to exist: without this, /bin held
+ * busybox and nothing else - no /bin/sh - and a session could not start a shell.
+ *
+ * A hard link is the closest thing to a symlink that needs no privilege on
+ * Windows, and it shares the inode, so ~300 applet names cost nothing. A target
+ * that is not a regular file (a directory, or a path that only exists at run time
+ * such as /proc/mounts or /dev/ptmx) has nothing to link to and is left alone -
+ * those are answered elsewhere (devices by the userland, directories by the
+ * layer that owns them). */
+static bool rootfs_link_copy(const char* from, const char* to)
+{
+    FILE*  in = fopen(from, "rb");
+    FILE*  out;
+    char   buf[16384];
+    size_t n;
+
+    if (!in) {
+        return false;
+    }
+    out = fopen(to, "wb");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(in);
+            fclose(out);
+            return false;
+        }
+    }
+    fclose(in);
+    return fclose(out) == 0;
+}
+
+static bool rootfs_extract_link(const char* dest_dir, const vp_shadow_entry_t* entry)
+{
+    char        link_host[ROOTFS_MAX_PATH * 2];
+    char        target_host[ROOTFS_MAX_PATH * 2];
+    struct stat st;
+
+    if (!entry->target || !entry->target[0]) {
+        return true;
+    }
+    if (!rootfs_join(link_host, sizeof(link_host), dest_dir, entry->path)) {
+        return false;
+    }
+
+    if (entry->target[0] == '/') {
+        if (!rootfs_join(target_host, sizeof(target_host), dest_dir, entry->target)) {
+            return false;
+        }
+    } else {
+        /* Relative to the link's own directory, which is what readlink() returns
+         * for these and what execve() resolves. */
+        size_t sep = 0;
+        size_t i;
+        for (i = 0; link_host[i]; ++i) {
+            if (link_host[i] == '/' || link_host[i] == '\\') {
+                sep = i;
+            }
+        }
+        if (sep + strlen(entry->target) + 2 >= sizeof(target_host)) {
+            return false;
+        }
+        memcpy(target_host, link_host, sep);
+        target_host[sep] = '/';
+        strcpy(target_host + sep + 1, entry->target);
+    }
+
+    if (stat(target_host, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return true;
+    }
+    if (vp_hardlink(target_host, link_host)) {
+        return true;
+    }
+    /* Different volumes (an app tree mounted beside the rootfs) refuse a hard
+     * link; a second copy of the target is the honest fallback. */
+    return rootfs_link_copy(target_host, link_host);
+}
+
 size_t vp_rootfs_extract(vp_rootfs_t* rootfs, const char* dest_dir, const char** error)
 {
     const char* local_error = NULL;
@@ -531,12 +623,16 @@ size_t vp_rootfs_extract(vp_rootfs_t* rootfs, const char* dest_dir, const char**
     size_t written = 0;
     const size_t count = vp_shadow_count(rootfs->shadow);
 
+    // Files and directories first, links second: a hard link needs its target to
+    // exist, and tar order is the packing tool's business (/bin/sh can precede
+    // /bin/busybox).
     for (uint32_t i = 0; i < count; ++i) {
         const vp_shadow_entry_t* entry = vp_shadow_entry(rootfs->shadow, i);
         if (!entry || entry->hidden) {
             continue;
         }
-        // Symlinks and overrides are the shadow layer's business, not the host's.
+        // Overrides name a host path and have nothing to write; links are the
+        // second pass below.
         if (entry->kind != VP_SHADOW_DIR && entry->kind != VP_SHADOW_FILE) {
             continue;
         }
@@ -553,6 +649,18 @@ size_t vp_rootfs_extract(vp_rootfs_t* rootfs, const char* dest_dir, const char**
         }
         if (!vp_rootfs_extract_to(rootfs, i, path)) {
             *error = "a file from the archive could not be written";
+            return written;
+        }
+        written++;
+    }
+
+    for (uint32_t i = 0; i < count; ++i) {
+        const vp_shadow_entry_t* entry = vp_shadow_entry(rootfs->shadow, i);
+        if (!entry || entry->hidden || entry->kind != VP_SHADOW_LINK) {
+            continue;
+        }
+        if (!rootfs_extract_link(dest_dir, entry)) {
+            *error = "a symlink from the archive could not be created";
             return written;
         }
         written++;

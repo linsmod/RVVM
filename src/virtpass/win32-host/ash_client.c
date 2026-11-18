@@ -64,16 +64,16 @@ static void ash_send_frame(int fd, const char* body);
 /* The core: --serve                                                   */
 /* ------------------------------------------------------------------ */
 
-/* The guest program a core boots: the host-owned system program /sbin/idle,
- * installed from the bundle's system layer. idle holds the machine open and
- * spawns a session per client on a pty the *host* hands it (see vp_core.h) -
- * the host owns the terminal, which is what lets a `vp` client attach over the
- * same adb-shaped byte pipe the Android host serves. A core program is not
- * selectable - it is part of the system, not an app - though `init=` can still
- * boot the legacy guest-side model (see ash_serve). */
+/* The guest program a core boots: the host-owned system program /sbin/vpshhd,
+ * installed from the bundle's system layer. It listens on the endpoint the host
+ * mounts (/run/vpsessiond/<port>.sock) and hands each connection to
+ * tinysshnoneauthd, so a core is an SSH server and the client is whatever ssh
+ * the user already has. A core program is not selectable - it is part of the
+ * system, not an app - though `init=` can still boot something else (see
+ * ash_serve). */
 static const char* ash_default_core_shell(void)
 {
-    return VP_GUEST_IDLE;
+    return VP_GUEST_SSHD;
 }
 
 /* The full path of this executable. CreateProcess wants the program itself

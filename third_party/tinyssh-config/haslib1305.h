@@ -1,0 +1,1 @@
+#undef HASLIB1305

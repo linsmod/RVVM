@@ -66,6 +66,13 @@ module at all, so it is excluded from librvvm and built into a host that links
 // loose ELF. tools/pack_system.py declares the same path when packing.
 #define VP_GUEST_SESSIOND  "/sbin/vpsessiond"
 
+// The SSH daemon: the run root a core boots now. It is the listener
+// (src/virtpass/guest-samples/vpshhd.c), not the protocol - tinysshnoneauthd
+// speaks SSH on the accepted connection. The guest-side session protocol
+// (vpsessiond) and the idle core are both retired from the running path; their
+// sources stay for reference.
+#define VP_GUEST_SSHD      "/sbin/vpshhd"
+
 // The idle core: a run root that never returns, so the machine it was booted
 // into outlives every client. A command's run is torn down by on_guest_exit the
 // moment its root exits, which is right for `vp exec-out` and wrong for a core

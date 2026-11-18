@@ -22,6 +22,9 @@
 !/include
 !/src
 !/tools
+# Third-party sources live outside src/ so the host build's recursive wildcard
+# over SRCDIR cannot reach them (see project.mk, TINYSSH_DIR).
+!/third_party
 
 # Explicitly track build system
 !/Makefile

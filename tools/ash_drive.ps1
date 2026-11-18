@@ -76,6 +76,8 @@ function New-AshSession {
         Decoder   = [Text.Encoding]::UTF8.GetDecoder()
         Actions   = @()
         ReadEnded = $false
+        Rx        = (New-Object 'System.Collections.Generic.List[byte]')
+        ExitCode  = $null
         EmptySince = $null
         ReadEndWhy = ''
         Closed    = $false
@@ -94,22 +96,43 @@ function Close-AshSession($d) {
 }
 
 function Send-AshFrame($d, [string]$body) {
-    Write-AshBytes $d ([Text.Encoding]::ASCII.GetBytes(
-        ([string][char]27) + ']999;' + $body + ([string][char]7)))
+    # 'R<rows>;<cols>' was the guest-side session server's control frame. The
+    # console protocol carries the same thing as a window-size packet, and its
+    # payload is "<rows>:<cols>" (see vp_client.c's send_winsize).
+    if ($body -match 'R(\d+)[;:](\d+)') {
+        Send-AshPacket $d 5 ([Text.Encoding]::ASCII.GetBytes("$($Matches[1]):$($Matches[2])"))
+    }
 }
 
-# --- bytes ------------------------------------------------------------------
-function Write-AshBytes($d, [byte[]]$b) {
+# One adb ShellProtocol packet: id, then a little-endian 32-bit length, then the
+# payload. The ids the drivers touch are 0 (stdin) and 5 (window size); the ones
+# they read are 1/2 (stdout/stderr) and 3 (exit).
+function Send-AshPacket($d, [int]$id, [byte[]]$payload) {
     if ($d.ReadEnded) { return }
+    $len  = if ($payload) { $payload.Length } else { 0 }
+    $hdr  = New-Object byte[] 5
+    $hdr[0] = [byte]$id
+    $hdr[1] = [byte]($len -band 0xff)
+    $hdr[2] = [byte](($len -shr 8) -band 0xff)
+    $hdr[3] = [byte](($len -shr 16) -band 0xff)
+    $hdr[4] = [byte](($len -shr 24) -band 0xff)
     try {
+        $frame = New-Object byte[] (5 + $len)
+        [Array]::Copy($hdr, 0, $frame, 0, 5)
+        if ($len) { [Array]::Copy($payload, 0, $frame, 5, $len) }
         $sent = 0
-        while ($sent -lt $b.Length) {
-            $sent += $d.Sock.Send($b, $sent, $b.Length - $sent,
+        while ($sent -lt $frame.Length) {
+            $sent += $d.Sock.Send($frame, $sent, $frame.Length - $sent,
                                   [System.Net.Sockets.SocketFlags]::None)
         }
     } catch {
         $d.ReadEnded = $true
     }
+}
+
+# --- bytes ------------------------------------------------------------------
+function Write-AshBytes($d, [byte[]]$b) {
+    Send-AshPacket $d 0 $b
 }
 
 # One bounded non-blocking read. Poll says "something is waiting" without
@@ -153,11 +176,29 @@ function Read-AshChunk($d, [int]$timeoutMs) {
         return $false
     }
     $chars = New-Object char[] 8192
-    # Incremental decoder: a multi-byte char split across two chunks is not
-    # two replacement chars.
-    $c = $d.Decoder.GetChars($tmp, 0, $n, $chars, 0)
-    if ($c -gt 0) { [void]$d.Buf.Append($chars, 0, $c) }
-    Add-AshSample $d $c
+    # The stream is framed, so a chunk is not text: append the bytes, then take
+    # every complete packet out of the front of it. Only stdout/stderr carry
+    # bytes the drivers assert on; exit reports the status and ready is the
+    # server saying the session exists.
+    for ($i = 0; $i -lt $n; $i++) { $d.Rx.Add($tmp[$i]) }
+    while ($d.Rx.Count -ge 5) {
+        $len = [int]$d.Rx[1] -bor ([int]$d.Rx[2] -shl 8) -bor ([int]$d.Rx[3] -shl 16) -bor ([int]$d.Rx[4] -shl 24)
+        if ($d.Rx.Count -lt 5 + $len) { break }
+        $id = [int]$d.Rx[0]
+        if ($len -gt 0) {
+            $payload = $d.Rx.GetRange(5, $len).ToArray()
+            if ($id -eq 1 -or $id -eq 2) {
+                # Incremental decoder: a multi-byte char split across two
+                # packets is not two replacement chars.
+                $c = $d.Decoder.GetChars($payload, 0, $payload.Length, $chars, 0)
+                if ($c -gt 0) { [void]$d.Buf.Append($chars, 0, $c) }
+                Add-AshSample $d $c
+            } elseif ($id -eq 3 -and $payload.Length -ge 1) {
+                $d.ExitCode = [int]$payload[0]
+            }
+        }
+        $d.Rx.RemoveRange(0, 5 + $len)
+    }
     return $true
 }
 
@@ -291,6 +332,8 @@ function Invoke-Session {
     $d.Buf       = New-Object System.Text.StringBuilder
     $d.Decoder   = [Text.Encoding]::UTF8.GetDecoder()
     $d.ReadEnded = $false
+    $d.Rx        = (New-Object 'System.Collections.Generic.List[byte]')
+    $d.ExitCode  = $null
     $d.EmptySince = $null
     $d.ReadEndWhy = ''
     $d.Closed    = $false

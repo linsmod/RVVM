@@ -6,15 +6,18 @@ is a host-provided program laid out at the *guest path* it is to appear at, so
 the host installs it by extracting the archive as a layer - no copy logic, and
 the guest names it like any other program:
 
-    sbin/vpsessiond
-    sbin/idle
+    sbin/vpshhd
+    sbin/tinysshd
 
 SYSTEM_PROGRAMS below is the single place a system program is declared: adding
-one here is the whole change. tools/pack_apps.py is pointed at this archive
-(--exclude-from) and skips every name it holds, so a system program is never
-also packed as an app. The session server's guest path must match
-VP_GUEST_SESSIOND in src/virtpass/vp_rootfs.h, and the idle core's must match
-VP_GUEST_IDLE.
+one here is the whole change. The source tree is separate from the app one
+(BUILDDIR/system-assets vs BUILDDIR/guest-assets), so tools/pack_apps.py never
+sees a system program and needs no exclusion list. The listener's guest path
+must match VP_GUEST_SSHD in src/virtpass/vp_rootfs.h.
+
+tinysshd is a multicall binary whose mode comes from basename(argv[0])
+(tinysshd.c), so nothing here needs a second name for it: vpshhd execs
+/sbin/tinysshd with argv[0] set to the mode it wants (see vpshhd.c).
 
 The archive is built deterministically - zero mtime, no owner, gzip mtime 0 -
 so repacking an unchanged set produces the same bytes.
@@ -35,8 +38,8 @@ import tarfile
 # (source basename without .exe, guest path in the system layer). A guest path is
 # relative - the archive's root is the guest's `/`.
 SYSTEM_PROGRAMS = [
-    ("vpsessiond", "sbin/vpsessiond"),
-    ("idle", "sbin/idle"),
+    ("vpshhd", "sbin/vpshhd"),
+    ("tinysshd", "sbin/tinysshd"),
 ]
 
 # (guest path, content, mode). Small config files layered over the rootfs -
