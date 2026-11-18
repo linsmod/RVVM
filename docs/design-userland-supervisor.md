@@ -71,7 +71,7 @@ bind 之前，把「还在启动」误报成「僵死」会让运维去杀健康
 daemon 启动子进程时 cwd 设为 release 目录（guest 相对路径按进程 cwd 解析，
 `tools/INDEX.md` 既定约束），stderr 重定向到实例日志文件。
 
-## 5. API 面（v1，CLI 与之后的 web 共用）
+## 5. API 面（v1 + v2 终端，CLI 与 web 共用）
 
 | 方法 | 路径 | 语义 |
 |---|---|---|
@@ -83,6 +83,8 @@ daemon 启动子进程时 cwd 设为 release 目录（guest 相对路径按进�
 | GET | `/api/instances/{port}/log` | 实例日志（支持 `?tail=N`） |
 | POST | `/api/instances/{port}/exec` | `{cmd}` → `ssh -p N`，同步返回 stdout/stderr/退出码 |
 | GET | `/api/health` | daemon 版本、DB 路径、release 目录、core 注册表摘要 |
+| GET | `/ws/{port}` | **v2 交互终端**：stdlib 最小 RFC6455 握手后，字节泵桥到 `ssh -tt -i <daemon密钥> -p N` |
+| GET | `/`、`/vendor/*` | web UI（单文件页 + xterm.js v6/fit vendor，免构建链） |
 
 鉴权：`Authorization: Bearer <SUPERVISOR_TOKEN>`，未配置 token 时仅接受
 127.0.0.1 来源（预览默认形态）。
@@ -104,9 +106,9 @@ CLI 是薄客户端：只调 HTTP API，不碰 DB、不 spawn 进程。
 
 ## 7. 明确不做（预览范围外）
 
-账号体系 / 多租户 / 计费 / 容器编排 / 多机调度 / web 后台 /
-websocket 终端（web 阶段再加）/ guest 内鉴权改造（tinysshnoneauthd → 带键 tinysshd
-是上公网的前置，独立事项）。
+账号体系 / 多租户 / 计费 / 容器编排 / 多机调度。
+（websocket 终端已于 v2 落地，见 §5；带键鉴权已于 vpshhd 的 auth.pub 模式落地——
+run 目录无 `auth.pub` 时保持 noneauth，dev 行为不变。）
 
 ## 8. 验收线（2026-11-18 实测全绿）
 

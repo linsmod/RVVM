@@ -59,6 +59,29 @@
 2. 起 daemon：`Start-Process python -ArgumentList 'tools/supervisor/supervisor.py','--bind','127.0.0.1:7911'`
 3. `python tools/supervisor/us.py health` → list/start/exec/rm
 
+## S3 v2：交互终端（2026-11-18 第二轮）
+
+- **鉴权前置已落地**：vpshhd 见 run 目录有 `auth.pub` 即自种 `~/.ssh/authorized_keys`
+  并以 `tinysshd`（公钥模式）拉起；daemon 生成 `id_ed25519` 并投递公钥；无 `auth.pub`
+  时保持 noneauth（dev 行为不变）。双向验证：带密钥 `auth-ok`、无密钥
+  `Permission denied (publickey)`。
+- **daemon ws 桥**：stdlib 最小 RFC6455（`GET /ws/<port>` → `ssh -tt -i <key>` 字节泵）；
+  前端 `web/vendor/`（xterm.js v6 + fit，免构建链），detail 面板移出表格重渲染范围。
+- **顺带修掉两个 RVVM 既有缺陷**（阻塞 pty-req，详见 `fix-userland-pty-req.md`）：
+  ioctl 请求号符号扩展（case 29 截断为 uint32）；pty fd 的 fstat 身份（st_dev/st_ino
+  与同名路径 stat 一致）。修复前 **vpssh 链的 pty-req 从未成功过**。
+- 验收：`ws_smoke.py` `WS-BRIDGE-OK`（pty 回显/行规程/求值）；页面与 vendor 资源全 200；
+  `fs_selftest` PASS；openssh/sshd_crash e2e 与 stash 基线逐项一致（既登记的环境问题）。
+
+### 过程坑（本轮新增）
+
+- **双 daemon 脑裂**：两个 `supervisor.py` 同时声称绑 7911（SO_REUSEADDR 语义），请求按
+  连接分落到两个进程、两个 DB——`rm` 时好时坏（RemoteDisconnected）。托盘 daemon 还持有
+  删库前的旧文件句柄（Windows 上打开着的文件删不掉），一直答旧库。处置：只留托盘登记的
+  一个；已登记 issues（daemon 应检测端口已占即退出）。
+- **watch 包装吞输出**：多命令拼接的输出只剩第一行，且后续命令实际都执行了（一次起了
+  4 个实例）。判据看落盘文件，一条命令一个文件。
+
 ## 本机部署（traycmd 托盘，2026-11-18）
 
 daemon 已注册为托盘命令（webui-demo 实例在 daemon 换手后由 reconcile 无缝保留）：

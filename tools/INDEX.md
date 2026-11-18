@@ -44,8 +44,9 @@
 
 | 脚本 | 内容 |
 |---|---|
-| `supervisor/supervisor.py` | userland supervisor daemon：`rvvm_ash --serve` 实例的起停/清单/日志/审计，SQLite 状态机 + reconcile。**仅标准库**。设计与用法见 `../docs/design-userland-supervisor.md` |
+| `supervisor/supervisor.py` | userland supervisor daemon：`rvvm_ash --serve` 实例的起停/清单/日志/审计，SQLite 状态机 + reconcile；含 ws 终端桥（stdlib RFC6455 → `ssh -tt`）与实例密钥管理。**仅标准库**。设计与用法见 `../docs/design-userland-supervisor.md` |
 | `supervisor/us.py` | 上面的 CLI：`us list/start/stop/rm/logs/exec/health`（thin HTTP client） |
+| `supervisor/ws_smoke.py` | ws 终端桥冒烟：`python ws_smoke.py <实例端口>`，握手 → 发命令 → 收 pty 回显 → `WS-BRIDGE-OK` |
 
 ## 打包 / 生成 / 安装
 

@@ -39,10 +39,13 @@ design §8 六条验收线全绿。
 直接服务；实例表 + 起停/删除 + 日志面板（3s 轮询）+ 一次性命令框，复用现有 API，
 静态页不经 token（同源），API 仍按 §5 鉴权。
 
-- v2（未动工）：交互终端（xterm.js + websocket 桥到实例 ssh 端点）。
-  两条路：加 `websockets`/`aiohttp` 依赖（届时单独确认），或 stdlib 实现最小
-  RFC6455 握手。**前置**：tinysshnoneauthd 换带键鉴权（网页终端等于给无鉴权
-  shell 包皮，不能先开）。
+- v2（**已完成，2026-11-18**）：交互终端。前置已满足——vpshhd 见 run 目录有
+  `auth.pub` 即自种 authorized_keys 并以 `tinysshd`（公钥模式）拉起，宿主密钥由
+  daemon 生成投递（dev 无该文件时行为不变）；daemon 内 stdlib 实现最小 RFC6455
+  ws 桥（`GET /ws/<port>` → `ssh -tt -i <key>`），前端 vendor xterm.js v6 +
+  fit 插件（`web/vendor/`，免构建链）。验收：`ws_smoke.py` `WS-BRIDGE-OK`、
+  页面路由与 vendor 资源全 200。过程中修掉两个 RVVM 既有缺陷
+  （见 `fix-userland-pty-req.md`）：ioctl 请求号符号扩展、pty fd 的 stat 身份。
 
 ## 全局验收
 
