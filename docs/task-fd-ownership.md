@@ -133,6 +133,40 @@ B1 取「每槽独占一个 CRT 号」而非「自管 guest fd → HANDLE 映射
 
 - 结论：B1 的号私有化把「父子共享号」这一类真实清掉了，也让锚不再占用 CRT 号，但**未闭合会话**。剩下的形态是「号在装槽之后被某个尚未定位的路径关掉」，与共享无关。下一步需要在 `_close` 上做带符号解析的探针（打印 `__builtin_return_address` 并用 `addr2line` 还原调用点），而不是继续给已知路径加标记
 
+### 2026-11-18 B1 后续：未知关闭源定位与闭合（B2）
+
+上一节留下的「装槽后号被外部关闭」已定位并修复，会话闭合。
+
+**探针方法**（`wf-debug-userland-fd.md` 探针规则的延伸，已整体回退）：
+
+- shim `close()`（`posix_shim.c`）是 exe 内所有 POSIX 拼写关闭的唯一咽喉（hostfs / vp_* / guest close(2) 全走它），在入口加一条 `RVVM_TRC(RVVM_TRC_FD, "shim_close fd=%d ra=%p rva=0x%llx", ...)`，`RVVM_TRACE=fd` 门控、零副作用、不占 fd
+- `ra` 用 `GetModuleHandleExA(FROM_ADDRESS)` 求出所在模块基址，打印 `rva = ra - base`；两轮运行 RVA 一致而 exe 每次启动 ASLR 基址不同，可据此确认 ra 属于哪个模块
+- release 构建的 DWARF 被 LTO 裁得只剩残片，`addr2line` 大面积 `??`；按 `rvvm_user.c` 注释里登记的配方改用 `mingw32-make bin CFLAGS=-g`（保持 LTO）——代码布局与无 -g 完全一致，且符号可解析。`USE_DEBUG=1 USE_LTO=0` 反而链接失败：shim 的 `ntohs/htonl` 与 ws2_32 导入库 multiple definition（release 一直靠 LTO 掩盖），此配方当前不可用
+- 无行号的地址用 `nm -n` 找所属符号区间；`addr2line -i` 在 LTO 分区上仍不可靠
+
+**根因**（`sys_close` case 57，`rvvm_user.c`）：
+
+- `userland_fd_close()` 对未跟踪号返回 false 后，else 分支把 guest 号**原样裸 `close()` 透传给宿主 CRT**。这个透传原本只为 asset 挂载 fd 服务（mount 直接发裸宿主号、不进槽表）
+- tinyssh 会话子进程的 `p_closefrom(3..255)` 对 3..255 逐个 `close(i)`：其中 pa 端槽已在前一步清掉的号（如 3/4/5）是未跟踪号 → 走透传 → `close(5)` 正好命中 fd=1 刚 `dup(ch[1])` 拿到的宿主 5。**杀 fd=1 的不是别人，是子进程自己的 sweep**
+- 证据链（`RVVM_TRACE=fd,sys`，一轮运行内）：`[104] take host=5`（fd=1）→ 2ms 后 `[104] shim_close fd=5`，RA 落在 `rvvm_user_thread_wrap` 区间（sweep 的透传 close，且**无 give 痕迹**）→ 退出时 `[104] give fd=1 host=5` 计数剩 1（102 的槽后来复用了 5）→ `sys_write(fd=1 host=5)` 先「成功」6 字节（写进回收后的别的对象，字节没到会话）再 `-9`
+- 修正一处旧结论：`shared` 告警与「两槽同号」确实是幻影的下游表现，不是独立缺陷
+
+**修复**（B2）：
+
+- 新增 `asset_fd_take()`（弹出式）：从 asset 表弹出并报告该号是否真是挂载发的宿主号
+- case 57 的 else 分支改为：真 asset fd 才按号裸关闭；其余未跟踪号按 POSIX 回 `-EBADF`，不碰任何东西
+
+**验证**：
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| `ssh -p 7900 "echo HELLO"` | 5 轮全 EXIT=1 无输出 | **3 轮全 `HELLO`、EXIT=0**（含去掉探针后的最终轮） |
+| trace 里 sweep 裸关闭（rva=0x21d05） | 每轮 1+ 次 | 0 次 |
+| `fs_selftest.ps1` | PASS | PASS |
+| `mount_e2e` / `memfs_e2e` / `procfs_e2e` / `openssh_e2e` | FAIL 57/63/25/17 | 与 `git stash` 基线**逐项相同**，均为本环境既有失败（`session_e2e` 环境缺陷同类），非本改动引入 |
+
+剩余：P3（删除 `host_fd_refs` 检测器等防御机制）未动；fork 继承 `ctx->asset_fds` 表时父子同号的边界未重新审计（P3 时一并看）。
+
 ### 2026-11-18 P1 实测
 
 - 会话不再以 111 退出（此前子进程 `dup(ch[i]) != i`），日志变为 `session 102 exited 0`

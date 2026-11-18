@@ -6296,6 +6296,23 @@ static void asset_fd_forget(int fd)
     }
 }
 
+/* Pop @fd from the table and say whether the mount had handed it out. Only an
+ * asset fd closes by its bare number: it is a host descriptor the slot table
+ * never saw. Every other untracked number is one the guest already closed -
+ * answering EBADF for it is what keeps a close(2) of a dead number from
+ * landing on the descriptor that number has since become. */
+static bool asset_fd_take(int fd)
+{
+    rvvm_userland_t* ctx = uctx();
+    for (size_t i = 0; i < RVVM_ASSET_FD_MAX; i++) {
+        if (ctx->asset_fds[i] == fd) {
+            ctx->asset_fds[i] = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* openat() inside the asset mount.
  *
  * The tree is packaged with the app, so it is read-only: a mutating access mode
@@ -17178,11 +17195,21 @@ static void* rvvm_user_thread_wrap(void* arg)
                          * one out closes it. */
                         asset_fd_forget((int)a0);
                         a0 = 0;
-                    } else {
-                        /* The guest closed a mount fd itself: drop it from the
-                         * run-end sweep before the number can be reused. */
-                        asset_fd_forget((int)a0);
+                    } else if (asset_fd_take((int)a0)) {
+                        /* The guest closed a mount fd itself: it is a host
+                         * descriptor the slot table never saw, so it closes
+                         * by its bare number - and drops from the run-end
+                         * sweep before the number can be reused. */
                         a0 = errno_ret(close(a0));
+                    } else {
+                        /* An untracked number that is not an asset fd is one
+                         * the guest already closed: POSIX answers EBADF and
+                         * touches nothing. Closing it raw would hand the
+                         * sweep of p_closefrom() the descriptor that number
+                         * has since become - a slot-private dup() result was
+                         * killed this way right after install (see
+                         * docs/task-fd-ownership.md). */
+                        a0 = -UAPI_EBADF;
                     }
                     break;
                 case 59: { // pipe2

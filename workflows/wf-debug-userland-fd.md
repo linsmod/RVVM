@@ -69,4 +69,5 @@ Select-String -Path "$env:TEMP\core1.err" -Pattern "install|dup|close|host_relea
 ## 执行经验
 
 - 2026-11-18：用本流程定位到 `write(1) = EBADF` 的根因是「父线程释放了子进程刚 `dup` 到的宿主号」，判读依据只有 `host_release (last ref, closing)` 与 `install fd=1 host=N` 的先后关系，时间戳在此完全不可用。
+- 2026-11-18（B2）：「给已知路径加标记」穷尽仍未命中时，下一层是**咽喉点探针**：shim `close()` 是 exe 内所有 POSIX 拼写关闭的唯一出口，在入口打一条 `RVVM_TRC(RVVM_TRC_FD, "shim_close fd=%d ra=%p rva=0x%llx", ...)`（`GetModuleHandleExA(FROM_ADDRESS)` 求 ra 所在模块基址，打印 RVA）即可抓到所有绕过用户层的裸关闭。符号解析：release 构建的 DWARF 被 LTO 裁剪，`addr2line` 大面积 `??`；`mingw32-make bin CFLAGS=-g`（保持 LTO）布局不变且可解析。`USE_DEBUG=1 USE_LTO=0` 因 shim `ntohs/htonl` 与 ws2_32 导入库冲突当前链接失败。无行号的地址用 `nm -n` 找所属符号区间。本轮用此法抓到根因：`sys_close` 对未跟踪号的裸 `close()` 透传（见 `../docs/task-fd-ownership.md` B2）。
 - `vptrace` 类探针（改 `main_tinysshd.c` 打 poll 状态）对「读侧没数据」很有用，但必须记得回退，否则会污染后续会话行为。
