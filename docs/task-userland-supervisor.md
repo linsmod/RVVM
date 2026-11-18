@@ -13,6 +13,8 @@
 - `tools/supervisor/supervisor.py`：daemon（SQLite WAL、状态机、reconcile、HTTP API、token、
   事件审计表）
 - `tools/supervisor/us.py`：CLI（list/start/stop/rm/logs/exec/health，thin HTTP client）
+- `tools/supervisor/web/index.html`：web UI v1（S3 第一刀，无依赖）：daemon 在 `GET /`
+  服务单文件静态页——实例表轮询、起停/删除、日志面板、一次性命令框；API 鉴权不变
 - 宿主最小改动：rvvm_ash 新增 `--rootfs <dir>`（`ash_main.c` 解析、`ash_client.c` 锁与
   mode-store 随目录收放、`win32_cmdpost_bridge.c` mount dest 覆盖）；默认路径行为不变
 

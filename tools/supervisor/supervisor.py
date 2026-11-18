@@ -559,6 +559,16 @@ def make_handler(sup, token):
             return json.loads(self.rfile.read(n) or b"{}")
 
         def do_GET(self):
+            path = urllib.parse.urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                code, ctype, body = serve_index()
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if not self._authed():
                 return self._send(401, {"error": "unauthorized"})
             path = urllib.parse.urlparse(self.path)
@@ -641,6 +651,18 @@ def make_handler(sup, token):
                 return self._send(e.status, {"error": e.message})
 
     return Handler
+
+
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+
+
+def serve_index():
+    """The one static page of the preview web UI. Same-origin as the API, so
+    the token question is unchanged: loopback or bearer, nothing else."""
+    path = os.path.join(WEB_DIR, "index.html")
+    with open(path, "rb") as f:
+        body = f.read()
+    return 200, "text/html; charset=utf-8", body
 
 
 def main():

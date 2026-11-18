@@ -34,10 +34,15 @@ design §8 六条验收线全绿。
 
 ## S3 web 后台（预览）
 
-**优先级：中。** S1/S2 稳定后，另立项。
+**优先级：中。** S1/S2 稳定后进行。**v1 已完成（2026-11-18）**：
+`tools/supervisor/web/index.html` 单文件页面（无构建链、零依赖），由 daemon 在 `GET /`
+直接服务；实例表 + 起停/删除 + 日志面板（3s 轮询）+ 一次性命令框，复用现有 API，
+静态页不经 token（同源），API 仍按 §5 鉴权。
 
-- 挂在同一 API 上的第三个客户端；websocket 终端（vp 管道桥）在本阶段引入，
-  需要 websocket 库（装依赖届时单独确认）
+- v2（未动工）：交互终端（xterm.js + websocket 桥到实例 ssh 端点）。
+  两条路：加 `websockets`/`aiohttp` 依赖（届时单独确认），或 stdlib 实现最小
+  RFC6455 握手。**前置**：tinysshnoneauthd 换带键鉴权（网页终端等于给无鉴权
+  shell 包皮，不能先开）。
 
 ## 全局验收
 
