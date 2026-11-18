@@ -78,6 +78,29 @@ ssh -p 7900 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL 127.0.0.1 "ech
 - **仍未通过**：sh（104）的 `sys_write(fd=2 host=10)` 写 37 字节后 EBADF。宿主 10 是父在 fork 后关闭 ch 端时 `_close` 掉的，而子 `dup(ch[2])` 恰好在同一窗口拿到 10——`host_fd_release` 的 `_close` 与另一线程的 `_dup` 之间没有原子性，这是 P1 保留引用计数时就存在的窗口，不是 P2 引入的
 - 结论：P2 的目标（锚号不混 CRT、socket 不进宿主 poll）达成；剩余阻断是 CRT 层的 `dup`/`close` 原子性，需要在 P3 之前单独处理
 
+### 2026-11-18 方案 A 实测（未闭合）
+
+改动：新增 `crt_lock`，`host_fd_release()` 的 `close()` 与四处 `dup()`（install 挪号、dup、dup2/dup3、inherit）都放进同一临界区；另给 `host_fd_acquire/release` 加了计数 trace（`host_ref host=N = M (acquire|release)`）。
+
+结果：`ssh "echo HELLO"` 仍退出 1、无输出，`sys_write(fd=1)` 仍是第一次成功、第二次 EBADF。**A 没有闭合问题。**
+
+计数 trace 暴露的真实形态（一次运行，时间戳毫秒）：
+
+```
+[102] host_ref host=8 = 1 (acquire)      fd=5 host=8 装槽
+[102] host_ref host=8 = 0 (release, closing)   fd=5 关闭 → close(8)
+[104] host_ref host=8 = 1 (acquire)      fd=1 拿到 8（父刚关闭的号）
+[104] host_ref host=8 = 2 (acquire)      fd=3 open("/etc/passwd") 也拿到 8
+[104] host_ref host=8 = 1 (release, kept)
+[104] host_ref host=8 = 0 (release, closing)
+```
+
+- `open("/etc/passwd")` 返回 8，而 fd=1 的槽已经记着 8：**CRT 认为 8 空闲，槽却仍命名它**。这不是两个线程抢同一个号，而是**槽里存着一个已经关掉的号**（幻影），计数因此虚高（2），`open` 的号被当成共享
+- 幻影的来源：fd=1 的 8 在父 `close(8)` 之后被写入，写的时候没有重新验证 8 还在。`crt_lock` 只能保证「分配/释放」互斥，管不到「槽里存的号是否还活着」
+- 因此 A 的定位是对的（`dup` 与 `close` 确实需要串行），但它**不是充分条件**：只要槽的号与 CRT 状态之间还有一次未经检查的写入，幻影就会出现
+
+- 结论：A 保留（无副作用，去掉一类真实竞争），但不闭合。剩下的缺口与设计文档一致——**号必须按 address space 私有**（B 方案），否则「槽里的号还有效吗」这个问题永远要靠引用计数猜。已登记为下一步
+
 ### 2026-11-18 P1 实测
 
 - 会话不再以 111 退出（此前子进程 `dup(ch[i]) != i`），日志变为 `session 102 exited 0`

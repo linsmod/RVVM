@@ -7478,6 +7478,15 @@ static bool userland_parent_alive(rvvm_process_t* proc)
 static int        host_fd_refs[HOST_FD_REF_MAX];
 static spinlock_t host_fd_ref_lock = SPINLOCK_INIT;
 
+/* Serialises the two CRT operations that read and change the same table slot:
+ * _dup() picks a free number, _close() gives one back. Each is thread-safe on
+ * its own, but the *pair* is not atomic, so a child's dup() can be handed a
+ * number in the same instant a sibling closes it - the reference count cannot
+ * prevent that, because both sides hold the number legitimately at that point.
+ * Holding this around both makes "the number was free" and "the number came
+ * back" one step, so a number is either still in use or genuinely reusable. */
+static spinlock_t crt_lock = SPINLOCK_INIT;
+
 static bool host_fd_counted(int host_fd, rvvm_fd_backend_t backend)
 {
     /* An anchor keeps its own reference (win_socket_anchor_ref/unref), and the
@@ -7497,6 +7506,8 @@ static void host_fd_acquire(int host_fd)
     }
     spin_lock(&host_fd_ref_lock);
     host_fd_refs[host_fd]++;
+    RVVM_TRC(RVVM_TRC_FD, "host_ref host=%d = %d (acquire)", host_fd,
+             host_fd_refs[host_fd]);
     spin_unlock(&host_fd_ref_lock);
 }
 
@@ -7516,9 +7527,15 @@ static void host_fd_release(int host_fd)
         last = host_fd_refs[host_fd] == 1;
         host_fd_refs[host_fd]--;
     }
+    RVVM_TRC(RVVM_TRC_FD, "host_ref host=%d = %d (release, %s)", host_fd,
+             host_fd_refs[host_fd], last ? "closing" : "kept");
     spin_unlock(&host_fd_ref_lock);
     if (last) {
+        /* Under crt_lock, so no dup() can be handed this number between the
+         * decision to close it and the close itself. */
+        spin_lock(&crt_lock);
         close(host_fd);
+        spin_unlock(&crt_lock);
     }
 }
 
@@ -7597,7 +7614,10 @@ static int userland_fd_host_off_console(int host_fd)
     int moved = host_fd;
 
     while (moved >= 0 && moved <= 2) {
-        int next = dup(moved);
+        int next;
+        spin_lock(&crt_lock);
+        next = dup(moved);
+        spin_unlock(&crt_lock);
         if (next < 0) {
             break;      /* nothing better to offer; the caller decides */
         }
@@ -8577,7 +8597,9 @@ static rvvm_addr_t userland_dev_fd_dup_open(int source_fd, int flags)
     if (own != -2) {
         return own >= 0 ? (rvvm_addr_t)own : -UAPI_EMFILE;
     }
+    spin_lock(&crt_lock);
     host_new = dup(userland_fd_host(ctx, source_fd));
+    spin_unlock(&crt_lock);
     if (host_new < 0) {
         return errno_ret(-1);
     }
@@ -8785,7 +8807,10 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
              * closing it on one side closes nothing on the other. */
             continue;
         }
-        int host_fd = dup(parent->fds[fd].fd);
+        int host_fd;
+        spin_lock(&crt_lock);
+        host_fd = dup(parent->fds[fd].fd);
+        spin_unlock(&crt_lock);
         if (host_fd >= 0) {
             /* A socket anchor is dup'd by the socket layer, which files the copy
              * under a fresh anchor; take the child's reference on it (this slot
@@ -16294,7 +16319,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * is this table's, because the host's number for the copy
                      * means nothing here - it may already be one of the guest's
                      * own descriptors, or another guest process's. */
-                    int host_new = dup(userland_fd_host(uctx(), (int)a0));
+                    int host_new;
+                    spin_lock(&crt_lock);
+                    host_new = dup(userland_fd_host(uctx(), (int)a0));
+                    spin_unlock(&crt_lock);
                     if (host_new < 0) {
                         a0 = errno_ret(-1);
                         break;
