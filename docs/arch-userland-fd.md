@@ -1,6 +1,6 @@
 # userland fd 设计现状
 
-最后核对：2026-11-18（B2：sys_close 未跟踪号不再透传，对应 `src/core/rvvm_user.c` 工作树状态）
+最后核对：2026-11-18（P3：防御机制已删，对应 `src/core/rvvm_user.c` 工作树状态）
 
 本文只描述**现在是什么**：guest 的 fd 号如何映射到宿主句柄，fork / close / execve 各自做了什么。修复过程与未解决的问题见 `../issues/fork-shared-crt-fd-space.md`。
 
@@ -20,7 +20,7 @@ wsock_fds_gen[i] = InterlockedIncrement64(&wsock_fds_gen_next);   // 永不为 0
 return WSOCK_ANCHOR_BASE + i;
 ```
 
-因此「这个号是不是锚」由区间判定（`wsock_index(fd) >= 0`），不再需要「某个 CRT 号恰好被登记」这种猜测。槽仍记录 `anchor_gen`，但它的作用是识别「同一个锚号被回收后换了对象」，不是区分锚与普通 fd。
+因此「这个号是不是锚」由区间判定（`wsock_index(fd) >= 0`），不再需要「某个 CRT 号恰好被登记」这种猜测。槽仍记录 `anchor_gen`，但它是**纯诊断字段**（fd_wr trace 打印），没有任何判定读它。
 
 `socket` 在 `userland_own_fd()` 里算「自有」——它不是宿主描述符，不能进宿主 `poll()`/`select()`；而槽的 `backend` 仍记 `HOST`，因为 close 要走 `win_socket_close()`。这两个判定分成 `userland_own_fd()` 与 `userland_sim_fd()` 两个函数，混用会把 socket 槽标成 SIM、让 close 不再关 socket。
 
@@ -35,7 +35,7 @@ return WSOCK_ANCHOR_BASE + i;
 | `cloexec` | `FD_CLOEXEC`，`execve` 会关掉该槽 |
 | `used` | 槽是否被占 |
 | `flags` | guest 的 open-file 标志字（仅 `SIM` 有值，HOST 去问宿主） |
-| `anchor_gen` | 归档时的锚代数；0 = 不骑锚（console、普通 host fd、模拟对象） |
+| `anchor_gen` | 归档时的锚代数；0 = 不骑锚（console、普通 host fd、模拟对象）。**纯诊断**，无判定读它 |
 | `holds_anchor_ref` | **本槽**是否持有锚引用（与 `win_socket_anchor_ref/unref` 配对，不看数字长相） |
 | `path` | 打开时的 guest 路径，仅供 `/proc/<pid>/fd/<n>`；每槽一份独立字符串 |
 
@@ -43,11 +43,10 @@ return WSOCK_ANCHOR_BASE + i;
 
 ## 3. 解析：guest 号 → 宿主号
 
-`userland_fd_host(ctx, fd)`：
+`userland_fd_host(ctx, fd)` 纯查表：
 
-1. 未跟踪的号：原样返回（视为「同号的宿主 fd」）。
-2. 跟踪的槽：若 `anchor_gen != 0` 且 `anchor_gen != win_socket_anchor_gen(槽.fd)`，返回 **-1**（stale，调用方得到 EBADF），因为该号已被 CRT 分给别的 socket。
-3. 否则返回槽里的 `fd`。
+1. 未跟踪的号：原样返回（视为「同号的宿主 fd」；close 对这种号另有约束，见第 5 节）。
+2. 跟踪的槽：返回槽里的 `fd`。号私有保证槽存活期间没人动它，无 stale 判定。
 
 所有 `read` / `write` / `fcntl` / `poll` 都先走这个解析。
 
@@ -76,7 +75,7 @@ guest 的 `fork` 在宿主进程里用线程模拟，父子两个 ctx 各有槽�
 | memfs 号 | `memfs_fd_release`（还 pin 与存储引用） |
 | pty 号 | `userland_pty_release` |
 | `/proc` 号 | `userland_proc_fd_release` |
-| `anchor_gen != 0` | `win_socket_close(fd)`：关 SOCKET，锚号按引用计数归还 |
+| `win_socket_is_fd(fd)`（锚号区间判定） | `win_socket_close(fd)`：关 SOCKET，锚号按引用计数归还 |
 | 其余（普通 HOST） | `host_fd_give()`：槽不再命名这个号就直接关闭它 |
 | **未跟踪号**（`userland_fd_close` 返回 false） | 只有 asset 挂载发的裸宿主号按号 `close()`（`asset_fd_take` 弹出）；其余回 `EBADF`，**不碰任何宿主号** |
 
@@ -86,10 +85,9 @@ guest 的 `fork` 在宿主进程里用线程模拟，父子两个 ctx 各有槽�
 
 宿主号**按槽私有**：一个号只属于一个 address space 里的一个槽。fork 用 `dup()` 给子进程另做一个号，`dup2` 复制时也另做，`open()` 给出一个没有别处命名的号。因此关闭一个槽就关闭它的号，不需要问「还有谁在用」。
 
-- `host_fd_owned(host, backend)`：`backend == HOST && 0 <= host < 4096 && win_socket_anchor_gen(host) == 0`——这个号是否由槽负责关闭（锚有自己的一套，合成号不进 CRT）
-- `host_fd_take(host)` / `host_fd_give(host)`：记录槽开始/停止命名这个号；`give` 直接 `close()`
-- `host_fd_alive(host)`：号是否还开着（Windows 走 `_get_osfhandle`），写槽后校验，抓「槽指向已关闭的号」
-- `host_fd_refs[]` **只剩检测作用**：`take` 时若计数已非零，说明同一个号被两个槽命名，`rvvm_warn` 报出两个槽号与 backend。它不决定任何关闭
+- `host_fd_owned(host, backend)`：`backend == HOST && 0 <= host < HOST_FD_MAX(4096)`——这个号是否由槽负责关闭。锚号在独立号段（≥ `WSOCK_ANCHOR_BASE`），区间已排除；合成号不进 CRT，由 backend 排除
+- `host_fd_give(host)`：槽不再命名这个号就直接 `close()`（在 `crt_lock` 内）
+- `host_fd_alive(host)`：号是否还开着（Windows 走 `_get_osfhandle`），写槽后校验，warn-only 断言，抓「槽指向已关闭的号」
 - `crt_lock` 覆盖 `_dup` 与 `_close` 这一对，使「号空闲」和「号归还」是一个原子步骤
 
 号只在 `userland_fds_write()` 里迁移：旧号 `give`、新号 `take`；**同一个号重写不迁移**（`set_flags`/`set_cloexec` 重写同一个槽，不能因此关掉它描述的号）。
@@ -197,7 +195,7 @@ ssh 客户端 ──TCP 7900──> vpshhd ──> tinysshd(会话主, 如 pid 1
 
 ## 11. 已知设计约束
 
-1. ~~父子共享一张 CRT 表。~~ 已解决到「号私有」这一层：`inherit` 不再把父槽的号整段复制给子槽，普通 HOST 号一律 `dup()`，memfs / pty / proc / dev 各自显式写槽；`host_fd_give()` 不看计数，槽不再命名这个号就关闭它。`host_fd_refs[]` 退化为检测器，`take` 时发现计数非零就 `rvvm_warn` 报出两个槽号。锚也不再占用 CRT 号（`wsock_nul[]` 已删除）。**「号被别人关掉」的最后一条路径也已闭合**：`sys_close` 对未跟踪号不再裸透传（只有 asset 挂载 fd 按号关闭，其余回 `EBADF`），guest 的 `p_closefrom` sweep 不再命中别的槽刚 `dup` 到的宿主号。证据与定位过程见 `task-fd-ownership.md` B2 一节。
+1. ~~父子共享一张 CRT 表。~~ 已解决到「号私有」这一层：`inherit` 不再把父槽的号整段复制给子槽，普通 HOST 号一律 `dup()`，memfs / pty / proc / dev 各自显式写槽；`host_fd_give()` 不看计数，槽不再命名这个号就关闭它。`host_fd_refs[]` 计数表与检测器已随 P3 删除。锚也不再占用 CRT 号（`wsock_nul[]` 已删除）。**「号被别人关掉」的最后一条路径也已闭合**：`sys_close` 对未跟踪号不再裸透传（只有 asset 挂载 fd 按号关闭，其余回 `EBADF`），guest 的 `p_closefrom` sweep 不再命中别的槽刚 `dup` 到的宿主号。证据与定位过程见 `task-fd-ownership.md` B2 一节。
 2. ~~锚号与 CRT 号共用数字。~~ 已解决：锚号改为 `0x40000000 + index` 独立号段，`wsock_nul[]` 保存 NUL 句柄且不对外。按数字判断类型的写法不再必要，剩余的 `anchor_gen` 只用于识别同号换对象。
 3. ~~引用计数的判定时刻有时差。~~ 已随「号私有」消解：关闭不再由计数决定，`host_fd_give()` 直接关掉槽自己的号，因此没有「当时算出的值」这种跨时刻判断。`crt_lock` 仍覆盖 `_dup` 与 `_close` 这一对，使「号空闲」与「号归还」是一个原子步骤。
 
@@ -205,7 +203,7 @@ ssh 客户端 ──TCP 7900──> vpshhd ──> tinysshd(会话主, 如 pid 1
 
 ## 12. 当前缺失（非现状）
 
-第 1、2、3 条约束都已落地，且 B1 遗留的「装槽后号被未知路径关闭」缺口已在 B2 闭合：根因是 `sys_close` 对未跟踪 guest 号的裸透传（详见 `task-fd-ownership.md`）。剩余待办只有 P3：删除 `host_fd_refs` 检测器与 stale 判定（见 `todo-fd-ownership.md`），以及 fork 时 `ctx->asset_fds` 表继承的边界复核。目标形态见 `design-fd-ownership.md`，历史问题证据见 `../issues/fork-shared-crt-fd-space.md`。
+第 1、2、3 条约束都已落地，B1 遗留的「装槽后号被未知路径关闭」缺口已在 B2 闭合（根因是 `sys_close` 对未跟踪 guest 号的裸透传，详见 `task-fd-ownership.md`），P3 已把 `host_fd_refs` / stale 判定 / `anchor_gen` 猜测分支删除。**唯一遗留**：fork 时 `ctx->asset_fds` 表继承的边界复核（asset fd 不进槽表，父子复制同号会共享宿主描述符；tinyssh 链路不触发，bundle app 链路需复核）。目标形态见 `design-fd-ownership.md`，历史问题证据见 `../issues/fork-shared-crt-fd-space.md`。
 
 ## 相关文件
 

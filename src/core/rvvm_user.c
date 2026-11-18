@@ -181,8 +181,7 @@ int  win_socket_wait(int fd, short events, int timeout_ms);
  * Each stub answers what win_socket.c answers for a number that is not a live
  * anchor, and every caller is already written against that: each one either
  * tests the answer, or sits in a branch only an anchor can reach. The fd slot's
- * anchor_gen field stays in the struct and stays 0 here, which is precisely the
- * "no generation" the stale-anchor check above it looks for. */
+ * anchor_gen field stays in the struct as a diagnostic, recorded 0 here. */
 static inline int         win_socket_is_fd(int fd)       { (void)fd; return 0; }
 static inline int         win_socket_wait_readable(int fd, int timeout_ms) { (void)fd; (void)timeout_ms; return -1; }
 static inline const char* win_socket_peer_str(int fd)    { (void)fd; return "?"; }
@@ -1453,11 +1452,8 @@ typedef struct {
     uint32_t flags;
     // The anchor generation this slot was filed under, or 0 for a descriptor that
     // rides on no anchor (a console, a plain host fd, an emulator-owned object).
-    // The anchor *number* alone is not an identity: it is freed and handed to the
-    // next socket as soon as the descriptor behind it goes, so a slot that
-    // outlives its anchor would otherwise resolve to a stranger's socket - the
-    // sshd master writing its log into a client's connection that way. Comparing
-    // the generation is what makes the number mean "mine" again.
+    // Purely diagnostic since the anchor numbers moved to their own range: the
+    // fd Wr trace and /proc/<pid>/fd peers read it, nothing decides on it.
     uint64_t anchor_gen;
     // Whether *this slot* holds a reference on the anchor it names. The
     // reference is what keeps the anchor's number out of the CRT's free list
@@ -7485,23 +7481,11 @@ static bool userland_parent_alive(rvvm_process_t* proc)
  * therefore closes its number, with no question of who else might still need
  * it - there is nobody else.
  *
- * This replaced a reference count that decided "whoever is last closes it".
- * The count was answering the wrong question: it kept a number alive for slots
- * that should never have shared one, so a parent's close and a child's open
- * could meet on the same digit and each believe it owned it. Numbers being
- * private is the invariant that makes the close safe, and the count below is
- * kept only to *detect* a violation of it.
- *
  * Not every slot owns a number: an anchor keeps its own reference (see
  * win_socket_anchor_ref/unref), and a synthetic number (memfs/pty/proc/dev)
  * names an object this layer serves, never a CRT descriptor. host_fd_owned()
  * is the single test for "this slot is responsible for closing this number". */
-#define HOST_FD_REF_MAX 4096
-
-/* How many slots name each number. One is the only legal value; anything more
- * means a number was filed twice, which is what rvvm_warn below reports. */
-static int        host_fd_refs[HOST_FD_REF_MAX];
-static spinlock_t host_fd_ref_lock = SPINLOCK_INIT;
+#define HOST_FD_MAX 4096
 
 /* Serialises the two CRT operations that read and change the same table slot:
  * _dup() picks a free number, _close() gives one back. Each is thread-safe on
@@ -7510,19 +7494,12 @@ static spinlock_t host_fd_ref_lock = SPINLOCK_INIT;
  * "the number was free" and "the number came back" one step. */
 static spinlock_t crt_lock = SPINLOCK_INIT;
 
-/* Whether @host_fd is a number this slot owns and must close. An anchor is
- * excluded because win_socket owns that number space; a synthetic number is
- * excluded because it never reaches the CRT. */
+/* Whether @host_fd is a number this slot owns and must close. Anchor numbers
+ * live outside the CRT range (WSOCK_ANCHOR_BASE), so the range test below
+ * already excludes them; a synthetic number is excluded by its backend. */
 static bool host_fd_owned(int host_fd, rvvm_fd_backend_t backend)
 {
-    /* The anchor test is the generation the slot records, not "some socket
-     * object answers to this number": an anchor keeps a NUL descriptor open
-     * until its last reference goes, and reading that as a live anchor would
-     * leave a pipe filed under the same number unowned. Anchor numbers live
-     * outside the CRT range anyway (WSOCK_ANCHOR_BASE), so the range test
-     * below catches them first. */
-    return backend == FD_BACKEND_HOST && host_fd >= 0 &&
-           host_fd < HOST_FD_REF_MAX && win_socket_anchor_gen(host_fd) == 0;
+    return backend == FD_BACKEND_HOST && host_fd >= 0 && host_fd < HOST_FD_MAX;
 }
 
 /* Whether @host_fd still names an open descriptor. Used to catch a slot being
@@ -7537,47 +7514,12 @@ static bool host_fd_alive(int host_fd)
 #endif
 }
 
-/* Record that a slot now names @host_fd. */
-static void host_fd_take(rvvm_userland_t* ctx, int fd, int host_fd)
-{
-    int shared;
-    if (host_fd < 0 || host_fd >= HOST_FD_REF_MAX) {
-        return;
-    }
-    spin_lock(&host_fd_ref_lock);
-    shared = host_fd_refs[host_fd];
-    host_fd_refs[host_fd]++;
-    RVVM_TRC(RVVM_TRC_FD, "host_ref host=%d = %d (take)", host_fd,
-             host_fd_refs[host_fd]);
-    spin_unlock(&host_fd_ref_lock);
-    if (shared > 0) {
-        /* Two slots on one number: one of them will be closed when the other's
-         * slot goes away, and the symptom is a write that answers EBADF while
-         * the slot still reads a number. Name both slots so the path that made
-         * the second one is obvious from the log. */
-        for (int i = 0; i < USERLAND_FD_TABLE_MAX; ++i) {
-            if (i != fd && ctx->fds[i].used && ctx->fds[i].fd == host_fd) {
-                rvvm_warn("host fd %d named by pid=%u fd=%d as well as fd=%d "
-                          "(be=%d)", host_fd, (unsigned)ctx->pid, i, fd,
-                          (int)ctx->fds[i].backend);
-            }
-        }
-    }
-}
-
 /* A slot stops naming @host_fd: the number is this slot's alone, so it goes. */
-static void host_fd_give(unsigned pid, int fd, int host_fd)
+static void host_fd_give(int host_fd)
 {
-    if (host_fd < 0 || host_fd >= HOST_FD_REF_MAX) {
+    if (host_fd < 0 || host_fd >= HOST_FD_MAX) {
         return;
     }
-    spin_lock(&host_fd_ref_lock);
-    if (host_fd_refs[host_fd] > 0) {
-        host_fd_refs[host_fd]--;
-    }
-    RVVM_TRC(RVVM_TRC_FD, "host_ref host=%d = %d (give, pid=%u fd=%d)", host_fd,
-             host_fd_refs[host_fd], pid, fd);
-    spin_unlock(&host_fd_ref_lock);
     /* Under crt_lock, so no dup() can be handed this number between the
      * decision to close it and the close itself. */
     spin_lock(&crt_lock);
@@ -7610,15 +7552,12 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
     ctx->fds[fd].cloexec = cloexec;
     ctx->fds[fd].backend = backend;
     ctx->fds[fd].flags   = flags;
-    /* An anchor-backed slot remembers *which* socket its number meant when it was
-     * filed; a slot riding on no anchor records 0, which never matches a live one
-     * (so a console and a plain host fd are never treated as recycled). */
+    /* An anchor-backed slot remembers *which* socket its number meant when it
+     * was filed; a slot riding on no anchor records 0. Diagnostic only: the
+     * fd_wr trace prints it, nothing decides on it. */
     ctx->fds[fd].anchor_gen = used ? win_socket_anchor_gen(host_fd) : 0;
     if (old_owned && (!new_owned || old_host != host_fd)) {
-        host_fd_give((unsigned)ctx->pid, fd, old_host);
-    }
-    if (new_owned && (!old_owned || old_host != host_fd)) {
-        host_fd_take(ctx, fd, host_fd);
+        host_fd_give(old_host);
     }
     if (new_owned && !host_fd_alive(host_fd)) {
         rvvm_warn("pid=%u fd=%d: filed on host %d, which is not open",
@@ -7760,24 +7699,9 @@ static bool userland_console_ready(rvvm_userland_t* ctx)
 static int userland_fd_host(rvvm_userland_t* ctx, int fd)
 {
     if (userland_fd_tracked(ctx, fd)) {
-        /* An anchor-backed slot whose anchor has since been recycled no longer
-         * refers to its own socket - the number now names somebody else's (the
-         * anchor table is run-wide, and a fork()ed sibling or a later socket in
-         * this process can take it the moment the descriptor behind it closes).
-         * Acting on that number would read or write a stranger's descriptor, so
-         * it is reported as the bad descriptor it now is. Returning -1 lets every
-         * caller reach the host with a number that can only fail, which is EBADF
-         * rather than someone else's data. A console and a plain host fd file no
-         * generation (0) and are always left alone. */
-        uint64_t gen = ctx->fds[fd].anchor_gen;
-        if (gen != 0 && gen != win_socket_anchor_gen(ctx->fds[fd].fd)) {
-            RVVM_TRC(RVVM_TRC_FD, "fd_stale pid=%u fd=%d host=%d gen=%llu now=%llu "
-                      "(anchor recycled under us)",
-                      (unsigned)ctx->pid, fd, ctx->fds[fd].fd,
-                      (unsigned long long)gen,
-                      (unsigned long long)win_socket_anchor_gen(ctx->fds[fd].fd));
-            return -1;
-        }
+        /* The number is the slot's alone (see "host numbers are private"):
+         * while the slot lives, nothing else can release or recycle it, so a
+         * plain lookup is the whole answer. */
         return ctx->fds[fd].fd;
     }
     return fd;
@@ -8106,14 +8030,11 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
         userland_proc_fd_release(ctx->fds[fd].fd);
     } else if (!userland_dev_by_fd(ctx->fds[fd].fd, NULL)) {
         /* A device descriptor is just a number: nothing was opened for it. */
-        /* Whether *this slot* names an anchor is a question only the slot can
-         * answer: the anchor and CRT numbers are separate spaces that happen to
-         * share digits, so asking win_socket_is_fd() here turns a plain file's
-         * descriptor 5 into the listener's anchor the moment an anchor 5 exists
-         * - and the close below then shuts the listener down. anchor_gen is
-         * recorded when the number is filed, so it is zero for a file that
-         * landed on 5 before any anchor did. */
-        if (ctx->fds[fd].anchor_gen != 0) {
+        /* Anchor numbers live in their own range (WSOCK_ANCHOR_BASE), so
+         * win_socket_is_fd() is a range test now, not the digit-guess it used
+         * to be: a plain file's descriptor can no longer be mistaken for an
+         * anchor. */
+        if (win_socket_is_fd(ctx->fds[fd].fd)) {
             /* A socket anchor: the socket goes now, and the anchor reference
              * this slot holds goes with it. */
             win_socket_close(ctx->fds[fd].fd);

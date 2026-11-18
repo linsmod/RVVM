@@ -67,7 +67,7 @@ ssh -p 7900 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL 127.0.0.1 "ech
 
 - [x] P1 fork 私有化
 - [x] P2 锚号独立 + poll 归类（socket 通道已通，见下）
-- [ ] P3 删除 `host_fd_refs` 与 stale 判定
+- [x] P3 删除 `host_fd_refs` 与 stale 判定（2026-11-18，见下）
 
 ### 2026-11-18 P2 实测
 
@@ -166,6 +166,27 @@ B1 取「每槽独占一个 CRT 号」而非「自管 guest fd → HANDLE 映射
 | `mount_e2e` / `memfs_e2e` / `procfs_e2e` / `openssh_e2e` | FAIL 57/63/25/17 | 与 `git stash` 基线**逐项相同**，均为本环境既有失败（`session_e2e` 环境缺陷同类），非本改动引入 |
 
 剩余：P3（删除 `host_fd_refs` 检测器等防御机制）未动；fork 继承 `ctx->asset_fds` 表时父子同号的边界未重新审计（P3 时一并看）。
+
+### 2026-11-18 P3 实测（完成）
+
+todo P3 的三个目标全部落地（提交见进度表；`crt_lock` 不在 P3 范围，保留——它仍在串行化 `_dup` 与 `close` 的分配/归还对）：
+
+- **`host_fd_refs` 计数表 + `host_fd_ref_lock` 删除**，`host_fd_take` 整体删除，`host_fd_give` 只保留关闭动作（`HOST_FD_REF_MAX` 更名 `HOST_FD_MAX`，作为 CRT 号归属上限）
+- **`userland_fd_host` stale 判定删除**，退化为纯查表（`design-fd-ownership.md` §3.4）
+- **close 分派删除 `anchor_gen` 猜测分支**：P2 后锚号在独立号段，`win_socket_is_fd()` 是区间判定，不再有「普通文件描述符 5 被当成锚 5」的问题
+- `anchor_gen` 字段按设计保留为**诊断字段**（fds_write 记录 + fd_wr trace 打印，无任何判定读它）；`host_fd_alive` 装槽断言保留（warn-only，B2 的根因正是它先暴露的形态）
+- todo 验收「`rg "host_fd_ref"` 无残留」达成；`anchor_gen` 有残留属「退化为诊断」分支，符合 todo 原文
+
+验证：
+
+| 项 | 结果 |
+|---|---|
+| `ssh -p 7900 "echo HELLO"` | 3 轮全 `HELLO`、EXIT=0 |
+| trace 告警（not open / stale / shared） | 0 |
+| `fs_selftest` | PASS |
+| mount/memfs/procfs/openssh e2e | 与基线逐项相同（57/63/25/17，环境既有） |
+
+**fork 继承 `ctx->asset_fds` 的边界**（本次未动，登记为遗留）：asset fd 表按 ctx 存，fork 时若父 ctx 的 asset fd 号被复制给子 ctx，子按号关闭会关掉父子共享的宿主描述符。tinyssh 链路不开 asset 挂载，未触发；vpsessiond 链路（bundle app）用到 asset 时需复核。
 
 ### 2026-11-18 P1 实测
 

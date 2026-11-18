@@ -47,7 +47,7 @@
 
 ## P3：删除剩余防御机制
 
-**优先级：低。** P1、P2 稳定后执行。
+**优先级：低。** P1、P2 稳定后执行。**已完成（2026-11-18）**：计数表与检测器删除、`userland_fd_host` 退化为查表、close 分派改按锚号区间判定；`anchor_gen` 走「退化为诊断字段」分支（fd_wr trace 打印，无判定读它）。执行记录见 `task-fd-ownership.md` P3 一节。
 
 要做：
 
@@ -57,7 +57,7 @@
 
 依赖：P1、P2。
 
-验收：全量回归通过；`rg "host_fd_ref|anchor_gen"` 无残留调用点。
+验收：全量回归通过；`rg "host_fd_ref|anchor_gen"` 无残留调用点（`anchor_gen` 按诊断分支保留字段与 trace）。
 
 ## 全局验收
 
