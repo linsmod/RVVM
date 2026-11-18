@@ -320,16 +320,14 @@ function openTerminal(port) {
       copySel();
       return false;
     }
-    if ((c && ev.key === "v") || (c && s && (ev.key === "v" || ev.key === "V")) ||
-        (s && ev.key === "Insert")) {
-      pasteText();
-      return false;
-    }
+    // Paste is NOT intercepted here: the browser delivers its paste event to
+    // xterm's textarea and xterm routes the text through onData (above).
+    // Intercepting Ctrl+V to readText() by hand raced that path - the text
+    // arrived natively while the manual read got denied, so the user saw a
+    // failure toast over a successful paste (and a double paste when both
+    // succeeded).
     return true;
   });
-  // The browser's own paste event (Ctrl+V on the focused textarea) also
-  // carries the text - route it, or a permitted paste would go nowhere.
-  term.onPaste((d) => send(d.replace(/\r?\n/g, "\r")));
   // Windows-console convention: right-click pastes, right-click with a
   // selection copies. A denied clipboard read falls back to Ctrl+V.
   container.addEventListener("contextmenu", (e) => {
