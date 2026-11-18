@@ -1,7 +1,7 @@
 # task: 宿主号私有化（fd 所有权）
 
 > 执行记录与恢复点。计划见 `todo-fd-ownership.md`，目标形态见 `design-fd-ownership.md`。
-> 分支：`fd-ownership`（2026-11-18 从 `android-abi-host` 切出）。
+> 分支：`fd-ownership`（2026-11-18 从 `android-abi-host` 切出）；同日 P3 收官后**快进合回 `android-abi-host`**（`65b918e..03c2134`），两支当时同 tip，后续开发在 `android-abi-host` 上继续。
 
 ## 起点状态
 
