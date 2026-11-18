@@ -10,18 +10,19 @@
 |---|---|---|---|
 | guest fd 号 | `0 .. USERLAND_FD_TABLE_MAX-1`（4096） | 进程 ctx 的槽表下标 | `userland_fd_slot_alloc(min_fd)`：从 `min_fd` 起找最低空槽 |
 | 宿主号 | Windows CRT fd | 槽的 `fd` 字段 | 宿主 `open` / `dup` / `socket` |
-| 锚号（socket anchor） | 同宿主号区间 | `wsock_fds[]` + `wsock_fds_gen[]` | `win_socket_alloc_anchor()` |
+| 锚号（socket anchor） | `0x40000000 + index`（`WSOCK_ANCHOR_BASE` 起） | `wsock_fds[]` + `wsock_fds_gen[]` + `wsock_nul[]` | `win_socket_alloc_anchor()` |
 
-关键点：**锚号不是独立号段**。`win_socket_alloc_anchor()` 用 `_open("NUL", _O_RDWR|_O_BINARY)` 先占一个真实 CRT 号，再由 `wsock_fd_alloc()` 把该号登记为 socket 锚并写一个非零代数：
+关键点：**锚号是独立号段**，不与 CRT 号重叠。每个锚背后仍有一个 `_open("NUL")` 句柄，但它只存在 `wsock_nul[index]` 里，作为 `WSAPoll` 的等待对象，**不出现在任何对外数字中**：
 
 ```c
-wsock_fds[fd]     = s;
-wsock_fds_gen[fd] = InterlockedIncrement64(&wsock_fds_gen_next);   // 永不为 0
+wsock_fds[i]     = s;
+wsock_fds_gen[i] = InterlockedIncrement64(&wsock_fds_gen_next);   // 永不为 0
+return WSOCK_ANCHOR_BASE + i;
 ```
 
-所以「锚号 11」和「管道 CRT 号 11」是**同一个数字、两套语义**，只能靠代数区分：`win_socket_anchor_gen(fd) != 0` 才是活锚。
+因此「这个号是不是锚」由区间判定（`wsock_index(fd) >= 0`），不再需要「某个 CRT 号恰好被登记」这种猜测。槽仍记录 `anchor_gen`，但它的作用是识别「同一个锚号被回收后换了对象」，不是区分锚与普通 fd。
 
-因此判断「这个槽是不是指向锚」**不能**问 `win_socket_is_fd(host)`（它只看 `wsock_fds[fd]` 有没有 socket 对象），必须看槽自己记录的 `anchor_gen`。
+`socket` 在 `userland_own_fd()` 里算「自有」——它不是宿主描述符，不能进宿主 `poll()`/`select()`；而槽的 `backend` 仍记 `HOST`，因为 close 要走 `win_socket_close()`。这两个判定分成 `userland_own_fd()` 与 `userland_sim_fd()` 两个函数，混用会把 socket 槽标成 SIM、让 close 不再关 socket。
 
 ## 2. 槽结构
 
@@ -194,15 +195,15 @@ ssh 客户端 ──TCP 7900──> vpshhd ──> tinysshd(会话主, 如 pid 1
 
 ## 11. 已知设计约束
 
-1. **父子共享一张 CRT 表。** 模拟 fork 不复制宿主表，父子槽各记一份宿主号；父线程的 `close` 与子线程的 `dup` 落在同一数字上，顺序由线程调度决定。
-2. **锚号与 CRT 号共用数字。** 任何「按数字判断是不是锚」的写法都会串味，必须用槽的 `anchor_gen`。
+1. **父子共享一张 CRT 表。** 模拟 fork 不复制宿主表，父子槽各记一份宿主号；父线程的 `close` 与子线程的 `dup` 落在同一数字上，顺序由线程调度决定。这是当前仍未解决的一条：`host_fd_release()` 的 `_close()` 与另一线程的 `_dup()` 之间没有原子性，实测 `sh` 的 stderr 管道就在这个窗口里失效。
+2. ~~锚号与 CRT 号共用数字。~~ 已解决：锚号改为 `0x40000000 + index` 独立号段，`wsock_nul[]` 保存 NUL 句柄且不对外。按数字判断类型的写法不再必要，剩余的 `anchor_gen` 只用于识别同号换对象。
 3. **引用计数的判定时刻有时差。** `counted` 在入槽时算，关闭时用当时算出的值；中间若锚的生灭变化，计数会漏。`host_fd_acquire()` 与 `dup()` 之间也有几条指令的窗口。
 
 后果与证据见 `../issues/fork-shared-crt-fd-space.md`；解法见第 12 节引用的两份文档。
 
 ## 12. 当前缺失（非现状）
 
-三条约束的解法尚未实现。目标是**宿主号按 address space 私有**——每个槽独占自己的号，共享只发生在对象层（inode / pty / SOCKET），于是「号会不会被别人关掉」这个问题不再需要回答。目标形态见 `design-fd-ownership.md`，实施计划与验收见 `todo-fd-ownership.md`，问题证据见 `../issues/fork-shared-crt-fd-space.md`。
+第 2 条已随锚号独立号段落地；第 1、3 条（CRT 号的 `dup`/`close` 原子性与引用计数的判定时差）尚未解决。目标是**宿主号按 address space 私有**——每个槽独占自己的号，共享只发生在对象层（inode / pty / SOCKET），于是「号会不会被别人关掉」这个问题不再需要回答。目标形态见 `design-fd-ownership.md`，实施计划与验收见 `todo-fd-ownership.md`，问题证据见 `../issues/fork-shared-crt-fd-space.md`。
 
 ## 相关文件
 

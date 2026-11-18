@@ -66,8 +66,17 @@ ssh -p 7900 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL 127.0.0.1 "ech
 ## 进度
 
 - [x] P1 fork 私有化
-- [ ] P2 锚号独立 + poll 归类
+- [x] P2 锚号独立 + poll 归类（socket 通道已通，见下）
 - [ ] P3 删除 `host_fd_refs` 与 stale 判定
+
+### 2026-11-18 P2 实测
+
+改动：`win_socket.c` 的锚号改为 `WSOCK_ANCHOR_BASE + index`，NUL 句柄存进 `wsock_nul[]`；`userland_own_fd()` 纳入 socket（poll/select 不再把锚号交给宿主），新增 `userland_sim_fd()` 只用于槽的 backend 判定；`dup3` 的「共享对象」分支改回 `userland_sim_fd`。
+
+- **socket 写通道已通**：`sys_write(guest fd=1 host=0x40000002)` 向客户端成功写出 120、52 字节，SSH 握手不再 reset，`session 102 exited 0`
+- 过程中修掉两个由号段变更暴露的分类错误：`install` 曾把 socket 槽标成 `FD_BACKEND_SIM`（close 不再走 `win_socket_close`）；`dup3` 曾把锚当共享对象复制、不取锚引用，导致槽立刻 `fd_stale`
+- **仍未通过**：sh（104）的 `sys_write(fd=2 host=10)` 写 37 字节后 EBADF。宿主 10 是父在 fork 后关闭 ch 端时 `_close` 掉的，而子 `dup(ch[2])` 恰好在同一窗口拿到 10——`host_fd_release` 的 `_close` 与另一线程的 `_dup` 之间没有原子性，这是 P1 保留引用计数时就存在的窗口，不是 P2 引入的
+- 结论：P2 的目标（锚号不混 CRT、socket 不进宿主 poll）达成；剩余阻断是 CRT 层的 `dup`/`close` 原子性，需要在 P3 之前单独处理
 
 ### 2026-11-18 P1 实测
 

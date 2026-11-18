@@ -158,6 +158,10 @@ int  win_socket_dup(int fd);
 /* Readiness of a socket anchor, for the slice-wise wait behind a blocking read
  * (see userland_wait_socket_readable). 1 = readable, 0 = timed out, -1 = error. */
 int  win_socket_wait_readable(int fd, int timeout_ms);
+/* Readiness bits for the same anchor (WIN_POLLIN / WIN_POLLOUT). A socket is one
+ * of our own descriptors, so poll()/select() ask here instead of handing its
+ * number to the host - anchor numbers are not CRT descriptors. */
+int  win_socket_wait(int fd, short events, int timeout_ms);
 #else
 /* Not a WinSock build, so the anchors do not exist - and a guest socket here is
  * a real host socket, with no anchor table, no generation and no reference to
@@ -1335,6 +1339,7 @@ static int64_t userland_pty_write(struct userland_pty* pty, bool master, const v
                                   size_t count, struct rvvm_userland* ctx, bool block);
 static int64_t userland_dev_read(int dev, void* buf, size_t count, bool block);
 static int64_t userland_dev_write(int dev, const void* buf, size_t count);
+static bool userland_sim_fd(int host_fd);
 static bool userland_own_fd(int host_fd);
 /* One read/write through the same dispatch read(2)/write(2) use: a pty end and
  * a /dev entry are served here, the console from the virtual TTY, and the rest
@@ -7641,7 +7646,7 @@ static void userland_fd_install(rvvm_userland_t* ctx, int guest_fd, int host_fd,
             win_socket_anchor_ref(host_fd);
         }
         userland_fds_write(ctx, guest_fd, true, host_fd, cloexec,
-                           userland_own_fd(host_fd) ? FD_BACKEND_SIM : FD_BACKEND_HOST,
+                           userland_sim_fd(host_fd) ? FD_BACKEND_SIM : FD_BACKEND_HOST,
                            0, "install");
         ctx->fds[guest_fd].holds_anchor_ref = anchored;
     }
@@ -10345,13 +10350,26 @@ typedef struct {
 /* Is this a descriptor the host cannot watch - one of ours (a pty end, a /dev
  * entry), or the console? The console is a host fd, so only the first kind
  * needs handling here. */
-static bool userland_own_fd(int host_fd)
+/* An object this userland serves itself, as opposed to a host descriptor. A
+ * socket anchor is *not* one of these for the purpose of the slot's backend: the
+ * slot records HOST so close() dispatches to win_socket_close(), which is what
+ * actually tears the socket down. Readiness is a different question - see
+ * userland_own_fd() below. */
+static bool userland_sim_fd(int host_fd)
 {
     struct userland_pty* pty = NULL;
     bool master = false;
     int dev = -1;
     return userland_pty_by_fd(host_fd, &pty, &master) || userland_dev_by_fd(host_fd, &dev) ||
            userland_proc_is_fd(host_fd) || memfs_fd_number(host_fd);
+}
+
+static bool userland_own_fd(int host_fd)
+{
+    /* "The host cannot watch this number": true for our own objects and for a
+     * socket anchor, whose number now lives outside the CRT range and would
+     * simply fail if it reached poll()/select(). */
+    return userland_sim_fd(host_fd) || win_socket_is_fd(host_fd) != 0;
 }
 
 /* Ready right now, for the direction being watched. A /dev entry never blocks
@@ -10372,6 +10390,13 @@ static bool userland_own_ready(int host_fd, bool write)
      * so is a write. */
     if (memfs_fd_number(host_fd)) {
         return true;
+    }
+    if (win_socket_is_fd(host_fd)) {
+        /* Windows has no readiness query that does not wait, so this is a
+         * zero-timeout select() per socket. It runs once per poll() iteration,
+         * which is why the caller's slice stays at 1 ms when every descriptor
+         * is ours. */
+        return win_socket_wait(host_fd, write ? POLLOUT : POLLIN, 0) > 0;
     }
     return userland_dev_by_fd(host_fd, &dev);
 }
@@ -16352,7 +16377,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                      * what dup()ing it would do - is what used to copy the host's
                      * own stdout instead of the guest's descriptor. */
                     if (userland_fd_is_console(uctx(), oldfd) ||
-                        userland_own_fd(host_old)) {
+                        userland_sim_fd(host_old)) {
                         struct userland_pty* pty = NULL;
                         bool master = false;
                         int  dev = -1;
