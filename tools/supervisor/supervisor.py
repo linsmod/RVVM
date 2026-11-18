@@ -15,7 +15,9 @@ reconciled, so a daemon restart never loses or double-books an instance.
 """
 
 import argparse
+import base64
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -23,6 +25,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import uuid
@@ -273,6 +276,40 @@ class Supervisor:
         self.ash = exe_path(self.release, "rvvm_ash")
         self.sup_dir = os.path.join(self.release, "runtime", "supervisor")
         os.makedirs(self.sup_dir, exist_ok=True)
+        self.ssh_key, self.ssh_pub = self._ensure_ssh_key()
+
+    def _ensure_ssh_key(self):
+        """One daemon-owned ed25519 pair: the private key is what the daemon
+        (and only it) uses to reach instances; the public half is dropped into
+        the session mount (runtime/run, mounted at guest /run/vpsessiond) where
+        vpshhd plants it for root and switches tinysshd to publickey auth.
+        Without auth.pub the guest keeps the dev none-auth behaviour."""
+        key = os.path.join(self.sup_dir, "id_ed25519")
+        pub = key + ".pub"
+        if not os.path.isfile(key):
+            subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+                            "-f", key], check=True)
+            log_line("generated instance ssh key %s" % key)
+        run_dir = os.path.join(self.release, "runtime", "run")
+        os.makedirs(run_dir, exist_ok=True)
+        with open(pub, "r", encoding="utf-8") as f:
+            publine = f.read().strip().split()
+        # Drop the comment field: tinysshd matches algorithm + base64 only.
+        with open(os.path.join(run_dir, "auth.pub"), "w",
+                  encoding="utf-8", newline="\n") as f:
+            f.write("%s %s\n" % (publine[0], publine[1]))
+        return key, pub
+
+    def ssh_args(self, port):
+        """Common ssh spelling for reaching instance <port>: key auth,
+        no host-key prompts, a pty for interactive sessions (-tt)."""
+        known_hosts = "NUL" if os.name == "nt" else "/dev/null"
+        return ["ssh", "-tt", "-i", self.ssh_key,
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=" + known_hosts,
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "-p", str(port), "root@127.0.0.1"]
 
     # -- reconcile ---------------------------------------------------------
 
@@ -491,15 +528,10 @@ class Supervisor:
     # -- exec ---------------------------------------------------------------
 
     def exec_cmd(self, port, cmd):
-        """One command through the core's own ssh endpoint (vpshhd ->
-        tinysshnoneauthd): the same link `ssh -p <port>` drives."""
-        known_hosts = "NUL" if os.name == "nt" else "/dev/null"
-        argv = ["ssh", "-p", str(port),
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=" + known_hosts,
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=10",
-                "127.0.0.1", cmd]
+        """One command through the instance's ssh endpoint, key-authenticated."""
+        argv = self.ssh_args(port)
+        argv.remove("-tt")  # one-shot command needs no pty
+        argv.append(cmd)
         try:
             p = subprocess.run(argv, capture_output=True,
                                timeout=EXEC_TIMEOUT_S)
@@ -558,8 +590,76 @@ def make_handler(sup, token):
             n = int(self.headers.get("Content-Length") or 0)
             return json.loads(self.rfile.read(n) or b"{}")
 
+        def _ws_terminal(self, port, qs):
+            """The web terminal: ws handshake, then a byte pump between the
+            browser and a key-authenticated ssh session on the instance.
+            Runs on this request's thread until either side goes away."""
+            key = self.headers.get("Sec-WebSocket-Key")
+            if not key or (self.headers.get("Upgrade", "").lower()
+                           != "websocket"):
+                return self._send(400, {"error": "websocket upgrade required"})
+            accept = base64.b64encode(hashlib.sha1(
+                (key + WS_GUID).encode()).digest()).decode()
+            self.connection.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n\r\n")
+
+            cols = min(int(qs.get("cols", ["120"])[0]) or 120, 500)
+            rows = min(int(qs.get("rows", ["32"])[0]) or 32, 200)
+            argv = sup.ssh_args(port)
+            argv.append("stty rows %d cols %d; exec /bin/sh -l" %
+                        (rows, cols))
+            try:
+                p = subprocess.Popen(argv, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT,
+                                     bufsize=0)
+            except OSError as e:
+                ws_send(self.connection, ("ssh: %s" % e).encode(), 0x1)
+                return
+
+            def pump_out():
+                try:
+                    while True:
+                        chunk = p.stdout.read(4096)
+                        if not chunk:
+                            break
+                        ws_send(self.connection, chunk, 0x2)
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+            threading.Thread(target=pump_out, daemon=True).start()
+            try:
+                while True:
+                    frame = ws_read_frame(self.rfile)
+                    if frame is None:
+                        break
+                    op, payload = frame
+                    if op == 0x8:  # close
+                        break
+                    if op == 0x9:  # ping -> pong
+                        ws_send(self.connection, payload, 0xA)
+                        continue
+                    if op in (0x1, 0x2) and payload and p.poll() is None:
+                        p.stdin.write(payload)
+                        p.stdin.flush()
+            except OSError:
+                pass
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                self.connection.close()
+                log_line("ws terminal closed port=%d" % port)
+
         def do_GET(self):
-            path = urllib.parse.urlparse(self.path).path
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
             if path in ("/", "/index.html"):
                 code, ctype, body = serve_index()
                 self.send_response(code)
@@ -569,19 +669,40 @@ def make_handler(sup, token):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path.startswith("/vendor/"):
+                code, ctype, body = serve_vendor(path[len("/vendor/"):])
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path.startswith("/ws/"):
+                # The browser cannot put a bearer header on a WebSocket, so
+                # the token rides the query string; loopback stays exempt.
+                qs = urllib.parse.parse_qs(parsed.query)
+                tok = qs.get("token", [""])[0]
+                ok = (tok == token and token) or \
+                    (not token and self.client_address[0] == "127.0.0.1")
+                if not ok:
+                    return self._send(401, {"error": "unauthorized"})
+                try:
+                    port = int(path[len("/ws/"):])
+                except ValueError:
+                    return self._send(400, {"error": "bad request"})
+                return self._ws_terminal(port, qs)
             if not self._authed():
                 return self._send(401, {"error": "unauthorized"})
-            path = urllib.parse.urlparse(self.path)
-            qs = urllib.parse.parse_qs(path.query)
-            parts = path.path.strip("/").split("/")
+            qs = urllib.parse.parse_qs(parsed.query)
+            parts = path.strip("/").split("/")
             try:
-                if path.path == "/api/health":
+                if path == "/api/health":
                     return self._send(200, {
                         "version": DAEMON_VERSION,
                         "release": sup.release,
                         "cores": core_snapshot(sup.release),
                     })
-                if path.path == "/api/instances":
+                if path == "/api/instances":
                     return self._send(200, {"instances": sup.reconcile()})
                 if len(parts) == 3 and parts[0] == "api" and \
                         parts[1] == "instances" and parts[2] == "log":
@@ -654,6 +775,13 @@ def make_handler(sup, token):
 
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+VENDOR_FILES = {
+    "xterm.js": "application/javascript",
+    "xterm.css": "text/css",
+    "addon-fit.js": "application/javascript",
+}
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 def serve_index():
@@ -663,6 +791,51 @@ def serve_index():
     with open(path, "rb") as f:
         body = f.read()
     return 200, "text/html; charset=utf-8", body
+
+
+def serve_vendor(name):
+    """Vendored frontend terminal bits (xterm.js). Whitelist only."""
+    if name not in VENDOR_FILES:
+        return 404, "text/plain", b"not found"
+    path = os.path.join(WEB_DIR, "vendor", name)
+    with open(path, "rb") as f:
+        return 200, VENDOR_FILES[name], f.read()
+
+
+# ------------------------------------------------------------ websocket (RFC6455
+# The terminal bridge needs exactly one dialect of it: a single client whose
+# frames are small binary blobs in both directions. Handshake, masked client
+# frames, unmasked server frames, close and ping - nothing else.
+
+def ws_send(conn, payload, opcode=0x2):
+    header = bytes([0x80 | opcode])
+    n = len(payload)
+    if n < 126:
+        header += bytes([n])
+    elif n < 65536:
+        header += bytes([126]) + n.to_bytes(2, "big")
+    else:
+        header += bytes([127]) + n.to_bytes(8, "big")
+    conn.sendall(header + payload)
+
+
+def ws_read_frame(rfile):
+    """One client frame, unmasked. Returns (opcode, payload) or None on EOF."""
+    hdr = rfile.read(2)
+    if len(hdr) < 2:
+        return None
+    opcode = hdr[0] & 0x0F
+    masked = hdr[1] & 0x80
+    ln = hdr[1] & 0x7F
+    if ln == 126:
+        ln = int.from_bytes(rfile.read(2), "big")
+    elif ln == 127:
+        ln = int.from_bytes(rfile.read(8), "big")
+    mask = rfile.read(4) if masked else None
+    payload = rfile.read(ln) if ln else b""
+    if mask:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return opcode, payload  # data, continuation, ping, close - caller sorts
 
 
 def main():

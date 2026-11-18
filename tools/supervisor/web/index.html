@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>userland supervisor</title>
+<link rel="stylesheet" href="/vendor/xterm.css">
 <style>
   :root {
     --bg: #0f1216; --panel: #171c23; --line: #242c36;
@@ -41,6 +42,7 @@
   button.primary { background: var(--acc); border-color: var(--acc); color: #fff; }
   button.primary:hover { color: #fff; }
   button.danger:hover { border-color: var(--bad); color: var(--bad); }
+  button.active { border-color: var(--acc); color: var(--acc); }
   table { width: 100%; border-collapse: collapse; background: var(--panel);
           border-radius: 8px; overflow: hidden; }
   th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--line); }
@@ -66,6 +68,10 @@
     flex: 1; background: var(--bg); color: var(--fg);
     border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px;
     font-family: Consolas, monospace;
+  }
+  .termbox {
+    background: #000; border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px; margin: 8px 0; height: 420px;
   }
   .muted { color: var(--dim); font-size: 12px; }
   #toast {
@@ -94,18 +100,22 @@
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
+  <div id="detail"></div>
   <div class="muted" style="margin-top:10px">
-    命令经实例自己的 ssh 端点（vpshhd → tinysshnoneauthd）执行；guest 内没有鉴权，
+    命令与终端经实例自己的 ssh 端点（密钥认证）；guest 内 root 无口令，
     本面板不要暴露到公网。
   </div>
 </main>
 <div id="toast"></div>
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
 <script>
 "use strict";
 
 const $ = (id) => document.getElementById(id);
 let openPort = null;
-let openTab = "log";
+let openMode = null;             // "log" | "term"
+let termState = null;            // {port, term, fit, ws}
 
 const tokenInput = $("token");
 tokenInput.value = localStorage.getItem("us_token") || "";
@@ -149,6 +159,58 @@ async function health() {
   }
 }
 
+function closeTerminal() {
+  if (!termState) return;
+  try { termState.ws.close(); } catch (e) {}
+  try { termState.term.dispose(); } catch (e) {}
+  termState = null;
+}
+
+function openDetail(port, mode) {
+  if (openPort === port && openMode === mode) return;
+  closeTerminal();
+  openPort = port;
+  openMode = mode;
+  renderDetail(port);
+  if (mode === "log") loadLog(port);
+  else openTerminal(port);
+}
+
+function toggleDetail(port, mode) {
+  if (openPort === port && openMode === mode) { closeDetail(); return; }
+  openDetail(port, mode);
+}
+
+function closeDetail() {
+  closeTerminal();
+  openPort = null;
+  openMode = null;
+  $("detail").innerHTML = "";
+}
+
+function renderDetail(port) {
+  if (openPort !== port || !openMode) return;
+  if (openMode === "log") {
+    $("detail").innerHTML = `
+      <div class="detail">
+        <div class="muted">实例 ${port} · 日志（3s 刷新）· 命令在实例内执行（回车发送）</div>
+        <pre id="log-${port}">日志加载中…</pre>
+        <div class="row">
+          <input id="cmd-${port}" placeholder="如：ls / 或 cat /etc/hostname"
+                 onkeydown="if(event.key==='Enter')exec(${port})">
+          <button class="primary" onclick="exec(${port})">执行</button>
+        </div>
+      </div>`;
+  } else {
+    $("detail").innerHTML = `
+      <div class="detail">
+        <div class="muted">实例 ${port} · 交互终端（密钥认证的 ssh 会话）</div>
+        <div class="termbox" id="term-${port}"></div>
+        <button onclick="closeDetail()">关闭终端</button>
+      </div>`;
+  }
+}
+
 async function refresh() {
   let inst = [];
   try {
@@ -157,6 +219,12 @@ async function refresh() {
     $("rows").innerHTML =
       `<tr><td colspan="7" class="muted">加载失败：${e.message}</td></tr>`;
     return;
+  }
+  const alive = inst.some((i) => i.port === openPort);
+  if (openPort !== null && !alive) {
+    // The instance is gone (deleted / fell out of the registry): the detail
+    // panel would sit on dead endpoints forever.
+    closeDetail();
   }
   $("rows").innerHTML = inst.length ? "" :
     `<tr><td colspan="7" class="muted">没有实例</td></tr>`;
@@ -170,34 +238,16 @@ async function refresh() {
       <td class="muted">${i.started_at || "-"}</td>
       <td>${i.label || "-"}</td>
       <td>
-        <button onclick="toggleDetail(${i.port})">日志 / 命令</button>
+        <button class="${openPort === i.port && openMode === "log" ? "active" : ""}"
+                onclick="toggleDetail(${i.port}, 'log')">日志 / 命令</button>
+        <button class="${openPort === i.port && openMode === "term" ? "active" : ""}"
+                onclick="toggleDetail(${i.port}, 'term')">终端</button>
         <button onclick="stopInstance(${i.port})">停止</button>
         <button class="danger" onclick="rmInstance(${i.port})">删除</button>
       </td>`;
     $("rows").appendChild(tr);
-    if (i.port === openPort) {
-      const d = document.createElement("tr");
-      d.innerHTML = `<td colspan="7" style="padding:0 12px 12px">
-        ${detailHtml(i.port)}</td>`;
-      $("rows").appendChild(d);
-      const input = document.getElementById("cmd-" + i.port);
-      if (input) input.focus();
-      loadLog(i.port);
-    }
+    if (i.port === openPort && openMode === "log") loadLog(i.port);
   }
-}
-
-function detailHtml(port) {
-  return `
-    <div class="detail">
-      <div class="muted">实例 ${port} · 日志（3s 刷新）· 命令在实例内执行（回车发送）</div>
-      <pre id="log-${port}">日志加载中…</pre>
-      <div class="row">
-        <input id="cmd-${port}" placeholder="如：ls / 或 cat /etc/hostname"
-               onkeydown="if(event.key==='Enter')exec(${port})">
-        <button class="primary" onclick="exec(${port})">执行</button>
-      </div>
-    </div>`;
 }
 
 async function loadLog(port) {
@@ -212,9 +262,28 @@ async function loadLog(port) {
   }
 }
 
-function toggleDetail(port) {
-  openPort = (openPort === port) ? null : port;
-  refresh();
+function openTerminal(port) {
+  const container = document.getElementById("term-" + port);
+  if (!container || termState) return;
+  const term = new Terminal({ cursorBlink: true, fontFamily: "Consolas, monospace" });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(container);
+  fit.fit();
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const tok = tokenInput.value.trim();
+  const ws = new WebSocket(
+    `${proto}://${location.host}/ws/${port}?token=${encodeURIComponent(tok)}` +
+    `&cols=${term.cols}&rows=${term.rows}`);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = (e) => term.write(new Uint8Array(e.data));
+  ws.onclose = () => term.write("\r\n\x1b[90m[连接已关闭]\x1b[0m");
+  ws.onerror = () => term.write("\r\n\x1b[31m[连接错误]\x1b[0m");
+  term.onData((d) => {
+    if (ws.readyState === 1) ws.send(new TextEncoder().encode(d));
+  });
+  termState = { port, term, fit, ws };
+  term.focus();
 }
 
 async function startInstance() {
@@ -237,9 +306,7 @@ async function stopInstance(port) {
 async function rmInstance(port) {
   if (!confirm(`删除实例 ${port}？其 rootfs 目录会一并清除。`)) return;
   try { await api("DELETE", `/api/instances/${port}`);
-        toast(`已删除：端口 ${port}`);
-        if (openPort === port) openPort = null;
-        refresh(); }
+        toast(`已删除：端口 ${port}`); refresh(); }
   catch (e) { toast("删除失败：" + e.message, true); }
 }
 
@@ -267,7 +334,8 @@ async function exec(port) {
 refresh();
 health();
 setInterval(refresh, 3000);
-setInterval(() => { if (openPort !== null) loadLog(openPort); }, 3000);
+setInterval(() => { if (openPort !== null && openMode === "log") loadLog(openPort); },
+            3000);
 setInterval(health, 10000);
 </script>
 </body>

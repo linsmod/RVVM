@@ -57,6 +57,9 @@
 #define VP_SSH_KEYDIR "/etc/tinyssh/sshkeydir"
 #define VP_SSH_KEY    VP_SSH_KEYDIR "/ed25519.pk"
 #define VP_TINYSSHD   "/sbin/tinysshd"
+#define VP_RUN_DIR    "/run/vpsessiond"
+#define VP_AUTH_PUB   VP_RUN_DIR "/auth.pub"
+#define VP_AUTH_KEYS  "/root/.ssh/authorized_keys"
 
 /* Children are short-lived by construction (one SSH connection each), so the
  * only thing the listener has to do about them is not leave zombies behind. */
@@ -77,6 +80,45 @@ static void vp_reap(int sig)
                     WEXITSTATUS(status));
         }
     }
+}
+
+/* Auth mode: when the host drops <session mount>/auth.pub into the run
+ * directory, sessions require the matching private key instead of admitting
+ * everyone (tinysshd's mode is argv[0]-spelled; see vp_serve). The public key
+ * is planted for the root account here, inside the guest, so the ownership
+ * and permission bits tinysshd's checks demand are the real ones - a file
+ * materialized on a Windows host cannot promise those. No auth.pub: dev
+ * behaviour, none-auth, unchanged. Returns 1 when auth mode is on. */
+static int vp_plant_authorized_keys(void)
+{
+    FILE *in = fopen(VP_AUTH_PUB, "r");
+    FILE *out;
+    char  line[4096];
+
+    if (!in) {
+        return 0;
+    }
+    fclose(in);
+    mkdir("/root", 0755);
+    mkdir("/root/.ssh", 0700);
+    out = fopen(VP_AUTH_KEYS, "w");
+    if (!out) {
+        fprintf(stderr, "vpshhd: cannot write %s: %s\n", VP_AUTH_KEYS,
+                strerror(errno));
+        return 0;
+    }
+    in = fopen(VP_AUTH_PUB, "r");
+    while (in && fgets(line, sizeof line, in)) {
+        fputs(line, out);
+    }
+    if (in) {
+        fclose(in);
+    }
+    fclose(out);
+    chmod(VP_AUTH_KEYS, 0600);
+    chmod("/root/.ssh", 0700);
+    fprintf(stderr, "vpshhd: auth mode (public key from %s)\n", VP_AUTH_PUB);
+    return 1;
 }
 
 /* Returns 0 when a host key is present, -1 when it could not be made. */
@@ -142,6 +184,7 @@ static void vp_serve(int listener, int conn)
 {
     pid_t pid = fork();
     int   nul;
+    int   vp_auth_mode = vp_plant_authorized_keys();
 
     if (pid < 0) {
         close(conn);
@@ -163,7 +206,7 @@ static void vp_serve(int listener, int conn)
     if (dup2(conn, 0) < 0 || dup2(conn, 1) < 0) {
         _exit(127);
     }
-    nul = open("/dev/null", O_WRONLY);
+    nul = open(VP_RUN_DIR "/tinysshd.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (nul >= 0) {
         dup2(nul, 2);
         if (nul > 2) {
@@ -174,7 +217,8 @@ static void vp_serve(int listener, int conn)
         close(conn);
     }
 
-    execl(VP_TINYSSHD, "tinysshnoneauthd", "-v", VP_SSH_KEYDIR, (char *) 0);
+    execl(VP_TINYSSHD, vp_auth_mode ? "tinysshd" : "tinysshnoneauthd", "-v",
+          VP_SSH_KEYDIR, (char *) 0);
     _exit(127);
 }
 
