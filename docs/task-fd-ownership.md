@@ -101,6 +101,38 @@ ssh -p 7900 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL 127.0.0.1 "ech
 
 - 结论：A 保留（无副作用，去掉一类真实竞争），但不闭合。剩下的缺口与设计文档一致——**号必须按 address space 私有**（B 方案），否则「槽里的号还有效吗」这个问题永远要靠引用计数猜。已登记为下一步
 
+### 2026-11-18 方案 B1 实测（部分落地，未闭合）
+
+B1 取「每槽独占一个 CRT 号」而非「自管 guest fd → HANDLE 映射」：后者要改写全部 `read`/`write`/`open` 的 IO 路径，而前者已经能保证「父关不掉子的号」，隔离效果等价。
+
+改动：
+
+- `inherit` 删掉「先把父槽的号整段复制给子槽、各类型分支再覆盖」的做法。memfs / pty / proc / dev 各自显式写槽，普通 HOST 号仍 `dup()`。此前那一行让两个 address space 短暂命名同一个号
+- `host_fd_acquire/release` 改名为 `host_fd_take/give`：`give` 不再看计数，槽不再命名它就关闭。`host_fd_refs[]` 降级为**检测器**——`take` 时若发现计数已非零就 `rvvm_warn`，把「一个号被两个槽命名」当场报出来（同时打印两个槽号与 backend）
+- 新增 `host_fd_alive()`（Windows 走 `_get_osfhandle`），在 `fds_write` 末尾校验「写进槽的号是否还开着」
+- **锚彻底退出 CRT 号空间**：`wsock_nul[]` 与每锚一次 `_open("NUL")` 全部删除。该句柄自 P2 锚号虚拟化后只被写入和关闭、从未被等待（`win_socket_wait` 走 SOCKET），却占着一个真实 CRT 号，且它的 `_close()` 不在 `crt_lock` 内。索引占用改由 `wsock_anchor_taken[]` 记录
+
+验证：
+
+| 轮次 | shared 告警 | `echo HELLO` |
+|---|---|---|
+| 5 轮 | 1–2 次（约 1/3 运行复现） | 始终 EXIT=1、无输出 |
+
+- `session 102 exited 0` 稳定，SSH 握手正常
+- 关键反证：**`shared=0` 的那一轮，`fd=1 host=5` 仍然 EBADF**。所以「两槽同号」不是这条失败的充分原因
+- 该轮：`sys_write(fd=1 host=5)` 请求 6 字节返回 `-9`（EBADF），`sys_write(fd=2 host=7)` 请求 37 字节返回 `-22`（EINVAL），随后 `exit_group(1)`。104 自身在这之前没有任何 close 调用
+- `fds_write` 末尾的 `host_fd_alive()` 在装槽时通过——号在写槽那一刻是活的，之后被外部关掉
+
+已排除的关闭路径（逐个加标记验证，均未命中 host 5）：
+
+- `host_fd_give()`（`crt_lock` 内，唯一的「正常」关闭）
+- `userland_fd_host_off_console()`（只关 0/1/2）
+- `userland_fd_add()` 表满
+- `vps_close_master()` / `vps_close_slave()`（Windows 侧不走裸 close）
+- asset open 失败路径
+
+- 结论：B1 的号私有化把「父子共享号」这一类真实清掉了，也让锚不再占用 CRT 号，但**未闭合会话**。剩下的形态是「号在装槽之后被某个尚未定位的路径关掉」，与共享无关。下一步需要在 `_close` 上做带符号解析的探针（打印 `__builtin_return_address` 并用 `addr2line` 还原调用点），而不是继续给已知路径加标记
+
 ### 2026-11-18 P1 实测
 
 - 会话不再以 111 退出（此前子进程 `dup(ch[i]) != i`），日志变为 `session 102 exited 0`

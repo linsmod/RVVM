@@ -134,9 +134,15 @@ struct wsock_sockaddr_un {
 /* Anchor numbers live in their own range, well above any CRT descriptor. They
  * used to *be* CRT numbers (whatever _open("NUL") returned): the two meanings
  * shared one number space, so every caller had to ask "is this a socket?"
- * before acting, and a wrong answer wrote into a file or closed a listener. The
- * NUL handle is still needed per anchor (see wsock_nul), but it is now an
- * implementation detail that no number outside this file refers to. */
+ * before acting, and a wrong answer wrote into a file or closed a listener.
+ *
+ * Nothing is opened for an anchor any more. An anchor is an index into this
+ * table, so taking or giving one never touches the CRT's number space - which
+ * also means it can neither hand a free number to, nor take one from, a
+ * descriptor. The NUL handle that used to back each anchor was only ever
+ * written and closed, never waited on (waiting goes through the SOCKET), so it
+ * was one CRT number held open for no reader - and its _close() ran outside
+ * the CRT lock the descriptor paths use. */
 #define WSOCK_ANCHOR_BASE 0x40000000
 
 /* WSAPoll() takes an array; cap the batch size and let the caller fall back */
@@ -145,10 +151,11 @@ struct wsock_sockaddr_un {
 static SRWLOCK wsock_lock = SRWLOCK_INIT;
 static SOCKET  wsock_fds[WSOCK_MAX_FD];
 
-/* The CRT handle behind each anchor, or -1 when the slot is free. Kept apart
- * from wsock_fds[] because it has to outlive the socket object: poll() needs a
- * handle to wait on even after the socket itself has been closed. */
-static int wsock_nul[WSOCK_MAX_FD];
+/* Whether an index is spoken for. It stays set between win_socket_alloc_anchor()
+ * and the moment the socket is bound, and again after the socket is closed while
+ * a slot still names the anchor - so two allocations cannot land on one index,
+ * and an anchor whose socket is gone is not handed out again. */
+static bool wsock_anchor_taken[WSOCK_MAX_FD];
 
 /* The table index behind @fd, or -1 when @fd is not an anchor number. Every
  * entry point goes through this: a number outside the range is somebody else's
@@ -193,13 +200,12 @@ static LONG wsock_fds_refs[WSOCK_MAX_FD];
  * gets handed back to the pool under a live slot (see wsock_anchor_release). */
 static bool wsock_fds_claimed[WSOCK_MAX_FD];
 
-/* Release the CRT number of an anchor, once nothing names it any more. @why says
- * which path is letting go, so an over-release names itself. */
+/* Release an anchor, once nothing names it any more. @why says which path is
+ * letting go, so an over-release names itself. */
 static void wsock_anchor_release(int fd, const char* why)
 {
     bool last;
     int  i = wsock_index(fd);
-    int  nul;
     if (i < 0) {
         return;
     }
@@ -230,16 +236,12 @@ static void wsock_anchor_release(int fd, const char* why)
     } else {
         last = (--wsock_fds_refs[i] == 0);
     }
-    nul = last ? wsock_nul[i] : -1;
     if (last) {
-        wsock_nul[i] = -1;
+        wsock_anchor_taken[i] = false;
     }
     ReleaseSRWLockExclusive(&wsock_lock);
     if (last) {
-        RVVM_TRC(RVVM_TRC_WSOCK, "free anchor %d (last reference, crt %d)", fd, nul);
-        if (nul >= 0) {
-            _close(nul);
-        }
+        RVVM_TRC(RVVM_TRC_WSOCK, "free anchor %d (last reference)", fd);
     } else {
         RVVM_TRC(RVVM_TRC_WSOCK, "anchor %d kept (still referenced)", fd);
     }
@@ -331,7 +333,7 @@ void win_socket_init(void)
          * win_socket_is_fd() would report every unrelated fd as a socket. */
         for (i = 0; i < WSOCK_MAX_FD; i++) {
             wsock_fds[i] = INVALID_SOCKET;
-            wsock_nul[i] = -1;
+            wsock_anchor_taken[i] = false;
         }
         WSAStartup(MAKEWORD(2, 2), &wsa);
         InterlockedExchange(&wsock_init_state, 2);
@@ -401,23 +403,18 @@ static void wsock_set_errno(void)
 
 int win_socket_alloc_anchor(void)
 {
-    int nul, i;
+    int i;
 
     if (wsock_init_state != 2) {
         win_socket_init();
     }
-    /* "NUL" is a plain CRT device: the handle can be closed or duplicated by the
-     * CRT without ever touching a socket object. It backs the anchor but is not
-     * the anchor: callers only ever see WSOCK_ANCHOR_BASE + index. */
-    nul = _open("NUL", _O_RDWR | _O_BINARY);
-    if (nul < 0) {
-        errno = EMFILE;
-        return -1;
-    }
+    /* An anchor is an index into this table, nothing more: no CRT descriptor is
+     * opened for it, so allocating one can neither consume nor release a number
+     * in the CRT's space. */
     AcquireSRWLockExclusive(&wsock_lock);
     for (i = 0; i < WSOCK_MAX_FD; ++i) {
-        if (wsock_nul[i] < 0 && wsock_fds[i] == INVALID_SOCKET) {
-            wsock_nul[i]         = nul;
+        if (!wsock_anchor_taken[i]) {
+            wsock_anchor_taken[i] = true;
             /* Zero: the reference belongs to whichever guest slot gets filed
              * onto this anchor, and takes it in userland_fd_install() / the
              * inherit paths. */
@@ -428,11 +425,10 @@ int win_socket_alloc_anchor(void)
     }
     ReleaseSRWLockExclusive(&wsock_lock);
     if (i == WSOCK_MAX_FD) {
-        _close(nul);
         errno = EMFILE;
         return -1;
     }
-    RVVM_TRC(RVVM_TRC_WSOCK, "anchor %d backed by crt %d", WSOCK_ANCHOR_BASE + i, nul);
+    RVVM_TRC(RVVM_TRC_WSOCK, "anchor %d allocated", WSOCK_ANCHOR_BASE + i);
     return WSOCK_ANCHOR_BASE + i;
 }
 
@@ -453,7 +449,6 @@ void win_socket_anchor_ref(int fd)
 void win_socket_free_anchor(int fd)
 {
     int  i = wsock_index(fd);
-    int  nul;
     bool was_claimed;
     long held;
     if (i < 0) {
@@ -468,16 +463,12 @@ void win_socket_free_anchor(int fd)
     held        = wsock_fds_refs[i];
     wsock_fds_claimed[i] = false;
     wsock_fds_refs[i]    = 0;
-    nul = wsock_nul[i];
-    wsock_nul[i] = -1;
+    wsock_anchor_taken[i] = false;
     ReleaseSRWLockExclusive(&wsock_lock);
     if (was_claimed) {
         rvvm_warn("anchor %d given back while %ld slot(s) still named it", fd, held);
     }
-    RVVM_TRC(RVVM_TRC_WSOCK, "free anchor %d (crt %d)", fd, nul);
-    if (nul >= 0) {
-        _close(nul);
-    }
+    RVVM_TRC(RVVM_TRC_WSOCK, "free anchor %d", fd);
 }
 
 /* A guest slot that named @fd is going away without closing a socket (an epoll

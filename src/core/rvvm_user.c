@@ -142,6 +142,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "rvvmlib.h"
 
 #if defined(_WIN32)
+#include <io.h>     // _get_osfhandle(), for "is this number still open?"
+
+
 /* win_socket.c owns the WinSock-backed descriptors (see win_socket.h). The
  * userland asks it whether one of its CRT anchors is a socket, because such an
  * anchor is a "NUL" device underneath and fstat() would report a character
@@ -7457,86 +7460,112 @@ static bool userland_parent_alive(rvvm_process_t* proc)
 #define FD_TRACE_LO 0
 #define FD_TRACE_HI 12
 
-/* ---- host descriptor references ---------------------------------------- *
+/* ---- host numbers are private ------------------------------------------- *
  * A fork() is served in-process, so a parent and its child are two address
- * spaces sharing one host CRT table. Each slot files the host number it rides
- * on, and more than one slot can name the same number: a fork that could not
- * make a copy, and - the case that matters - a slot that is closed in one
- * address space while the number has already been handed out again in another.
- * Closing on the strength of "my slot said 8" then takes the descriptor out
- * from under whoever owns 8 now, and the symptom is a pipe write that answers
- * EBADF with a slot that still reads host=8.
+ * spaces over one host CRT table. A host number belongs to exactly one slot in
+ * exactly one address space: fork dups the number for the child, dup2 dups it
+ * for the copy, and open() hands out one nothing else names. Closing a slot
+ * therefore closes its number, with no question of who else might still need
+ * it - there is nobody else.
  *
- * So a host number is not closed by whoever happens to name it last, but only
- * when the last *reference* to it goes: every slot that files the number takes
- * one, every slot that stops filing it gives one back, and the CRT close()
- * happens exactly once, when the count reaches zero. Anchor numbers are not
- * counted here - win_socket_anchor_ref/unref already own that number space,
- * and a synthetic (memfs/pty/proc/dev) number never reaches the CRT. */
+ * This replaced a reference count that decided "whoever is last closes it".
+ * The count was answering the wrong question: it kept a number alive for slots
+ * that should never have shared one, so a parent's close and a child's open
+ * could meet on the same digit and each believe it owned it. Numbers being
+ * private is the invariant that makes the close safe, and the count below is
+ * kept only to *detect* a violation of it.
+ *
+ * Not every slot owns a number: an anchor keeps its own reference (see
+ * win_socket_anchor_ref/unref), and a synthetic number (memfs/pty/proc/dev)
+ * names an object this layer serves, never a CRT descriptor. host_fd_owned()
+ * is the single test for "this slot is responsible for closing this number". */
 #define HOST_FD_REF_MAX 4096
 
+/* How many slots name each number. One is the only legal value; anything more
+ * means a number was filed twice, which is what rvvm_warn below reports. */
 static int        host_fd_refs[HOST_FD_REF_MAX];
 static spinlock_t host_fd_ref_lock = SPINLOCK_INIT;
 
 /* Serialises the two CRT operations that read and change the same table slot:
  * _dup() picks a free number, _close() gives one back. Each is thread-safe on
- * its own, but the *pair* is not atomic, so a child's dup() can be handed a
- * number in the same instant a sibling closes it - the reference count cannot
- * prevent that, because both sides hold the number legitimately at that point.
- * Holding this around both makes "the number was free" and "the number came
- * back" one step, so a number is either still in use or genuinely reusable. */
+ * its own, but the *pair* is not atomic, so a dup() could be handed a number in
+ * the same instant another thread closes it. Holding this around both makes
+ * "the number was free" and "the number came back" one step. */
 static spinlock_t crt_lock = SPINLOCK_INIT;
 
-static bool host_fd_counted(int host_fd, rvvm_fd_backend_t backend)
+/* Whether @host_fd is a number this slot owns and must close. An anchor is
+ * excluded because win_socket owns that number space; a synthetic number is
+ * excluded because it never reaches the CRT. */
+static bool host_fd_owned(int host_fd, rvvm_fd_backend_t backend)
 {
-    /* An anchor keeps its own reference (win_socket_anchor_ref/unref), and the
-     * live-anchor test is the generation the slot files, not "some socket
-     * object answers to this number": an anchor number that has been given back
-     * still sits in the CRT table until its NUL fd is closed, and reading that
-     * as a live anchor would leave the pipe filed under the same number
-     * uncounted - the surplus release that closed a sibling's descriptor. */
+    /* The anchor test is the generation the slot records, not "some socket
+     * object answers to this number": an anchor keeps a NUL descriptor open
+     * until its last reference goes, and reading that as a live anchor would
+     * leave a pipe filed under the same number unowned. Anchor numbers live
+     * outside the CRT range anyway (WSOCK_ANCHOR_BASE), so the range test
+     * below catches them first. */
     return backend == FD_BACKEND_HOST && host_fd >= 0 &&
            host_fd < HOST_FD_REF_MAX && win_socket_anchor_gen(host_fd) == 0;
 }
 
-static void host_fd_acquire(int host_fd)
+/* Whether @host_fd still names an open descriptor. Used to catch a slot being
+ * filed on a number that is already gone, which otherwise reads fine until the
+ * write through it fails somewhere else. */
+static bool host_fd_alive(int host_fd)
 {
+#if defined(_WIN32)
+    return _get_osfhandle(host_fd) != (intptr_t)-1;
+#else
+    return fcntl(host_fd, F_GETFD) >= 0;
+#endif
+}
+
+/* Record that a slot now names @host_fd. */
+static void host_fd_take(rvvm_userland_t* ctx, int fd, int host_fd)
+{
+    int shared;
     if (host_fd < 0 || host_fd >= HOST_FD_REF_MAX) {
         return;
     }
     spin_lock(&host_fd_ref_lock);
+    shared = host_fd_refs[host_fd];
     host_fd_refs[host_fd]++;
-    RVVM_TRC(RVVM_TRC_FD, "host_ref host=%d = %d (acquire)", host_fd,
+    RVVM_TRC(RVVM_TRC_FD, "host_ref host=%d = %d (take)", host_fd,
              host_fd_refs[host_fd]);
     spin_unlock(&host_fd_ref_lock);
+    if (shared > 0) {
+        /* Two slots on one number: one of them will be closed when the other's
+         * slot goes away, and the symptom is a write that answers EBADF while
+         * the slot still reads a number. Name both slots so the path that made
+         * the second one is obvious from the log. */
+        for (int i = 0; i < USERLAND_FD_TABLE_MAX; ++i) {
+            if (i != fd && ctx->fds[i].used && ctx->fds[i].fd == host_fd) {
+                rvvm_warn("host fd %d named by pid=%u fd=%d as well as fd=%d "
+                          "(be=%d)", host_fd, (unsigned)ctx->pid, i, fd,
+                          (int)ctx->fds[i].backend);
+            }
+        }
+    }
 }
 
-/* Hand one reference back. Only the one that takes the count to zero closes
- * the host descriptor - and a slot that gives back a reference it never took
- * (count already zero) closes nothing: that is the repeated close of a slot
- * whose number already went round the CRT allocator once. */
-static void host_fd_release(int host_fd)
+/* A slot stops naming @host_fd: the number is this slot's alone, so it goes. */
+static void host_fd_give(unsigned pid, int fd, int host_fd)
 {
-    bool last = false;
-
     if (host_fd < 0 || host_fd >= HOST_FD_REF_MAX) {
         return;
     }
     spin_lock(&host_fd_ref_lock);
     if (host_fd_refs[host_fd] > 0) {
-        last = host_fd_refs[host_fd] == 1;
         host_fd_refs[host_fd]--;
     }
-    RVVM_TRC(RVVM_TRC_FD, "host_ref host=%d = %d (release, %s)", host_fd,
-             host_fd_refs[host_fd], last ? "closing" : "kept");
+    RVVM_TRC(RVVM_TRC_FD, "host_ref host=%d = %d (give, pid=%u fd=%d)", host_fd,
+             host_fd_refs[host_fd], pid, fd);
     spin_unlock(&host_fd_ref_lock);
-    if (last) {
-        /* Under crt_lock, so no dup() can be handed this number between the
-         * decision to close it and the close itself. */
-        spin_lock(&crt_lock);
-        close(host_fd);
-        spin_unlock(&crt_lock);
-    }
+    /* Under crt_lock, so no dup() can be handed this number between the
+     * decision to close it and the close itself. */
+    spin_lock(&crt_lock);
+    close(host_fd);
+    spin_unlock(&crt_lock);
 }
 
 static void userland_fds_write(rvvm_userland_t* ctx, int fd,
@@ -7544,19 +7573,18 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
                                rvvm_fd_backend_t backend,
                                uint32_t flags, const char* op)
 {
-    /* The old number gives its reference back and the new one takes its own,
-     * both after the rewrite below (host_fd_acquire/release). The same number
-     * on both sides is a re-filing of one slot, not a hand-over, so neither
-     * happens - that is what keeps a fork's double write of one slot honest. */
-    int  old_host    = ctx->fds[fd].fd;
-    bool old_counted = ctx->fds[fd].used &&
-                       host_fd_counted(old_host, ctx->fds[fd].backend);
-    bool new_counted = used && host_fd_counted(host_fd, backend);
+    /* The slot's old number goes and the new one becomes its own, both after
+     * the rewrite below. The same number on both sides is a re-filing of one
+     * slot, not a hand-over, so neither happens - that is what keeps a
+     * set_flags() or a set_cloexec() from closing the descriptor it describes. */
+    int  old_host  = ctx->fds[fd].fd;
+    bool old_owned = ctx->fds[fd].used &&
+                     host_fd_owned(old_host, ctx->fds[fd].backend);
+    bool new_owned = used && host_fd_owned(host_fd, backend);
 
     /* The slot is rewritten wholesale; the anchor reference it holds is *not*
      * adjusted here. This function is also called to re-file a slot that keeps
-     * naming the same anchor (fork() copies a slot through it and then again for
-     * the dup it makes of it), and adjusting per call would drop references the
+     * naming the same anchor, and adjusting per call would drop references the
      * slot still holds. Whoever hands a slot an anchor takes the reference
      * (userland_fd_install / userland_fd_dup / the inherit paths), and whoever
      * takes it away gives it back (userland_fd_close). */
@@ -7569,11 +7597,15 @@ static void userland_fds_write(rvvm_userland_t* ctx, int fd,
      * filed; a slot riding on no anchor records 0, which never matches a live one
      * (so a console and a plain host fd are never treated as recycled). */
     ctx->fds[fd].anchor_gen = used ? win_socket_anchor_gen(host_fd) : 0;
-    if (old_counted && (!new_counted || old_host != host_fd)) {
-        host_fd_release(old_host);
+    if (old_owned && (!new_owned || old_host != host_fd)) {
+        host_fd_give((unsigned)ctx->pid, fd, old_host);
     }
-    if (new_counted && (!old_counted || old_host != host_fd)) {
-        host_fd_acquire(host_fd);
+    if (new_owned && (!old_owned || old_host != host_fd)) {
+        host_fd_take(ctx, fd, host_fd);
+    }
+    if (new_owned && !host_fd_alive(host_fd)) {
+        rvvm_warn("pid=%u fd=%d: filed on host %d, which is not open",
+                  (unsigned)ctx->pid, fd, host_fd);
     }
     if (fd >= FD_TRACE_LO && fd <= FD_TRACE_HI) {
         RVVM_TRC(RVVM_TRC_FD, "fd_wr[%s] pid=%u fd=%d used=%d host=%d gen=%llu clo=%d be=%d fl=%x",
@@ -7665,9 +7697,9 @@ static void userland_fd_install(rvvm_userland_t* ctx, int guest_fd, int host_fd,
         if (anchored) {
             win_socket_anchor_ref(host_fd);
         }
-        userland_fds_write(ctx, guest_fd, true, host_fd, cloexec,
-                           userland_sim_fd(host_fd) ? FD_BACKEND_SIM : FD_BACKEND_HOST,
-                           0, "install");
+        rvvm_fd_backend_t be = userland_sim_fd(host_fd) ? FD_BACKEND_SIM
+                                                       : FD_BACKEND_HOST;
+        userland_fds_write(ctx, guest_fd, true, host_fd, cloexec, be, 0, "install");
         ctx->fds[guest_fd].holds_anchor_ref = anchored;
     }
 }
@@ -8065,17 +8097,15 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
          * recorded when the number is filed, so it is zero for a file that
          * landed on 5 before any anchor did. */
         if (ctx->fds[fd].anchor_gen != 0) {
-            /* A socket anchor: the socket goes now, the CRT number only once
-             * nothing names it (this call drops this slot's reference). */
+            /* A socket anchor: the socket goes now, and the anchor reference
+             * this slot holds goes with it. */
             win_socket_close(ctx->fds[fd].fd);
             ctx->fds[fd].holds_anchor_ref = false;
         } else {
-            /* The CRT number is not closed here: the slot gives its reference
-             * on it back through the write below, and only the last reference
-             * closes it (see host_fd_release). Closing because this slot names
-             * the number is what took a descriptor out from under a fork
-             * sibling that had already been handed the same number - the pipe
-             * write that answered EBADF with a slot still reading host=8. */
+            /* The CRT number is closed through the write below, which gives the
+             * slot's number back (host_fd_give). It is this slot's own number:
+             * no other slot in any address space names it, because a fork dups
+             * the number for the child rather than sharing it. */
             if (ctx->fds[fd].holds_anchor_ref) {
                 win_socket_anchor_unref(ctx->fds[fd].fd);
                 ctx->fds[fd].holds_anchor_ref = false;
@@ -8746,17 +8776,21 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
             }
             continue;
         }
-        /* Copy the slot wholesale through the unified write. */
-        userland_fds_write(child, fd, parent->fds[fd].used, parent->fds[fd].fd,
-                           parent->fds[fd].cloexec,
-                           parent->fds[fd].backend, parent->fds[fd].flags, "inherit");
-        child->fds[fd].holds_anchor_ref = false;
+        /* No slot is copied wholesale here. Every kind of descriptor below files
+         * the child's slot itself, because copying the parent's number - even
+         * when it is overwritten immediately after - leaves two address spaces
+         * naming one number for a moment, and a close on either side inside
+         * that moment takes the descriptor away from the other. A slot either
+         * owns its number or is absent. */
         if (memfs_fd_number(parent->fds[fd].fd)) {
             /* A tmpfs descriptor: the child gets a slot on the same inode, one
              * pin and one storage reference of its own, so its close releases
              * its own and the parent keeps reading. The child slot is filed at
-             * the parent's index, because the fd table was just handed the same
-             * synthetic number and the number is what names the slot. */
+             * the parent's index, because the number is what names the slot. */
+            userland_fds_write(child, fd, true, parent->fds[fd].fd,
+                               parent->fds[fd].cloexec, parent->fds[fd].backend,
+                               parent->fds[fd].flags, "inherit_memfs");
+            child->fds[fd].holds_anchor_ref = false;
             uint32_t         idx = (uint32_t)(parent->fds[fd].fd - RVVM_MEMFS_FD_BASE);
             rvvm_memfs_fd_t* pd  = memfs_fd_lookup(parent, parent->fds[fd].fd);
             rvvm_memfs_fd_t* cd  = &child->memfs_fds[idx];
@@ -8798,13 +8832,20 @@ static void userland_fd_table_inherit(rvvm_userland_t* child, rvvm_userland_t* p
              * own reference to the same slot (its close releases that reference,
              * not the parent's). */
             userland_proc_fd_ref(parent->fds[fd].fd);
+            userland_fds_write(child, fd, true, parent->fds[fd].fd,
+                               parent->fds[fd].cloexec, parent->fds[fd].backend,
+                               parent->fds[fd].flags, "inherit_proc");
+            child->fds[fd].holds_anchor_ref = false;
             continue;
         }
         if (userland_dev_by_fd(parent->fds[fd].fd, NULL)) {
             /* A /dev entry is a number this layer answers for, not a host
-             * handle: there is nothing to copy or to hold. The slot was already
-             * copied above with the same number - that number is the run's, and
-             * closing it on one side closes nothing on the other. */
+             * handle: there is nothing to duplicate or to hold, and closing the
+             * number on one side closes nothing on the other. */
+            userland_fds_write(child, fd, true, parent->fds[fd].fd,
+                               parent->fds[fd].cloexec, parent->fds[fd].backend,
+                               parent->fds[fd].flags, "inherit_dev");
+            child->fds[fd].holds_anchor_ref = false;
             continue;
         }
         int host_fd;

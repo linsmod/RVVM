@@ -82,17 +82,19 @@ guest 的 `fork` 在宿主进程里用线程模拟，父子两个 ctx 共享**�
 
 最后统一 `userland_fds_write(ctx, fd, used=false, ...)` 清槽。
 
-## 6. 宿主号引用计数
+## 6. 宿主号的所有权
 
-`host_fd_refs[HOST_FD_REF_MAX=4096]` + 一把 `spinlock`：
+宿主号**按槽私有**：一个号只属于一个 address space 里的一个槽。fork 用 `dup()` 给子进程另做一个号，`dup2` 复制时也另做，`open()` 给出一个没有别处命名的号。因此关闭一个槽就关闭它的号，不需要问「还有谁在用」。
 
-- `host_fd_acquire(host)`：计数 +1
-- `host_fd_release(host)`：计数 -1，**归零才 `close(host)`**；计数已是 0 时什么都不关（重复关闭不再误伤）
-- `host_fd_counted(host, backend)`：`backend == HOST && 0 <= host < 4096 && win_socket_anchor_gen(host) == 0`（锚号有自己的一套引用，不进这张表）
+- `host_fd_owned(host, backend)`：`backend == HOST && 0 <= host < 4096 && win_socket_anchor_gen(host) == 0`——这个号是否由槽负责关闭（锚有自己的一套，合成号不进 CRT）
+- `host_fd_take(host)` / `host_fd_give(host)`：记录槽开始/停止命名这个号；`give` 直接 `close()`
+- `host_fd_alive(host)`：号是否还开着（Windows 走 `_get_osfhandle`），写槽后校验，抓「槽指向已关闭的号」
+- `host_fd_refs[]` **只剩检测作用**：`take` 时若计数已非零，说明同一个号被两个槽命名，`rvvm_warn` 报出两个槽号与 backend。它不决定任何关闭
+- `crt_lock` 覆盖 `_dup` 与 `_close` 这一对，使「号空闲」和「号归还」是一个原子步骤
 
-引用只在 `userland_fds_write()` 里迁移：旧号 release、新号 acquire；**同一个号重写不迁移**（fork 会把同一个槽写两次，不能因此多计）。
+号只在 `userland_fds_write()` 里迁移：旧号 `give`、新号 `take`；**同一个号重写不迁移**（`set_flags`/`set_cloexec` 重写同一个槽，不能因此关掉它描述的号）。
 
-> 这张表是定位「fork 后宿主号被父线程收走」时引入的，尚未完全闭合窗口，见 `../issues/fork-shared-crt-fd-space.md`。
+> 一处仍未定位的缺口：某个路径在装槽之后关闭了宿主号（`shared=0` 时也会发生），见 `task-fd-ownership.md`。
 
 ## 7. 读 / 写路径
 
@@ -195,15 +197,15 @@ ssh 客户端 ──TCP 7900──> vpshhd ──> tinysshd(会话主, 如 pid 1
 
 ## 11. 已知设计约束
 
-1. **父子共享一张 CRT 表。** 模拟 fork 不复制宿主表，父子槽各记一份宿主号；父线程的 `close` 与子线程的 `dup` 落在同一数字上，顺序由线程调度决定。这是当前仍未解决的一条：`host_fd_release()` 的 `_close()` 与另一线程的 `_dup()` 之间没有原子性，实测 `sh` 的 stderr 管道就在这个窗口里失效。
+1. ~~父子共享一张 CRT 表。~~ 已解决到「号私有」这一层：`inherit` 不再把父槽的号整段复制给子槽，普通 HOST 号一律 `dup()`，memfs / pty / proc / dev 各自显式写槽；`host_fd_give()` 不看计数，槽不再命名这个号就关闭它。`host_fd_refs[]` 退化为检测器，`take` 时发现计数非零就 `rvvm_warn` 报出两个槽号。锚也不再占用 CRT 号（`wsock_nul[]` 已删除）。**仍未闭合**：宿主号在装槽之后被某个尚未定位的路径关掉，`sh` 的 stdout 因此 EBADF，证据见 `../docs/task-fd-ownership.md`。
 2. ~~锚号与 CRT 号共用数字。~~ 已解决：锚号改为 `0x40000000 + index` 独立号段，`wsock_nul[]` 保存 NUL 句柄且不对外。按数字判断类型的写法不再必要，剩余的 `anchor_gen` 只用于识别同号换对象。
-3. **引用计数的判定时刻有时差。** `counted` 在入槽时算，关闭时用当时算出的值；中间若锚的生灭变化，计数会漏。`host_fd_acquire()` 与 `dup()` 之间也有几条指令的窗口。
+3. ~~引用计数的判定时刻有时差。~~ 已随「号私有」消解：关闭不再由计数决定，`host_fd_give()` 直接关掉槽自己的号，因此没有「当时算出的值」这种跨时刻判断。`crt_lock` 仍覆盖 `_dup` 与 `_close` 这一对，使「号空闲」与「号归还」是一个原子步骤。
 
 后果与证据见 `../issues/fork-shared-crt-fd-space.md`；解法见第 12 节引用的两份文档。
 
 ## 12. 当前缺失（非现状）
 
-第 2 条已随锚号独立号段落地；第 1、3 条（CRT 号的 `dup`/`close` 原子性与引用计数的判定时差）尚未解决。目标是**宿主号按 address space 私有**——每个槽独占自己的号，共享只发生在对象层（inode / pty / SOCKET），于是「号会不会被别人关掉」这个问题不再需要回答。目标形态见 `design-fd-ownership.md`，实施计划与验收见 `todo-fd-ownership.md`，问题证据见 `../issues/fork-shared-crt-fd-space.md`。
+第 1、2、3 条都已落地：锚号独立号段、号按槽私有、关闭不再依赖计数。**「号会不会被别人关掉」这个问题在设计上已经回答完了**（不会），仍有一处实现缺口：某个路径在装槽之后关闭了宿主号，与私有化无关，证据与已排除清单见 `task-fd-ownership.md`。目标形态见 `design-fd-ownership.md`，实施计划与验收见 `todo-fd-ownership.md`，历史问题证据见 `../issues/fork-shared-crt-fd-space.md`。
 
 ## 相关文件
 
