@@ -198,11 +198,11 @@ ssh 客户端 ──TCP 7900──> vpshhd ──> tinysshd(会话主, 如 pid 1
 2. **锚号与 CRT 号共用数字。** 任何「按数字判断是不是锚」的写法都会串味，必须用槽的 `anchor_gen`。
 3. **引用计数的判定时刻有时差。** `counted` 在入槽时算，关闭时用当时算出的值；中间若锚的生灭变化，计数会漏。`host_fd_acquire()` 与 `dup()` 之间也有几条指令的窗口。
 
-后果与候选方案见 `../issues/fork-shared-crt-fd-space.md`。
+后果与证据见 `../issues/fork-shared-crt-fd-space.md`；解法见第 12 节引用的两份文档。
 
-## 12. 下一步（非现状）
+## 12. 当前缺失（非现状）
 
-第 10、11 节描述的是现状，其中三条约束的解法不在本文范围：目标是**宿主号按 address space 私有**——每个槽独占自己的号，共享只发生在对象层（inode / pty / SOCKET），于是「号会不会被别人关掉」这个问题不再需要回答。目标形态、不变量与改造前后对比见 `design-fd-ownership.md`；实施阶段与验收见 `../issues/fork-shared-crt-fd-space.md`。
+三条约束的解法尚未实现。目标是**宿主号按 address space 私有**——每个槽独占自己的号，共享只发生在对象层（inode / pty / SOCKET），于是「号会不会被别人关掉」这个问题不再需要回答。目标形态见 `design-fd-ownership.md`，实施计划与验收见 `todo-fd-ownership.md`，问题证据见 `../issues/fork-shared-crt-fd-space.md`。
 
 ## 相关文件
 
