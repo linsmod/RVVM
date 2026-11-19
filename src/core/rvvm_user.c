@@ -528,9 +528,20 @@ struct uapi_itimerval {
     struct uapi_timeval it_value;
 };
 
+/* RISC-V 64 Linux struct tms: clock_t is long (64-bit), four fields. The host
+ * struct tms is not this shape on every host (mingw clock_t is 32-bit), so it
+ * is converted field by field rather than copied. */
+struct uapi_tms {
+    int64_t utime;
+    int64_t stime;
+    int64_t cutime;
+    int64_t cstime;
+};
+
 BUILD_ASSERT(sizeof(struct uapi_timespec) == 16);
 BUILD_ASSERT(sizeof(struct uapi_timeval) == 16);
 BUILD_ASSERT(sizeof(struct uapi_itimerval) == 32);
+BUILD_ASSERT(sizeof(struct uapi_tms) == 32);
 
 struct uapi_pollfd {
     int32_t  fd;
@@ -565,7 +576,11 @@ BUILD_ASSERT(sizeof(struct statx_timestamp) == 16);
  * host filesystem metadata (on Windows st_ino is the NTFS file id), so the
  * guest gets a stable opaque inode and one fixed device instead. Hashing only
  * the inode keeps stat(2), statx(2) and getdents64's d_ino in agreement. */
-#define RVVM_GUEST_DEV 0x52564D01u
+/* dev 0:1. statx reports a device as major/minor, stat as a dev_t; keeping
+ * this value equal to makedev(0, 1) is what lets the two agree. */
+#define RVVM_GUEST_DEV       1u
+#define RVVM_GUEST_DEV_MAJOR 0u
+#define RVVM_GUEST_DEV_MINOR 1u
 
 static uint64_t guest_ino_hash(uint64_t ino)
 {
@@ -4923,6 +4938,29 @@ static rvvm_path_owner_t rvvm_path_owner(const struct rvvm_mount_ns* ns, const c
         owner.mount = NULL;
     }
     return owner;
+}
+
+/* Is @abs backed by the host? A host-backed root is a HOSTFS row by provider
+ * (see mount_root_set_backing), and so is a hostfs mount; proc/dev/tmpfs/asset
+ * paths are the core's own. statx needs to know before it asks the host, so it
+ * can keep the same synthetic identity stat(2) gives those rows. */
+static bool guest_path_is_host_backed(const char* abs)
+{
+    rvvm_userland_t*  ctx = uctx();
+    rvvm_path_owner_t owner;
+    bool              backed = false;
+
+    if (!ctx || !ctx->mountns || !abs) {
+        return false;
+    }
+    spin_lock(&ctx->mountns->lock);
+    owner = rvvm_path_owner(ctx->mountns, abs);
+    if (owner.mount && (owner.provider == RVVM_MOUNT_HOSTFS ||
+                        mount_row_is_root(owner.mount))) {
+        backed = true;
+    }
+    spin_unlock(&ctx->mountns->lock);
+    return backed;
 }
 
 /* Where a guest-absolute path hangs on the host, if anywhere.
@@ -13671,7 +13709,7 @@ PUBLIC int rvvm_session_pty_attach(rvvm_machine_t* machine, int pid,
      * The backend is HOST because the number names a real descriptor on this
      * host - the pty slave - and the guest's read/write go straight to it. */
     for (int fd = 0; fd <= 2; fd++) {
-        userland_fds_write(ctx, fd, true, p->slave, false, false,
+        userland_fds_write(ctx, fd, true, p->slave, false,
                            FD_BACKEND_HOST, 0, "session");
     }
     p->pid = pid;
@@ -18789,21 +18827,32 @@ static void* rvvm_user_thread_wrap(void* arg)
                     a0 = rvvm_sys_getgid();
                     break;
                 case 153: // times
-                    // TODO: Struct conversion!
                     rvvm_info("sys_times(%lx)", a0);
                     {
                         /* The CPU times are the host's process accounting; the
                          * return value is "ticks since boot", and the guest's
-                         * boot is the run start, not the host's. */
+                         * boot is the run start, not the host's. The buffer is
+                         * the guest's 64-bit struct tms, converted field by
+                         * field (the host's clock_t may be 32-bit). */
                         struct tms tms;
                         clock_t    host_ticks = times(&tms);
-                        struct tms* out = a0 ? to_ptr_wr(a0) : NULL;
-                        if (out) {
-                            *out = tms;
+                        if (host_ticks == (clock_t)-1) {
+                            a0 = errno_ret(-1);
+                            break;
                         }
-                        a0 = host_ticks == (clock_t)-1
-                           ? errno_ret(-1)
-                           : (rvvm_addr_t)(guest_uptime_ns() / 10000000ULL);
+                        if (a0) {
+                            struct uapi_tms* out = to_ptr_sz_wr(a0, sizeof(*out));
+                            if (!out) {
+                                a0 = -UAPI_EFAULT;
+                                break;
+                            }
+                            out->utime  = (int64_t)tms.tms_utime;
+                            out->stime  = (int64_t)tms.tms_stime;
+                            out->cutime = (int64_t)tms.tms_cutime;
+                            out->cstime = (int64_t)tms.tms_cstime;
+                        }
+                        /* USER_HZ is 100 on the guest (and in the win32 shim). */
+                        a0 = (rvvm_addr_t)(guest_uptime_ns() / 10000000ULL);
                     }
                     break;
                 case 154: // setpgid
@@ -19474,17 +19523,34 @@ case 179: // sysinfo
                     // (asserted above), unlike struct stat.
                     rvvm_info("sys_statx(%ld, %s, %lx, %lx, %lx)", a0, to_str(a1), a2, a3, a4);
                     struct statx* stx = to_ptr_sz_wr(a4, sizeof(*stx));
+                    const char*   path = to_str(a1);
+                    char          abs[UAPI_PATH_MAX];
+                    bool          host_backed = true;
                     if (!stx) {
                         a0 = -UAPI_EFAULT;
                     } else {
-                        a0 = errno_ret(statx(userland_fd_host(uctx(), (int)a0),
-                                             wrap_guest_path(path_buf, (int)a0, to_str(a1)), a2, a3, stx));
-                        if (a0 == 0) {
-                            /* Same opaque identity as stat(2): hash the host
-                             * inode and keep one fixed guest device. */
-                            stx->stx_ino = guest_ino_hash(stx->stx_ino);
-                            stx->stx_dev_major = 0;
-                            stx->stx_dev_minor = 1;
+                        if (path && path[0] &&
+                            guest_path_abs_of((int)a0, path, abs, sizeof(abs))) {
+                            host_backed = guest_path_is_host_backed(abs);
+                        }
+                        if (!host_backed) {
+                            /* proc/dev/tmpfs are the core's own rows; stat(2)
+                             * answers them with synthetic identities, and the
+                             * host path here is not theirs to stat. ENOSYS lets
+                             * a libc fall back to fstatat. */
+                            a0 = -UAPI_ENOSYS;
+                        } else {
+                            a0 = errno_ret(statx(userland_fd_host(uctx(), (int)a0),
+                                                 wrap_guest_path(path_buf, (int)a0, path),
+                                                 a2, a3, stx));
+                            if (a0 == 0) {
+                                /* Same opaque identity as stat(2): hash the
+                                 * host inode and use major/minor of the fixed
+                                 * guest device, so the two agree on (dev,ino). */
+                                stx->stx_ino = guest_ino_hash(stx->stx_ino);
+                                stx->stx_dev_major = RVVM_GUEST_DEV_MAJOR;
+                                stx->stx_dev_minor = RVVM_GUEST_DEV_MINOR;
+                            }
                         }
                     }
                     break;

@@ -241,7 +241,8 @@ ssh -i $key -p 7940 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o Bat
   `newfstatat`/`newfstat` 的宿主持久分支传 true；`getdents64` 对宿主目录记录的
   `d_ino` 做同一 hash；`statx` 成功后写 `stx_ino`/固定 dev。
 - 验证：selftest 的 `stat -c '%i %d' /etc/hostname` 与 `ls -i` 的 ino 相等，
-  `dev == 0x52564D01`，且不等于宿主 `os.stat(...).st_ino`；
+  `dev == 1`（0:1，与 statx 的 major/minor 一致），且不等于宿主
+  `os.stat(...).st_ino`；
   `test_std` 的 `fstat(dirfd) agrees with stat(".") on dev/ino` 通过。
 - 未覆盖：Windows 上 `statx` 返回 ENOSYS，`test_std` 的 statx 段 SKIP；
   statx 的 hash 分支需要在 Linux 宿主上复核（登记遗留）。

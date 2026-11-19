@@ -71,6 +71,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/times.h>
 #include <sys/utsname.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -746,6 +747,37 @@ static void stage_clock(void)
     errno = 0;
     rc = syscall(SYS_gettimeofday, 0, 0);
     check(rc == 0, msgf("gettimeofday(NULL, NULL) succeeds (rc=%ld, %s)", rc, rc < 0 ? strerror(errno) : "ok"));
+
+    /* times(2): the return is guest uptime ticks, and the buffer is the
+     * guest's 64-bit struct tms. Poisoning it first catches a host struct
+     * copy that writes only the host's four 32-bit fields. */
+    struct tms tms;
+    const clock_t poison = (clock_t)0xAAAAAAAAAAAAAAAAULL;
+    memset(&tms, 0xAA, sizeof(tms));
+    errno = 0;
+    clock_t ticks = times(&tms);
+    if (ticks == (clock_t)-1) {
+        skip("times(2)", strerror(errno));
+    } else {
+        check(ticks >= 0, msgf("times(2) returns non-negative ticks (%ld)", (long)ticks));
+        check(tms.tms_utime != poison && tms.tms_stime != poison &&
+              tms.tms_cutime != poison && tms.tms_cstime != poison,
+              "times(2) fills all four 64-bit tms fields");
+        check(tms.tms_utime >= 0 && tms.tms_stime >= 0 &&
+              tms.tms_cutime >= 0 && tms.tms_cstime >= 0,
+              "times(2) CPU times are non-negative");
+
+        struct timespec mono = {0};
+        clock_gettime(CLOCK_MONOTONIC, &mono);
+        long long expected = (long long)mono.tv_sec * 100 + mono.tv_nsec / 10000000;
+        long long delta = (long long)ticks - expected;
+        check(delta > -200 && delta < 200,
+              msgf("times(2) return tracks guest uptime (delta %lld ticks)", delta));
+
+        errno = 0;
+        ticks = times(NULL);
+        check(ticks >= 0, msgf("times(NULL) succeeds and returns ticks (%ld)", (long)ticks));
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -779,6 +811,9 @@ static void stage_statx(void)
         check((uint64_t)st.st_size == stx.size,
               msgf("statx size agrees with stat(2) (%llu vs %lld)", (unsigned long long)stx.size, (long long)st.st_size));
         check((uint64_t)st.st_ino == stx.ino, "statx ino agrees with stat(2)");
+        check(st.st_dev == 1, msgf("stat device is the synthetic 0:1 (%u)", (unsigned)st.st_dev));
+        check(stx.dev_major == 0 && stx.dev_minor == 1,
+              msgf("statx device is the same 0:1 (%u:%u)", stx.dev_major, stx.dev_minor));
     }
 
     if (g_file_fd >= 0) {

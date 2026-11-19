@@ -279,8 +279,8 @@ def main():
             guest_ino = int(numbers[0][0]) if numbers and numbers[0] else 0
             guest_dev = int(numbers[0][1]) if len(numbers[0]) > 1 else 0
             dir_ino = int(numbers[1][0]) if len(numbers) > 1 else 0
-            fails += check(guest_dev == 0x52564D01,
-                           "stat device is the fixed guest dev (%d)" % guest_dev)
+            fails += check(guest_dev == 1,
+                           "stat device is the fixed guest dev 0:1 (%d)" % guest_dev)
             fails += check(guest_ino != 0 and guest_ino == dir_ino,
                            "stat and getdents agree on the guest inode")
             if rootfs_name:
