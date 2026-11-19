@@ -1000,7 +1000,15 @@ def make_handler(sup, token):
                     sup.stop(port)
                     row = sup.db.instance(port)
                     if row and row["rootfs"]:
+                        # The rootfs, plus the sidecars that live beside it:
+                        # <rootfs>.modes and <rootfs>.lock (host state, not
+                        # guest-visible files inside the tree).
                         shutil.rmtree(row["rootfs"], ignore_errors=True)
+                        for suffix in (".modes", ".lock"):
+                            try:
+                                os.remove(row["rootfs"] + suffix)
+                            except OSError:
+                                pass
                     shutil.rmtree(sup.run_dir(port), ignore_errors=True)
                     sup.db.delete(port)
                     sup.db.event(port, "deleted", "")

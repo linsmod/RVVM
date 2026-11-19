@@ -214,6 +214,40 @@ def main():
             fails += check("AUTH=0" in r.stdout,
                            "instance %d has its own auth.pub" % p1)
 
+            # C4: the mode store and rootfs lock are host-side sidecars, not
+            # files under the guest's /. A rootfs chmod is persisted; a hostfs
+            # chmod is not, because the store is keyed by host path.
+            r = run_ssh(
+                key, p1,
+                "chmod 700 /etc/hostname; "
+                "touch /run/vpsessiond/selftest-hostfs; "
+                "chmod 600 /run/vpsessiond/selftest-hostfs; "
+                "test ! -e /rootfs.modes; echo NOMODES=$?; "
+                "test ! -e /.ash.lock; echo NOLOCK=$?")
+            fails += check("NOMODES=0" in r.stdout,
+                           "guest / has no rootfs.modes")
+            fails += check("NOLOCK=0" in r.stdout,
+                           "guest / has no .ash.lock")
+            time.sleep(0.5)
+            rootfs_name = insts.get(p1, {}).get("rootfs", "")
+            if rootfs_name:
+                rootfs = os.path.join(release, "runtime", "roots",
+                                      rootfs_name)
+                fails += check(os.path.isfile(rootfs + ".modes"),
+                               "mode store lives beside the rootfs")
+                fails += check(os.path.isfile(rootfs + ".lock"),
+                               "rootfs lock lives beside the rootfs")
+                try:
+                    with open(rootfs + ".modes", "r",
+                              encoding="utf-8", errors="replace") as f:
+                        modes = f.read()
+                except OSError:
+                    modes = ""
+                run_dir = os.path.join(release, "runtime", "run", str(p1))
+                fails += check(run_dir not in modes and
+                               run_dir.replace("\\", "/") not in modes,
+                               "hostfs chmod is not persisted")
+
             r = run_ssh(key, p1,
                         "mkdir -p /hostdir; mount -t hostfs '%s' /hostdir; "
                         "echo RC=$?; rmdir /hostdir 2>/dev/null"
@@ -225,6 +259,14 @@ def main():
             for port in started:
                 api(token, "DELETE", "/api/instances/%d" % port,
                     port=args.daemon_port)
+        for port in started:
+            name = insts.get(port, {}).get("rootfs", "")
+            if not name:
+                continue
+            base = os.path.join(release, "runtime", "roots", name)
+            for suffix in (".modes", ".lock"):
+                fails += check(not os.path.exists(base + suffix),
+                               "rm removed %s%s" % (name, suffix))
     finally:
         if proc and proc.poll() is None:
             proc.terminate()

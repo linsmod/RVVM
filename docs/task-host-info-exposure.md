@@ -109,7 +109,7 @@
 | C1 | `fix(core): make guest hostfs mounts an explicit host grant` | core 策略 + ash flag + 测试/文档 | 进行中 |
 | C2 | `fix(supervisor): require a token and stop returning host paths` | token、鉴权、API 字段、us/ws/UI | 完成（待提交） |
 | C3 | `fix(supervisor): isolate each instance's /run/vpsessiond` | per-instance run dir + `--run-dir` | 完成（待提交） |
-| C4 | `fix(ash): keep guest mode store and lock outside the guest root` | sidecar + 跳过 hostfs chmod + 清理 | 待做 |
+| C4 | `fix(ash): keep guest mode store and lock outside the guest root` | sidecar + 跳过 hostfs chmod + 清理 | 完成（待提交） |
 | C5 | `fix(core): answer statfs without host disk numbers` | statfs/fstatfs 合成 | 待做 |
 | C6 | `fix(core): synthesize guest file identity` | st_dev/st_ino/getdents/statx | 待做 |
 | C7 | `fix(core): rebase guest uptime and monotonic clock` | uptime/sysinfo/starttime/btime | 待做 |
@@ -195,6 +195,21 @@ ssh -i $key -p 7940 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o Bat
 - 兼容：旧 daemon 起的实例用共享 `runtime/run/<port>.ready`，`ssh_ready` 仍能识别
   （`legacy_ready_path`）；新实例一律 per-instance，停止/删除时清掉两代标记。
 - 清理：selftest 结束后测试 core/rootfs/run 目录已删，只剩用户的 7926/7927。
+
+### C4 恢复点（2026-11-19 已跑）
+
+- 代码点：`ash_client.c` per-instance mode/lock 改 `<rootfs>.modes`/`<rootfs>.lock`；
+  `rvvm_user.c` `mode_path_persistable()`（prefix 内才持久化）与 `path_has_prefix()`
+  接受 `\\`；`supervisor.py` `rm` 删除两个 sidecar；`selftest.py` 增 9 项。
+- 验证：
+  1. guest `/` 无 `rootfs.modes`、`.ash.lock`；
+  2. 宿主 `<rootfs>.modes`/`<rootfs>.lock` 存在（lock 内容仍是宿主 pid，但不在 guest 可见）；
+  3. guest `chmod /etc/hostname` 后 sidecar 有该 rootfs 路径；
+  4. guest `chmod /run/vpsessiond/selftest-hostfs` 后 sidecar **不**包含该 hostfs 路径；
+  5. `us rm` 删除 rootfs 时两个 sidecar 一并消失。
+- 备注：sidecar 仍按宿主路径记录 rootfs 内文件（这是 mode store 的键），但它在 rootfs 外，
+  guest 不可见；hostfs 路径不写入。旧实例（旧二进制）内的 `rootfs.modes` 需要 `us rm`
+  或重启到新二进制后才消失。
 
 后续提交的恢复点在本文件追加。
 

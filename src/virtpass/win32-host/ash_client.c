@@ -469,10 +469,12 @@ static bool ash_lock_path(char* out, size_t size)
     char runtime[MAX_PATH];
 
     if (ash_rootfs_dir_set) {
-        /* A per-instance rootfs locks inside its own directory: the lock
-         * lives and dies with the tree it guards. */
+        /* The lock is host state, not guest state: keep it beside the rootfs
+         * rather than inside it. The file records the host pid, and the
+         * rootfs directory is mounted as the guest's / - a guest must not be
+         * able to read or delete the host's lock. */
         CreateDirectoryA(ash_rootfs_dir, NULL);
-        return snprintf(out, size, "%s\\.ash.lock", ash_rootfs_dir) < (int)size;
+        return snprintf(out, size, "%s.lock", ash_rootfs_dir) < (int)size;
     }
     if (!ash_exe_directory(exe_dir, sizeof(exe_dir))) {
         return false;
@@ -484,16 +486,17 @@ static bool ash_lock_path(char* out, size_t size)
 }
 
 /* Where a run keeps the permission bits the host filesystem cannot hold:
- * beside the persisted rootfs, so the two live and are cleared together.
- * A per-instance rootfs keeps its modes inside its own directory. */
+ * beside the persisted rootfs, so the two live and are cleared together. The
+ * per-instance file is a sidecar (<rootfs>.modes), not <rootfs>\rootfs.modes:
+ * the rootfs is the guest's /, and the mode store is keyed by host path - it
+ * must not be a file the guest can read. */
 static bool ash_mode_store_path(char* out, size_t size)
 {
     char exe_dir[MAX_PATH];
     char runtime[MAX_PATH];
 
     if (ash_rootfs_dir_set) {
-        return snprintf(out, size, "%s\\rootfs.modes", ash_rootfs_dir) <
-               (int)size;
+        return snprintf(out, size, "%s.modes", ash_rootfs_dir) < (int)size;
     }
     if (!ash_exe_directory(exe_dir, sizeof(exe_dir))) {
         return false;

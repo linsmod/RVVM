@@ -769,6 +769,7 @@ static bool         mode_store_flusher_started;
 
 static void mode_store_ensure_loaded(void);
 static void mode_store_flush(void);
+static bool mode_path_persistable(const char* path);
 
 static char* mode_path_strdup(const char* path)
 {
@@ -851,13 +852,22 @@ static void mode_path_set_locked(const char* path, uint32_t mode)
 static void mode_override_record_path(const char* host_path, uint32_t mode, bool persist)
 {
     struct stat st = {0};
+    bool        keep;
 
     if (!host_path || !*host_path) {
         return;
     }
+    /* The store is keyed by host path, so it would leak the host layout if a
+     * hostfs chmod (or an old file) put a path outside the run's root in it.
+     * The mode still applies to the identity table below - the guest's chmod
+     * is honoured for this run - but only paths under the root prefix are
+     * persisted. */
+    keep = mode_path_persistable(host_path);
     spin_lock(&mode_store_lock);
-    mode_path_set_locked(host_path, mode);
-    if (persist) {
+    if (keep) {
+        mode_path_set_locked(host_path, mode);
+    }
+    if (persist && keep) {
         mode_store_dirty = true;
     }
     spin_unlock(&mode_store_lock);
@@ -869,7 +879,7 @@ static void mode_override_record_path(const char* host_path, uint32_t mode, bool
     /* Coalesced: a package install records hundreds of these, and the file is
      * rewritten at most once a second. The flusher thread comes back for the
      * tail of the burst, which no later record would carry. */
-    if (persist && time(NULL) != mode_store_flush_time) {
+    if (persist && keep && time(NULL) != mode_store_flush_time) {
         mode_store_flush();
     }
 }
@@ -922,6 +932,11 @@ static void mode_store_ensure_loaded(void)
 static void mode_path_rename(const char* from, const char* to)
 {
     if (!from || !to || !*from || !*to) {
+        return;
+    }
+    /* A rootfs entry renamed onto a hostfs path would move a host path into
+     * the store; leave it filed under its old (root-relative) name instead. */
+    if (!mode_path_persistable(to)) {
         return;
     }
     spin_lock(&mode_store_lock);
@@ -4709,11 +4724,31 @@ static void proc_symbolize(const char* label, const char* elf, const rvvm_addr_t
 /* Component-aware prefix match: "/tmp" has to be followed by '/' or end the
  * path. A bare rvvm_strfind() prefix test also accepted "/tmpfoo", which took
  * any such path out of the prefix and onto the host's own root - a guest could
- * leave its namespace just by naming a directory "/tmp-something". */
+ * leave its namespace just by naming a directory "/tmp-something". The
+ * backslash is for host paths on Windows (the mode store asks the same
+ * question of a path the host handed it). */
 static bool path_has_prefix(const char* path, const char* prefix)
 {
     size_t len = rvvm_strlen(prefix);
-    return rvvm_strfind(path, prefix) == path && (path[len] == '/' || path[len] == 0);
+    return rvvm_strfind(path, prefix) == path &&
+           (path[len] == '/' || path[len] == '\\' || path[len] == 0);
+}
+
+/* Is @path something the run's mode store may persist? It is keyed by host
+ * path, so only paths under the root prefix belong in it; a hostfs chmod (or a
+ * stale entry) outside the root would write the host layout into a file the
+ * guest used to be able to read. A run whose root is memory has no host paths
+ * of its own, so nothing is persisted there. */
+static bool mode_path_persistable(const char* path)
+{
+    rvvm_userland_t* ctx = uctx();
+    if (!ctx) {
+        return true;    /* no context (host-side call): leave it to the caller */
+    }
+    if (!ctx->prefix_path) {
+        return false;
+    }
+    return path_has_prefix(path, ctx->prefix_path);
 }
 
 /* ============================================================

@@ -29,6 +29,10 @@
   不是 guest root 的自带权限。宿主用 `rvvm_user_mount_hostfs()` 预挂载不受影响；
   `rvvm_ash --allow-guest-hostfs` / `rvvm_user_set_guest_hostfs()` 是显式授权，测试与
   WSL 形态才打开。默认关是 2026-11-19 宿主信息收敛的一部分。
+- **per-instance mode store / rootfs lock 是 rootfs 外的 sidecar**：
+  `<rootfs>.modes` / `<rootfs>.lock`；`<rootfs>` 是 guest 的 `/`，所以这两个文件不再
+  出现在 guest 里。mode store 只持久化 prefix 内的路径，hostfs chmod 的宿主路径不写入。
+  默认（无 `--rootfs`）仍是 `runtime/rootfs.modes` / `runtime/ash-core.lock`。
 - `root=` 是 **guest 路径**，与 prefix 组合（等价 chroot），不是宿主路径；只在有 prefix 时生效。
 - dev 号由合成规则给出，不用宿主真实 `st_dev`（三宿主行为必须一致）。
 
