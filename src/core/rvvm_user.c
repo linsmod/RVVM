@@ -11058,6 +11058,19 @@ static void uapi_itimerval_from_host(struct uapi_itimerval* dst, const struct it
 
 static int64_t rvvm_sys_sendfile(rvvm_userland_t* ctx, int out_fd, int in_fd, int64_t* offset, size_t count)
 {
+    /* A tmpfs end is an inode, not a host descriptor: userland_read_fd() and
+     * userland_write_fd() below only know how to reach the host, and would ask
+     * the host about a synthetic number (EBADF) *after* consuming a chunk from
+     * the other side. That is how `cat /bin/busybox > /tmp/x` used to lose its
+     * first 32K and still report success: sendfile failed halfway, the caller
+     * fell back to read/write from the advanced position. Refuse before any
+     * byte moves - ENOSYS is what a kernel without sendfile answers, and every
+     * copy loop falls back to read/write on it. */
+    if (memfs_fd_for_guest(ctx, in_fd) || memfs_fd_for_guest(ctx, out_fd)) {
+        RVVM_TRC(RVVM_TRC_FD, "sendfile: in=%d out=%d on a tmpfs -> ENOSYS (caller reads/writes)",
+                  in_fd, out_fd);
+        return -UAPI_ENOSYS;
+    }
     uint8_t* buf   = safe_new_arr(uint8_t, SENDFILE_CHUNK);
     int64_t  off   = offset ? *offset : 0;
     int64_t  total = 0;

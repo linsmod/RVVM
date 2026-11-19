@@ -24,6 +24,7 @@
 | `fix-userland-hart-registration.md` | 修复史 | userland hart 未入 `machine->harts` → 每次 fork 漏 16 MiB RVJIT 堆：现象 / 根因 / 修法 / 验证 |
 | `fix-userland-pty-req.md` | 修复史 | guest ioctl 请求号符号扩展（TIOCGPTN 永不命中）+ pty fd 的 stat 身份不一致（ttyname 判 ENODEV）：现象 / 根因 / 修法 / 验证 |
 | `fix-userland-tty-cc.md` | 修复史 | 空闲提示符 ^C 无反应、连按两次会话卡死：TCGETS 不报 `c_cc`（busybox lineedit 靠 VINTR 认键）+ 信号 handler 的 longjmp 让 `sig_inflight` 永久占住（poll 永远 EINTR） |
+| `fix-userland-sendfile-tmpfs.md` | 修复史 | `cp`/`cat` 到 `/tmp` 静默丢开头 32K：sendfile 不认 memfs fd，消耗一个 chunk 后失败、调用方从错位继续 |
 | `INDEX.md` | 索引 | 本文件 |
 
 ## 仓库根目录的文档（历史位置，未迁入 docs/）
