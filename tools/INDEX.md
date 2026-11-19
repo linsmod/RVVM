@@ -50,7 +50,8 @@
 | `supervisor/selftest.py` | supervisor 安全自测（独立测试 release + 临时 daemon/DB/端口）：无 token 401、有 token 200、API 无绝对宿主路径/endpoint、默认拒绝 guest hostfs；约 10s |
 
 Agent 侧的完整用法（起实例、`us` 各子命令、ssh 的两种拼法、交互式 pty 测试配方、已知坑）
-整理成了技能 `c:/Users/linswin/.agents/skills/userland-vm/SKILL.md`，新会话直接加载它即可。
+在仓库里有一份：`skills/userland-vm/SKILL.md`；本机同时安装到
+`c:/Users/linswin/.agents/skills/userland-vm/SKILL.md` 供 harness 直接加载，两份保持一致。
 
 ## 打包 / 生成 / 安装
 

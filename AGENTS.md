@@ -244,7 +244,8 @@
 
 - [本地机器快速搜索文件](c:/Users/linswin/.agents/skills/everything-search/SKILL.md)
 - [沙箱绕过](c:/Users/linswin/.agents/skills/traycmd/SKILL.md)，章节：一次性或临时命令
-- [起 userland VM 并用 ssh 测](c:/Users/linswin/.agents/skills/userland-vm/SKILL.md)，章节：常见测试配方 / 纪律与已知坑
+- [起 userland VM 并用 ssh 测](skills/userland-vm/SKILL.md)，章节：常见测试配方 / 纪律与已知坑
+  （本机同时安装了一份到 `c:/Users/linswin/.agents/skills/userland-vm/SKILL.md`，供 harness 直接加载；两份内容保持一致）
 
 路径不存在或无法读取时，跳过该技能，并在回复中提一句。
 
