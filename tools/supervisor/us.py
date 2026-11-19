@@ -142,10 +142,11 @@ def cmd_health(_):
     print("daemon  : %s" % data.get("version"))
     print("release : %s" % data.get("release"))
     cores = data.get("cores", {})
+    # JSON object keys are strings, and the pid may come back as one too.
     print("cores   : %s" % (", ".join(
-        "%d(pid %d, %s)" % (p, v["pid"],
-                            "alive" if v["alive"] else "dead")
-        for p, v in sorted(cores.items())) or "none"))
+        "%s(pid %s, %s)" % (p, v.get("pid", "?"),
+                            "alive" if v.get("alive") else "dead")
+        for p, v in sorted(cores.items(), key=lambda kv: int(kv[0]))) or "none"))
 
 
 COMMANDS = {

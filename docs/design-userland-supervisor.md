@@ -71,6 +71,26 @@ bind 之前，把「还在启动」误报成「僵死」会让运维去杀健康
 daemon 启动子进程时 cwd 设为 release 目录（guest 相对路径按进程 cwd 解析，
 `tools/INDEX.md` 既定约束），stderr 重定向到实例日志文件。
 
+### 4.1 release 树的选取（2026-11-19 收紧）
+
+一个 release 树要被 daemon 接受，必须**同时**具备 `rvvm_ash`（或 `.exe`）和
+`bundle/{rootfs,system,apps}.tar.gz`——后者是 core 启动时解包的东西。只有 `bin`
+的构建树（`make BUILDDIR=... bin` 出来的试验目录）不再能被自动发现：
+
+- `--release` 显式指定时不满足就立刻退出，并列出缺什么；
+- 自动发现时逐个检查，不合格的跳过并在日志里报出原因；
+- 多个合格候选（例如 `release.windows.*` 与 `release.test.*`）取 **`rvvm_ash` 最新的**
+  那个，并打印全部候选与最终选择。
+
+此前是「按名字排序取第一个有 `rvvm_ash` 的目录」，于是 `release.cc2.windows.x86_64`
+这种只编了 `bin` 的试验目录会被选中，实例起来 25 秒后变 `failed`，而原因（缺 bundle）
+在界面上完全不可见。**每个 release 树各自持有 `runtime/supervisor/supervisor.db`**，
+所以选错树还等于换了一套实例状态——这一条也写进了启动日志。
+
+daemon 单例：绑定前先 `GET /api/health` 探测目标端口，已有 daemon 应答就退出并报出
+对方的 version/release。`SO_REUSEADDR` 在 Windows 上允许第二个进程绑正在 LISTEN 的
+端口，两个 daemon 各持一份 DB 会表现为 `stop` 时好时坏、两次 `list` 结果不同。
+
 ## 5. API 面（v1 + v2 终端，CLI 与 web 共用）
 
 | 方法 | 路径 | 语义 |

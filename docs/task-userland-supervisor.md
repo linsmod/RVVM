@@ -113,6 +113,29 @@
 未验证：浏览器侧 `document.execCommand`/权限弹窗行为未实测（按用户要求不做 web 测试），
 当前实现刻意不依赖它——复制用 `navigator.clipboard.writeText`，粘贴主路径走浏览器 paste。
 
+## S3 v4：daemon 防呆（2026-11-19）
+
+事故形态：托盘里的 daemon 自动选中了一个只编了 `bin` 的试验目录
+（`release.cc2.windows.x86_64`，为绕开被占用 exe 而临时建），它没有 `bundle/`，
+于是「启动实例」25 秒后变 `failed`，界面上只看到状态，看不到原因；同时因为 DB 落在
+release 树内，换树还等于换了一整套实例状态。
+
+落地（设计与规则见 `design-userland-supervisor.md` §4.1）：
+
+- `find_release_dir()` 要求 `rvvm_ash` + `bundle/{rootfs,system,apps}.tar.gz` 齐全；
+  显式 `--release` 不合格立即退出并列出缺项；自动发现跳过不合格项（日志写原因），
+  多候选取 `rvvm_ash` 最新者并打印全部候选。
+- `Supervisor.start()` 启动前再查一次同一组文件，缺就 `500` + 明确消息，
+  不再“起了必死、25 秒后 failed”。
+- `main()` 绑定前 `GET /api/health` 探测：已有 daemon 应答就退出并报出对方
+  version/release，避免两个 daemon 共用一个端口、各持一份 DB。
+- `us.py health` 的 `%d` 格式化崩溃顺手修掉（JSON 里 pid 是字符串）。
+
+验证：daemon 在跑时再启动一个 → 立即退出并打印 `daemon 0.2.0, release ...`；
+伪造 `release.zz.windows.x86_64`（只有 exe）→ 被跳过并报 `missing bundle/...`，
+仍选 `release.test`；重启托盘任务后 `us health` / `us start` / `us exec` 正常，
+实例 7916 `running`。
+
 ## 本机部署（traycmd 托盘，2026-11-18）
 
 daemon 已注册为托盘命令（webui-demo 实例在 daemon 换手后由 reconcile 无缝保留）：

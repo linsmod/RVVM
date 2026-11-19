@@ -27,7 +27,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -49,22 +51,98 @@ def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
+BUNDLE_NEEDS = ("rootfs.tar.gz", "system.tar.gz", "apps.tar.gz")
+
+
+def core_binary(release):
+    """rvvm_ash inside a release tree, .exe spelling first."""
+    exe = os.path.join(release, "rvvm_ash_x86_64.exe")
+    return exe if os.path.isfile(exe) else os.path.join(release, "rvvm_ash")
+
+
+def release_missing(release):
+    """What keeps this tree from booting an instance: the core binary, or one of
+    the bundle archives it unpacks at startup.
+
+    A build tree - `make bin` into a scratch BUILDDIR, or a debug tree - has the
+    binary but no bundle. Picking one used to look like a start that silently
+    failed 25 seconds later ("no live core"), while the actual cause was a
+    directory choice nobody could see. Now a tree either has all four pieces or
+    it is skipped with the reason."""
+    missing = []
+    if not os.path.isfile(os.path.join(release, "rvvm_ash_x86_64.exe")) and \
+            not os.path.isfile(os.path.join(release, "rvvm_ash")):
+        missing.append("rvvm_ash")
+    for name in BUNDLE_NEEDS:
+        if not os.path.isfile(os.path.join(release, "bundle", name)):
+            missing.append("bundle/" + name)
+    return missing
+
+
 def find_release_dir(explicit):
-    """The release tree holding rvvm_ash / vp. Explicit wins; otherwise walk
-    up from this script (tools/supervisor) into the repo and pick the
-    release.*.x86_64 directory."""
+    """The release tree holding rvvm_ash / vp *and* the bundle an instance boots
+    from. Explicit wins and is validated; otherwise every release.* directory is
+    checked and the one with the newest core binary wins, so a freshly built
+    tree is the one picked - never a half-built one that only looks usable."""
     if explicit:
-        return os.path.abspath(explicit)
+        full = os.path.abspath(explicit)
+        missing = release_missing(full)
+        if missing:
+            raise SystemExit("supervisor: %s cannot run instances: missing %s"
+                             % (full, ", ".join(missing)))
+        return full
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.dirname(os.path.dirname(here))
+    usable, skipped = [], []
     for name in sorted(os.listdir(repo)):
         full = os.path.join(repo, name)
-        if name.startswith("release.") and os.path.isdir(full) and (
-                os.path.isfile(os.path.join(full, "rvvm_ash_x86_64.exe")) or
-                os.path.isfile(os.path.join(full, "rvvm_ash"))):
-            return full
-    raise SystemExit("supervisor: no release.* directory with rvvm_ash found "
-                     "(pass --release)")
+        if not (name.startswith("release.") and os.path.isdir(full)):
+            continue
+        missing = release_missing(full)
+        if missing:
+            skipped.append((name, missing))
+            continue
+        usable.append(full)
+    if not usable:
+        lines = ["supervisor: no release.* tree under %s can run instances" % repo]
+        for name, missing in skipped:
+            lines.append("  %s: missing %s" % (name, ", ".join(missing)))
+        if not skipped:
+            lines.append("  (no release.* directory at all - build one, or pass --release)")
+        raise SystemExit("\n".join(lines))
+    usable.sort(key=lambda p: -os.path.getmtime(core_binary(p)))
+    chosen = usable[0]
+    if len(usable) > 1:
+        log_line("release trees: %s -> using %s (newest rvvm_ash; each tree keeps "
+                 "its own runtime/ and database)"
+                 % (", ".join(os.path.basename(p) for p in usable),
+                    os.path.basename(chosen)))
+    if skipped:
+        log_line("release trees skipped: %s"
+                 % "; ".join("%s (missing %s)" % (name, ", ".join(missing))
+                             for name, missing in skipped))
+    return chosen
+
+
+def probe_daemon(host, port, timeout=2.0):
+    """Who already answers on this bind address, or None.
+
+    Two daemons on one port is not a modelling problem, it is a data problem:
+    SO_REUSEADDR lets the second bind while the first is listening, requests
+    land on either one, and each keeps its own database - so `stop` works half
+    the time and two `list` calls disagree. Refusing to start is the cheap
+    guard; the message names the daemon that holds the port."""
+    url = "http://%s:%d/api/health" % (host, port)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            info = json.loads(r.read().decode("utf-8", "replace"))
+        return "daemon %s, release %s" % (info.get("version", "?"),
+                                          info.get("release", "?"))
+    except urllib.error.HTTPError as e:
+        # Something answers, it just wants a token we do not have.
+        return "HTTP %d" % e.code
+    except Exception:
+        return None
 
 
 def exe_path(release, stem):
@@ -435,6 +513,12 @@ class Supervisor:
         if memfs:
             raise ApiError(400, "memfs mode is broken (guest exits 1); "
                            "see issues/INDEX.md")
+        missing = release_missing(self.release)
+        if missing:
+            # Say why, instead of starting a process that cannot boot and
+            # leaving a "failed" row 25 seconds later.
+            raise ApiError(500, "release %s cannot run instances: missing %s"
+                           % (self.release, ", ".join(missing)))
         logp = self.log_path(port)
         rootfs = self.new_rootfs_dir(port)
         env = dict(os.environ)
@@ -488,7 +572,8 @@ class Supervisor:
                               "pid=%d" % snap[port]["pid"])
                 return {"port": port, "actual": "running",
                         "pid": snap[port]["pid"]}
-        self.db.set(port, actual="failed", stopped_at=now_iso())
+        self.db.set(port, actual="failed", stopped_at=now_iso(),
+                    note="no live core within %ds - see %s" % (self.grace, logp))
         self.db.event(port, "failed", "no live core within %ds" % self.grace)
         return {"port": port, "actual": "failed"}
 
@@ -859,7 +944,17 @@ def main():
     sup.reconcile()
 
     host, _, port = args.bind.rpartition(":")
-    httpd = ThreadingHTTPServer((host or "127.0.0.1", int(port)),
+    host = host or "127.0.0.1"
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    holder = probe_daemon(probe_host, int(port))
+    if holder:
+        raise SystemExit(
+            "supervisor: %s:%s already answers (%s)\n"
+            "  not starting a second daemon: the two would share the port and "
+            "keep separate databases.\n"
+            "  stop the running one first (tray: 结束任务, or quickcmd kill <id>)."
+            % (host, port, holder))
+    httpd = ThreadingHTTPServer((host, int(port)),
                                 make_handler(sup, args.token))
     log_line("supervisor %s: release=%s db=%s bind=%s token=%s"
              % (DAEMON_VERSION, release, db_path, args.bind,
