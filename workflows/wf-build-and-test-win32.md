@@ -28,6 +28,8 @@ Get-Process rvvm_winhost_x86_64,rvvm_ash_x86_64 -ErrorAction SilentlyContinue | 
 pwsh ./build_virtpass.ps1 -Target win32 -Jobs 8
 #    -Target all|win32|apk|android|assets|dist|jni|sdk|clean
 #    -Clean 只在需要时加；额外 make 参数直接跟在后面（如 USE_RVJIT=0）
+#    默认 GUEST_DEBUG=0：guest ELF 优化并 strip，bundle 不带宿主构建路径；
+#    需要 guest 行表调试时追加 GUEST_DEBUG=1。
 
 # 3. 只编单个目标（省时）
 mingw32-make release.windows.x86_64/rvvm_winhost_x86_64.exe -j8

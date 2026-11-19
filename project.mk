@@ -494,9 +494,17 @@ override SYSTEM_ASSETS_DIR  := $(BUILDDIR)/system-assets
 override GUEST_OBJ_DIR      := $(BUILDDIR)/guest-obj
 override GUEST_ZIG          := zig cc
 override GUEST_AR           := zig ar
-# Debug build of the guests: -O0 -g keeps line tables for the in-host
-# userland debugger; -fno-sanitize=undefined is a zig cc requirement
-override GUEST_CFLAGS := -target riscv64-linux-musl -O0 -g -I$(INCDIR) -fno-sanitize=undefined
+# Guest debug info: -O0 -g keeps line tables for the in-host userland debugger,
+# but it also embeds absolute build paths (the repo, the zig cache under the
+# builder's profile). Release/bundle builds pass GUEST_DEBUG=0: optimize and
+# strip the final ELF. The path remap applies to both modes, so even a debug
+# guest does not carry the builder's repo path.
+override GUEST_DEBUG ?= 1
+override GUEST_OPT := $(if $(filter 0,$(GUEST_DEBUG)),-O2,-O0 -g)
+override GUEST_LDFLAGS := $(if $(filter 0,$(GUEST_DEBUG)),-s,)
+override GUEST_CFLAGS := -target riscv64-linux-musl $(GUEST_OPT)\
+	-ffile-prefix-map=$(CURDIR)=/src -fdebug-prefix-map=$(CURDIR)=/src\
+	-I$(INCDIR) -fno-sanitize=undefined
 # Whole guest ABI header directory: listing the headers by hand silently missed
 # vp_aaudio.h / vp_sensor_abi.h, so edits to those never rebuilt a guest.
 override GUEST_HEADS := $(filter %.h,$(call ls_dir,$(INCDIR)/virtpass))
@@ -609,7 +617,7 @@ $(GUEST_OBJ_DIR)/libgles_stubs.a: $(GUEST_OBJ_DIR)/vp_gl_stub.o
 $(GUEST_ASSETS_DIR)/%.exe: $(SRCDIR)/virtpass/guest-samples/%.c $(GUEST_LIBS) $(GUEST_HEADS) $(GUEST_STAMP)
 	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)LD$(TEXT)] $@ $(RESET))
-	@$(call shell_esc,$(GUEST_ZIG) $(GUEST_CFLAGS) -static -L$(GUEST_OBJ_DIR) $< -landroid_stubs -lgles_stubs -o $@)
+	@$(call shell_esc,$(GUEST_ZIG) $(GUEST_CFLAGS) -static $(GUEST_LDFLAGS) -L$(GUEST_OBJ_DIR) $< -landroid_stubs -lgles_stubs -o $@)
 
 # The server is linked in one go: 97 translation units with no useful partial
 # rebuild (a change to any tinyssh header rebuilds most of them anyway), and one
@@ -624,7 +632,7 @@ $(TINYSSH_OUT): $(tinyssh_srcs) $(wildcard $(TINYSSH_CONFIG)/*.h) $(GUEST_STAMP)
 $(SYSTEM_ASSETS_DIR)/%.exe: $(SRCDIR)/virtpass/guest-samples/%.c $(GUEST_LIBS) $(GUEST_HEADS) $(GUEST_STAMP)
 	$(call create_dirs,$(dir $@))
 	$(call println,$(TEXT)[$(GREEN)LD$(TEXT)] $@ $(RESET))
-	@$(call shell_esc,$(GUEST_ZIG) $(GUEST_CFLAGS) -static -L$(GUEST_OBJ_DIR) $< -landroid_stubs -lgles_stubs -o $@)
+	@$(call shell_esc,$(GUEST_ZIG) $(GUEST_CFLAGS) -static $(GUEST_LDFLAGS) -L$(GUEST_OBJ_DIR) $< -landroid_stubs -lgles_stubs -o $@)
 
 .PHONY: guest-assets # Cross-compile the guest samples into the build tree
 guest-assets: $(guest_assets)

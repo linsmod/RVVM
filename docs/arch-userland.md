@@ -34,6 +34,10 @@
 - **guest 时间从 run 起点算**：`/proc/uptime`、`sysinfo.uptime`、`/proc/<pid>/stat` starttime、
   guest `CLOCK_MONOTONIC*`/`BOOTTIME`、`times()` 都减去 `run_start_ns`；`/proc/stat btime`
   是 guest 启动 epoch（now - uptime）。宿主 uptime 不再出现在 guest。
+- **guest 可见的构建标识收敛**：`uname.version` 固定为 `RVVM userland`（不再带
+  `RVVM_VERSION` 的 git/dirty）；`/proc/mounts` 头是 guest-facing 文字；release/bundle
+  的 guest ELF 默认 `GUEST_DEBUG=0`（`-O2 -s`），构建路径不进入 bundle；调试行表用
+  `GUEST_DEBUG=1`。
 - **宿主持久文件的身份合成**：`st_dev` 固定为 `RVVM_GUEST_DEV`，`st_ino = guest_ino_hash(host st_ino)`；
   `getdents64` 的 `d_ino` 用同一 hash，`statx` 也写同一值（Linux 宿主；Windows 上 statx 目前 SKIP）。
   宿主 NTFS file id / 卷号不再直接交给 guest；`stat`/`fstat`/`getdents` 之间的 ino 保持一致。

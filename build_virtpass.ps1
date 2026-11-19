@@ -359,6 +359,13 @@ try {
 
     $makeCmd = @("-j$Jobs") + $makeTargets
     if ($needsGradle) { $makeCmd += "ANDROID_VARIANT=$Variant" }
+    # Bundle/release guests carry no debug info by default: -g embeds the
+    # builder's absolute paths (repo and zig cache) and the guest can read them.
+    # A debugging run can still pass GUEST_DEBUG=1 through -MakeArgs.
+    $guestDebugSet = @($MakeArgs | Where-Object { $_ -match '^GUEST_DEBUG=' })
+    if (-not $guestDebugSet -and (Test-Goal @('guest-assets', 'android', 'dist'))) {
+        $makeCmd += 'GUEST_DEBUG=0'
+    }
     if ($MakeArgs) { $makeCmd += $MakeArgs }
     Invoke-Make $makeCmd
 
