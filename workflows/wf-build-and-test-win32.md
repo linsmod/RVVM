@@ -38,6 +38,16 @@ mingw32-make release.windows.x86_64/rvvm_winhost_x86_64.exe -j8
 ./release.windows.x86_64/rvvm_winhost_x86_64.exe --app test_cli
 printf 'ls /\nexit\n' | ./release.windows.x86_64/rvvm_winhost_x86_64.exe --app test_cli
 
+# 4a. 不启动 supervisor/ssh，直接用 rvvm_user 跑一个 guest ELF（trace 最直观）
+#     默认 prefix 是 <exe>\runtime\rootfs；-prefix 可指向任意已装好的根
+$env:RVVM_TRACE='fd'      # 或 sys/all
+$env:RVVM_VERBOSE='1'
+.\release.windows.x86_64\rvvm_user_x86_64.exe /bin/busybox echo hi
+.\release.windows.x86_64\rvvm_user_x86_64.exe /bin/busybox sh -c "echo via-sh-c"
+.\release.windows.x86_64\rvvm_user_x86_64.exe -prefix <rootfs> /data/app/probe_fcntl_lock/bin/probe_fcntl_lock.exe
+# 脚本模式也可以从 stdin 喂：
+('echo piped-$((2+3))' + "`n" + 'exit' + "`n") | .\release.windows.x86_64\rvvm_user_x86_64.exe /bin/ash
+
 # 4b. 会话模式：起 core 监听 7900，再用 ssh 连（tinyssh 链路）
 #     清 rootfs 与 run 下的日志，否则上一轮的会话状态会干扰观察
 Remove-Item -Recurse -Force release.windows.x86_64/runtime/rootfs -ErrorAction SilentlyContinue

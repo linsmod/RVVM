@@ -17,6 +17,7 @@
 | `task-userland-supervisor.md` | 执行 | supervisor 预览的执行记录：交付物、验收结果、过程坑与遗留 |
 | `task-host-info-exposure.md` | 执行 | 宿主信息暴露审计与 8 次提交的批量修复：P0 hostfs/supervisor 鉴权、P1 元数据/构建路径，含恢复点与测试配方 |
 | `fix-host-info-exposure.md` | 修复史 | 上述修复的现象/根因/修法表/验证/遗留（C1–C8 commit） |
+| `fix-fcntl-record-locks.md` | 修复史 | SQLite unix VFS 的 `F_GETLK/F_SETLK/F_SETLKW`：emulator 锁表、fork/close/byte-range、`RVVM_TRACE=fd` 与 direct `rvvm_user` 探针 |
 | `test-timing.md` | 测试 | 关键测试的实测耗时（supervisor selftest 33.5s；fs/hostfs selftest PASS） |
 | `arch-virtpass.md` | 现状 | 宿主侧：VirtPass 抽象层与 ABI 跟随规则、代码位置、bundle `--app` 启动面、console attach、vpsessiond 日志、日志 sink + ring。最后核对 2026-11-17（源自原根目录 `DEV.md`） |
 | `hist-lessons.md` | 教训 | 大 C 单文件改动、Windows 构建/运行、合成 VFS、外部工具的数据质量反噬、调试方法、测试纪律、设计推演、内存泄漏排查方法（源自原根目录 `dev_debug_notes.md`） |

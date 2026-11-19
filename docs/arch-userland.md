@@ -75,6 +75,14 @@
   加 `sendfile` 路径（`userland_read_fd/write_fd`），否则会出现「一半工具正常」。
 - 合成对象的表放**全局**（emulator 级 + 全局锁），不放 per-address-space：fork 会让子进程继承同一个合成号，
   per-AS 表里没有这个号 ⇒ 子进程关不掉、引用计数不归零、对象泄漏。
+- **POSIX 记录锁（SQLite）**：`fcntl(F_GETLK/F_SETLK/F_SETLKW)` 由 emulator 自己的锁表实现，
+  键是 `(guest process/ctx, host 文件 dev+ino 或 memfs ino, byte range, type)`；不是宿主 `fcntl`，
+  因为所有 guest 进程共用一个宿主进程，宿主锁会失去 per-process 语义。`fork` 不继承锁（owner 是 ctx），
+  关闭**任意**同文件 fd 释放该进程在该文件上的全部锁；进程退出由 fd 表清理和 owner sweep 释放。
+  `F_SETLK` 冲突返回 `EAGAIN`，`F_SETLKW` 以 10ms 轮询并响应 pending signal（`EINTR`）。
+  `RVVM_TRACE=fd` 会打出 `fcntl_lock setlk/getlk/setlkw/...` 行；探针：
+  `/data/app/probe_fcntl_lock/...`（fork/阻塞/close）与 `probe_fcntl_simple`（单进程）。
+  可在宿主直接 `rvvm_user -prefix <rootfs> /probe_fcntl_lock` 独立跑，不必起 supervisor/ssh。
 - 生命周期照 pty/dev 的范式：`is_fd` → `fd_ref`（dup/inherit）→ `fd_release`（close）；
   `fd_release` 在锁内取 `data`、`memset` 槽、解锁后再 `free`。
 - 进程枚举从 family root 沿 `child_ctx` DFS 并按 pid 去重（`ps` 自己是子进程）。

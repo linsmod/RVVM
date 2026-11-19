@@ -8,4 +8,6 @@
 | `tools/supervisor/selftest.py` | Windows，独立测试 release + 7912 daemon + 7940/7941 实例 | 33.5 s | 两实例 + SSH 检查；结束清理 |
 | `tools/fs_selftest.ps1` | Windows | 未计时（PASS） | 90 checks，0 failures |
 | `tools/hostfs_selftest.ps1` | Windows | 未计时（PASS） | 150 checks，0 failures |
-| `/data/app/test_std/bin/test_std.exe` | 7940 实例 | 未计时 | 159 checks，1 failed（既有 dup(2) 基线），7 skipped；新增 times/tms 5 项全 PASS，statx 在 Windows SKIP |
+| `/data/app/test_std/bin/test_std.exe` | `rvvm_user -prefix <rootfs> /test_std`（直接，不 ssh） | < 30 s（PASS） | 159 checks，0 failed，7 skipped；times/tms 5 项 PASS，statx 在 Windows SKIP。之前经 SSH/pty 时出现的 dup(2) 基线 FAIL 在直接运行下不复现 |
+| `rvvm_user -prefix <rootfs> /probe_fcntl_lock` | Windows 宿主，直接 userland | < 1 s（PASS） | fork/F_GETLK/F_SETLK/F_SETLKW/byte range/close 释放；`RVVM_TRACE=fd` 可见锁表 trace |
+| `rvvm_user -prefix <rootfs> /probe_fcntl_simple` | 同上 | < 1 s（PASS） | 单进程 open/lock/getlk/unlock/close |

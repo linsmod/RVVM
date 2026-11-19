@@ -528,6 +528,16 @@ struct uapi_itimerval {
     struct uapi_timeval it_value;
 };
 
+/* RISC-V 64 Linux struct flock. The guest ABI is fixed (short, short, off_t,
+ * off_t, pid_t); the host struct differs per libc, so the core converts. */
+struct uapi_flock {
+    int16_t l_type;
+    int16_t l_whence;
+    int64_t l_start;
+    int64_t l_len;
+    int32_t l_pid;
+};
+
 /* RISC-V 64 Linux struct tms: clock_t is long (64-bit), four fields. The host
  * struct tms is not this shape on every host (mingw clock_t is 32-bit), so it
  * is converted field by field rather than copied. */
@@ -542,6 +552,7 @@ BUILD_ASSERT(sizeof(struct uapi_timespec) == 16);
 BUILD_ASSERT(sizeof(struct uapi_timeval) == 16);
 BUILD_ASSERT(sizeof(struct uapi_itimerval) == 32);
 BUILD_ASSERT(sizeof(struct uapi_tms) == 32);
+BUILD_ASSERT(sizeof(struct uapi_flock) == 32);
 
 struct uapi_pollfd {
     int32_t  fd;
@@ -7693,6 +7704,12 @@ static bool userland_parent_alive(rvvm_process_t* proc)
 #define UAPI_F_SETFD         2
 #define UAPI_F_GETFL         3
 #define UAPI_F_SETFL         4
+#define UAPI_F_GETLK         5
+#define UAPI_F_SETLK         6
+#define UAPI_F_SETLKW        7
+#define UAPI_F_RDLCK         0
+#define UAPI_F_WRLCK         1
+#define UAPI_F_UNLCK         2
 #define UAPI_F_DUPFD_CLOEXEC 1030
 #define UAPI_FD_CLOEXEC      1
 
@@ -8206,6 +8223,395 @@ static rvvm_memfs_fd_t* memfs_fd_for_guest(rvvm_userland_t* ctx, int guest_fd)
     return memfs_fd_lookup(ctx, userland_fd_host(ctx, guest_fd));
 }
 
+/* ------------------------------------------------------------------ *
+ * POSIX record locks (fcntl F_SETLK/F_SETLKW/F_GETLK)                *
+ *                                                                    *
+ * SQLite's unix VFS takes byte-range locks on the database file.      *
+ * Passing the guest's struct flock to the host is not an option: the  *
+ * pointer is a guest address, and on Windows there is no fcntl at     *
+ * all. More importantly, POSIX locks are owned by the *process*, not  *
+ * by the host fd; every guest process here shares one host process,   *
+ * so host locks would make all guests look like the same owner.       *
+ *                                                                    *
+ * The table is therefore emulator-owned: (owner context, file        *
+ * identity, byte range, type). It is global because fork()ed address  *
+ * spaces and their threads must contend with each other; the owner is *
+ * the address-space pointer, not the host pid. A lock is released by  *
+ * closing *any* descriptor for that file (POSIX), by process exit, or *
+ * by an explicit F_UNLCK.                                            *
+ * ------------------------------------------------------------------ */
+#define RVVM_FD_LOCK_MAX 512
+
+typedef struct {
+    bool           used;
+    const void*    owner;   /* rvvm_userland_t*: a process, not an fd */
+    uint32_t       pid;     /* reported by F_GETLK                      */
+    uint64_t       dev;
+    uint64_t       ino;
+    int64_t        start;   /* inclusive */
+    int64_t        end;     /* exclusive; len 0 is INT64_MAX           */
+    int16_t        type;    /* UAPI_F_RDLCK / UAPI_F_WRLCK             */
+} fd_lock_t;
+
+static fd_lock_t  fd_locks[RVVM_FD_LOCK_MAX];
+static spinlock_t fd_lock_lock = RVVM_LOCK_INIT;
+
+/* The file a lock belongs to. A host file uses its host (dev, ino); a tmpfs
+ * file uses the memory filesystem's synthetic dev plus the inode, with the
+ * top bit set so the two ranges cannot collide. @size and @cur are for
+ * SEEK_END / SEEK_CUR. */
+static bool fd_lock_file_info(rvvm_userland_t* ctx, int host_fd,
+                              uint64_t* dev, uint64_t* ino,
+                              uint64_t* size, uint64_t* cur)
+{
+    rvvm_memfs_fd_t* md = memfs_fd_lookup(ctx, host_fd);
+    if (md) {
+        rvvm_memfs_info_t info;
+        if (rvvm_memfs_stat_ino(md->fs, md->ino, &info) != RVVM_MEMFS_OK ||
+            info.kind != RVVM_MEMFS_REG) {
+            return false;
+        }
+        *dev = 0x8000000000000000ULL | (uint64_t)rvvm_memfs_dev(md->fs);
+        *ino = (uint64_t)md->ino;
+        *size = info.size;
+        *cur = md->off;
+        return true;
+    }
+    {
+        struct stat st;
+        off_t       pos;
+        if (host_fd < 0 || fstat(host_fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+            return false;
+        }
+        *dev = (uint64_t)st.st_dev;
+        *ino = (uint64_t)st.st_ino;
+        *size = (uint64_t)st.st_size;
+        pos = lseek(host_fd, 0, SEEK_CUR);
+        *cur = pos >= 0 ? (uint64_t)pos : 0;
+        return true;
+    }
+}
+
+static bool fd_lock_range(const struct uapi_flock* fl, uint64_t size,
+                          uint64_t cur, int64_t* out_start, int64_t* out_end)
+{
+    int64_t start = fl->l_start;
+    int64_t len = fl->l_len;
+
+    if (size > (uint64_t)INT64_MAX) {
+        size = (uint64_t)INT64_MAX;
+    }
+    if (cur > (uint64_t)INT64_MAX) {
+        cur = (uint64_t)INT64_MAX;
+    }
+    if (fl->l_whence == SEEK_CUR) {
+        if (start > INT64_MAX - (int64_t)cur) {
+            return false;
+        }
+        start += (int64_t)cur;
+    } else if (fl->l_whence == SEEK_END) {
+        if (start > INT64_MAX - (int64_t)size) {
+            return false;
+        }
+        start += (int64_t)size;
+    } else if (fl->l_whence != SEEK_SET) {
+        return false;
+    }
+    if (len < 0) {
+        if (len == INT64_MIN || start < INT64_MIN - len) {
+            return false;   /* -INT64_MIN has no positive int64_t */
+        }
+        start += len;
+        len = -len;
+    }
+    if (start < 0) {
+        return false;
+    }
+    *out_start = start;
+    if (len == 0 || len > INT64_MAX - start) {
+        *out_end = INT64_MAX;
+    } else {
+        *out_end = start + len;
+    }
+    return *out_end > *out_start;
+}
+
+/* Caller holds fd_lock_lock. */
+static bool fd_lock_conflict_locked(const void* owner, uint64_t dev,
+                                    uint64_t ino, int64_t start, int64_t end,
+                                    int16_t type, fd_lock_t* out)
+{
+    for (int i = 0; i < RVVM_FD_LOCK_MAX; i++) {
+        const fd_lock_t* l = &fd_locks[i];
+        if (!l->used || l->owner == owner || l->dev != dev || l->ino != ino) {
+            continue;
+        }
+        if (l->end <= start || end <= l->start) {
+            continue;
+        }
+        /* Read locks do not conflict with each other; everything else does. */
+        if (type == UAPI_F_RDLCK && l->type == UAPI_F_RDLCK) {
+            continue;
+        }
+        if (out) {
+            *out = *l;
+        }
+        return true;
+    }
+    return false;
+}
+
+/* Caller holds fd_lock_lock. */
+static fd_lock_t* fd_lock_free_slot(void)
+{
+    for (int i = 0; i < RVVM_FD_LOCK_MAX; i++) {
+        if (!fd_locks[i].used) {
+            return &fd_locks[i];
+        }
+    }
+    return NULL;
+}
+
+/* Replace @owner's locks over [start,end) with @type. F_UNLCK only trims.
+ * Caller holds fd_lock_lock; the free-slot count was checked by the caller. */
+static void fd_lock_apply_locked(rvvm_userland_t* ctx, uint64_t dev,
+                                 uint64_t ino, int64_t start, int64_t end,
+                                 int16_t type)
+{
+    for (int i = 0; i < RVVM_FD_LOCK_MAX; i++) {
+        fd_lock_t* l = &fd_locks[i];
+        if (!l->used || l->owner != ctx || l->dev != dev || l->ino != ino) {
+            continue;
+        }
+        if (l->end <= start || end <= l->start) {
+            continue;
+        }
+        if (l->start < start && l->end > end) {
+            /* The new range is in the middle: keep the left part, move the
+             * right part to a free slot. The caller guaranteed one. */
+            fd_lock_t* right = fd_lock_free_slot();
+            if (right) {
+                *right = *l;
+                right->start = end;
+                l->end = start;
+            }
+        } else if (l->start < start) {
+            l->end = start;
+        } else if (l->end > end) {
+            l->start = end;
+        } else {
+            l->used = false;
+        }
+    }
+    if (type != UAPI_F_UNLCK) {
+        fd_lock_t* l = fd_lock_free_slot();
+        if (l) {
+            memset(l, 0, sizeof(*l));
+            l->used = true;
+            l->owner = ctx;
+            l->pid = ctx->pid;
+            l->dev = dev;
+            l->ino = ino;
+            l->start = start;
+            l->end = end;
+            l->type = type;
+        }
+    }
+}
+
+/* Four-lock table entry count check before fd_lock_apply_locked() modifies
+ * anything: a split needs one slot and a new lock needs another. */
+static int fd_lock_slots_needed_locked(rvvm_userland_t* ctx, uint64_t dev,
+                                       uint64_t ino, int64_t start, int64_t end,
+                                       int16_t type)
+{
+    int need = type != UAPI_F_UNLCK;
+    for (int i = 0; i < RVVM_FD_LOCK_MAX; i++) {
+        const fd_lock_t* l = &fd_locks[i];
+        if (l->used && l->owner == ctx && l->dev == dev && l->ino == ino &&
+            l->start < end && start < l->end &&
+            l->start < start && l->end > end) {
+            need++;
+        }
+    }
+    return need;
+}
+
+static void fd_lock_release_file(rvvm_userland_t* ctx, int host_fd)
+{
+    uint64_t dev, ino, size, cur;
+    int      released = 0;
+
+    if (!ctx || !fd_lock_file_info(ctx, host_fd, &dev, &ino, &size, &cur)) {
+        return;
+    }
+    spin_lock(&fd_lock_lock);
+    for (int i = 0; i < RVVM_FD_LOCK_MAX; i++) {
+        fd_lock_t* l = &fd_locks[i];
+        if (l->used && l->owner == ctx && l->dev == dev && l->ino == ino) {
+            l->used = false;
+            released++;
+        }
+    }
+    spin_unlock(&fd_lock_lock);
+    RVVM_TRC(RVVM_TRC_FD, "fcntl_lock release_file pid=%u dev=%llx ino=%llx n=%d",
+             (unsigned)ctx->pid, (unsigned long long)dev,
+             (unsigned long long)ino, released);
+}
+
+static void fd_lock_release_owner(rvvm_userland_t* ctx)
+{
+    int released = 0;
+
+    if (!ctx) {
+        return;
+    }
+    spin_lock(&fd_lock_lock);
+    for (int i = 0; i < RVVM_FD_LOCK_MAX; i++) {
+        if (fd_locks[i].used && fd_locks[i].owner == ctx) {
+            fd_locks[i].used = false;
+            released++;
+        }
+    }
+    spin_unlock(&fd_lock_lock);
+    if (released) {
+        RVVM_TRC(RVVM_TRC_FD, "fcntl_lock release_owner pid=%u n=%d",
+                 (unsigned)ctx->pid, released);
+    }
+}
+
+/* The fcntl(2) record-lock commands. @guest_ptr is the guest's struct flock. */
+static rvvm_addr_t rvvm_sys_fcntl_lock(rvvm_userland_t* ctx, int guest_fd,
+                                       unsigned long cmd, rvvm_addr_t guest_ptr)
+{
+    struct uapi_flock fl;
+    uint64_t          dev, ino, size, cur;
+    int64_t           start, end;
+    int               host_fd;
+    int               acc;
+
+    if (!userland_fd_tracked(ctx, guest_fd)) {
+        return -UAPI_EBADF;
+    }
+    host_fd = userland_fd_host(ctx, guest_fd);
+    if (!fd_lock_file_info(ctx, host_fd, &dev, &ino, &size, &cur)) {
+        return -UAPI_EINVAL;
+    }
+
+    if (cmd == UAPI_F_GETLK) {
+        struct uapi_flock* out = to_ptr_sz_wr(guest_ptr, sizeof(*out));
+        if (!out) {
+            return -UAPI_EFAULT;
+        }
+        fl = *out;
+        if (fl.l_type != UAPI_F_RDLCK && fl.l_type != UAPI_F_WRLCK) {
+            return -UAPI_EINVAL;
+        }
+        if (!fd_lock_range(&fl, size, cur, &start, &end)) {
+            return -UAPI_EINVAL;
+        }
+        RVVM_TRC(RVVM_TRC_FD, "fcntl_lock getlk pid=%u fd=%d type=%d "
+                 "start=%lld end=%lld", (unsigned)ctx->pid, guest_fd,
+                 (int)fl.l_type, (long long)start, (long long)end);
+        spin_lock(&fd_lock_lock);
+        {
+            fd_lock_t conflict;
+            if (fd_lock_conflict_locked(ctx, dev, ino, start, end, fl.l_type,
+                                        &conflict)) {
+                fl.l_type   = conflict.type;
+                fl.l_whence = SEEK_SET;
+                fl.l_start  = conflict.start;
+                fl.l_len    = conflict.end == INT64_MAX
+                            ? 0 : conflict.end - conflict.start;
+                fl.l_pid    = (int32_t)conflict.pid;
+            } else {
+                fl.l_type   = UAPI_F_UNLCK;
+                fl.l_whence = SEEK_SET;
+                fl.l_start  = 0;
+                fl.l_len    = 0;
+                fl.l_pid    = 0;
+            }
+        }
+        spin_unlock(&fd_lock_lock);
+        RVVM_TRC(RVVM_TRC_FD, "fcntl_lock getlk -> type=%d pid=%d "
+                 "start=%lld len=%lld", (int)fl.l_type, (int)fl.l_pid,
+                 (long long)fl.l_start, (long long)fl.l_len);
+        *out = fl;
+        return 0;
+    }
+
+    if (cmd != UAPI_F_SETLK && cmd != UAPI_F_SETLKW) {
+        return -UAPI_EINVAL;
+    }
+    {
+        const struct uapi_flock* in = to_ptr_sz(guest_ptr, sizeof(*in));
+        if (!in) {
+            return -UAPI_EFAULT;
+        }
+        fl = *in;
+    }
+    if (fl.l_type != UAPI_F_RDLCK && fl.l_type != UAPI_F_WRLCK &&
+        fl.l_type != UAPI_F_UNLCK) {
+        return -UAPI_EINVAL;
+    }
+    acc = (int)(userland_fd_flags(ctx, guest_fd) & UAPI_O_ACCMODE);
+    if (fl.l_type == UAPI_F_RDLCK && acc == UAPI_O_WRONLY) {
+        return -UAPI_EBADF;
+    }
+    if (fl.l_type == UAPI_F_WRLCK && acc == UAPI_O_RDONLY) {
+        return -UAPI_EBADF;
+    }
+    if (!fd_lock_range(&fl, size, cur, &start, &end)) {
+        return -UAPI_EINVAL;
+    }
+    RVVM_TRC(RVVM_TRC_FD, "fcntl_lock %s pid=%u fd=%d type=%d "
+             "start=%lld end=%lld",
+             cmd == UAPI_F_SETLKW ? "setlkw" : "setlk", (unsigned)ctx->pid,
+             guest_fd, (int)fl.l_type, (long long)start, (long long)end);
+
+    for (;;) {
+        fd_lock_t conflict;
+        int       need;
+        spin_lock(&fd_lock_lock);
+        if (!fd_lock_conflict_locked(ctx, dev, ino, start, end, fl.l_type,
+                                     &conflict)) {
+            need = fd_lock_slots_needed_locked(ctx, dev, ino, start, end,
+                                               fl.l_type);
+            if (need > 0) {
+                int free_slots = 0;
+                for (int i = 0; i < RVVM_FD_LOCK_MAX; i++) {
+                    if (!fd_locks[i].used) {
+                        free_slots++;
+                    }
+                }
+                if (free_slots < need) {
+                    spin_unlock(&fd_lock_lock);
+                    return -UAPI_ENOLCK;
+                }
+            }
+            fd_lock_apply_locked(ctx, dev, ino, start, end, fl.l_type);
+            spin_unlock(&fd_lock_lock);
+            RVVM_TRC(RVVM_TRC_FD, "fcntl_lock %s -> ok",
+                     cmd == UAPI_F_SETLKW ? "setlkw" : "setlk");
+            return 0;
+        }
+        spin_unlock(&fd_lock_lock);
+        if (cmd == UAPI_F_SETLK) {
+            RVVM_TRC(RVVM_TRC_FD, "fcntl_lock setlk -> busy (owner pid %u)",
+                     (unsigned)conflict.pid);
+            return -UAPI_EAGAIN;
+        }
+        if (atomic_load_uint32(&ctx->sig_pending) ||
+            userland_thread_finished()) {
+            RVVM_TRC(RVVM_TRC_FD, "fcntl_lock setlkw -> EINTR");
+            return -UAPI_EINTR;
+        }
+        RVVM_TRC(RVVM_TRC_FD, "fcntl_lock setlkw waiting (owner pid %u)",
+                 (unsigned)conflict.pid);
+        sleep_ms(10);
+    }
+}
+
 /* @abs - a guest-absolute path - turned into the mount-relative key the memory
  * filesystem uses, whose root is the mount point. @mount->path is a prefix of
  * @abs by construction (the caller resolved it), and the mount's own root is
@@ -8245,6 +8651,14 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
 {
     if (!userland_fd_tracked(ctx, fd)) {
         return false;
+    }
+    /* POSIX record locks are per process and released by closing *any*
+     * descriptor for that file, not just the descriptor that took the lock.
+     * Do this while the host fd is still open and still names the file. A
+     * console is an attach, not a guest descriptor over the file behind host
+     * stdin/stdout, so closing it does not close such a file. */
+    if (ctx->fds[fd].backend != FD_BACKEND_CONSOLE) {
+        fd_lock_release_file(ctx, ctx->fds[fd].fd);
     }
     /* Say what is going away, and whose it was, before it goes. A socket's
      * peer is the one thing that survives a fork and an address-recycling
@@ -8874,6 +9288,9 @@ static void userland_fd_table_free(rvvm_userland_t* ctx)
             userland_fd_close(ctx, fd);
         }
     }
+    /* The close hooks normally release these; the sweep is the backstop for a
+     * lock whose descriptor was lost to an error path before the table went. */
+    fd_lock_release_owner(ctx);
 }
 
 /* Mark the table empty, save for the console: a fresh run on this machine, or a
@@ -16825,6 +17242,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                             a0 = own >= 0 ? (rvvm_addr_t)own : (rvvm_addr_t)-UAPI_EMFILE;
                             break;
                         }
+                    }
+                    if (a1 == UAPI_F_GETLK || a1 == UAPI_F_SETLK ||
+                        a1 == UAPI_F_SETLKW) {
+                        /* Emulator-owned record locks (SQLite). The guest
+                         * pointer is not a host pointer, and host locks would
+                         * be per host process, not per guest process. */
+                        a0 = rvvm_sys_fcntl_lock(uctx(), guest_fd,
+                                                 (unsigned long)a1, a2);
+                        break;
                     }
                     a0 = errno_ret(fcntl(fcntl_host, a1, a2));
                     if ((int64_t)a0 >= 0 && (a1 == UAPI_F_DUPFD || a1 == UAPI_F_DUPFD_CLOEXEC)) {
