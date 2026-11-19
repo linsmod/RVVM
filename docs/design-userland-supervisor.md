@@ -112,24 +112,26 @@ guest 还没 boot，第一次 ssh 仍可能被拒。现在由**真正监听的�
 
 | 方法 | 路径 | 语义 |
 |---|---|---|
-| GET | `/api/instances` | 列表（含 actual/desired/pid/端口/label/rootfs/启动时间），内嵌 reconcile 结果 |
+| GET | `/api/instances` | 列表（含 actual/desired/pid/端口/label/rootfs basename/启动时间），内嵌 reconcile 结果；不返回绝对宿主路径 |
 | POST | `/api/instances` | `{label?, port?}` → 分配端口、建 `roots/<port>-<uuid>` 目录并启动，同步等宽限内结果 |
 | POST | `/api/instances/{port}/start` | stopped/crashed → starting |
 | POST | `/api/instances/{port}/stop` | 终止 core（按 `.core` 的 pid）；强杀残留的注册文件由 daemon 回收 |
 | DELETE | `/api/instances/{port}` | 确保停止后删除记录并清掉实例的 rootfs 目录（保留日志与审计） |
 | GET | `/api/instances/{port}/log` | 实例日志（支持 `?tail=N`） |
 | POST | `/api/instances/{port}/exec` | `{cmd}` → `ssh -p N`，同步返回 stdout/stderr/退出码 |
-| GET | `/api/health` | daemon 版本、DB 路径、release 目录、core 注册表摘要 |
+| GET | `/api/health` | daemon 版本、release basename、core 摘要（pid/shell/alive，无 endpoint 路径） |
 | GET | `/ws/{port}` | **v2 交互终端**：stdlib 最小 RFC6455 握手后，字节泵桥到 `ssh -tt -i <daemon密钥> -p N` |
 | GET | `/`、`/vendor/*` | web UI（单文件页 + xterm.js v6/fit vendor，免构建链） |
 
-鉴权：`Authorization: Bearer <SUPERVISOR_TOKEN>`，未配置 token 时仅接受
-127.0.0.1 来源（预览默认形态）。
+鉴权：`Authorization: Bearer <SUPERVISOR_TOKEN>`，**任何来源都要求 token**
+（2026-11-19 修订：loopback 不是安全边界，guest 的 socket 就是宿主 socket，
+guest 访问 127.0.0.1 与宿主本机无区别）。未显式给 token 时 daemon 自动生成并写入
+`<release>/runtime/supervisor/token`（0600），WebSocket 走 `?token=`。
 
 ## 6. CLI（`us`）
 
 ```
-us [--url U] [--token T] <command>
+us [--url U] [--token T] [--token-file F] <command>
   us list                     实例表
   us start [--memfs] [label]  起实例（打印端口）
   us stop <port>              停实例

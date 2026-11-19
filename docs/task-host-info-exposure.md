@@ -107,7 +107,7 @@
 | # | commit | 范围 | 状态 |
 |---|---|---|---|
 | C1 | `fix(core): make guest hostfs mounts an explicit host grant` | core 策略 + ash flag + 测试/文档 | 进行中 |
-| C2 | `fix(supervisor): require a token and stop returning host paths` | token、鉴权、API 字段、us/ws/UI | 待做 |
+| C2 | `fix(supervisor): require a token and stop returning host paths` | token、鉴权、API 字段、us/ws/UI | 完成（待提交） |
 | C3 | `fix(supervisor): isolate each instance's /run/vpsessiond` | per-instance run dir + `--run-dir` | 待做 |
 | C4 | `fix(ash): keep guest mode store and lock outside the guest root` | sidecar + 跳过 hostfs chmod + 清理 | 待做 |
 | C5 | `fix(core): answer statfs without host disk numbers` | statfs/fstatfs 合成 | 待做 |
@@ -163,6 +163,25 @@ ssh -i $key -p 7940 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o Bat
   4. 注意：挂到 rootfs 里已存在的 `/mnt` 时 `ls` 仍为空（影子目录优先级，旧行为），
      测 hostfs 用不存在的新目录（如 `/hostdir`）或 `/mnt/c`。
 - 清理：删临时 core、临时目录、测试 rootfs/run；不碰 7926/7927。
+
+### C2 恢复点（2026-11-19 已跑）
+
+- 代码点：`supervisor.py`（`hmac`/`secrets`、`load_or_create_token()`、
+  `public_core()`、`public_instance()`、严格 `_authed()`/WS、`probe_daemon()` 401 文案、
+  `start()`/`main()` 去绝对路径）；`us.py`（全局 `--url/--token/--token-file`、
+  token 文件发现、`token_value()`）；`ws_smoke.py`（token + `US_URL` 指向 daemon）；
+  `web/index.html` token 必填提示；`tools/supervisor/selftest.py`。
+- 验证：
+  1. 无 token `GET /api/health` -> 401。
+  2. `release.*/runtime/supervisor/token` 自动生成；带 token -> 200。
+  3. `/api/health` 的 `release` 是 basename，`cores` 无 `endpoint`；
+     `/api/instances` 的 `rootfs`/`log_path` 是 basename，`registry` 无 `endpoint`；
+     JSON 无 `H:\`/`C:\`/`github_repos`。
+  4. `us.py --token <t> health` 正常；错误 token -> 401 退出 1。
+  5. `ws_smoke.py 7940 <t>` -> `WS-BRIDGE-OK`。
+  6. `tools/supervisor/selftest.py --release <test tree>` 13 项全 ok。
+- 备注：测试 release 树名不是 `release.*` 时，`us.py` 自动发现 token 不适用，
+  测试用 `--token/--token-file`；真实 `release.*` 树自动发现。
 
 后续提交的恢复点在本文件追加。
 

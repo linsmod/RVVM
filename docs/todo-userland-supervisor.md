@@ -28,7 +28,8 @@ design §8 六条验收线全绿。
 要做：
 
 - `tools/supervisor/us.py`：thin HTTP client，`list/start/stop/rm/logs/exec/health`
-- 配置来源：`--url/--token` > 环境变量 > 默认 127.0.0.1:7911
+- 配置来源：`--url/--token/--token-file` > 环境变量 > `release.*/runtime/supervisor/token`
+  > 默认 127.0.0.1:7911；daemon 永远要求 token（2026-11-19 修订）
 
 验收：CLI 走完 design §8 全部五条验收线。
 

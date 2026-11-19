@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""supervisor selftest - token auth, path projection, and the guest hostfs gate.
+
+Runs a throwaway daemon against a *test* release tree (never the tree a user's
+daemon is serving), starts one instance, and checks the API from the outside:
+
+  - /api/health and /api/instances without a token -> 401;
+  - with the token -> 200, and no absolute host paths or registry endpoints;
+  - the guest's own mount -t hostfs is refused unless the host granted it
+    (this daemon is started without --allow-guest-hostfs, so the default is the
+    one under test).
+
+Usage:
+    python tools/supervisor/selftest.py --release <test release tree>
+    python tools/supervisor/selftest.py --release <tree> --daemon-port 7912 \
+        --instance-port 7940
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SUPERVISOR = os.path.join(HERE, "supervisor.py")
+KEY_REL = os.path.join("runtime", "supervisor", "id_ed25519")
+TOKEN_REL = os.path.join("runtime", "supervisor", "token")
+KNOWN_HOSTS = "NUL" if os.name == "nt" else "/dev/null"
+
+
+def check(ok, what):
+    print(("ok   " if ok else "FAIL ") + what)
+    return 0 if ok else 1
+
+
+def api(token, method, path, body=None, port=7912, timeout=120):
+    req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path),
+                                 method=method)
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, data, timeout=timeout) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as e:
+        return e.code, {}
+
+
+def wait_up(port, proc, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return False
+        try:
+            code, _ = api("", "GET", "/api/health", port=port, timeout=2)
+            if code in (200, 401):
+                return True
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def ssh_command(key, port, command):
+    return ["ssh", "-i", key, "-p", str(port),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=" + KNOWN_HOSTS,
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "root@127.0.0.1", command]
+
+
+def run_ssh(key, port, command, timeout=60):
+    return subprocess.run(ssh_command(key, port, command),
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def no_host_paths(obj):
+    text = json.dumps(obj)
+    bad = re.search(r"[A-Za-z]:[\\/]", text) or "github_repos" in text or \
+        "linswin" in text
+    return not bad
+
+
+def main():
+    ap = argparse.ArgumentParser(description="supervisor selftest")
+    ap.add_argument("--release", required=True,
+                    help="test release tree (rvvm_ash + bundle/), not a user's")
+    ap.add_argument("--daemon-port", type=int, default=7912)
+    ap.add_argument("--instance-port", type=int, default=7940)
+    ap.add_argument("--token", default=None,
+                    help="explicit token; otherwise read the generated file")
+    args = ap.parse_args()
+
+    release = os.path.abspath(args.release)
+    exe = os.path.join(release, "rvvm_ash_x86_64.exe")
+    if not os.path.isfile(exe):
+        exe = os.path.join(release, "rvvm_ash")
+    bundle = os.path.join(release, "bundle")
+    if not os.path.isfile(exe) or not os.path.isdir(bundle):
+        print("FAIL release %s is not a test tree with rvvm_ash + bundle/"
+              % release)
+        return 2
+
+    tmp = tempfile.mkdtemp(prefix="rvvm-sup-selftest-")
+    db = os.path.join(tmp, "sup.db")
+    out = os.path.join(tmp, "daemon.out")
+    err = os.path.join(tmp, "daemon.err")
+    hostdir = os.path.join(tmp, "hostdir")
+    os.makedirs(hostdir)
+    with open(os.path.join(hostdir, "marker.txt"), "w", encoding="ascii") as f:
+        f.write("HOSTFS-MARKER")
+
+    fails = 0
+    proc = None
+    try:
+        logf = open(out, "wb")
+        errf = open(err, "wb")
+        proc = subprocess.Popen(
+            [sys.executable, SUPERVISOR, "--release", release, "--db", db,
+             "--bind", "127.0.0.1:%d" % args.daemon_port],
+            cwd=HERE, stdout=logf, stderr=errf)
+        if not wait_up(args.daemon_port, proc):
+            print("FAIL daemon did not answer")
+            return 1
+
+        code, _ = api("", "GET", "/api/health", port=args.daemon_port)
+        fails += check(code == 401, "health without token is 401 (got %s)" % code)
+
+        token = args.token
+        if not token:
+            try:
+                with open(os.path.join(release, TOKEN_REL), "r",
+                          encoding="utf-8") as f:
+                    token = f.read().strip()
+            except OSError:
+                token = ""
+        fails += check(bool(token), "daemon has a token")
+        if not token:
+            return 1
+
+        code, health = api(token, "GET", "/api/health",
+                           port=args.daemon_port)
+        fails += check(code == 200, "health with token is 200 (got %s)" % code)
+        fails += check(no_host_paths(health), "health has no host paths")
+        fails += check("endpoint" not in json.dumps(health),
+                       "health has no registry endpoint")
+        fails += check(not any(sep in str(health.get("release", ""))
+                               for sep in ("/", "\\")),
+                       "health release is a basename")
+
+        code, body = api(token, "POST", "/api/instances",
+                         {"label": "selftest", "port": args.instance_port},
+                         port=args.daemon_port)
+        fails += check(code == 200 and body.get("actual") == "running",
+                       "instance starts (got %s %s)" % (code, body))
+        if code != 200 or body.get("actual") != "running":
+            with open(err, "r", encoding="utf-8", errors="replace") as f:
+                print(f.read()[-4000:])
+            return 1
+
+        code, listing = api(token, "GET", "/api/instances",
+                            port=args.daemon_port)
+        fails += check(code == 200, "instances with token is 200 (got %s)" % code)
+        fails += check(no_host_paths(listing), "instances has no host paths")
+        inst = (listing.get("instances") or [{}])[0]
+        fails += check("endpoint" not in json.dumps(inst.get("registry", {})),
+                       "registry has no endpoint")
+        fails += check(not any(sep in str(inst.get("rootfs", ""))
+                               for sep in ("/", "\\")),
+                       "rootfs is a basename")
+        fails += check(not any(sep in str(inst.get("log_path", ""))
+                               for sep in ("/", "\\")),
+                       "log_path is a basename")
+
+        key = os.path.join(release, KEY_REL)
+        r = run_ssh(key, args.instance_port,
+                    "mkdir -p /hostdir; mount -t hostfs '%s' /hostdir; "
+                    "echo RC=$?; rmdir /hostdir 2>/dev/null"
+                    % hostdir.replace("\\", "/"))
+        fails += check(re.search(r"RC=([1-9]\d*)", r.stdout) is not None,
+                       "guest hostfs is denied by default (%r)" % r.stdout.strip())
+
+        api(token, "DELETE", "/api/instances/%d" % args.instance_port,
+            port=args.daemon_port)
+    finally:
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("=== %s: supervisor selftest (%d failure(s)) ==="
+          % ("PASS" if fails == 0 else "FAIL", fails))
+    return 0 if fails == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

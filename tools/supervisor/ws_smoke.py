@@ -2,15 +2,57 @@
 """Smoke test for the supervisor's websocket terminal bridge.
 Speaks just enough RFC6455 client-side to validate the daemon's server side:
 handshake -> send a command -> expect the command's output back -> close.
-Usage: python ws_smoke.py <instance-port>   (instance must be running)"""
+Usage: python ws_smoke.py <instance-port> [token]
+Token: the argument, else US_TOKEN / SUPERVISOR_TOKEN, else the newest
+release.*/runtime/supervisor/token. The daemon requires one; loopback is not
+an authentication boundary (a guest shares the host's network stack)."""
 import base64
 import hashlib
 import os
 import socket
 import struct
 import sys
+import urllib.parse
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 7918
+_DAEMON = urllib.parse.urlparse(os.environ.get("US_URL",
+                                               "http://127.0.0.1:7911"))
+DAEMON_HOST = _DAEMON.hostname or "127.0.0.1"
+DAEMON_PORT = _DAEMON.port or 7911
+
+
+def token_value():
+    if len(sys.argv) > 2 and sys.argv[2]:
+        return sys.argv[2]
+    token = os.environ.get("US_TOKEN") or os.environ.get("SUPERVISOR_TOKEN")
+    if token:
+        return token
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(here))
+    newest, newest_mtime = None, -1
+    try:
+        for name in os.listdir(repo):
+            if not name.startswith("release."):
+                continue
+            path = os.path.join(repo, name, "runtime", "supervisor", "token")
+            if os.path.isfile(path) and os.path.getmtime(path) > newest_mtime:
+                newest, newest_mtime = path, os.path.getmtime(path)
+    except OSError:
+        pass
+    if newest:
+        try:
+            with open(newest, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            pass
+    return ""
+
+
+TOKEN = token_value()
+if not TOKEN:
+    print("ws_smoke: a supervisor token is required (arg, US_TOKEN, "
+          "SUPERVISOR_TOKEN, or release.*/runtime/supervisor/token)")
+    sys.exit(2)
 
 
 def send_frame(s, payload, opcode=0x1):
@@ -48,15 +90,17 @@ def read_frame(s):
     return opcode, read_exact(s, ln)
 
 
-s = socket.create_connection(("127.0.0.1", 7911), timeout=15)
+s = socket.create_connection((DAEMON_HOST, DAEMON_PORT), timeout=15)
 key = base64.b64encode(os.urandom(16)).decode()
 s.sendall((
-    "GET /ws/%d HTTP/1.1\r\n"
-    "Host: 127.0.0.1:7911\r\n"
+    "GET /ws/%d?token=%s HTTP/1.1\r\n"
+    "Host: %s:%d\r\n"
     "Upgrade: websocket\r\n"
     "Connection: Upgrade\r\n"
     "Sec-WebSocket-Key: %s\r\n"
-    "Sec-WebSocket-Version: 13\r\n\r\n" % (PORT, key)).encode())
+    "Sec-WebSocket-Version: 13\r\n\r\n"
+    % (PORT, urllib.parse.quote(TOKEN), DAEMON_HOST, DAEMON_PORT,
+       key)).encode())
 resp = b""
 while b"\r\n\r\n" not in resp:
     resp += s.recv(4096)

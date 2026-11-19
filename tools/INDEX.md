@@ -44,9 +44,10 @@
 
 | 脚本 | 内容 |
 |---|---|
-| `supervisor/supervisor.py` | userland supervisor daemon：`rvvm_ash --serve` 实例的起停/清单/日志/审计，SQLite 状态机 + reconcile；含 ws 终端桥（stdlib RFC6455 → `ssh -tt`）与实例密钥管理。**仅标准库**。设计与用法见 `../docs/design-userland-supervisor.md` |
-| `supervisor/us.py` | 上面的 CLI：`us list/start/stop/rm/logs/exec/health`（thin HTTP client） |
-| `supervisor/ws_smoke.py` | ws 终端桥冒烟：`python ws_smoke.py <实例端口>`，握手 → 发命令 → 收 pty 回显 → `WS-BRIDGE-OK` |
+| `supervisor/supervisor.py` | userland supervisor daemon：`rvvm_ash --serve` 实例的起停/清单/日志/审计，SQLite 状态机 + reconcile；含 ws 终端桥（stdlib RFC6455 → `ssh -tt`）与实例密钥管理。**仅标准库**。API/WS 始终要求 token（无则自动生成到 `runtime/supervisor/token`），API 不回绝对宿主路径。设计与用法见 `../docs/design-userland-supervisor.md` |
+| `supervisor/us.py` | 上面的 CLI：`us list/start/stop/rm/logs/exec/health`（thin HTTP client），token 从 flag/env/token 文件解析 |
+| `supervisor/ws_smoke.py` | ws 终端桥冒烟：`python ws_smoke.py <实例端口> [token]`，握手 → 发命令 → 收 pty 回显 → `WS-BRIDGE-OK`；无 token 时退出 2 |
+| `supervisor/selftest.py` | supervisor 安全自测（独立测试 release + 临时 daemon/DB/端口）：无 token 401、有 token 200、API 无绝对宿主路径/endpoint、默认拒绝 guest hostfs；约 10s |
 
 Agent 侧的完整用法（起实例、`us` 各子命令、ssh 的两种拼法、交互式 pty 测试配方、已知坑）
 整理成了技能 `c:/Users/linswin/.agents/skills/userland-vm/SKILL.md`，新会话直接加载它即可。

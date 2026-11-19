@@ -12,8 +12,11 @@ never touches the database, never spawns a core itself. Standard library only.
     us exec <port> <command...>
     us health
 
-Endpoint/token: --url/--token flags, then US_URL/US_TOKEN, then
-http://127.0.0.1:7911 with SUPERVISOR_TOKEN unset (loopback daemon).
+Endpoint/token: --url/--token/--token-file flags, then US_URL / US_TOKEN /
+US_TOKEN_FILE / SUPERVISOR_TOKEN, then the newest
+release.*/runtime/supervisor/token, then http://127.0.0.1:7911. The daemon
+requires a token: loopback is not an authentication boundary (a guest shares
+the host's network stack), so leaving it empty is not a fallback.
 """
 
 import argparse
@@ -25,6 +28,77 @@ import urllib.request
 
 DEFAULT_URL = "http://127.0.0.1:7911"
 
+# Set by main() from the flags; call() is used by every command, so keeping
+# the options here avoids threading them through seven signatures.
+OPTS = {"url": None, "token": None, "token_file": None}
+
+
+def parse_globals(argv):
+    """Pull --url/--token/--token-file (and = spellings) out of argv, wherever
+    they appear, and return the command and its own arguments."""
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        key = None
+        if a in ("--url", "--token", "--token-file") and i + 1 < len(argv):
+            key, val = a[2:].replace("-", "_"), argv[i + 1]
+            i += 2
+        elif a.startswith("--url="):
+            key, val = "url", a.split("=", 1)[1]
+            i += 1
+        elif a.startswith("--token-file="):
+            key, val = "token_file", a.split("=", 1)[1]
+            i += 1
+        elif a.startswith("--token="):
+            key, val = "token", a.split("=", 1)[1]
+            i += 1
+        else:
+            rest.append(a)
+            i += 1
+            continue
+        OPTS[key] = val
+    return rest
+
+
+def default_token_file():
+    """The daemon writes its generated token beside its database. With several
+    release trees, the newest token wins; an explicit --token/-file or env var
+    always overrides this."""
+    path = OPTS["token_file"] or os.environ.get("US_TOKEN_FILE")
+    if path:
+        return path
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(here))
+    candidates = []
+    try:
+        for name in os.listdir(repo):
+            if not name.startswith("release."):
+                continue
+            full = os.path.join(repo, name, "runtime", "supervisor", "token")
+            if os.path.isfile(full):
+                candidates.append(full)
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def token_value():
+    token = OPTS["token"] or os.environ.get("US_TOKEN") or \
+        os.environ.get("SUPERVISOR_TOKEN")
+    if token:
+        return token
+    path = default_token_file()
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
 
 def die(msg):
     print("us: " + msg, file=sys.stderr)
@@ -33,13 +107,9 @@ def die(msg):
 
 def call(method, path, body=None):
     """One HTTP round-trip against the daemon; errors exit non-zero."""
-    p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--url")
-    p.add_argument("--token")
-    known, _ = p.parse_known_args()
-    url = (known.url or os.environ.get("US_URL") or DEFAULT_URL).rstrip("/")
-    token = known.token or os.environ.get("US_TOKEN") or \
-        os.environ.get("SUPERVISOR_TOKEN") or ""
+    url = (OPTS["url"] or os.environ.get("US_URL") or
+           DEFAULT_URL).rstrip("/")
+    token = token_value()
     req = urllib.request.Request(url + path, method=method)
     if token:
         req.add_header("Authorization", "Bearer " + token)
@@ -161,13 +231,14 @@ COMMANDS = {
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    rest = parse_globals(sys.argv[1:])
+    if not rest or rest[0] in ("-h", "--help"):
         print(__doc__.strip())
-        sys.exit(0 if len(sys.argv) >= 2 else 2)
-    cmd = sys.argv[1]
+        sys.exit(0 if rest else 2)
+    cmd = rest[0]
     if cmd not in COMMANDS:
         die("unknown command '%s' (try: %s)" % (cmd, ", ".join(COMMANDS)))
-    COMMANDS[cmd](sys.argv[2:])
+    COMMANDS[cmd](rest[1:])
 
 
 if __name__ == "__main__":

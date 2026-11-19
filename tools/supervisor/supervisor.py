@@ -18,9 +18,11 @@ import argparse
 import base64
 import ctypes
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import subprocess
@@ -143,7 +145,7 @@ def probe_daemon(host, port, timeout=2.0):
                                           info.get("release", "?"))
     except urllib.error.HTTPError as e:
         # Something answers, it just wants a token we do not have.
-        return "HTTP %d" % e.code
+        return "HTTP %d (token required)" % e.code
     except Exception:
         return None
 
@@ -264,6 +266,53 @@ def core_snapshot(release):
             "alive": pid_alive(pid),
         }
     return snap
+
+
+def public_core(info):
+    """What an API client may know about a core: no host endpoint path.
+
+    The registry's endpoint is a host path (the socket/session endpoint), and
+    the pid is host metadata. The API is the daemon's admin surface, but it is
+    still reachable from the guest's loopback (the guest shares the host
+    network stack), so the token and this projection are two layers, not one."""
+    if not info:
+        return None
+    return {
+        "pid": info.get("pid", 0),
+        "shell": info.get("shell", ""),
+        "alive": bool(info.get("alive")),
+    }
+
+
+# ---------------------------------------------------------------- token
+
+def token_path(release):
+    return os.path.join(release, "runtime", "supervisor", "token")
+
+
+def load_or_create_token(release):
+    """Return (token, path, generated). A token is mandatory: loopback is not
+    an authentication boundary here, because a guest's sockets are the host's
+    sockets and a guest sees 127.0.0.1. The file is the stable, copyable half
+    for the CLI and the web UI; an explicit --token stays the caller's own."""
+    path = token_path(release)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+        if token:
+            return token, path, False
+    except OSError:
+        pass
+    token = secrets.token_urlsafe(32)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(token + "\n")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return token, path, True
 
 
 # ---------------------------------------------------------------- database
@@ -511,6 +560,23 @@ class Supervisor:
 
     # -- listing -----------------------------------------------------------
 
+    def public_instance(self, item):
+        """The API view of a row: no absolute host paths.
+
+        rootfs/log_path are useful to the daemon, not to a client that could be
+        the guest itself. The basenames keep them identifiable; the full paths
+        stay in the database and the daemon's own log."""
+        item = dict(item)
+        for key in ("rootfs", "log_path"):
+            if item.get(key):
+                item[key] = os.path.basename(item[key])
+        item["registry"] = public_core(item.get("registry"))
+        note = item.get("note")
+        if note:
+            item["note"] = note.replace(self.release,
+                                        os.path.basename(self.release))
+        return item
+
     def listing(self):
         snap = core_snapshot(self.release)
         out = []
@@ -521,7 +587,7 @@ class Supervisor:
             item["ssh_ready"] = (row["actual"] == "running" and
                                  os.path.isfile(self.ready_path(row["port"])))
             item["registry"] = snap.get(row["port"])
-            out.append(item)
+            out.append(self.public_instance(item))
         return out
 
     # -- port allocation ---------------------------------------------------
@@ -565,9 +631,11 @@ class Supervisor:
         missing = release_missing(self.release)
         if missing:
             # Say why, instead of starting a process that cannot boot and
-            # leaving a "failed" row 25 seconds later.
+            # leaving a "failed" row 25 seconds later. The release is named by
+            # its basename: the API answer must not carry a host path.
             raise ApiError(500, "release %s cannot run instances: missing %s"
-                           % (self.release, ", ".join(missing)))
+                           % (os.path.basename(self.release),
+                              ", ".join(missing)))
         logp = self.log_path(port)
         rootfs = self.new_rootfs_dir(port)
         # The marker is per port and lives in a tree-shared directory: whatever
@@ -594,7 +662,8 @@ class Supervisor:
                                     stdout=logf, stderr=logf, **kwargs)
         except OSError as e:
             logf.close()
-            raise ApiError(500, "could not spawn %s: %s" % (self.ash, e))
+            raise ApiError(500, "could not spawn %s: %s"
+                           % (os.path.basename(self.ash), e))
         try:
             self.db.insert(port=port, label=label, desired="running",
                            actual="starting", rootfs=rootfs,
@@ -614,7 +683,7 @@ class Supervisor:
             logf.close()
             raise ApiError(500, "core started but could not be recorded; "
                            "it was terminated to avoid an orphan")
-        self.db.event(port, "start", rootfs)
+        self.db.event(port, "start", os.path.basename(rootfs))
         started_at = time.time()
         outcome, pid = self.wait_ready(port, started_at, proc.pid)
         if outcome == "ready":
@@ -623,11 +692,13 @@ class Supervisor:
             return {"port": port, "actual": "running", "pid": pid}
         if outcome == "dead":
             self.db.set(port, actual="failed", stopped_at=now_iso(),
-                        note="core exited before sshd was ready - see %s" % logp)
+                        note="core exited before sshd was ready - see %s"
+                             % os.path.basename(logp))
             self.db.event(port, "failed", "core exited before sshd was ready")
             return {"port": port, "actual": "failed"}
         self.db.set(port, actual="failed", stopped_at=now_iso(),
-                    note="sshd not ready within %ds - see %s" % (self.grace, logp))
+                    note="sshd not ready within %ds - see %s"
+                         % (self.grace, os.path.basename(logp)))
         self.db.event(port, "failed", "sshd not ready within %ds" % self.grace)
         return {"port": port, "actual": "failed"}
 
@@ -712,10 +783,11 @@ def make_handler(sup, token):
             log_line("http " + (fmt % args))
 
         def _authed(self):
-            if not token:
-                return self.client_address[0] == "127.0.0.1"
-            return self.headers.get("Authorization", "") == \
-                "Bearer " + token
+            # Loopback is not an authentication boundary: a guest's sockets are
+            # the host's sockets, so a guest reaches this API as 127.0.0.1.
+            # The token is mandatory (main() always has one).
+            return hmac.compare_digest(self.headers.get("Authorization", ""),
+                                       "Bearer " + token)
 
         def _send(self, code, obj):
             body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -819,12 +891,11 @@ def make_handler(sup, token):
                 return
             if path.startswith("/ws/"):
                 # The browser cannot put a bearer header on a WebSocket, so
-                # the token rides the query string; loopback stays exempt.
+                # the token rides the query string. No loopback exemption: the
+                # guest is loopback too.
                 qs = urllib.parse.parse_qs(parsed.query)
                 tok = qs.get("token", [""])[0]
-                ok = (tok == token and token) or \
-                    (not token and self.client_address[0] == "127.0.0.1")
-                if not ok:
+                if not (tok and hmac.compare_digest(tok, token)):
                     return self._send(401, {"error": "unauthorized"})
                 try:
                     port = int(path[len("/ws/"):])
@@ -839,8 +910,9 @@ def make_handler(sup, token):
                 if path == "/api/health":
                     return self._send(200, {
                         "version": DAEMON_VERSION,
-                        "release": sup.release,
-                        "cores": core_snapshot(sup.release),
+                        "release": os.path.basename(sup.release),
+                        "cores": {p: public_core(info) for p, info in
+                                  core_snapshot(sup.release).items()},
                     })
                 if path == "/api/instances":
                     return self._send(200, {"instances": sup.reconcile()})
@@ -1010,11 +1082,19 @@ def main():
         print("supervisor: already running at http://%s:%s/ (%s)"
               % (host, port, holder))
         return
+    # The token is created after the duplicate-daemon probe: a second start
+    # must not rewrite the token of the daemon that is already serving.
+    if args.token:
+        token = args.token
+        token_src = "set"
+    else:
+        token, token_file, generated = load_or_create_token(release)
+        token_src = "file %s%s" % (token_file, " (generated)" if generated else "")
     httpd = ThreadingHTTPServer((host, int(port)),
-                                make_handler(sup, args.token))
+                                make_handler(sup, token))
     log_line("supervisor %s: release=%s db=%s bind=%s token=%s"
-             % (DAEMON_VERSION, release, db_path, args.bind,
-                "set" if args.token else "none(loopback only)"))
+             % (DAEMON_VERSION, os.path.basename(release),
+                os.path.basename(db_path), args.bind, token_src))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
