@@ -1,8 +1,8 @@
 # 任务：宿主信息暴露与 guest 默认特权收敛
 
 最后更新：2026-11-19
-状态：进行中（C1 开始前）
-分支：当前工作分支（不新建分支，除非用户要求）
+状态：完成（C1–C8 已提交；遗留见第 7 节）
+分支：`android-abi-host`（当前工作分支，未新建分支）
 
 本文件是自包含的恢复文档：会话中断后按「目标」「提交计划」「测试环境」「恢复点」继续，
 不依赖 `issues/` 才能恢复。
@@ -117,6 +117,19 @@
 
 每提交独立可构建、可回退；C1/C2 是 P0，先做。C6/C8 若超预期，拆成 2 次或转
 `issues/`，总数控制在 8–10 次。
+
+实际提交（2026-11-19）：
+
+| # | commit | 说明 |
+|---|---|---|
+| C1 | `b23e899` | hostfs 默认拒绝 + `--allow-guest-hostfs` |
+| C2 | `dc0e96c` | supervisor 强制 token + API 去绝对路径 |
+| C3 | `db5d27c` | 每实例独立 `/run/vpsessiond` |
+| C4 | `f511db0` | mode store / rootfs lock 移到 rootfs 外 |
+| C5 | `d44d5e3` | statfs/fstatfs 合成 guest 预算 |
+| C6 | `1d5e6bc` | st_dev/st_ino/getdents 身份合成 |
+| C7 | `72eea66` | uptime/monotonic/btime rebase + futex 修正 |
+| C8 | `c5baea6` | uname/mounts 头 + GUEST_DEBUG strip |
 
 ## 5. 测试环境（不要碰用户的实例）
 
@@ -279,12 +292,24 @@ ssh -i $key -p 7940 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o Bat
 
 ## 7. 遗留 / 待登记
 
-- `times()`/`clock()` 若仍返回宿主 ticks，登记 issue（C7 视情况处理）。
-- Android 宿主未逐项实测；如果默认关 hostfs 影响 app，登记 issue。
-- zig 预编译 libc 路径无法 remap 时，release 只 strip，登记 issue。
-- supervisor API 的 UI 文案、`userland-vm` 技能文档（仓库外）在 C2 后同步/提醒。
+- `statx` 的 guest 身份合成只在 Linux 编译路径执行；Windows 上 `statx` 返回 ENOSYS，
+  `test_std` 的 statx 段 SKIP。需要 Linux 宿主复核 `stat` 与 `statx` 的 ino 一致。
+- `times()` 的 `struct tms` 仍是既有 TODO（Windows 上 host/guest `clock_t` 宽度可能不同）；
+  本次只把返回的“since boot” ticks 改成 guest uptime。
+- Android 宿主未逐项实测：默认关 guest hostfs 是否影响 APK 内 app，需要真机/模拟器验证。
+- 用户现有的 `release.test.windows.x86_64/bundle` 仍是旧 debug 构建；需要下一次
+  `build_virtpass.ps1` 重打 bundle，旧 guest 二进制里的构建路径才会消失。本次没有覆盖
+  用户正在使用的树。
+- 仓库外技能 `c:/Users/linswin/.agents/skills/userland-vm/SKILL.md` 仍描述“无 token/共享
+  runtime/run”；若未同步，使用它的 agent 会按旧接口操作。
+- `test_std` 的 `a dup(2) of stdout keeps its /proc link name` 是 C6 前就有的基线 FAIL，
+  与本次改动无关。
 
 ## 8. 过程记录
 
 - 2026-11-19：完成审计，确认上述 P0/P1/P2；用户批准批量修，按 8 次提交执行。
 - 2026-11-19：写本文件，开始 C1。
+- 2026-11-19：C1–C8 提交完成（hash 见 §4）；`fs_selftest` 90 checks PASS、
+  `hostfs_selftest` 150 checks PASS、`supervisor/selftest.py` 全 ok（约 33.5s）。
+- 2026-11-19：`test_std` 154 checks / 1 failed（既有 dup 基线）/ 7 skipped；
+  futex 段在 C7 中途曾回归，已随 `run_start_ns` 的 futex 修正恢复。
