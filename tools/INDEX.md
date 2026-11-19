@@ -48,6 +48,9 @@
 | `supervisor/us.py` | 上面的 CLI：`us list/start/stop/rm/logs/exec/health`（thin HTTP client） |
 | `supervisor/ws_smoke.py` | ws 终端桥冒烟：`python ws_smoke.py <实例端口>`，握手 → 发命令 → 收 pty 回显 → `WS-BRIDGE-OK` |
 
+Agent 侧的完整用法（起实例、`us` 各子命令、ssh 的两种拼法、交互式 pty 测试配方、已知坑）
+整理成了技能 `c:/Users/linswin/.agents/skills/userland-vm/SKILL.md`，新会话直接加载它即可。
+
 ## 打包 / 生成 / 安装
 
 | 脚本 | 内容 |
