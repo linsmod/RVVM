@@ -53,6 +53,17 @@ def log_line(msg):
     print(time.strftime("[%Y-%m-%d %H:%M:%S] ") + msg, flush=True)
 
 
+def label_to_hostname(label):
+    """A label as the guest's hostname: letters, digits, '.', '_' and '-', at
+    most 63 characters; anything else becomes '-'. None means "keep the
+    default" (rvvm-user), so an unlabelled instance looks like it always did."""
+    if not label:
+        return None
+    out = "".join(c if (c.isalnum() or c in "._-") else "-" for c in label.strip())
+    out = out.strip(".-")[:63]
+    return out or None
+
+
 def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
@@ -681,6 +692,11 @@ class Supervisor:
         self.drop_ready(port)
         env = dict(os.environ)
         env["RVVM_LOG_FILE"] = logp
+        guest_name = label_to_hostname(label)
+        if guest_name:
+            # The guest calls itself what the user called the instance:
+            # `us start web` boots a machine whose prompt and uname -n say "web".
+            env["RVVM_HOSTNAME"] = guest_name
         argv = [self.ash, "--serve", "--port", str(port),
                 "--rootfs", rootfs, "--run-dir", run_dir]
         flags = 0

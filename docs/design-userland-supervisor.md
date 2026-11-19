@@ -163,6 +163,13 @@ vm --start               没有 running 实例时先起一个
 可以复用同一个名字。旧版本库里可能留下的重复标签由客户端兜底：`vm --label X` 命中多个时
 取第一个能连上的，并在 stderr 说明实际用了哪个端口。匹配是精确且区分大小写的。
 
+**标签同时是 guest 的 hostname**：daemon 启动 core 时把它（只保留 `[A-Za-z0-9._-]`，其余
+字符换成 `-`，最长 63）放进 `RVVM_HOSTNAME`，core 用它初始化该 run 的 UTS 名字——提示符
+的 `\h`、`uname -n`、`hostname` 都显示它；没有标签则保持历史上的 `rvvm-user`。
+`hostname NAME` 在 guest 内也生效：UTS 名字按 run 共享（`rvvm_uts_ns_t`，与 mount
+namespace 同样引用计数、fork 继承），所以子进程改完后父 shell 的新提示符也会变。
+非 root 的 `sethostname` 返回 EPERM，与内核一致。
+
 token/key 解析与 `us.py` 同一套（`--url/--token/--token-file` → 环境变量 →
 最新的 `release.*/runtime/supervisor/token`，私钥在同目录 `id_ed25519`）。
 本机把它装到了 `C:\Users\linswin\.local\bin\vm.cmd`，所以命令行里直接敲 `vm`。

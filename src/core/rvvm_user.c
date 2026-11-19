@@ -1978,6 +1978,68 @@ typedef struct rvvm_mount_ns {
     rvvm_mount_t  mounts[RVVM_MOUNT_MAX];
 } rvvm_mount_ns_t;
 
+/*
+ * The run's UTS name: what uname(2) reports as nodename/domainname, shared by
+ * every process of the run and refcounted, exactly like the mount namespace.
+ *
+ * It cannot live in the per-process context: `hostname web` runs in a child
+ * process, and a copy there would succeed and change nothing the shell behind
+ * it can see. Linux puts these two strings in the UTS namespace; so does this.
+ */
+typedef struct rvvm_uts_ns {
+    spinlock_t    lock;
+    uint32_t      refs;
+    char          hostname[65];
+    char          domainname[65];
+} rvvm_uts_ns_t;
+
+static struct rvvm_uts_ns* userland_utsns_new(void)
+{
+    struct rvvm_uts_ns* ns = safe_new_obj(rvvm_uts_ns_t);
+    /* RVVM_HOSTNAME names the run - the supervisor fills it from the instance
+     * label, so `us start web` boots a machine that calls itself "web". */
+    const char* host = getenv("RVVM_HOSTNAME");
+    *ns = (struct rvvm_uts_ns){
+        .lock = SPINLOCK_INIT,
+        .refs = 1,
+    };
+    rvvm_strlcpy(ns->hostname, (host && host[0]) ? host : "rvvm-user",
+                 sizeof(ns->hostname));
+    return ns;
+}
+
+static void userland_utsns_ref(struct rvvm_uts_ns* ns)
+{
+    if (ns) {
+        atomic_add_uint32(&ns->refs, 1);
+    }
+}
+
+static void userland_utsns_unref(struct rvvm_uts_ns* ns)
+{
+    if (ns && atomic_sub_uint32(&ns->refs, 1) == 1) {
+        free(ns);
+    }
+}
+
+static void userland_utsns_name(struct rvvm_uts_ns* ns, char* hostname,
+                                char* domainname, size_t len)
+{
+    if (!ns) {
+        rvvm_strlcpy(hostname, "rvvm-user", len);
+        if (domainname) {
+            domainname[0] = '\0';
+        }
+        return;
+    }
+    spin_lock(&ns->lock);
+    rvvm_strlcpy(hostname, ns->hostname, len);
+    if (domainname) {
+        rvvm_strlcpy(domainname, ns->domainname, len);
+    }
+    spin_unlock(&ns->lock);
+}
+
 /* Defined with the mount syscalls; the defaults below ask for it, because a
  * tmpfs row's options are written from the storage rather than from the request. */
 static void tmpfs_options(char* options, size_t size, rvvm_memfs_t* memfs, bool read_only);
@@ -2198,6 +2260,9 @@ char*                    guest_root_path;
     // File creation mask, see umask(2) and guest_create_mode(). Per address
     // space because Linux's is per process, and inherited across fork.
     uint32_t                 umask;
+    // The run's UTS name (hostname/domainname), shared with every process of
+    // the run and refcounted - the same reasoning as mountns above.
+    struct rvvm_uts_ns*      utsns;
     // Guest-virtual working directory. Relative paths in guest syscalls are
     // resolved against this, never against the host process's own cwd: the host
     // cwd is wherever the emulator happened to be started from, which has
@@ -10311,6 +10376,10 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
         rvvm_user_set_guest_root(machine, parent->guest_root_path);
     }
     rvvm_strlcpy(ctx->cwd, parent->cwd, sizeof(ctx->cwd));
+    /* The UTS name is the namespace's, so a fork()ed process sees the same
+     * hostname - and a sethostname() in either one stays visible to both. */
+    ctx->utsns = parent->utsns;
+    userland_utsns_ref(ctx->utsns);
 
     /* The same asset mount: the ops are the host's and outlive any run. The
      * descriptors this context hands out are its own to sweep. */
@@ -19335,13 +19404,15 @@ static void* rvvm_user_thread_wrap(void* arg)
                         // Just lie about the host details
                         struct uapi_new_utsname name = {
                             .sysname = "Linux",
-                            .nodename = "rvvm-user",
                             .release = "6.6.6",
                             /* The host build's git describe is host metadata;
                              * the guest only needs a stable identity. */
                             .version = "RVVM userland",
                             .machine = "riscv64",
                         };
+                        userland_utsns_name(uctx()->utsns, name.nodename,
+                                            name.domainname,
+                                            sizeof(name.nodename));
                         struct uapi_new_utsname* out = to_ptr_sz_wr(a0, sizeof(*out));
                         if (!out) {
                             a0 = -UAPI_EFAULT;
@@ -19350,6 +19421,46 @@ static void* rvvm_user_thread_wrap(void* arg)
                         memcpy(out, &name, sizeof(name));
                         a0 = 0;
                     }
+                    break;
+                }
+                case 161: { // sethostname
+                    /* Per UTS namespace, never the host's: the guest owns its
+                     * name, and a non-root guest gets the kernel's EPERM. */
+                    if (uctx()->fake_euid != 0) {
+                        a0 = -UAPI_EPERM;
+                        break;
+                    }
+                    const uint8_t* src = a0 ? to_ptr(a0) : NULL;
+                    if (!src || !uctx()->utsns) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    size_t len = a1 < sizeof(uctx()->utsns->hostname) - 1
+                               ? (size_t)a1 : sizeof(uctx()->utsns->hostname) - 1;
+                    spin_lock(&uctx()->utsns->lock);
+                    memcpy(uctx()->utsns->hostname, src, len);
+                    uctx()->utsns->hostname[len] = '\0';
+                    spin_unlock(&uctx()->utsns->lock);
+                    a0 = 0;
+                    break;
+                }
+                case 162: { // setdomainname
+                    if (uctx()->fake_euid != 0) {
+                        a0 = -UAPI_EPERM;
+                        break;
+                    }
+                    const uint8_t* src = a0 ? to_ptr(a0) : NULL;
+                    if (!src || !uctx()->utsns) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    size_t len = a1 < sizeof(uctx()->utsns->domainname) - 1
+                               ? (size_t)a1 : sizeof(uctx()->utsns->domainname) - 1;
+                    spin_lock(&uctx()->utsns->lock);
+                    memcpy(uctx()->utsns->domainname, src, len);
+                    uctx()->utsns->domainname[len] = '\0';
+                    spin_unlock(&uctx()->utsns->lock);
+                    a0 = 0;
                     break;
                 }
                 case 165: // getrusage
@@ -21134,6 +21245,7 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
         ctx->rlim_max[i] = UINT64_MAX;
     }
     rvvm_strlcpy(ctx->cwd, "/", sizeof(ctx->cwd));
+    ctx->utsns = userland_utsns_new();
     // The process id space starts where every run of this instance starts
     ctx->taskids = userland_taskids_new(USERLAND_FIRST_TASK_ID);
     // Terminal state before the guest changes it - must match the TCGETS
@@ -21318,6 +21430,8 @@ static void userland_destroy(rvvm_machine_t* machine)
      * below reads the table when it closes a descriptor. */
     userland_mountns_unref(ctx->mountns);
     ctx->mountns = NULL;
+    userland_utsns_unref(ctx->utsns);
+    ctx->utsns = NULL;
     safe_free(ctx->guest_root_path);
     /* The timer thread holds a pointer to this context, so it is joined before
      * anything below is released. */
@@ -21474,6 +21588,8 @@ PUBLIC int rvvm_user_linux_ex(rvvm_machine_t* machine, int argc, char** argv, ch
      * An execve() does NOT come through here: a process keeps its cwd across an
      * exec, so guest_exec() leaves ctx->cwd alone. */
     rvvm_strlcpy(ctx->cwd, "/", sizeof(ctx->cwd));
+    userland_utsns_unref(ctx->utsns);
+    ctx->utsns = userland_utsns_new();
 
     /* A fresh process starts on an empty address space: the image, the brk heap
      * and the stack are all placed from scratch below (see guest_vm_init()). */

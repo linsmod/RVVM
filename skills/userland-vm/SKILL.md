@@ -112,6 +112,8 @@ vm --start                           # 没有 running 实例时先起一个
 ```
 
 - 起实例时给名字：`python tools/supervisor/us.py start web`（label 是位置参数）。
+  这个 label 会变成 guest 的 hostname：提示符 `web:~#`、`uname -n`、`hostname` 都是它
+  （无标签仍是 `rvvm-user`）。guest 里 `hostname NAME` 也生效，且对同一 run 的所有进程可见。
 - 默认连**端口最小（最早启动）**的 running 实例；`--port` / `--label` 二选一。
 - token/key 与 `us.py` 同一套解析（`--url/--token/--token-file` → 环境变量 → 最新的
   `release.*/runtime/supervisor/token`，私钥在同目录 `id_ed25519`）。
