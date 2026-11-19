@@ -66,6 +66,10 @@ void ash_install_termination_handler(void);
 /*
  * ash_serve(): the core.
  *
+ * @run_dir is this run's host directory for /run/vpsessiond, or NULL for the
+ * release's shared runtime\run. A core per instance names its own, so a guest
+ * cannot see another instance's ready marker, auth.pub or logs.
+ *
  * @cmdline is the run's boot arguments (`root= init= loglevel= debug`), or NULL.
  * It is applied here rather than by the caller because two of its arguments are
  * this function's to apply and not the caller's to: init= names the core program,
@@ -74,7 +78,7 @@ void ash_install_termination_handler(void);
  * it earlier. root= is passed on to the machine.
  */
 int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline,
-              const char* rootfs_dir);
+              const char* rootfs_dir, const char* run_dir);
 int ash_client(int port, const char* one_cmd, bool autostart);
 int ash_list(void);
 int ash_shutdown(int port);

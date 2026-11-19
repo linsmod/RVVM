@@ -121,6 +121,12 @@ void win32_host_set_rootfs_dir(const char* dir);
 // win32_host_start_guest().
 void win32_host_allow_guest_hostfs(bool on);
 
+// The host directory mounted at the guest's /run/vpsessiond for this run.
+// NULL keeps the release default (<exe>\runtime\run). A core per instance
+// names its own directory so one guest cannot see another's ready marker,
+// auth.pub or logs. Set before win32_host_start_guest().
+void win32_host_set_run_dir(const char* dir);
+
 /*
  * The next run is a core: a machine kept up for clients rather than a one-shot
  * command, serving a session per client (see vp_core.h). The control terminal a

@@ -108,7 +108,7 @@
 |---|---|---|---|
 | C1 | `fix(core): make guest hostfs mounts an explicit host grant` | core 策略 + ash flag + 测试/文档 | 进行中 |
 | C2 | `fix(supervisor): require a token and stop returning host paths` | token、鉴权、API 字段、us/ws/UI | 完成（待提交） |
-| C3 | `fix(supervisor): isolate each instance's /run/vpsessiond` | per-instance run dir + `--run-dir` | 待做 |
+| C3 | `fix(supervisor): isolate each instance's /run/vpsessiond` | per-instance run dir + `--run-dir` | 完成（待提交） |
 | C4 | `fix(ash): keep guest mode store and lock outside the guest root` | sidecar + 跳过 hostfs chmod + 清理 | 待做 |
 | C5 | `fix(core): answer statfs without host disk numbers` | statfs/fstatfs 合成 | 待做 |
 | C6 | `fix(core): synthesize guest file identity` | st_dev/st_ino/getdents/statx | 待做 |
@@ -182,6 +182,19 @@ ssh -i $key -p 7940 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o Bat
   6. `tools/supervisor/selftest.py --release <test tree>` 13 项全 ok。
 - 备注：测试 release 树名不是 `release.*` 时，`us.py` 自动发现 token 不适用，
   测试用 `--token/--token-file`；真实 `release.*` 树自动发现。
+
+### C3 恢复点（2026-11-19 已跑）
+
+- 代码点：`supervisor.py` 的 `run_dir()`/`ensure_run_dir()`/`write_auth_pub()`，
+  `--run-dir` 进 argv，`rm` 删除 run 目录，`ready_path`/`legacy_ready_path`/
+  `ready_present`；`ash_main.c` `--run-dir`；`ash_client.c` run-dir override；
+  `win32_cmdpost_bridge.c` `win32_host_set_run_dir()` 与 `/run/vpsessiond` mount。
+- 验证：`tools/supervisor/selftest.py` 起两个实例（7940/7941）：
+  各看得到自己的 `<port>.ready`，看不到对方的；各自有 `auth.pub`；
+  `rootfs`/`log_path` 仍是 basename；hostfs 默认拒绝仍成立。20 项全 ok。
+- 兼容：旧 daemon 起的实例用共享 `runtime/run/<port>.ready`，`ssh_ready` 仍能识别
+  （`legacy_ready_path`）；新实例一律 per-instance，停止/删除时清掉两代标记。
+- 清理：selftest 结束后测试 core/rootfs/run 目录已删，只剩用户的 7926/7927。
 
 后续提交的恢复点在本文件追加。
 

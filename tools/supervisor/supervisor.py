@@ -23,6 +23,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -410,25 +411,35 @@ class Supervisor:
 
     def _ensure_ssh_key(self):
         """One daemon-owned ed25519 pair: the private key is what the daemon
-        (and only it) uses to reach instances; the public half is dropped into
-        the session mount (runtime/run, mounted at guest /run/vpsessiond) where
-        vpshhd plants it for root and switches tinysshd to publickey auth.
-        Without auth.pub the guest keeps the dev none-auth behaviour."""
+        (and only it) uses to reach instances. The public half is written into
+        each instance's own run directory by start(), where vpshhd plants it
+        for root and switches tinysshd to publickey auth. Without auth.pub the
+        guest keeps the dev none-auth behaviour."""
         key = os.path.join(self.sup_dir, "id_ed25519")
         pub = key + ".pub"
         if not os.path.isfile(key):
             subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
                             "-f", key], check=True)
             log_line("generated instance ssh key %s" % key)
-        run_dir = os.path.join(self.release, "runtime", "run")
-        os.makedirs(run_dir, exist_ok=True)
-        with open(pub, "r", encoding="utf-8") as f:
+        return key, pub
+
+    def run_dir(self, port):
+        """<release>/runtime/run/<port>: this instance's /run/vpsessiond."""
+        return os.path.join(self.release, "runtime", "run", str(port))
+
+    def ensure_run_dir(self, port):
+        d = self.run_dir(port)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def write_auth_pub(self, run_dir):
+        """Drop the public half into the instance's run directory. The comment
+        is stripped: tinysshd matches algorithm + base64 only."""
+        with open(self.ssh_pub, "r", encoding="utf-8") as f:
             publine = f.read().strip().split()
-        # Drop the comment field: tinysshd matches algorithm + base64 only.
         with open(os.path.join(run_dir, "auth.pub"), "w",
                   encoding="utf-8", newline="\n") as f:
             f.write("%s %s\n" % (publine[0], publine[1]))
-        return key, pub
 
     def ssh_args(self, port):
         """Common ssh spelling for reaching instance <port>: key auth,
@@ -518,19 +529,28 @@ class Supervisor:
     # -- readiness ---------------------------------------------------------
 
     def ready_path(self, port):
-        """Where the guest's ssh listener says it is up.
-
-        `runtime/run` is the host directory the guest sees as /run/vpsessiond
-        (the same one auth.pub crosses), so vpshhd's marker is visible here the
+        """Where the guest's ssh listener says it is up. Each instance mounts
+        its own run directory at /run/vpsessiond, so this is
+        runtime/run/<port>/<port>.ready; vpshhd's marker is visible here the
         moment listen() succeeded - no TCP probe, no guessing from the registry
         (which appears before the guest has even booted)."""
+        return os.path.join(self.run_dir(port), "%d.ready" % port)
+
+    def legacy_ready_path(self, port):
+        """The pre-per-instance shared marker, still checked for an instance
+        started by an older daemon (and removed on the next start/stop)."""
         return os.path.join(self.release, "runtime", "run", "%d.ready" % port)
 
+    def ready_present(self, port):
+        return os.path.isfile(self.ready_path(port)) or \
+            os.path.isfile(self.legacy_ready_path(port))
+
     def drop_ready(self, port):
-        try:
-            os.remove(self.ready_path(port))
-        except OSError:
-            pass
+        for path in (self.ready_path(port), self.legacy_ready_path(port)):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def wait_ready(self, port, started_at, child_pid=None):
         """("ready"|"dead"|"timeout", pid). The marker is the answer; a live
@@ -543,7 +563,7 @@ class Supervisor:
             info = core_snapshot(self.release).get(port)
             if info and info["alive"]:
                 seen_pid = info["pid"]
-                if os.path.isfile(self.ready_path(port)):
+                if self.ready_present(port):
                     return "ready", seen_pid
                 if time.time() - started_at >= READY_FALLBACK_S and tcp_open(port):
                     log_line("port %d: ssh answers but no readiness marker - "
@@ -585,7 +605,7 @@ class Supervisor:
             item["tcp"] = tcp_open(row["port"]) if row["actual"] in (
                 "starting", "running") else False
             item["ssh_ready"] = (row["actual"] == "running" and
-                                 os.path.isfile(self.ready_path(row["port"])))
+                                 self.ready_present(row["port"]))
             item["registry"] = snap.get(row["port"])
             out.append(self.public_instance(item))
         return out
@@ -638,14 +658,22 @@ class Supervisor:
                               ", ".join(missing)))
         logp = self.log_path(port)
         rootfs = self.new_rootfs_dir(port)
-        # The marker is per port and lives in a tree-shared directory: whatever
-        # is there belongs to a previous instance, never to the one about to
-        # boot.
+        # One run directory per instance: auth.pub, the readiness marker and the
+        # guest's vpshhd/tinysshd logs go here and are mounted at
+        # /run/vpsessiond. A shared directory let one guest read or overwrite
+        # another instance's state.
+        try:
+            run_dir = self.ensure_run_dir(port)
+            self.write_auth_pub(run_dir)
+        except OSError:
+            raise ApiError(500, "could not prepare the instance run directory")
+        # Whatever is in this instance's directory belongs to a previous run,
+        # never to the one about to boot (the legacy shared marker too).
         self.drop_ready(port)
         env = dict(os.environ)
         env["RVVM_LOG_FILE"] = logp
         argv = [self.ash, "--serve", "--port", str(port),
-                "--rootfs", rootfs]
+                "--rootfs", rootfs, "--run-dir", run_dir]
         flags = 0
         kwargs = {}
         if os.name == "nt":
@@ -972,8 +1000,8 @@ def make_handler(sup, token):
                     sup.stop(port)
                     row = sup.db.instance(port)
                     if row and row["rootfs"]:
-                        import shutil
                         shutil.rmtree(row["rootfs"], ignore_errors=True)
+                    shutil.rmtree(sup.run_dir(port), ignore_errors=True)
                     sup.db.delete(port)
                     sup.db.event(port, "deleted", "")
                     return self._send(200, {"port": port, "deleted": True})

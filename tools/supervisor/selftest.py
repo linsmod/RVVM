@@ -160,40 +160,71 @@ def main():
                                for sep in ("/", "\\")),
                        "health release is a basename")
 
-        code, body = api(token, "POST", "/api/instances",
-                         {"label": "selftest", "port": args.instance_port},
-                         port=args.daemon_port)
-        fails += check(code == 200 and body.get("actual") == "running",
-                       "instance starts (got %s %s)" % (code, body))
-        if code != 200 or body.get("actual") != "running":
-            with open(err, "r", encoding="utf-8", errors="replace") as f:
-                print(f.read()[-4000:])
-            return 1
+        second_port = args.instance_port + 1
+        started = []
+        for port, label in ((args.instance_port, "selftest"),
+                            (second_port, "selftest-2")):
+            code, body = api(token, "POST", "/api/instances",
+                             {"label": label, "port": port},
+                             port=args.daemon_port)
+            fails += check(code == 200 and body.get("actual") == "running",
+                           "instance %d starts (got %s %s)"
+                           % (port, code, body))
+            if code != 200 or body.get("actual") != "running":
+                with open(err, "r", encoding="utf-8", errors="replace") as f:
+                    print(f.read()[-4000:])
+                for p in started:
+                    api(token, "DELETE", "/api/instances/%d" % p,
+                        port=args.daemon_port)
+                return 1
+            started.append(port)
+        try:
+            code, listing = api(token, "GET", "/api/instances",
+                                port=args.daemon_port)
+            fails += check(code == 200,
+                           "instances with token is 200 (got %s)" % code)
+            fails += check(no_host_paths(listing), "instances has no host paths")
+            insts = {i.get("port"): i
+                     for i in (listing.get("instances") or [])}
+            for port in (args.instance_port, second_port):
+                inst = insts.get(port, {})
+                fails += check(
+                    "endpoint" not in json.dumps(inst.get("registry", {})),
+                    "registry %d has no endpoint" % port)
+                fails += check(
+                    not any(sep in str(inst.get("rootfs", ""))
+                            for sep in ("/", "\\")),
+                    "rootfs %d is a basename" % port)
+                fails += check(
+                    not any(sep in str(inst.get("log_path", ""))
+                            for sep in ("/", "\\")),
+                    "log_path %d is a basename" % port)
 
-        code, listing = api(token, "GET", "/api/instances",
-                            port=args.daemon_port)
-        fails += check(code == 200, "instances with token is 200 (got %s)" % code)
-        fails += check(no_host_paths(listing), "instances has no host paths")
-        inst = (listing.get("instances") or [{}])[0]
-        fails += check("endpoint" not in json.dumps(inst.get("registry", {})),
-                       "registry has no endpoint")
-        fails += check(not any(sep in str(inst.get("rootfs", ""))
-                               for sep in ("/", "\\")),
-                       "rootfs is a basename")
-        fails += check(not any(sep in str(inst.get("log_path", ""))
-                               for sep in ("/", "\\")),
-                       "log_path is a basename")
+            key = os.path.join(release, KEY_REL)
+            p1, p2 = args.instance_port, second_port
+            r = run_ssh(key, p1,
+                        "test -f /run/vpsessiond/%d.ready; echo OWN=$?; "
+                        "test -f /run/vpsessiond/%d.ready; echo OTHER=$?; "
+                        "test -f /run/vpsessiond/auth.pub; echo AUTH=$?"
+                        % (p1, p2))
+            fails += check("OWN=0" in r.stdout,
+                           "instance %d sees its own ready marker" % p1)
+            fails += check("OTHER=1" in r.stdout,
+                           "instance %d cannot see %d's ready marker" % (p1, p2))
+            fails += check("AUTH=0" in r.stdout,
+                           "instance %d has its own auth.pub" % p1)
 
-        key = os.path.join(release, KEY_REL)
-        r = run_ssh(key, args.instance_port,
-                    "mkdir -p /hostdir; mount -t hostfs '%s' /hostdir; "
-                    "echo RC=$?; rmdir /hostdir 2>/dev/null"
-                    % hostdir.replace("\\", "/"))
-        fails += check(re.search(r"RC=([1-9]\d*)", r.stdout) is not None,
-                       "guest hostfs is denied by default (%r)" % r.stdout.strip())
-
-        api(token, "DELETE", "/api/instances/%d" % args.instance_port,
-            port=args.daemon_port)
+            r = run_ssh(key, p1,
+                        "mkdir -p /hostdir; mount -t hostfs '%s' /hostdir; "
+                        "echo RC=$?; rmdir /hostdir 2>/dev/null"
+                        % hostdir.replace("\\", "/"))
+            fails += check(
+                re.search(r"RC=([1-9]\d*)", r.stdout) is not None,
+                "guest hostfs is denied by default (%r)" % r.stdout.strip())
+        finally:
+            for port in started:
+                api(token, "DELETE", "/api/instances/%d" % port,
+                    port=args.daemon_port)
     finally:
         if proc and proc.poll() is None:
             proc.terminate()

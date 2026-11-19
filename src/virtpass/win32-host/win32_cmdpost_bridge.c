@@ -240,6 +240,12 @@ static bool g_rootfs_dir_set = false;
  * and a guest that can name C:\ is not a sandbox. */
 static bool g_allow_guest_hostfs = false;
 
+/* Where this run's /run/vpsessiond lives on the host. Empty = the release's
+ * shared runtime\run (the single-run host); a core per instance names its own
+ * directory, so one guest cannot see another's auth.pub, ready marker or log. */
+static char g_run_dir[MAX_PATH];
+static bool g_run_dir_set = false;
+
 /* Host-side suspend/resume guards. The machine handle only exists while a guest
  * is booted, so every host control call goes through these instead of testing
  * g_guest_machine at each call site. */
@@ -1216,6 +1222,17 @@ void win32_host_set_rootfs_dir(const char* dir)
 void win32_host_allow_guest_hostfs(bool on)
 {
     g_allow_guest_hostfs = on;
+}
+
+void win32_host_set_run_dir(const char* dir)
+{
+    if (dir && dir[0]) {
+        DWORD n = GetFullPathNameA(dir, sizeof(g_run_dir), g_run_dir, NULL);
+        g_run_dir_set = n > 0 && n < sizeof(g_run_dir);
+    } else {
+        g_run_dir_set = false;
+        g_run_dir[0] = '\0';
+    }
 }
 
 void win32_host_set_cmdline(const char* str)
@@ -3339,16 +3356,28 @@ bool win32_host_start_guest(int argc, char** argv)
          * under the rootfs. The socket has to be reachable by the host client
          * whatever the guest's / is backed by, and a run with no rootfs has no
          * directory under it to put one in - /run is the same choice Linux makes
-         * for runtime sockets, and for the same reason. */
+         * for runtime sockets, and for the same reason.
+         *
+         * A core per instance names its own run directory (--run-dir): the
+         * ready marker, auth.pub and logs are per-instance state, and a shared
+         * directory let one guest read or overwrite another's. The single-run
+         * host keeps the release default. */
         {
+            char run_dir[MAX_PATH];
             char exe_dir[MAX_PATH];
             char runtime[MAX_PATH];
-            char run_dir[MAX_PATH];
+            bool have_dir = false;
 
-            if (win32_exe_directory(exe_dir, sizeof(exe_dir))) {
+            if (g_run_dir_set) {
+                snprintf(run_dir, sizeof(run_dir), "%s", g_run_dir);
+                have_dir = true;
+            } else if (win32_exe_directory(exe_dir, sizeof(exe_dir))) {
                 snprintf(runtime, sizeof(runtime), "%s\\runtime", exe_dir);
                 CreateDirectoryA(runtime, NULL);
                 snprintf(run_dir, sizeof(run_dir), "%s\\runtime\\run", exe_dir);
+                have_dir = true;
+            }
+            if (have_dir) {
                 CreateDirectoryA(run_dir, NULL);
                 if (rvvm_user_mount_hostfs(g_guest_machine, "/run/vpsessiond",
                                            run_dir) != 0) {

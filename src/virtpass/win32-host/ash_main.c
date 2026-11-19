@@ -48,7 +48,8 @@ static void print_usage(const char* self)
     fprintf(stderr,
             "usage: %s --serve [--idle S] [--dlog <guest-path>] [--memfs]\n"
             "          [--cmdline <linux-args>] [--port N]\n"
-            "          [--rootfs <dir>] [--allow-guest-hostfs]\n"
+            "          [--rootfs <dir>] [--run-dir <dir>]\n"
+            "          [--allow-guest-hostfs]\n"
             "       %s --list\n"
             "\n"
             "  %s --serve          run the core: one run (one machine, one rootfs)\n"
@@ -64,6 +65,10 @@ static void print_usage(const char* self)
             "the idle core does not honour it. --serve --dlog <path> puts the\n"
             "legacy session server's log at that guest path. --serve --memfs runs\n"
             "the bundle from memory instead of <exe>\\runtime\\rootfs.\n"
+            "  --serve --run-dir <dir> mounts <dir> at the guest's\n"
+            "          /run/vpsessiond instead of <exe>\\runtime\\run. One core per\n"
+            "          instance names its own, so ready markers, auth.pub and logs\n"
+            "          are not shared between guests.\n"
             "  --serve --allow-guest-hostfs lets the guest mount a host directory\n"
             "          itself (`mount -t hostfs <host path> <guest path>`). Off by\n"
             "          default: hostfs is a host capability, not a guest default.\n"
@@ -99,6 +104,7 @@ int main(int argc, char** argv)
     const char* dlog    = NULL;
     const char* cmdline = NULL;
     const char* rootfs  = NULL;
+    const char* run_dir = NULL;
     int         idle    = 0;
     int         port    = ash_port();
     int         i       = 1;
@@ -145,6 +151,10 @@ int main(int argc, char** argv)
             rootfs = argv[++i];
         } else if (!strncmp(a, "--rootfs=", 9)) {
             rootfs = a + 9;
+        } else if (!strcmp(a, "--run-dir") && i + 1 < argc) {
+            run_dir = argv[++i];
+        } else if (!strncmp(a, "--run-dir=", 10)) {
+            run_dir = a + 10;
         } else if (!strcmp(a, "--shutdown") || !strcmp(a, "--sock-path") ||
                    !strcmp(a, "--no-autostart")) {
             /* Verbs (and a flag) of the client era. The AF_UNIX endpoint and
@@ -202,5 +212,5 @@ int main(int argc, char** argv)
     /* Before ash_serve() builds the machine: the grant belongs to the run, and
      * win32_host_start_guest() applies it to the fresh userland context. */
     win32_host_allow_guest_hostfs(allow_guest_hostfs);
-    return ash_serve(port, idle, dlog, cmdline, rootfs);
+    return ash_serve(port, idle, dlog, cmdline, rootfs, run_dir);
 }

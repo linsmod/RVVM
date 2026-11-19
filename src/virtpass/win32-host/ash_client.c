@@ -152,12 +152,24 @@ static bool ash_core_file(int port, char* out, size_t size)
  * win32_cmdpost_bridge.c). The session endpoints live here, one per port, and the
  * client reaches them as plain host paths - beside runtime\cores (the core
  * registry) and runtime\rootfs (the rootfs), because all three are the release
- * tree's own runtime state rather than anything the guest owns. */
+ * tree's own runtime state rather than anything the guest owns.
+ *
+ * A supervisor-run core names a per-instance directory with --run-dir, so its
+ * ready marker, auth.pub and logs are not shared with any other guest. Without
+ * it, the release default keeps the single-run host's historical layout. */
+static char ash_run_dir_override[MAX_PATH];
+static bool ash_run_dir_set = false;
+
 static bool ash_runtime_run_dir(char* out, size_t size)
 {
     char exe_dir[MAX_PATH];
     char runtime[MAX_PATH];
 
+    if (ash_run_dir_set) {
+        snprintf(out, size, "%s", ash_run_dir_override);
+        CreateDirectoryA(out, NULL);
+        return true;
+    }
     if (!ash_exe_directory(exe_dir, sizeof(exe_dir))) {
         return false;
     }
@@ -640,7 +652,7 @@ void ash_install_termination_handler(void)
 }
 
 int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline,
-              const char* rootfs_dir)
+              const char* rootfs_dir, const char* run_dir)
 {
     if (rootfs_dir && rootfs_dir[0]) {
         /* The bundle is materialized here instead of the release's own
@@ -648,6 +660,13 @@ int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline,
          * cores live beside each other, each behind its own lock. */
         snprintf(ash_rootfs_dir, sizeof(ash_rootfs_dir), "%s", rootfs_dir);
         ash_rootfs_dir_set = true;
+    }
+    if (run_dir && run_dir[0]) {
+        /* This core's /run/vpsessiond state: its own ready marker, auth.pub and
+         * logs. The host mounts exactly this directory, so nothing in it is a
+         * shared cross-instance surface. */
+        snprintf(ash_run_dir_override, sizeof(ash_run_dir_override), "%s", run_dir);
+        ash_run_dir_set = true;
     }
     const char* shell = ash_default_core_shell();
     const char* init_arg;
@@ -745,6 +764,7 @@ int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline,
      * so that a command line overrides the image rather than the other way
      * round. */
     win32_host_set_rootfs_dir(ash_rootfs_dir_set ? ash_rootfs_dir : NULL);
+    win32_host_set_run_dir(ash_run_dir_set ? ash_run_dir_override : NULL);
     win32_host_set_cmdline(cmdline);
 
     /* The guest's permission bits outlive this process: the host filesystem

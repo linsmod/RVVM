@@ -58,15 +58,16 @@ bind 之前，把「还在启动」误报成「僵死」会让运维去杀健康
 
 | 需求 | 原语 | 出处 |
 |---|---|---|
-| 实例化 | `rvvm_ash --serve --port N --rootfs <dir>` | `ash_main.c`（端口即 ID）；`--rootfs` 为本次新增（锁与 mode-store 随目录收放） |
+| 实例化 | `rvvm_ash --serve --port N --rootfs <dir> --run-dir <run>` | `ash_main.c`（端口即 ID）；`--rootfs`/`--run-dir` 为本次新增（rootfs 锁/mode-store 与 `/run/vpsessiond` 随实例目录收放） |
 | 实例清单 | `runtime/cores/*.core` | `ash_client.c`（自注册/自删/残回收） |
 | 日志 | `RVVM_LOG_FILE=<supervisor>/<port>.log`、`RVVM_LOG_RING_DUMP` 同目录 | utils.h log ring |
 | 终端/命令 | `ssh -p N 127.0.0.1 "<cmd>"`（vpssh 链：vpshhd → tinysshnoneauthd） | 客户端任意 ssh |
 | 探活 | pid 活性 + tcp connect 端口 | |
 
-宿主改动（最小面）：`ash_main.c` 解析 `--rootfs`、`ash_client.c` 锁与 mode-store
-按目录收放、`win32_cmdpost_bridge.c` mount dest 覆盖。默认路径（无 `--rootfs`）
-行为不变，`runtime/ash-core.lock` 历史名保留。
+宿主改动（最小面）：`ash_main.c` 解析 `--rootfs`/`--run-dir`、`ash_client.c` 锁与
+mode-store 按目录收放、`win32_cmdpost_bridge.c` 按 run 目录 mount `/run/vpsessiond`。
+默认路径（无 `--rootfs`/`--run-dir`）行为不变，`runtime/ash-core.lock` 历史名保留。
+2026-11-19 起 supervisor 每实例传独立 `--run-dir`，ready/auth.pub/日志不再共享。
 
 daemon 启动子进程时 cwd 设为 release 目录（guest 相对路径按进程 cwd 解析，
 `tools/INDEX.md` 既定约束），stderr 重定向到实例日志文件。
@@ -99,7 +100,7 @@ guest 还没 boot，第一次 ssh 仍可能被拒。现在由**真正监听的�
 | 环节 | 行号/文件 | 行为 |
 |---|---|---|
 | guest | `src/virtpass/guest-samples/vpshhd.c` | `listen()` 成功后写 `/run/vpsessiond/<port>.ready`（tmp + rename 原子落盘，内容 `pid=` / `port=`），监听器退出时删除 |
-| 宿主可见性 | 同一目录 | `/run/vpsessiond` 就是 host 的 `<release>/runtime/run`（auth.pub、vpshhd.log 都走它），所以 daemon 直接看到文件出现 |
+| 宿主可见性 | 每实例一个目录 | `/run/vpsessiond` 是 host 的 `<release>/runtime/run/<port>`（该实例的 auth.pub、ready、vpshhd.log 都走它），daemon 直接看到文件出现；实例之间互不可见、不可写 |
 | daemon 启动 | `Supervisor.wait_ready()` | spawn 前先删掉同端口的旧标记；`start()` 等到标记出现才置 `running`（上限仍是 `STARTING_GRACE_S`） |
 | 兼容旧 guest | `READY_FALLBACK_S = 8` | live core 8 秒内没有标记、但 TCP 能连上 → 按就绪处理并**打日志**说明用了 TCP 兜底 |
 | 失败区分 | `start()` | core 先死 → `core exited before sshd was ready`；一直没就绪 → `sshd not ready within 25s`，两者都带实例日志路径 |
@@ -147,7 +148,8 @@ CLI 是薄客户端：只调 HTTP API，不碰 DB、不 spawn 进程。
 
 账号体系 / 多租户 / 计费 / 容器编排 / 多机调度。
 （websocket 终端已于 v2 落地，见 §5；带键鉴权已于 vpshhd 的 auth.pub 模式落地——
-run 目录无 `auth.pub` 时保持 noneauth，dev 行为不变。）
+每个实例的 run 目录由 daemon 写入自己的 `auth.pub`，无 `auth.pub` 时保持 noneauth，
+dev 行为不变。）
 
 ## 8. 验收线（2026-11-18 实测全绿）
 
