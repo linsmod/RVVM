@@ -948,12 +948,13 @@ def main():
     probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     holder = probe_daemon(probe_host, int(port))
     if holder:
-        raise SystemExit(
-            "supervisor: %s:%s already answers (%s)\n"
-            "  not starting a second daemon: the two would share the port and "
-            "keep separate databases.\n"
-            "  stop the running one first (tray: 结束任务, or quickcmd kill <id>)."
-            % (host, port, holder))
+        # Not an error: the daemon the user is asking for is already there.
+        # Exiting 0 keeps a tray entry from piling up "failed" runs when its
+        # instance got orphaned (a host restart drops the tray's job table but
+        # not the detached daemon) and the user presses start again.
+        print("supervisor: already running at http://%s:%s/ (%s)"
+              % (host, port, holder))
+        return
     httpd = ThreadingHTTPServer((host, int(port)),
                                 make_handler(sup, args.token))
     log_line("supervisor %s: release=%s db=%s bind=%s token=%s"
