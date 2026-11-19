@@ -144,6 +144,23 @@ us [--url U] [--token T] [--token-file F] <command>
 
 CLI 是薄客户端：只调 HTTP API，不碰 DB、不 spawn 进程。
 
+### 6.1 `vm`：像 `bash` 一样用实例
+
+`tools/supervisor/vm.py`（+ `vm.cmd` 包装）是给"进 VM 里敲命令"这个动作的客户端，
+不经过 HTTP exec，直接 ssh 到实例端点：
+
+```
+vm                       交互 shell（pty：^C、^D、窗口大小、vi 都正常）
+vm -c "uname -m"         一次性执行，退出码就是 guest 命令的退出码
+vm --list                哪些实例可连
+vm --port 7929 -c "ls /" 指定实例（默认取端口最小、即最早起的那个 running）
+vm --start               没有 running 实例时先起一个
+```
+
+token/key 解析与 `us.py` 同一套（`--url/--token/--token-file` → 环境变量 →
+最新的 `release.*/runtime/supervisor/token`，私钥在同目录 `id_ed25519`）。
+本机把它装到了 `C:\Users\linswin\.local\bin\vm.cmd`，所以命令行里直接敲 `vm`。
+
 ## 7. 明确不做（预览范围外）
 
 账号体系 / 多租户 / 计费 / 容器编排 / 多机调度。
