@@ -31,6 +31,9 @@
   WSL 形态才打开。默认关是 2026-11-19 宿主信息收敛的一部分。
 - **`statfs`/`df` 不回宿主磁盘数字**：rootfs 行报 1 GiB、hostfs 行报 64 MiB 的固定 guest 预算，
   不落回宿主 `statfs()`；`fstatfs` 对宿主持久 fd 同样用预算。数字不是配额，只是 guest 视图。
+- **guest 时间从 run 起点算**：`/proc/uptime`、`sysinfo.uptime`、`/proc/<pid>/stat` starttime、
+  guest `CLOCK_MONOTONIC*`/`BOOTTIME`、`times()` 都减去 `run_start_ns`；`/proc/stat btime`
+  是 guest 启动 epoch（now - uptime）。宿主 uptime 不再出现在 guest。
 - **宿主持久文件的身份合成**：`st_dev` 固定为 `RVVM_GUEST_DEV`，`st_ino = guest_ino_hash(host st_ino)`；
   `getdents64` 的 `d_ino` 用同一 hash，`statx` 也写同一值（Linux 宿主；Windows 上 statx 目前 SKIP）。
   宿主 NTFS file id / 卷号不再直接交给 guest；`stat`/`fstat`/`getdents` 之间的 ino 保持一致。

@@ -112,7 +112,7 @@
 | C4 | `fix(ash): keep guest mode store and lock outside the guest root` | sidecar + 跳过 hostfs chmod + 清理 | 完成（待提交） |
 | C5 | `fix(core): answer statfs without host disk numbers` | statfs/fstatfs 合成 | 完成（待提交） |
 | C6 | `fix(core): synthesize guest file identity` | st_dev/st_ino/getdents/statx | 完成（statx 在 Windows 上 SKIP，待 Linux 宿主复核） |
-| C7 | `fix(core): rebase guest uptime and monotonic clock` | uptime/sysinfo/starttime/btime | 待做 |
+| C7 | `fix(core): rebase guest uptime and monotonic clock` | uptime/sysinfo/starttime/btime | 完成（Windows 实测；clock_nanosleep 仅 Linux 路径未实测） |
 | C8 | `fix(build): remove host build paths from guest-visible metadata` | uname/comment + 构建路径 | 待做 |
 
 每提交独立可构建、可回退；C1/C2 是 P0，先做。C6/C8 若超预期，拆成 2 次或转
@@ -234,6 +234,26 @@ ssh -i $key -p 7940 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o Bat
   statx 的 hash 分支需要在 Linux 宿主上复核（登记遗留）。
 - 设计取舍：只 hash `st_ino`，不混 host `st_dev`，这样 `stat`/`statx`/`getdents`
   三个入口对同一文件给同一个 guest ino；跨卷 inode 碰撞的概率留给 64 位 hash。
+
+### C7 恢复点（2026-11-19 已跑，Linux-only 分支未实测）
+
+- 代码点：`rvvm_userland_t.run_start_ns`（create 时记录，fork 继承）；
+  `guest_uptime_ns()`/`guest_btime()`；`/proc/uptime`、`sysinfo.uptime`、
+  `/proc/<pid>/stat` starttime、`/proc/stat btime`；`clock_gettime` 对
+  `MONOTONIC*/BOOTTIME` 减 base；`clock_nanosleep` 的 `TIMER_ABSTIME` 对单调钟加 base、
+  REALTIME 用 host realtime→monotonic offset；`times()` 返回值改为 guest ticks；
+  Linux 的 `sysinfo(2)` 改为合成（不再读宿主 uptime/RAM）。
+- 验证：selftest 中 guest `/proc/uptime`=8s（宿主是数天），`btime` 与
+  `date +%s - uptime` 完全一致（1795081152）。
+- 附带修复：`futex(WAIT_BITSET)` 的 guest 绝对 deadline 也随 `run_start_ns` 调整
+  （Windows fallback 用 `guest_uptime_ns()`，Linux 的 host futex 路径加 base；
+  `FUTEX_CLOCK_REALTIME` 不 rebase）。test_std 的 futex 段从 1 FAIL 恢复到全 PASS。
+- 回归判据：`test_std` 154 checks / 1 failed（只剩既有的
+  `a dup(2) of stdout keeps its /proc link name`，C6 前就存在），7 skipped。
+- 未覆盖：`clock_nanosleep` 只在 `__linux__` 下编译，Windows 上没跑到；`times()` 的
+  `struct tms` 布局是既有 TODO（Windows host/guest clock_t 宽度问题），本次只改返回值。
+- 注意：`clock_gettime` 的 REALTIME 保持宿主墙钟；内部 `userland_monotonic_ns` 仍用宿主，
+  只有 guest 可见的返回值 rebase。
 
 后续提交的恢复点在本文件追加。
 

@@ -292,6 +292,22 @@ def main():
                     host_ino = None
                 fails += check(host_ino is None or guest_ino != host_ino,
                                "guest inode is not the host st_ino")
+
+            # C7: guest uptime starts at the run, not at the host boot.
+            r = run_ssh(key, p1,
+                        "cat /proc/uptime; date +%s; grep '^btime ' /proc/stat")
+            lines = r.stdout.strip().splitlines()
+            try:
+                up = float(lines[0].split()[0])
+                now = int(lines[1])
+                btime = int(lines[2].split()[1])
+            except (IndexError, ValueError):
+                up, now, btime = -1, 0, 0
+            fails += check(0 <= up < 600,
+                           "guest uptime is the run's, not the host's (%s)" % up)
+            fails += check(abs((now - up) - btime) <= 5,
+                           "btime is now - guest uptime (%d vs %d)"
+                           % (btime, now - int(up)))
         finally:
             for port in started:
                 api(token, "DELETE", "/api/instances/%d" % port,

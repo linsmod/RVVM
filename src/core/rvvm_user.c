@@ -2132,6 +2132,11 @@ typedef struct rvvm_userland {
     // guest's syscall path here (VirtPass: its vp_cmdpost_t); the core only
     // hands it back through rvvm_user_host_ctx().
     void*                    host_ctx;
+    // Host monotonic nanoseconds at the moment this run was created. Guest
+    // uptime and CLOCK_MONOTONIC are measured from here, so they do not reveal
+    // when the host booted; forked address spaces inherit it (a run is one
+    // uptime, not one per process).
+    uint64_t                 run_start_ns;
     // Whether the guest may name a host directory in mount(2) itself. Default
     // false: hostfs is a host-granted capability, not a guest default. The
     // host's own rvvm_user_mount_hostfs() calls are unaffected by this.
@@ -3927,6 +3932,36 @@ static THREAD_LOCAL rvvm_userland_t* tls_userland = NULL;
 static inline rvvm_userland_t* uctx(void)
 {
     return tls_userland;
+}
+
+/* Guest-visible monotonic time: host monotonic minus the run's start. Internal
+ * waits keep calling userland_monotonic_ns() directly - they need the host
+ * clock, not the guest's rebased one. */
+static uint64_t guest_uptime_ns(void)
+{
+    rvvm_userland_t* ctx = uctx();
+    uint64_t         now = userland_monotonic_ns();
+
+    if (!ctx || now <= ctx->run_start_ns) {
+        return 0;
+    }
+    return now - ctx->run_start_ns;
+}
+
+/* Linux's clock ids (the guest passes these numbers; the host's headers need
+ * not define every one of them). */
+#define RVVM_CLOCK_MONOTONIC       1
+#define RVVM_CLOCK_MONOTONIC_RAW   4
+#define RVVM_CLOCK_MONOTONIC_COARSE 6
+#define RVVM_CLOCK_BOOTTIME        7
+
+/* /proc/stat's btime is the guest's boot epoch, not the host's: the wall clock
+ * minus the run's uptime. */
+static unsigned long long guest_btime(void)
+{
+    uint64_t now = (uint64_t)time(NULL);
+    uint64_t up  = guest_uptime_ns() / 1000000000ULL;
+    return (unsigned long long)(now > up ? now - up : 0);
 }
 
 /* The machine the calling thread is running a guest in, or NULL when it is not
@@ -9771,6 +9806,7 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
 
     /* Filesystem view and credentials: to the guest's files this is the same
      * process. The prefix is copied, since the parent's string may be its own. */
+    ctx->run_start_ns = parent->run_start_ns;
     ctx->fake_root    = parent->fake_root;
     ctx->fake_uid     = parent->fake_uid;
     ctx->fake_euid    = parent->fake_euid;
@@ -10288,11 +10324,12 @@ static rvvm_addr_t rvvm_sys_wait4(rvvm_userland_t* ctx, rvvm_user_thread_t* self
     }
 }
 
-#define UAPI_FUTEX_CMD_MASK    0x3F
-#define UAPI_FUTEX_WAIT        0x0
-#define UAPI_FUTEX_WAKE        0x1
-#define UAPI_FUTEX_WAIT_BITSET 0x9
-#define UAPI_FUTEX_WAKE_BITSET 0xA
+#define UAPI_FUTEX_CMD_MASK       0x3F
+#define UAPI_FUTEX_WAIT           0x0
+#define UAPI_FUTEX_WAKE           0x1
+#define UAPI_FUTEX_WAIT_BITSET    0x9
+#define UAPI_FUTEX_WAKE_BITSET    0xA
+#define UAPI_FUTEX_CLOCK_REALTIME 0x100
 
 static int uapi_ts_to_host(struct timespec* dst, const struct uapi_timespec* src);
 
@@ -10309,7 +10346,20 @@ static int rvvm_sys_futex(uint32_t* addr, int futex_op, uint32_t val,
     }
 #if defined(__linux__)
     struct timespec ts;
-    const struct timespec* hts = uapi_ts_to_host(&ts, timeout) ? &ts : NULL;
+    const struct timespec* hts = NULL;
+    if (uapi_ts_to_host(&ts, timeout)) {
+        /* WAIT_BITSET's timeout is an absolute instant on the guest's
+         * monotonic clock (or realtime with FUTEX_CLOCK_REALTIME). The host
+         * syscall expects its own monotonic clock, so add the run's start. */
+        if ((futex_op & UAPI_FUTEX_CMD_MASK) == UAPI_FUTEX_WAIT_BITSET &&
+            !(futex_op & UAPI_FUTEX_CLOCK_REALTIME)) {
+            uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ULL +
+                          (uint64_t)ts.tv_nsec + uctx()->run_start_ns;
+            ts.tv_sec  = (time_t)(ns / 1000000000ULL);
+            ts.tv_nsec = (long)(ns % 1000000000ULL);
+        }
+        hts = &ts;
+    }
     return errno_ret(syscall(SYS_futex, addr, futex_op, val, hts, uaddr2, val3));
 #else
     UNUSED(uaddr2); UNUSED(val3);
@@ -10319,11 +10369,19 @@ static int rvvm_sys_futex(uint32_t* addr, int futex_op, uint32_t val,
     if (timeout) {
         uint64_t deadline_ms = timeout->tv_sec * 1000 + (timeout->tv_nsec + 999999) / 1000000;
         if (absolute) {
-            struct timespec now;
-            if (clock_gettime(CLOCK_MONOTONIC, &now)) {
-                return -UAPI_EINVAL;
+            uint64_t now_ms;
+            if (futex_op & UAPI_FUTEX_CLOCK_REALTIME) {
+                struct timespec now;
+                if (clock_gettime(CLOCK_REALTIME, &now)) {
+                    return -UAPI_EINVAL;
+                }
+                now_ms = (uint64_t)now.tv_sec * 1000 +
+                         (uint64_t)now.tv_nsec / 1000000;
+            } else {
+                /* The guest's absolute monotonic deadline is uptime from the
+                 * run start, not the host's uptime. */
+                now_ms = guest_uptime_ns() / 1000000ULL;
             }
-            uint64_t now_ms = (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
             wait_ms = deadline_ms > now_ms ? deadline_ms - now_ms : 0;
         } else {
             wait_ms = deadline_ms;
@@ -14685,7 +14743,16 @@ static size_t userland_proc_gen_stat(rvvm_process_t* proc, rvvm_userland_t* home
         tty = (136ULL << 8) | (home->ctty->index & 0xFF);   /* Linux pts major */
     }
     unsigned long long nthreads  = userland_proc_thread_count(home);
-    unsigned long long starttime = proc->start_ms * 100ULL / 1000ULL;   /* USER_HZ */
+    /* starttime is on the guest's clock, so subtract the run's host start; a
+     * process that started before it (impossible for a forked child, but not
+     * for a stale record) reports 0 rather than a host uptime. */
+    unsigned long long starttime;
+    {
+        rvvm_userland_t*  uptime_ctx = home ? home : uctx();
+        uint64_t          run_ms = uptime_ctx ? uptime_ctx->run_start_ns / 1000000ULL : 0;
+        uint64_t          proc_ms = proc->start_ms > run_ms ? proc->start_ms - run_ms : 0;
+        starttime = proc_ms * 100ULL / 1000ULL;   /* USER_HZ */
+    }
     unsigned long long vsize     = userland_proc_vsize(home);
     unsigned long long rss       = vsize ? (vsize / 4096ULL) : 0;   /* pretend resident */
 
@@ -14755,7 +14822,7 @@ static size_t userland_proc_gen_status(rvvm_process_t* proc, rvvm_userland_t* ho
 
 static size_t userland_proc_gen_uptime(char* buf, size_t size)
 {
-    unsigned long long secs = userland_monotonic_ns() / 1000000000ULL;
+    unsigned long long secs = guest_uptime_ns() / 1000000000ULL;
     return userland_proc_appendf(buf, size, 0, "%llu.00 %llu.00\n", secs, secs);
 }
 
@@ -14899,7 +14966,7 @@ static size_t userland_proc_gen_root_stat(char* buf, size_t size)
     len = userland_proc_appendf(buf, size, len, "cpu  0 0 0 0 0 0 0 0 0 0\n");
     len = userland_proc_appendf(buf, size, len, "cpu0 0 0 0 0 0 0 0 0 0 0\n");
     len = userland_proc_appendf(buf, size, len, "intr 0\nctxt 0\n");
-    len = userland_proc_appendf(buf, size, len, "btime %llu\n", (unsigned long long)time(NULL));
+    len = userland_proc_appendf(buf, size, len, "btime %llu\n", guest_btime());
     len = userland_proc_appendf(buf, size, len, "processes %u\n", n);
     len = userland_proc_appendf(buf, size, len, "procs_running 1\nprocs_blocked 0\n");
     len = userland_proc_appendf(buf, size, len, "softirq 0 0 0 0 0 0 0 0 0 0\n");
@@ -14918,7 +14985,7 @@ static void userland_fill_sysinfo(struct uapi_sysinfo* si)
     uint32_t pids[RVVM_PROC_PID_MAX];
     uint32_t n = 0;
     userland_proc_snapshot_walk(userland_family_root(uctx()), pids, &n, RVVM_PROC_PID_MAX, 0);
-    si->uptime   = (uapi_long_t)(userland_monotonic_ns() / 1000000000ULL);
+    si->uptime   = (uapi_long_t)(guest_uptime_ns() / 1000000000ULL);
     si->procs    = (uint16_t)n;
     /* Memory as /proc/meminfo reports it (same source, so `free` - which reads
      * sysinfo - and `top` - which reads meminfo - agree). */
@@ -18342,6 +18409,26 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_info("sys_clock_gettime(%lx, %lx)", a0, a1);
                     int ret = clock_gettime(a0, &ts);
                     if (ret == 0) {
+                        /* The guest's monotonic clocks start at its own run,
+                         * not when the host booted. Rebase only the clocks
+                         * measured from boot; REALTIME and the CPU-time clocks
+                         * keep their host answers. */
+                        switch ((int)a0) {
+                        case RVVM_CLOCK_MONOTONIC:
+                        case RVVM_CLOCK_MONOTONIC_RAW:
+                        case RVVM_CLOCK_MONOTONIC_COARSE:
+                        case RVVM_CLOCK_BOOTTIME: {
+                            uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ULL +
+                                          (uint64_t)ts.tv_nsec;
+                            uint64_t base = uctx()->run_start_ns;
+                            ns = ns > base ? ns - base : 0;
+                            ts.tv_sec  = (time_t)(ns / 1000000000ULL);
+                            ts.tv_nsec = (long)(ns % 1000000000ULL);
+                            break;
+                        }
+                        default:
+                            break;
+                        }
                         // A NULL target has nothing to write back to; that is
                         // not worth faulting on, POSIX allows it for getres/clock_gettime alike
                         struct uapi_timespec* out = to_ptr_wr(a1);
@@ -18383,13 +18470,27 @@ static void* rvvm_user_thread_wrap(void* arg)
                     uint64_t deadline = userland_monotonic_ns() + ns;
                     if (a1 & 0x1) {
                         /* TIMER_ABSTIME: the target is on the guest's clock,
-                         * which is not the one the wait is measured with. */
-                        struct timespec rt = {0}, mo = {0};
-                        clock_gettime(CLOCK_REALTIME, &rt);
-                        clock_gettime(CLOCK_MONOTONIC, &mo);
-                        int64_t offset = (int64_t)((uint64_t)mo.tv_sec * 1000000000ULL + mo.tv_nsec) -
-                                         (int64_t)((uint64_t)rt.tv_sec * 1000000000ULL + rt.tv_nsec);
-                        deadline = (uint64_t)((int64_t)ns + offset);
+                         * which is not the one the wait is measured with. A
+                         * monotonic target is guest uptime, so add the run's
+                         * host start; a realtime target needs the host's
+                         * realtime-to-monotonic offset. */
+                        switch ((int)a0) {
+                        case RVVM_CLOCK_MONOTONIC:
+                        case RVVM_CLOCK_MONOTONIC_RAW:
+                        case RVVM_CLOCK_MONOTONIC_COARSE:
+                        case RVVM_CLOCK_BOOTTIME:
+                            deadline = ns + uctx()->run_start_ns;
+                            break;
+                        default: {
+                            struct timespec rt = {0}, mo = {0};
+                            clock_gettime(CLOCK_REALTIME, &rt);
+                            clock_gettime(CLOCK_MONOTONIC, &mo);
+                            int64_t offset = (int64_t)((uint64_t)mo.tv_sec * 1000000000ULL + mo.tv_nsec) -
+                                             (int64_t)((uint64_t)rt.tv_sec * 1000000000ULL + rt.tv_nsec);
+                            deadline = (uint64_t)((int64_t)ns + offset);
+                            break;
+                        }
+                        }
                     }
                     uint64_t left = userland_sleep_until(deadline);
                     if (left) {
@@ -18690,7 +18791,20 @@ static void* rvvm_user_thread_wrap(void* arg)
                 case 153: // times
                     // TODO: Struct conversion!
                     rvvm_info("sys_times(%lx)", a0);
-                    a0 = errno_ret(times(to_ptr_wr(a0)));
+                    {
+                        /* The CPU times are the host's process accounting; the
+                         * return value is "ticks since boot", and the guest's
+                         * boot is the run start, not the host's. */
+                        struct tms tms;
+                        clock_t    host_ticks = times(&tms);
+                        struct tms* out = a0 ? to_ptr_wr(a0) : NULL;
+                        if (out) {
+                            *out = tms;
+                        }
+                        a0 = host_ticks == (clock_t)-1
+                           ? errno_ret(-1)
+                           : (rvvm_addr_t)(guest_uptime_ns() / 10000000ULL);
+                    }
                     break;
                 case 154: // setpgid
                     rvvm_info("sys_setpgid(%lx, %lx)", a0, a1);
@@ -18803,16 +18917,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                     break;
 case 179: // sysinfo
                     rvvm_info("sys_sysinfo(%lx)", a0);
-#ifdef __linux__
-                    // TODO: struct conversion(?)
-                    a0 = errno_ret(sysinfo(to_ptr_wr(a0)));
-#else
-                    /* No host sysinfo(): answer from the registry, so `ps`
-                     * (which calls it before walking /proc) gets a workable
-                     * structure instead of ENOSYS. */
+                    /* Always synthesized, including on Linux: the host's
+                     * sysinfo() would report the host's uptime and RAM. `ps`
+                     * (which calls this before walking /proc) gets the run's
+                     * own numbers instead. */
                     userland_fill_sysinfo(to_ptr_sz_wr(a0, sizeof(struct uapi_sysinfo)));
                     a0 = 0;
-#endif
                     break;
                 case 194: // shmget
                     rvvm_info("sys_shmget(%lx, %lx, %lx)", a0, a1, a2);
@@ -20485,6 +20595,10 @@ PUBLIC rvvm_machine_t* rvvm_user_create(void)
 
     rvvm_userland_t* ctx = safe_new_obj(rvvm_userland_t);
     ctx->machine      = machine;
+    /* Guest uptime starts here; a host monotonic clock read is allowed to fail
+     * into 0, which only makes the guest's uptime start at whatever the next
+     * read reports. */
+    ctx->run_start_ns = userland_monotonic_ns();
     /* Set per launch below; the fork path overwrites it for a child. */
     ctx->pid          = 0;
     vector_init(ctx->children);
