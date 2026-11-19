@@ -1,7 +1,7 @@
 # 任务：宿主信息暴露与 guest 默认特权收敛
 
 最后更新：2026-11-19
-状态：完成（C1–C8 已提交；遗留见第 7 节）
+状态：完成（C1–C9 已提交；遗留见第 7 节）
 分支：`android-abi-host`（当前工作分支，未新建分支）
 
 本文件是自包含的恢复文档：会话中断后按「目标」「提交计划」「测试环境」「恢复点」继续，
@@ -130,6 +130,7 @@
 | C6 | `1d5e6bc` | st_dev/st_ino/getdents 身份合成 |
 | C7 | `72eea66` | uptime/monotonic/btime rebase + futex 修正 |
 | C8 | `c5baea6` | uname/mounts 头 + GUEST_DEBUG strip |
+| C9 | `a115ef5` | statx 与 stat 的 dev/ino 对齐；`times()` tms 逐字段转换；Linux-only pty 参数修正 |
 
 ## 5. 测试环境（不要碰用户的实例）
 
@@ -245,7 +246,8 @@ ssh -i $key -p 7940 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o Bat
   `os.stat(...).st_ino`；
   `test_std` 的 `fstat(dirfd) agrees with stat(".") on dev/ino` 通过。
 - 未覆盖：Windows 上 `statx` 返回 ENOSYS，`test_std` 的 statx 段 SKIP；
-  statx 的 hash 分支需要在 Linux 宿主上复核（登记遗留）。
+  C9 已把 statx 的 dev/ino 与 stat 对齐，并加 test_std 断言，但 Linux 宿主运行仍被
+  既有 Linux 构建缺口挡住（登记 `issues/INDEX.md`）。
 - 设计取舍：只 hash `st_ino`，不混 host `st_dev`，这样 `stat`/`statx`/`getdents`
   三个入口对同一文件给同一个 guest ino；跨卷 inode 碰撞的概率留给 64 位 hash。
 
@@ -264,8 +266,8 @@ ssh -i $key -p 7940 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o Bat
   `FUTEX_CLOCK_REALTIME` 不 rebase）。test_std 的 futex 段从 1 FAIL 恢复到全 PASS。
 - 回归判据：`test_std` 154 checks / 1 failed（只剩既有的
   `a dup(2) of stdout keeps its /proc link name`，C6 前就存在），7 skipped。
-- 未覆盖：`clock_nanosleep` 只在 `__linux__` 下编译，Windows 上没跑到；`times()` 的
-  `struct tms` 布局是既有 TODO（Windows host/guest clock_t 宽度问题），本次只改返回值。
+- 未覆盖：`clock_nanosleep` 只在 `__linux__` 下编译，Windows 上没跑到；C7 当时只改了
+  `times()` 返回值，`struct tms` 布局由 C9 补上（4×64-bit 逐字段转换 + test_std 毒化检查）。
 - 注意：`clock_gettime` 的 REALTIME 保持宿主墙钟；内部 `userland_monotonic_ns` 仍用宿主，
   只有 guest 可见的返回值 rebase。
 
@@ -291,18 +293,33 @@ ssh -i $key -p 7940 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o Bat
 
 后续提交的恢复点在本文件追加。
 
+### C9 恢复点（2026-11-19 已提交，Linux 运行未覆盖）
+
+- 代码点：`RVVM_GUEST_DEV=1`（0:1）；`guest_path_is_host_backed()`；`statx` 只对
+  host-backed 路径用宿主 statx + 同 hash + dev 0/1，core 合成行返回 `ENOSYS`；
+  `struct uapi_tms`（4×int64，size 32）+ `times()` 逐字段转换；
+  `rvvm_session_pty_attach()` 的 Linux-only `userland_fds_write` 参数数量修正。
+- 验证：
+  1. Windows host 构建通过；`test_std` 从 154 checks 增到 159：
+     `times()` 5 项（毒化 4 字段、非负、guest uptime 对齐、NULL）全 PASS；
+     `statx` 仍 SKIP；唯一 FAIL 是既有 dup(2) 基线。
+  2. selftest 的 `stat device is the fixed guest dev 0:1 (1)` / inode 检查 PASS。
+  3. 用 `GUEST_DEBUG=0` 重打 guest assets/apps/system，`test_std` 的 times 段通过。
+- 未覆盖：WSL Linux 构建失败于既有缺口（`libvterm-0.3.3/libvterm.a` 是 mingw 产物；
+  `rvvm_user` 缺 `cmdpost_dispatch/init/end_run`），statx 的 Linux 运行验证仍待可构建
+  的 Linux 宿主。登记 `issues/INDEX.md` 的 `[build] [linux]`。
+
 ## 7. 遗留 / 待登记
 
-- `statx` 的 guest 身份合成只在 Linux 编译路径执行；Windows 上 `statx` 返回 ENOSYS，
-  `test_std` 的 statx 段 SKIP。需要 Linux 宿主复核 `stat` 与 `statx` 的 ino 一致。
-- `times()` 的 `struct tms` 仍是既有 TODO（Windows 上 host/guest `clock_t` 宽度可能不同）；
-  本次只把返回的“since boot” ticks 改成 guest uptime。
+- `statx` 已在代码上对齐 `stat` 的 dev 0:1/ino hash，并加了 `test_std` 断言；Windows
+  上仍 ENOSYS/SKIP，Linux 运行被既有 Linux 构建缺口挡住。
+- `times()` 已由 C9 修好并实测；不再是遗留。
 - Android 宿主未逐项实测：默认关 guest hostfs 是否影响 APK 内 app，需要真机/模拟器验证。
 - 用户现有的 `release.test.windows.x86_64/bundle` 仍是旧 debug 构建；需要下一次
   `build_virtpass.ps1` 重打 bundle，旧 guest 二进制里的构建路径才会消失。本次没有覆盖
   用户正在使用的树。
-- 仓库外技能 `c:/Users/linswin/.agents/skills/userland-vm/SKILL.md` 仍描述“无 token/共享
-  runtime/run”；若未同步，使用它的 agent 会按旧接口操作。
+- 仓库外技能 `c:/Users/linswin/.agents/skills/userland-vm/SKILL.md` 已于 2026-11-19
+  同步 token/per-instance run/hostfs/selftest 接口。
 - `test_std` 的 `a dup(2) of stdout keeps its /proc link name` 是 C6 前就有的基线 FAIL，
   与本次改动无关。
 

@@ -38,7 +38,7 @@
 | `1d5e6bc` | `st_dev` 固定、`st_ino=hash(host ino)`；`getdents64`/`statx` 同 hash |
 | `72eea66` | `run_start_ns` rebase uptime/monotonic/starttime/btime/times；futex/clock_nanosleep 单调 deadline 加 base |
 | `c5baea6` | `uname` 固定 `RVVM userland`；mounts 头 guest-facing；`GUEST_DEBUG=0` 时 `-O2 -s`，bundle 默认剥离 |
-| 后续 | `statx` 对 host-backed 路径与 `stat` 用同一 dev 0:1/ino hash；core 合成行返回 `ENOSYS`；`times()` 按 guest 4×64-bit `struct tms` 逐字段转换 |
+| `a115ef5` | `statx` 对 host-backed 路径与 `stat` 用同一 dev 0:1/ino hash；core 合成行返回 `ENOSYS`；`times()` 按 guest 4×64-bit `struct tms` 逐字段转换 |
 
 ## 验证
 
