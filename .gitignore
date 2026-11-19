@@ -43,6 +43,9 @@
 !/AGENTS.md
 !/docs/
 !/workflows/
+# Agent skills kept with the project (the harness also installs them under
+# ~/.agents/skills; this copy is what gets reviewed and carried around)
+!/skills
 
 # Explicitly track repository metadata
 !/README*
