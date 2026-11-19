@@ -110,7 +110,7 @@
 | C2 | `fix(supervisor): require a token and stop returning host paths` | token、鉴权、API 字段、us/ws/UI | 完成（待提交） |
 | C3 | `fix(supervisor): isolate each instance's /run/vpsessiond` | per-instance run dir + `--run-dir` | 完成（待提交） |
 | C4 | `fix(ash): keep guest mode store and lock outside the guest root` | sidecar + 跳过 hostfs chmod + 清理 | 完成（待提交） |
-| C5 | `fix(core): answer statfs without host disk numbers` | statfs/fstatfs 合成 | 待做 |
+| C5 | `fix(core): answer statfs without host disk numbers` | statfs/fstatfs 合成 | 完成（待提交） |
 | C6 | `fix(core): synthesize guest file identity` | st_dev/st_ino/getdents/statx | 待做 |
 | C7 | `fix(core): rebase guest uptime and monotonic clock` | uptime/sysinfo/starttime/btime | 待做 |
 | C8 | `fix(build): remove host build paths from guest-visible metadata` | uname/comment + 构建路径 | 待做 |
@@ -210,6 +210,16 @@ ssh -i $key -p 7940 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o Bat
 - 备注：sidecar 仍按宿主路径记录 rootfs 内文件（这是 mode store 的键），但它在 rootfs 外，
   guest 不可见；hostfs 路径不写入。旧实例（旧二进制）内的 `rootfs.modes` 需要 `us rm`
   或重启到新二进制后才消失。
+
+### C5 恢复点（2026-11-19 已跑）
+
+- 代码点：`rvvm_user.c` `synthetic_fill_statfs()`（ext4 magic，固定 1 GiB/64 MiB）、
+  `rvvm_sys_statfs_abs()` 增加 root（`mount_row_is_root` 先于通用 hostfs）与 hostfs 分支、
+  `statfs64` 不再调用宿主 `statfs()`、`fstatfs64` 对宿主持久 fd 用预算。
+- 验证：selftest 的 `stat -f /` 为 `Total: 262144 Free: 196608`（1 GiB），
+  `/run/vpsessiond` 为 `Total: 16384 Free: 12288`（64 MiB），输出无宿主 inode/usage 数。
+- 备注：root 是 host-backed 时 provider 是 `RVVM_MOUNT_HOSTFS`，所以必须先按
+  `mount_row_is_root()` 判断，不能按 provider 判 root；这是第一次测试失败的原因。
 
 后续提交的恢复点在本文件追加。
 

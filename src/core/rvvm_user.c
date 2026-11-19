@@ -5570,14 +5570,44 @@ static void core_fill_statfs(struct statfs* st, const char* fstype)
     st->f_frsize  = 4096;
 }
 
+/* statfs(2) for a host-backed row. The blocks are a fixed guest budget, not the
+ * host volume's: a guest that can read 1000G/97% is reading the host's disk
+ * usage, and a `df` is not worth that. The root gets a plausible 1 GiB; a
+ * hostfs mount gets a smaller fixed budget. Neither number is a quota - the
+ * host still stores the bytes - but they are the guest's view, not the host's
+ * own accounting. */
+#define RVVM_STATFS_EXT4_MAGIC 0x0000EF53u
+#define RVVM_GUEST_ROOT_BYTES  (1024ULL * 1024ULL * 1024ULL)
+#define RVVM_GUEST_HOSTFS_BYTES (64ULL * 1024ULL * 1024ULL)
+
+static void synthetic_fill_statfs(struct statfs* st, uint64_t bytes,
+                                  uint64_t files)
+{
+    const uint64_t bsize = 4096;
+    uint64_t       blocks = bytes / bsize;
+    uint64_t       free_blocks = blocks / 4 * 3;
+
+    memset(st, 0, sizeof(*st));
+    st->f_type    = RVVM_STATFS_EXT4_MAGIC;
+    st->f_bsize   = (long)bsize;
+    st->f_frsize  = (long)bsize;
+    st->f_blocks  = (long)blocks;
+    st->f_bfree   = (long)free_blocks;
+    st->f_bavail  = (long)free_blocks;
+    st->f_files   = (long)files;
+    st->f_ffree   = (long)(files / 4 * 3);
+    st->f_namelen = 255;
+}
+
 /* statfs(2)/fstatfs64(2) against the table.
  *
  * statfs is a question about a filesystem, and which filesystem answers is what
  * the table says: the row covering the path replies out of its own state - a
- * memfs from its storage, a core row from fixed superblock facts - and the
- * caller falls through to the host only for a hostfs row, whose bytes really
- * are the host's and whose statfs is therefore the true one. Returns false when
- * the table has no answer and the host should be asked.
+ * memfs from its storage, a core row from fixed superblock facts, a host-backed
+ * row from the fixed guest budget above. Nothing falls through to the host
+ * statfs: the host volume's capacity/usage is host information, and a guest
+ * reading `df` must not learn it. Returns false only when the table has no row
+ * at all.
  *
  * The reference is taken under the namespace lock and the storage is asked
  * after it, so an unmount on another thread cannot free what this call is
@@ -5612,6 +5642,18 @@ static bool rvvm_sys_statfs_abs(const char* abs, struct statfs* st)
     } else if (owner.mount && (owner.provider == RVVM_MOUNT_CORE ||
                                !strcmp(fstype, "sysfs"))) {
         core_fill_statfs(st, fstype);
+        answered = true;
+    } else if (owner.mount && mount_row_is_root(owner.mount)) {
+        /* A host-backed root is a HOSTFS row by provider (see
+         * mount_root_set_backing), so the path test has to come before the
+         * generic hostfs budget. */
+        synthetic_fill_statfs(st, RVVM_GUEST_ROOT_BYTES, 65536);
+        answered = true;
+    } else if (owner.mount && owner.provider == RVVM_MOUNT_HOSTFS) {
+        synthetic_fill_statfs(st, RVVM_GUEST_HOSTFS_BYTES, 16384);
+        answered = true;
+    } else if (!owner.mount) {
+        synthetic_fill_statfs(st, RVVM_GUEST_ROOT_BYTES, 65536);
         answered = true;
     }
     return answered;
@@ -16873,14 +16915,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = -UAPI_EFAULT;
                         break;
                     }
-                    /* The filesystem the path belongs to answers first, and a
-                     * hostfs row (or no row at all) falls through to the host -
-                     * whose statfs is then the true one rather than the default. */
-                    if (guest_path_abs_of(UAPI_AT_FDCWD, to_str(a0), abs, sizeof(abs)) &&
-                        rvvm_sys_statfs_abs(abs, &stfs)) {
+                    /* The row covering the path answers; a path the table
+                     * cannot place still gets the guest's fixed budget rather
+                     * than the host's volume numbers. Nothing here asks the
+                     * host's statfs. */
+                    if (guest_path_abs_of(UAPI_AT_FDCWD, to_str(a0), abs,
+                                          sizeof(abs))) {
+                        if (!rvvm_sys_statfs_abs(abs, &stfs)) {
+                            synthetic_fill_statfs(&stfs,
+                                                  RVVM_GUEST_ROOT_BYTES, 65536);
+                        }
                         a0 = 0;
                     } else {
-                        a0 = errno_ret(statfs(wrap_guest_path(path_buf, UAPI_AT_FDCWD, to_str(a0)), &stfs));
+                        a0 = -UAPI_ENOENT;
                     }
                     uapi_statfs64_convert(out, &stfs);
                     break;
@@ -16908,7 +16955,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                         core_fill_statfs(&stfs, userland_proc_is_fd(hfd) ? "proc" : "devtmpfs");
                         a0 = 0;
                     } else {
-                        a0 = errno_ret(fstatfs(hfd, &stfs));
+                        /* A host-backed descriptor. Its filesystem is the
+                         * run's root or a hostfs row; either way the host
+                         * volume's numbers are not the guest's to read. */
+                        synthetic_fill_statfs(&stfs, RVVM_GUEST_ROOT_BYTES,
+                                              65536);
+                        a0 = 0;
                     }
                     uapi_statfs64_convert(out, &stfs);
                     break;

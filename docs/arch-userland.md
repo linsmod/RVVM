@@ -29,6 +29,8 @@
   不是 guest root 的自带权限。宿主用 `rvvm_user_mount_hostfs()` 预挂载不受影响；
   `rvvm_ash --allow-guest-hostfs` / `rvvm_user_set_guest_hostfs()` 是显式授权，测试与
   WSL 形态才打开。默认关是 2026-11-19 宿主信息收敛的一部分。
+- **`statfs`/`df` 不回宿主磁盘数字**：rootfs 行报 1 GiB、hostfs 行报 64 MiB 的固定 guest 预算，
+  不落回宿主 `statfs()`；`fstatfs` 对宿主持久 fd 同样用预算。数字不是配额，只是 guest 视图。
 - **per-instance mode store / rootfs lock 是 rootfs 外的 sidecar**：
   `<rootfs>.modes` / `<rootfs>.lock`；`<rootfs>` 是 guest 的 `/`，所以这两个文件不再
   出现在 guest 里。mode store 只持久化 prefix 内的路径，hostfs chmod 的宿主路径不写入。

@@ -255,6 +255,20 @@ def main():
             fails += check(
                 re.search(r"RC=([1-9]\d*)", r.stdout) is not None,
                 "guest hostfs is denied by default (%r)" % r.stdout.strip())
+
+            # C5: df/statfs is the fixed guest budget, not the host volume.
+            r = run_ssh(key, p1, "stat -f /; stat -f /run/vpsessiond")
+            fails += check("Total: 262144" in r.stdout and
+                           "Free: 196608" in r.stdout,
+                           "root statfs is the synthetic 1 GiB budget (%r)"
+                           % r.stdout.strip())
+            fails += check("Total: 16384" in r.stdout and
+                           "Free: 12288" in r.stdout,
+                           "hostfs statfs is the synthetic 64 MiB budget (%r)"
+                           % r.stdout.strip())
+            fails += check("255012694" not in r.stdout and
+                           "7131305" not in r.stdout,
+                           "statfs has no host inode/usage numbers")
         finally:
             for port in started:
                 api(token, "DELETE", "/api/instances/%d" % port,
