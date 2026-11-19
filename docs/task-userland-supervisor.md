@@ -138,6 +138,20 @@ release 树内，换树还等于换了一整套实例状态。
 仍选 `release.test`；重启托盘任务后 `us health` / `us start` / `us exec` 正常，
 实例 7916 `running`。
 
+## S3 v5：sshd 就绪汇报（2026-11-19）
+
+`running` 之前只表示「core 注册了、pid 活着」，比 ssh 可用早约 0.5–1 秒。现在由
+guest 的 `/sbin/vpshhd` 在 `listen()` 成功后写 `<release>/runtime/run/<port>.ready`
+（tmp+rename，内容 `pid=`/`port=`），daemon 的 `start()` 以该标记为就绪条件：
+
+- spawn 前清掉同端口旧标记；等到标记才置 `running`，上限仍 25 s；
+- 旧 guest 没有标记时，live core 满 8 s 且 TCP 可连 → 按就绪处理并打日志（兼容兜底）；
+- core 先死 → note `core exited before sshd was ready`；一直不ready → `sshd not ready within 25s`；
+- `GET /api/instances` 增加 `ssh_ready`。
+
+实测：`us start` 1.35 s 返回，随后立即 `us exec` 成功（旧行为 1.8 s 返回、2.3 s 才能连）；
+杀掉 core 后 1 秒内判定 failed 且 note 正确。设计见 `design-userland-supervisor.md` §4.2。
+
 ## 本机部署（traycmd 托盘，2026-11-18）
 
 daemon 已注册为托盘命令（webui-demo 实例在 daemon 换手后由 reconcile 无缝保留）：

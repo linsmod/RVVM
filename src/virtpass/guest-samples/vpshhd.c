@@ -222,6 +222,38 @@ static void vp_serve(int listener, int conn)
     _exit(127);
 }
 
+/* Tell whoever started this core that ssh is actually listening.
+ *
+ * The supervisor's `start` used to call an instance running as soon as the
+ * core's registry file appeared, which is before the guest has booted and
+ * before this listener exists - so the first ssh could still be refused. The
+ * marker is written after listen() succeeded and lands in the same host-visible
+ * mount as vpshhd.log (the run directory the host passes in at /run/vpsessiond),
+ * so a host-side supervisor can wait for it instead of guessing. Without that
+ * mount (a dev run) there is nobody to tell and nothing breaks. */
+static void vp_report_ready(int port)
+{
+    char  path[64];
+    char  tmp[64];
+    FILE *f;
+
+    snprintf(path, sizeof path, VP_RUN_DIR "/%d.ready", port);
+    snprintf(tmp, sizeof tmp, VP_RUN_DIR "/%d.ready.tmp", port);
+    f = fopen(tmp, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "pid=%ld\nport=%d\n", (long) getpid(), port);
+    fclose(f);
+    /* Rename, not create: the reader polls for the file, and half a line is
+     * worse than no line. */
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return;
+    }
+    fprintf(stderr, "vpshhd: ready (%s)\n", path);
+}
+
 int main(int argc, char **argv)
 {
     int port = VP_SSH_PORT;
@@ -263,6 +295,7 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "vpshhd: listening on %s:%d\n", VP_SSH_ADDR, port);
+    vp_report_ready(port);
 
     for (;;) {
         int conn = accept(listener, 0, 0);
@@ -280,5 +313,12 @@ int main(int argc, char **argv)
     }
 
     close(listener);
+    {
+        /* The listener is gone, so the claim would be a lie until the next
+         * boot. The host removes it too - a killed core never gets here. */
+        char path[64];
+        snprintf(path, sizeof path, VP_RUN_DIR "/%d.ready", port);
+        unlink(path);
+    }
     return 0;
 }

@@ -36,6 +36,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 DAEMON_VERSION = "0.2.0"
 STARTING_GRACE_S = 25      # ceiling for a start, not the typical time: a core
                            # registers in ~2 s and its ssh answers right after
+READY_FALLBACK_S = 8       # by then a TCP connect may stand in for the marker
+                           # (a guest built before vpshhd wrote one)
 STOP_GRACE_S = 10
 EXEC_TIMEOUT_S = 60
 PORT_BASE = 7910           # 7900 is the dev/test port, instances start above it
@@ -418,6 +420,7 @@ class Supervisor:
                                 stopped_at=now_iso())
                     self.db.event(port, "crashed",
                                   "core registry gone or pid dead")
+                    self.drop_ready(port)
             elif row["actual"] in ("crashed", "stopped", "failed", "orphan"):
                 if live:
                     # A stopped record with a live core means someone started
@@ -463,6 +466,49 @@ class Supervisor:
     def log_path(self, port):
         return os.path.join(self.sup_dir, "%d.log" % port)
 
+    # -- readiness ---------------------------------------------------------
+
+    def ready_path(self, port):
+        """Where the guest's ssh listener says it is up.
+
+        `runtime/run` is the host directory the guest sees as /run/vpsessiond
+        (the same one auth.pub crosses), so vpshhd's marker is visible here the
+        moment listen() succeeded - no TCP probe, no guessing from the registry
+        (which appears before the guest has even booted)."""
+        return os.path.join(self.release, "runtime", "run", "%d.ready" % port)
+
+    def drop_ready(self, port):
+        try:
+            os.remove(self.ready_path(port))
+        except OSError:
+            pass
+
+    def wait_ready(self, port, started_at, child_pid=None):
+        """("ready"|"dead"|"timeout", pid). The marker is the answer; a live
+        core with no marker after READY_FALLBACK_S falls back to a TCP connect,
+        logged, so an older guest still works instead of failing the start."""
+        deadline = started_at + self.grace
+        seen_pid = None
+        while time.time() < deadline:
+            time.sleep(0.25)
+            info = core_snapshot(self.release).get(port)
+            if info and info["alive"]:
+                seen_pid = info["pid"]
+                if os.path.isfile(self.ready_path(port)):
+                    return "ready", seen_pid
+                if time.time() - started_at >= READY_FALLBACK_S and tcp_open(port):
+                    log_line("port %d: ssh answers but no readiness marker - "
+                             "guest predates it? using the TCP probe" % port)
+                    return "ready", seen_pid
+            elif info is not None:
+                # The registry is there and its pid is gone: the core died.
+                return "dead", seen_pid
+            elif child_pid and time.time() - started_at > 1.0 and \
+                    not pid_alive(child_pid):
+                # Died before it ever wrote a registry file.
+                return "dead", seen_pid
+        return "timeout", seen_pid
+
     # -- listing -----------------------------------------------------------
 
     def listing(self):
@@ -472,6 +518,8 @@ class Supervisor:
             item = dict(row)
             item["tcp"] = tcp_open(row["port"]) if row["actual"] in (
                 "starting", "running") else False
+            item["ssh_ready"] = (row["actual"] == "running" and
+                                 os.path.isfile(self.ready_path(row["port"])))
             item["registry"] = snap.get(row["port"])
             out.append(item)
         return out
@@ -522,6 +570,10 @@ class Supervisor:
                            % (self.release, ", ".join(missing)))
         logp = self.log_path(port)
         rootfs = self.new_rootfs_dir(port)
+        # The marker is per port and lives in a tree-shared directory: whatever
+        # is there belongs to a previous instance, never to the one about to
+        # boot.
+        self.drop_ready(port)
         env = dict(os.environ)
         env["RVVM_LOG_FILE"] = logp
         argv = [self.ash, "--serve", "--port", str(port),
@@ -538,8 +590,8 @@ class Supervisor:
             kwargs["start_new_session"] = True
         logf = open(logp, "ab")
         try:
-            subprocess.Popen(argv, cwd=self.release, env=env,
-                             stdout=logf, stderr=logf, **kwargs)
+            proc = subprocess.Popen(argv, cwd=self.release, env=env,
+                                    stdout=logf, stderr=logf, **kwargs)
         except OSError as e:
             logf.close()
             raise ApiError(500, "could not spawn %s: %s" % (self.ash, e))
@@ -563,19 +615,20 @@ class Supervisor:
             raise ApiError(500, "core started but could not be recorded; "
                            "it was terminated to avoid an orphan")
         self.db.event(port, "start", rootfs)
-        deadline = time.time() + self.grace
-        while time.time() < deadline:
-            time.sleep(0.5)
-            snap = core_snapshot(self.release)
-            if port in snap and snap[port]["alive"]:
-                self.db.set(port, actual="running", pid=snap[port]["pid"])
-                self.db.event(port, "running",
-                              "pid=%d" % snap[port]["pid"])
-                return {"port": port, "actual": "running",
-                        "pid": snap[port]["pid"]}
+        started_at = time.time()
+        outcome, pid = self.wait_ready(port, started_at, proc.pid)
+        if outcome == "ready":
+            self.db.set(port, actual="running", pid=pid)
+            self.db.event(port, "running", "pid=%s, sshd ready" % pid)
+            return {"port": port, "actual": "running", "pid": pid}
+        if outcome == "dead":
+            self.db.set(port, actual="failed", stopped_at=now_iso(),
+                        note="core exited before sshd was ready - see %s" % logp)
+            self.db.event(port, "failed", "core exited before sshd was ready")
+            return {"port": port, "actual": "failed"}
         self.db.set(port, actual="failed", stopped_at=now_iso(),
-                    note="no live core within %ds - see %s" % (self.grace, logp))
-        self.db.event(port, "failed", "no live core within %ds" % self.grace)
+                    note="sshd not ready within %ds - see %s" % (self.grace, logp))
+        self.db.event(port, "failed", "sshd not ready within %ds" % self.grace)
         return {"port": port, "actual": "failed"}
 
     def stop(self, port):
@@ -610,6 +663,7 @@ class Supervisor:
             self.db.set(port, desired="stopped", actual="stopped", pid=None,
                         stopped_at=now_iso())
         self.db.event(port, "stopped", "")
+        self.drop_ready(port)
 
     # -- exec ---------------------------------------------------------------
 

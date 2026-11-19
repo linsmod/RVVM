@@ -91,6 +91,23 @@ daemon 单例：绑定前先 `GET /api/health` 探测目标端口，已有 daemo
 对方的 version/release。`SO_REUSEADDR` 在 Windows 上允许第二个进程绑正在 LISTEN 的
 端口，两个 daemon 各持一份 DB 会表现为 `stop` 时好时坏、两次 `list` 结果不同。
 
+### 4.2 就绪汇报（2026-11-19）
+
+`running` 曾经等于「core 注册表里有这一行且 pid 活着」——那是 host 侧 core 起来，
+guest 还没 boot，第一次 ssh 仍可能被拒。现在由**真正监听的那个进程**汇报：
+
+| 环节 | 行号/文件 | 行为 |
+|---|---|---|
+| guest | `src/virtpass/guest-samples/vpshhd.c` | `listen()` 成功后写 `/run/vpsessiond/<port>.ready`（tmp + rename 原子落盘，内容 `pid=` / `port=`），监听器退出时删除 |
+| 宿主可见性 | 同一目录 | `/run/vpsessiond` 就是 host 的 `<release>/runtime/run`（auth.pub、vpshhd.log 都走它），所以 daemon 直接看到文件出现 |
+| daemon 启动 | `Supervisor.wait_ready()` | spawn 前先删掉同端口的旧标记；`start()` 等到标记出现才置 `running`（上限仍是 `STARTING_GRACE_S`） |
+| 兼容旧 guest | `READY_FALLBACK_S = 8` | live core 8 秒内没有标记、但 TCP 能连上 → 按就绪处理并**打日志**说明用了 TCP 兜底 |
+| 失败区分 | `start()` | core 先死 → `core exited before sshd was ready`；一直没就绪 → `sshd not ready within 25s`，两者都带实例日志路径 |
+| 观测 | `GET /api/instances` | 新增 `ssh_ready`（`actual == running` 且标记存在） |
+
+实测（2026-11-19，本机）：`us start` 1.35 s 返回，返回后**立即** `us exec` 成功；
+旧行为是 1.8 s 返回但 2.3 s 才连得上。杀掉 core 后 1 秒内即判 `failed` 并给出正确 note。
+
 ## 5. API 面（v1 + v2 终端，CLI 与 web 共用）
 
 | 方法 | 路径 | 语义 |
