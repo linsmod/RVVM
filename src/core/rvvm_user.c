@@ -142,7 +142,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "rvvmlib.h"
 
 #if defined(_WIN32)
-#include <io.h>     // _get_osfhandle(), for "is this number still open?"
+#include <io.h>      // _get_osfhandle(), for "is this number still open?"
+#include <windows.h> // GetFileType(), for "is this a disk file?"
 
 
 /* win_socket.c owns the WinSock-backed descriptors (see win_socket.h). The
@@ -8277,10 +8278,30 @@ static bool fd_lock_file_info(rvvm_userland_t* ctx, int host_fd,
         *cur = md->off;
         return true;
     }
+    if (host_fd < 0) {
+        return false;
+    }
+#if defined(_WIN32)
+    /* Only a disk file can carry a record lock, and the CRT is not a safe way
+     * to ask what a handle is: _fstat64() answers a pipe's size through
+     * PeekNamedPipe(), which can wait on a synchronous pipe. This runs on every
+     * close and every fcntl, so a close() that happened to pick a pipe would
+     * never return - the sshd session path closes inherited pipes while it
+     * sets a child up, and that is exactly where a whole session wedged.
+     * GetFileType() is the cheap, non-blocking question; NUL, pty and socket
+     * numbers are not CRT descriptors and fail it too. */
+    {
+        intptr_t handle = _get_osfhandle(host_fd);
+        if (handle == (intptr_t)-1 ||
+            GetFileType((HANDLE)handle) != FILE_TYPE_DISK) {
+            return false;
+        }
+    }
+#endif
     {
         struct stat st;
         off_t       pos;
-        if (host_fd < 0 || fstat(host_fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (fstat(host_fd, &st) != 0 || !S_ISREG(st.st_mode)) {
             return false;
         }
         *dev = (uint64_t)st.st_dev;

@@ -64,3 +64,37 @@ trace 显示 `setlk -> ok`、`getlk -> type=0 ...`、`setlkw waiting (owner pid 
 - `F_OFD_*` 未实现；标准 SQLite unix VFS 使用 `F_SETLK`，如启用 OFD 变体需另加。
 - 跨 supervisor 实例（不同 core 进程）访问同一 DB 文件时，锁表不共享；这是
   emulator-owned 锁的边界，必要时可叠加宿主锁，但会重新引入 per-host-process owner。
+
+## 后续修复（同日）：close 钩子对管道做 fstat 导致 SSH 会话卡死
+
+### 现象
+
+`5e9b73a` 之后，supervisor 起的实例 `us start` 成功，但 `us exec` / direct ssh
+一直停在 KEX（客户端收到服务端 KEXINIT 后等 ECDH_REPLY），10s 也不返回；直接
+`rvvm_user` 跑 fcntl 探针仍 PASS。用 supervisor 的 spawn 方式
+（`DETACHED_PROCESS`、`stdin=DEVNULL`）可稳定复现，约 1/3 概率失败。
+
+### 根因
+
+`userland_fd_close()` 在 close 分派前调用 `fd_lock_release_file()`，后者用
+`fd_lock_file_info()` 求文件身份。Windows 的 `_fstat64()` 对管道会调用
+`PeekNamedPipe()`；同步管道上该调用可能一直等待。sshd 建立会话时关闭继承的
+管道，close 线程就停在 `_fstat64 → PeekNamedPipe`，整个会话不再推进。
+
+gdb 对卡住的 core 间隔 10s 取两次栈，完全一致：
+`fd_lock_file_info ← userland_fd_close ← ... ← msvcrt!_fstat64 ← PeekNamedPipe`。
+问题不在 anchor 或 `/dev`/procfs 合成号（`_get_osfhandle()` 对它们返回 -1）。
+
+### 修法
+
+`fd_lock_file_info()` 在 memfs 检查后加边界：`host_fd < 0` 返回 false；Windows
+上 `_get_osfhandle()` 无效或 `GetFileType() != FILE_TYPE_DISK` 返回 false，之后
+才允许 `fstat`。锁表、owner、区间、close 语义都不变。
+
+### 验证
+
+- supervisor 方式 spawn 的 core：10/10 次 ssh 探针（5s 上限）通过。
+- `us start` + `us exec` 正常；随后 direct ssh 5/5 通过。
+- `probe_fcntl_simple`、`probe_fcntl_lock` 仍 PASS。
+- `test_std`：159 checks / 1 failed / 7 skipped，唯一失败是既有的
+  `a dup(2) of stdout keeps its /proc link name` 基线项。

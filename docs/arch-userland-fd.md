@@ -81,6 +81,12 @@ guest 的 `fork` 在宿主进程里用线程模拟，父子两个 ctx 各有槽�
 
 最后统一 `userland_fds_write(ctx, fd, used=false, ...)` 清槽。
 
+close 之前还要处理 POSIX 记录锁：`fd_lock_release_file()` 需要文件身份（dev+ino）。
+身份只存在于 memfs 或普通磁盘文件上。Windows 上必须先 `GetFileType()` 确认是
+`FILE_TYPE_DISK` 再 `fstat`：`_fstat64()` 对管道会走 `PeekNamedPipe()`，可能一直
+等待。这一步对每个非 console 槽都会执行，所以不能用 `fstat` 去探类型；锚号与
+`/dev`/procfs 合成号由 `_get_osfhandle()` 的无效返回直接排除。
+
 ## 6. 宿主号的所有权
 
 宿主号**按槽私有**：一个号只属于一个 address space 里的一个槽。fork 用 `dup()` 给子进程另做一个号，`dup2` 复制时也另做，`open()` 给出一个没有别处命名的号。因此关闭一个槽就关闭它的号，不需要问「还有谁在用」。
