@@ -2347,6 +2347,11 @@ char*                    guest_root_path;
     // form is the *family*, and it is what a process group is searched in: a
     // session's terminal must be able to signal a group whose members live in
     // address spaces other than the one that wrote to it.
+    // The pid namespace this address space belongs to: the root of the fork
+    // tree it was created in. Unlike parent_ctx this survives the death of the
+    // immediate parent (Linux reparents to init inside the same namespace),
+    // which is what lets an orphan still signal its former relatives.
+    struct rvvm_userland*         family_root_ctx;
     struct rvvm_userland*         parent_ctx;
     // Every address space this one forked. The family is otherwise only
     // linked upwards, and that upward link is the one that goes stale: a
@@ -7609,6 +7614,11 @@ static rvvm_userland_t* userland_proc_ctx(rvvm_userland_t* ctx, rvvm_process_t* 
 #define USERLAND_FAMILY_DEPTH_MAX 256
 static rvvm_userland_t* userland_family_root(rvvm_userland_t* ctx)
 {
+    if (ctx && ctx->family_root_ctx) {
+        /* The namespace recorded at fork time: an orphan whose parent_ctx was
+         * cleared still belongs to it. */
+        return ctx->family_root_ctx;
+    }
     rvvm_userland_t* root = ctx;
     for (int i = 0; root && root->parent_ctx && i < USERLAND_FAMILY_DEPTH_MAX; ++i) {
         root = root->parent_ctx;
@@ -10423,6 +10433,13 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
      * one that reads the keyboard), and the console's foreground group - the
      * child answers to the same terminal the parent does. */
     ctx->parent_ctx  = parent;
+    /* The pid namespace is wider than the immediate parent: reparenting to init
+     * on Linux keeps an orphan in it, and this is what lets one still reach its
+     * former relatives (`timeout`'s watchdog killing the command it wraps after
+     * the process in between has exited). Cached here so detaching the parent
+     * does not shrink the family to the orphan itself. */
+    ctx->family_root_ctx = parent->family_root_ctx
+                         ? parent->family_root_ctx : parent;
     /* ...and the other half of that link, filed on the parent: it is the only
      * record of this address space that outlives the parent (see the children
      * field, and userland_detach_family). */
@@ -12405,6 +12422,10 @@ static size_t userland_signal_group(rvvm_userland_t* ctx, uint32_t pgid, uint32_
     return group.count;
 }
 
+/* Defined with /proc, far below; kill(2) above it needs the family-wide lookup. */
+static rvvm_process_t* userland_proc_find_family(rvvm_userland_t* ctx, uint32_t pid,
+                                                 rvvm_userland_t** home);
+
 /* Route a signal at @pid and return the guest errno to hand back, 0 on success.
  *
  * The pid selects what is signalled, as on Linux:
@@ -12451,7 +12472,13 @@ static rvvm_addr_t userland_signal_pid(rvvm_userland_t* ctx, rvvm_user_thread_t*
         return 0;
     }
 
-    rvvm_process_t* target = userland_proc_find(ctx, (uint32_t)pid);
+    /* A pid names a process in the whole family, not only in the caller's own
+     * registry: a shell's `kill $PPID`, `timeout`'s watchdog killing the
+     * command it wraps, and `kill -0 <ancestor>` are all cross-address-space
+     * here, because every fork() is. Looking only in ctx->procs made all of
+     * them ESRCH. */
+    rvvm_userland_t* home = NULL;
+    rvvm_process_t*  target = userland_proc_find_family(ctx, (uint32_t)pid, &home);
     if (!target) {
         return -UAPI_ESRCH;
     }
@@ -12467,7 +12494,7 @@ static rvvm_addr_t userland_signal_pid(rvvm_userland_t* ctx, rvvm_user_thread_t*
         return 0;
     }
 
-    userland_proc_signal(ctx, target, sig);
+    userland_proc_signal(home ? home : ctx, target, sig);
     userland_proc_unref(target);
     return 0;
 }
@@ -12716,6 +12743,8 @@ static void* userland_itimer_thread(void* arg)
         /* pid 0: the signal is for whoever is running here, which is the only
          * process a timer can mean. Undeliverable (no handler) means the
          * default disposition, exactly as kill(2) reports it. */
+        RVVM_TRC(RVVM_TRC_SIGNAL, "itimer: pid %u expired, SIGALRM to the main thread",
+                  it->ctx->pid);
         userland_signal_pid(it->ctx, it->ctx->userland_main_thread, 0, UAPI_SIGALRM);
     }
     return NULL;
@@ -12760,6 +12789,9 @@ static rvvm_addr_t userland_setitimer_real(rvvm_userland_t* ctx,
     }
     it->interval_ns = value_ns ? interval_ns : 0;
     it->deadline_ns = value_ns ? (now + value_ns) : 0;
+    RVVM_TRC(RVVM_TRC_SIGNAL, "itimer: pid %u arms value=%llu ns interval=%llu ns (now %llu)",
+              ctx->pid, (unsigned long long)value_ns, (unsigned long long)interval_ns,
+              (unsigned long long)now);
     if (value_ns && !it->started) {
         it->started = true;
         start = true;
@@ -21359,6 +21391,11 @@ static void userland_detach_records(rvvm_userland_t* dying, rvvm_userland_t* ctx
         }
     }
     spin_unlock(&ctx->proc_lock);
+    /* The namespace's root is going away: whoever named it becomes its own
+     * root rather than keeping a pointer to freed memory. */
+    if (ctx->family_root_ctx == dying) {
+        ctx->family_root_ctx = NULL;
+    }
 }
 
 /* Detach @node - which stays alive - and everything forked below it. */
