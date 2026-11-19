@@ -656,6 +656,15 @@ class Supervisor:
             raise ApiError(500, "release %s cannot run instances: missing %s"
                            % (os.path.basename(self.release),
                               ", ".join(missing)))
+        if label:
+            # A label is how a client names an instance ("vm --label web"), so
+            # it has to pick exactly one live machine. Rows written before this
+            # check can still share one; the client copes with those.
+            for row in self.db.instances():
+                if row["port"] != port and (row["label"] or "") == label and \
+                        row["actual"] in ("starting", "running"):
+                    raise ApiError(409, "label %r is already used by port %d"
+                                   % (label, row["port"]))
         logp = self.log_path(port)
         rootfs = self.new_rootfs_dir(port)
         # One run directory per instance: auth.pub, the readiness marker and the

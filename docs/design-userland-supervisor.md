@@ -154,8 +154,14 @@ vm                       交互 shell（pty：^C、^D、窗口大小、vi 都正
 vm -c "uname -m"         一次性执行，退出码就是 guest 命令的退出码
 vm --list                哪些实例可连
 vm --port 7929 -c "ls /" 指定实例（默认取端口最小、即最早起的那个 running；多个实例时先探测，打不通的跳过并说明）
+vm --label web -c "ls /" 按标签选实例（标签在活着的实例之间唯一）
 vm --start               没有 running 实例时先起一个
 ```
+
+**标签**：`us start [--port N] [label]` 里的 label 是给人用的名字，不是自由标签云。
+`start()` 拒绝与**运行中/启动中**实例重名的 label（409，并指出占用它的端口）；停掉旧实例后
+可以复用同一个名字。旧版本库里可能留下的重复标签由客户端兜底：`vm --label X` 命中多个时
+取第一个能连上的，并在 stderr 说明实际用了哪个端口。匹配是精确且区分大小写的。
 
 token/key 解析与 `us.py` 同一套（`--url/--token/--token-file` → 环境变量 →
 最新的 `release.*/runtime/supervisor/token`，私钥在同目录 `id_ed25519`）。

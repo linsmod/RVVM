@@ -105,12 +105,14 @@ ssh -tt -i $key -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o LogLeve
 ```powershell
 vm                                   # 进交互 shell（pty：^C/^D/vi/窗口大小都正常）
 vm -c "uname -m; ls /"               # 一次性执行，退出码就是 guest 命令的
-vm --list                            # 有哪些 running 实例
+vm --list                            # 有哪些 running 实例（含标签）
+vm --label web -c "ls /data/app"     # 按标签选（标签在活实例间唯一，重名会被 409 拒绝）
 vm --port 7929 -c "cat /etc/hostname"
 vm --start                           # 没有 running 实例时先起一个
 ```
 
-- 默认连**端口最小（最早启动）的可用实例**：多实例时先做一次 `ssh true` 探测，打不通的跳过并在 stderr 说明，探测全失败则仍按第一个执行（探测只是方便，不是门槛）。`--port` 可指定。
+- 起实例时给名字：`python tools/supervisor/us.py start web`（label 是位置参数）。
+- 默认连**端口最小（最早启动）**的 running 实例；`--port` / `--label` 二选一。
 - token/key 与 `us.py` 同一套解析（`--url/--token/--token-file` → 环境变量 → 最新的
   `release.*/runtime/supervisor/token`，私钥在同目录 `id_ed25519`）。
 - 连不上时（ssh 退出码 255）会提示还有哪些实例可换，不做静默切换。

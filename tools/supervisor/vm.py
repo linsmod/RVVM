@@ -77,11 +77,33 @@ def reachable(release, port):
         return False
 
 
-def pick_instance(release, inst, wanted):
-    if wanted is not None:
-        match = [i for i in inst if int(i["port"]) == wanted]
+def pick_instance(release, inst, wanted_port, wanted_label):
+    if wanted_port is not None and wanted_label is not None:
+        uscli.die("use --port or --label, not both")
+    if wanted_port is not None:
+        match = [i for i in inst if int(i["port"]) == wanted_port]
         if not match:
-            uscli.die("no running instance on port %d (see `vm --list`)" % wanted)
+            uscli.die("no running instance on port %d (see `vm --list`)" % wanted_port)
+        return match[0]
+    if wanted_label is not None:
+        match = [i for i in inst if (i.get("label") or "") == wanted_label]
+        if not match:
+            labels = sorted({i.get("label") for i in inst if i.get("label")})
+            uscli.die("no running instance labelled %r (running labels: %s)"
+                      % (wanted_label, ", ".join(labels) or "none"))
+        if len(match) == 1:
+            return match[0]
+        # Labels are not unique in the database (a daemon from before the
+        # uniqueness check may have left duplicates): take a reachable one and
+        # say which, rather than failing on an otherwise usable machine.
+        for i in match:
+            if reachable(release, int(i["port"])):
+                print("vm: %d instances are labelled %r; using port %s"
+                      % (len(match), wanted_label, i["port"]), file=sys.stderr)
+                return i
+        print("vm: %d instances are labelled %r; none answered a probe, "
+              "using port %s" % (len(match), wanted_label, match[0]["port"]),
+              file=sys.stderr)
         return match[0]
     if not inst:
         return None
@@ -119,6 +141,8 @@ def main():
                     help="run CMD instead of opening a shell")
     ap.add_argument("-p", "--port", type=int,
                     help="instance port (default: the lowest running one)")
+    ap.add_argument("-L", "--label", metavar="NAME",
+                    help="pick the instance carrying this label")
     ap.add_argument("-l", "--list", action="store_true",
                     help="list running instances and their ports")
     ap.add_argument("--start", action="store_true",
@@ -131,10 +155,12 @@ def main():
 
     release = release_dir()
     inst = running_instances()
-    if a.port is not None:
-        inst = [i for i in inst if int(i["port"]) == a.port]
-        if not inst:
-            uscli.die("no running instance on port %d (see `vm --list`)" % a.port)
+    if a.port is not None or a.label is not None:
+        if a.port is not None:
+            inst = [i for i in inst if int(i["port"]) == a.port]
+            if not inst:
+                uscli.die("no running instance on port %d (see `vm --list`)"
+                          % a.port)
     elif not inst and a.start:
         _, data = uscli.call("POST", "/api/instances", {"label": None, "port": None})
         if data.get("actual") != "running":
@@ -145,7 +171,7 @@ def main():
         uscli.die("no running instance - start one with `us start`, "
                   "or use `vm --start`")
 
-    chosen = pick_instance(release, inst, a.port)
+    chosen = pick_instance(release, inst, a.port, a.label)
     port = int(chosen["port"])
     argv = ssh_argv(release, port, pty=a.command is None)
     if a.command is not None:
