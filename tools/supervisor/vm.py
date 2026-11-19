@@ -61,6 +61,45 @@ def ssh_argv(release, port, pty):
     return argv
 
 
+def reachable(release, port):
+    """One cheap round-trip: does this instance actually take a session?
+
+    'running' in the daemon means the core's registry is alive, not that its
+    sshd accepts connections - a wedged guest answers TCP and resets the key
+    exchange. Probing avoids sending the user's real command to a machine that
+    cannot run it (and avoids the double-execution risk of retrying the real
+    command after a transport failure)."""
+    argv = ssh_argv(release, port, pty=False) + ["true"]
+    try:
+        return subprocess.run(argv, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def pick_instance(release, inst, wanted):
+    if wanted is not None:
+        match = [i for i in inst if int(i["port"]) == wanted]
+        if not match:
+            uscli.die("no running instance on port %d (see `vm --list`)" % wanted)
+        return match[0]
+    if not inst:
+        return None
+    if len(inst) == 1:
+        return inst[0]
+    for i in inst:
+        if reachable(release, int(i["port"])):
+            if int(i["port"]) != int(inst[0]["port"]):
+                print("vm: port %s did not answer; using %s"
+                      % (inst[0]["port"], i["port"]), file=sys.stderr)
+            return i
+    # Probes are a convenience, not a gate: a transient failure must not stop
+    # the user from running the command on the machine they expect.
+    print("vm: no instance answered a probe; trying port %s anyway"
+          % inst[0]["port"], file=sys.stderr)
+    return inst[0]
+
+
 def print_list():
     inst = running_instances()
     if not inst:
@@ -106,7 +145,8 @@ def main():
         uscli.die("no running instance - start one with `us start`, "
                   "or use `vm --start`")
 
-    port = int(inst[0]["port"])
+    chosen = pick_instance(release, inst, a.port)
+    port = int(chosen["port"])
     argv = ssh_argv(release, port, pty=a.command is None)
     if a.command is not None:
         argv.append(a.command)
@@ -114,12 +154,6 @@ def main():
         rc = subprocess.call(argv)
     except OSError as e:
         uscli.die("could not spawn ssh: %s" % e)
-    if rc == 255 and a.port is None and len(inst) > 1:
-        # ssh only returns 255 for transport failures; say which instances
-        # were not tried instead of leaving the port number unexplained.
-        print("vm: could not connect to port %d; other running instances: %s "
-              "(pick one with --port N)" % (port,
-              ", ".join(str(i["port"]) for i in inst[1:])), file=sys.stderr)
     return rc
 
 

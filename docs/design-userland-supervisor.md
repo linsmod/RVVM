@@ -153,7 +153,7 @@ CLI 是薄客户端：只调 HTTP API，不碰 DB、不 spawn 进程。
 vm                       交互 shell（pty：^C、^D、窗口大小、vi 都正常）
 vm -c "uname -m"         一次性执行，退出码就是 guest 命令的退出码
 vm --list                哪些实例可连
-vm --port 7929 -c "ls /" 指定实例（默认取端口最小、即最早起的那个 running）
+vm --port 7929 -c "ls /" 指定实例（默认取端口最小、即最早起的那个 running；多个实例时先探测，打不通的跳过并说明）
 vm --start               没有 running 实例时先起一个
 ```
 
