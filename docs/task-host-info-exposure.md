@@ -111,7 +111,7 @@
 | C3 | `fix(supervisor): isolate each instance's /run/vpsessiond` | per-instance run dir + `--run-dir` | 完成（待提交） |
 | C4 | `fix(ash): keep guest mode store and lock outside the guest root` | sidecar + 跳过 hostfs chmod + 清理 | 完成（待提交） |
 | C5 | `fix(core): answer statfs without host disk numbers` | statfs/fstatfs 合成 | 完成（待提交） |
-| C6 | `fix(core): synthesize guest file identity` | st_dev/st_ino/getdents/statx | 待做 |
+| C6 | `fix(core): synthesize guest file identity` | st_dev/st_ino/getdents/statx | 完成（statx 在 Windows 上 SKIP，待 Linux 宿主复核） |
 | C7 | `fix(core): rebase guest uptime and monotonic clock` | uptime/sysinfo/starttime/btime | 待做 |
 | C8 | `fix(build): remove host build paths from guest-visible metadata` | uname/comment + 构建路径 | 待做 |
 
@@ -220,6 +220,20 @@ ssh -i $key -p 7940 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o Bat
   `/run/vpsessiond` 为 `Total: 16384 Free: 12288`（64 MiB），输出无宿主 inode/usage 数。
 - 备注：root 是 host-backed 时 provider 是 `RVVM_MOUNT_HOSTFS`，所以必须先按
   `mount_row_is_root()` 判断，不能按 provider 判 root；这是第一次测试失败的原因。
+
+### C6 恢复点（2026-11-19 已跑，statx 限 Windows 未覆盖）
+
+- 代码点：`rvvm_user.c` `RVVM_GUEST_DEV`/`guest_ino_hash()`；
+  `uapi_stat_convert(..., host_backed)`（host-backed 才 hash/固定 dev）；
+  `newfstatat`/`newfstat` 的宿主持久分支传 true；`getdents64` 对宿主目录记录的
+  `d_ino` 做同一 hash；`statx` 成功后写 `stx_ino`/固定 dev。
+- 验证：selftest 的 `stat -c '%i %d' /etc/hostname` 与 `ls -i` 的 ino 相等，
+  `dev == 0x52564D01`，且不等于宿主 `os.stat(...).st_ino`；
+  `test_std` 的 `fstat(dirfd) agrees with stat(".") on dev/ino` 通过。
+- 未覆盖：Windows 上 `statx` 返回 ENOSYS，`test_std` 的 statx 段 SKIP；
+  statx 的 hash 分支需要在 Linux 宿主上复核（登记遗留）。
+- 设计取舍：只 hash `st_ino`，不混 host `st_dev`，这样 `stat`/`statx`/`getdents`
+  三个入口对同一文件给同一个 guest ino；跨卷 inode 碰撞的概率留给 64 位 hash。
 
 后续提交的恢复点在本文件追加。
 

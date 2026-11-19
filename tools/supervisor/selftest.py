@@ -269,6 +269,29 @@ def main():
             fails += check("255012694" not in r.stdout and
                            "7131305" not in r.stdout,
                            "statfs has no host inode/usage numbers")
+
+            # C6: host st_ino/st_dev never reach the guest; stat(2) and
+            # getdents64 agree on the opaque inode.
+            r = run_ssh(key, p1,
+                        "stat -c '%i %d' /etc/hostname; "
+                        "ls -i /etc/hostname")
+            numbers = [line.split() for line in r.stdout.strip().splitlines()]
+            guest_ino = int(numbers[0][0]) if numbers and numbers[0] else 0
+            guest_dev = int(numbers[0][1]) if len(numbers[0]) > 1 else 0
+            dir_ino = int(numbers[1][0]) if len(numbers) > 1 else 0
+            fails += check(guest_dev == 0x52564D01,
+                           "stat device is the fixed guest dev (%d)" % guest_dev)
+            fails += check(guest_ino != 0 and guest_ino == dir_ino,
+                           "stat and getdents agree on the guest inode")
+            if rootfs_name:
+                host_file = os.path.join(release, "runtime", "roots",
+                                         rootfs_name, "etc", "hostname")
+                try:
+                    host_ino = os.stat(host_file).st_ino
+                except OSError:
+                    host_ino = None
+                fails += check(host_ino is None or guest_ino != host_ino,
+                               "guest inode is not the host st_ino")
         finally:
             for port in started:
                 api(token, "DELETE", "/api/instances/%d" % port,

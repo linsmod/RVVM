@@ -561,10 +561,27 @@ BUILD_ASSERT(sizeof(struct statx) == 256);
 BUILD_ASSERT(sizeof(struct statx_timestamp) == 16);
 #endif
 
-static void uapi_stat_convert(struct uapi_stat* dst, const struct stat* src)
+/* Guest-visible identity for a host-backed file. The host's st_dev/st_ino are
+ * host filesystem metadata (on Windows st_ino is the NTFS file id), so the
+ * guest gets a stable opaque inode and one fixed device instead. Hashing only
+ * the inode keeps stat(2), statx(2) and getdents64's d_ino in agreement. */
+#define RVVM_GUEST_DEV 0x52564D01u
+
+static uint64_t guest_ino_hash(uint64_t ino)
 {
-    dst->dev = src->st_dev;
-    dst->ino = src->st_ino;
+    uint64_t h = 1469598103934665603ULL;
+    h ^= ino;
+    h *= 1099511628211ULL;
+    h ^= h >> 32;
+    return h ? h : 1;
+}
+
+static void uapi_stat_convert(struct uapi_stat* dst, const struct stat* src,
+                              bool host_backed)
+{
+    dst->dev = host_backed ? (uint64_t)RVVM_GUEST_DEV : (uint64_t)src->st_dev;
+    dst->ino = host_backed ? guest_ino_hash((uint64_t)src->st_ino)
+                           : (uint64_t)src->st_ino;
     dst->mode = src->st_mode;
     dst->nlink = src->st_nlink;
     dst->uid = src->st_uid;
@@ -10928,6 +10945,23 @@ static int64_t rvvm_sys_getdents64(int fd, void* dirp, size_t size)
      * the Win32 directory walk in posix_shim.c elsewhere. The guest structure
      * (struct uapi_linux_dirent64 above) is filled by that layer. */
     int64_t ret = errno_ret(syscall(SYS_getdents64, fd, dirp, size));
+    /* A host directory's d_ino is the host's file id (NTFS on Windows), and
+     * stat(2) of the same entry gets the same host value before conversion.
+     * Hash both sides here and in uapi_stat_convert() so `ls -i` and `stat`
+     * agree on the guest's opaque inode, and the host id never reaches the
+     * guest. d_off stays the host's cursor cookie: it is not an inode. */
+    if (ret > 0 && dirp) {
+        size_t off = 0;
+        while (off + sizeof(struct uapi_linux_dirent64) <= (size_t)ret) {
+            struct uapi_linux_dirent64* de =
+                (struct uapi_linux_dirent64*)((char*)dirp + off);
+            if (de->d_reclen == 0) {
+                break;
+            }
+            de->d_ino = guest_ino_hash(de->d_ino);
+            off += de->d_reclen;
+        }
+    }
     //rvvm_warn("getdents64(%d, %p, %ld) -> %ld (%s)", fd, dirp, size, ret, (ret < 0) ? strerror(errno) : "Success");
     return ret;
 }
@@ -17939,7 +17973,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                             break;
                         }
                         a0 = 0;
-                        uapi_stat_convert(out, &st);
+                        uapi_stat_convert(out, &st, false);
                         break;
                     }
                     /* A procfs path: a directory, a generated file, or a link
@@ -17972,14 +18006,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                                 proc_st.st_nlink = 1;
                                 proc_st.st_size  = (off_t)rvvm_strlen(alias);
                                 a0 = 0;
-                                uapi_stat_convert(out, &proc_st);
+                                uapi_stat_convert(out, &proc_st, false);
                                 break;
                             }
                             if (userland_proc_path_stat(a == DEV_FD_NONE ? proc_abs : alias,
                                                         userland_current_pid(),
                                                         follow, &proc_st)) {
                                 a0 = 0;
-                                uapi_stat_convert(out, &proc_st);
+                                uapi_stat_convert(out, &proc_st, false);
                                 break;
                             }
                         }
@@ -17996,7 +18030,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         if (guest_path_absolutize(dev_abs, sizeof(dev_abs), path) &&
                             userland_dev_stat_path(dev_abs, &dev_st)) {
                             a0 = 0;
-                            uapi_stat_convert(out, &dev_st);
+                            uapi_stat_convert(out, &dev_st, false);
                             break;
                         }
                     }
@@ -18014,7 +18048,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                                 break;
                             }
                             a0 = 0;
-                            uapi_stat_convert(out, &mem_st);
+                            uapi_stat_convert(out, &mem_st, false);
                             break;
                         }
                     }
@@ -18027,7 +18061,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         if (entry && entry->kind == VP_SHADOW_LINK) {
                             shadow_fill_stat(&st, entry);
                             a0 = 0;
-                            uapi_stat_convert(out, &st);
+                            uapi_stat_convert(out, &st, false);
                             break;
                         }
                     }
@@ -18036,7 +18070,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                     if (!path && (a3 & AT_EMPTY_PATH) && asset_dir_lookup((int)a0)) {
                         asset_dir_fill_stat(&st);
                         a0 = 0;
-                        uapi_stat_convert(out, &st);
+                        uapi_stat_convert(out, &st, false);
                         break;
                     }
                     /* fstatat(fd, NULL, AT_EMPTY_PATH) on a procfs descriptor. */
@@ -18044,7 +18078,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         int phfd = userland_fd_host(uctx(), (int)a0);
                         if (userland_proc_is_fd(phfd) && userland_proc_fd_fill_stat(phfd, &st)) {
                             a0 = 0;
-                            uapi_stat_convert(out, &st);
+                            uapi_stat_convert(out, &st, false);
                             break;
                         }
                     }
@@ -18073,13 +18107,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                         /* ...and a chmod the guest performed beats both */
                         stat_apply_mode_override(&st);
                     }
-                    uapi_stat_convert(out, &st);
+                    uapi_stat_convert(out, &st, true);
                     break;
                 }
                 case 80: { // newfstat
                     struct stat st = {0};
                     struct uapi_stat* out = to_ptr_sz_wr(a1, sizeof(*out));
                     const long fd = (long)a0;
+                    bool host_backed = false;
                     rvvm_info("sys_newfstat(%ld, %lx)", a0, a1);
                     if (!out) {
                         a0 = -UAPI_EFAULT;
@@ -18148,6 +18183,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         } else {
                             a0 = errno_ret(fstat(hfd, &st));
                             if (a0 == 0) {
+                                host_backed = true;
                                 mode_store_ensure_loaded();
                                 stat_apply_mode_override(&st);
                                 rvvm_info("fstat fd=%ld mode=%o dev=%llx ino=%llx",
@@ -18158,7 +18194,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                         }
                     }
                     RVVM_TRC(RVVM_TRC_FD, "DBG newfstat fd=%ld ret=%ld host_size=%lld", fd, (long)a0, (long long)st.st_size);
-                    uapi_stat_convert(out, &st);
+                    uapi_stat_convert(out, &st, host_backed);
                     break;
                 }
                 case 82: // fsync
@@ -19331,6 +19367,13 @@ case 179: // sysinfo
                     } else {
                         a0 = errno_ret(statx(userland_fd_host(uctx(), (int)a0),
                                              wrap_guest_path(path_buf, (int)a0, to_str(a1)), a2, a3, stx));
+                        if (a0 == 0) {
+                            /* Same opaque identity as stat(2): hash the host
+                             * inode and keep one fixed guest device. */
+                            stx->stx_ino = guest_ino_hash(stx->stx_ino);
+                            stx->stx_dev_major = 0;
+                            stx->stx_dev_minor = 1;
+                        }
                     }
                     break;
                 }
