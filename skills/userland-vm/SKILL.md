@@ -119,6 +119,8 @@ vm --start                           # 没有 running 实例时先起一个
   `release.*/runtime/supervisor/token`，私钥在同目录 `id_ed25519`）。
 - 连不上时（ssh 退出码 255）会提示还有哪些实例可换，不做静默切换。
 - 在没有 `vm` 的机器上：`python tools/supervisor/vm.py ...` 等价。
+- PowerShell 里装 `vm.ps1`（`@args` 原样传参，`vm -c 'echo "a b"'` 不会丢引号）；
+  cmd.exe 用同目录 `vm.cmd`——它按 `%*` 重新解析命令行，命令里带引号会散架。
 
 ## 常见测试配方
 
