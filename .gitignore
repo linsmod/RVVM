@@ -7,6 +7,10 @@
 /*/
 /*
 
+# Python bytecode from tools/ (the supervisor CLI imports its sibling)
+__pycache__/
+*.pyc
+
 # Ignore Kate editor temp files
 *.kate-swp
 
