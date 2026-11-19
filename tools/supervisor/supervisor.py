@@ -944,8 +944,8 @@ def make_handler(sup, token):
                     })
                 if path == "/api/instances":
                     return self._send(200, {"instances": sup.reconcile()})
-                if len(parts) == 3 and parts[0] == "api" and \
-                        parts[1] == "instances" and parts[2] == "log":
+                if len(parts) == 4 and parts[0] == "api" and \
+                        parts[1] == "instances" and parts[3] == "log":
                     port = int(parts[2])
                     n = int(qs.get("tail", ["200"])[0])
                     return self._send(200, {"log": sup.tail_log(port, n)})
