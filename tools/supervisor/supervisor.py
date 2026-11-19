@@ -34,7 +34,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DAEMON_VERSION = "0.2.0"
-STARTING_GRACE_S = 25      # guest boot to a live registry takes ~20s
+STARTING_GRACE_S = 25      # ceiling for a start, not the typical time: a core
+                           # registers in ~2 s and its ssh answers right after
 STOP_GRACE_S = 10
 EXEC_TIMEOUT_S = 60
 PORT_BASE = 7910           # 7900 is the dev/test port, instances start above it

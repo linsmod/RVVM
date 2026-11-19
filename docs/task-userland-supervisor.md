@@ -25,7 +25,9 @@
   `--rootfs` 改动；锁文件落在 rootfs 目录内（默认路径保留 `runtime/ash-core.lock` 历史名）
 - exec 走 core 的 ssh 端点：`ssh -p N -o BatchMode=yes -o UserKnownHostsFile=NUL 127.0.0.1 <cmd>`
   （Windows NUL / POSIX /dev/null），vp 从管理面退役
-- 启动宽限 25s（注册文件在 guest 起机后即写，rootfs 首次解包约 20s）
+- 启动宽限 25s 是**上限**，不是典型耗时：2026-11-19 两次实测 `us start` 1.6/1.8s 返回，
+  ssh 可执行命令 2.0/2.3s（rootfs 每次新解包但很小，core 是用户态 ELF 不是内核启动）；
+  `us rm` 实测 9.1/10.7s（stop 宽限 + 删除 rootfs）
 - Windows 强杀（TerminateProcess）绕过 core 的清理 handler：stop() 对自己杀的 core 回收残留
   `.core`（与 C 侧 stale 回收同一语义）
 
