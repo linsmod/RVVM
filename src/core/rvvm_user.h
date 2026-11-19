@@ -364,6 +364,13 @@ void rvvm_user_set_prefix(rvvm_machine_t* machine, const char* prefix);
 // guest's / is memory (see above). The pointer is owned by the machine.
 const char* rvvm_user_get_prefix(rvvm_machine_t* machine);
 
+// Whether the guest may name a host directory itself, with mount(2) -
+// `mount -t hostfs <dir> <path>`. Default false: the guest's root is not a
+// permission to read the host, and the host's own rvvm_user_mount_hostfs()
+// calls are not affected either way. Grant it only for a run whose guest is
+// trusted with that capability (a test, a WSL-shaped workflow).
+void rvvm_user_set_guest_hostfs(rvvm_machine_t* machine, bool allow);
+
 // Mount a host directory at a guest path: the guest's /mnt/c is the host's C:\,
 // and everything under it is that host directory's. This is what WSL calls drvfs
 // and MinGW spells /c, and it is the answer to "how does a guest see a host tree"
@@ -382,9 +389,9 @@ const char* rvvm_user_get_prefix(rvvm_machine_t* machine);
 // directory asked for would serve the wrong files), -EBUSY if something is
 // already mounted there, -ENOSPC if the table is full.
 //
-// The guest can also do this itself, with mount(2) - `mount -t hostfs <dir>
-// <path>` - which is the same row built from the same place: giving a guest a
-// mount(2) is already giving it the run's own view of the host.
+// This is the host-granted spelling. The guest's own `mount -t hostfs` goes
+// through rvvm_user_set_guest_hostfs() and is refused unless the host granted
+// it.
 int rvvm_user_mount_hostfs(rvvm_machine_t* machine, const char* guest_path,
                            const char* host_path);
 

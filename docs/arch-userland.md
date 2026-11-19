@@ -1,6 +1,6 @@
 # 架构现状：userland 模拟（guest 侧）
 
-最后核对：2026-11-17（依据源码与 `src/core/rvvm_user.h` 注释，未逐条实测）。
+最后核对：2026-11-19（依据源码与 `src/core/rvvm_user.h` 注释；hostfs 默认拒绝已端到端实测）。
 
 只写「现在是什么」。宿主侧（VirtPass ABI、bundle 启动面、日志 sink/ring）见 `arch-virtpass.md`；
 设计取舍见 `../handover.md`（Step 1-6 落地记录，早于挂表行模型，读时注意）；
@@ -25,6 +25,10 @@
   非 NULL = 宿主目录（bundle 由 `vp_rootfs_extract()` 安装进去）。
 - **其余一切都是挂表的一行**：`rvvm_user_mount_hostfs()` 或 guest 自己 `mount(2)`
   （`-t hostfs`、`tmpfs`）。`/dev`、`/sys`、`/proc`、`/tmp`、`/var/tmp` 各有自己的一行，不吃 prefix。
+- **guest 自己 `mount -t hostfs <宿主路径>` 默认被拒绝**（`EPERM`）：宿主路径是宿主信息，
+  不是 guest root 的自带权限。宿主用 `rvvm_user_mount_hostfs()` 预挂载不受影响；
+  `rvvm_ash --allow-guest-hostfs` / `rvvm_user_set_guest_hostfs()` 是显式授权，测试与
+  WSL 形态才打开。默认关是 2026-11-19 宿主信息收敛的一部分。
 - `root=` 是 **guest 路径**，与 prefix 组合（等价 chroot），不是宿主路径；只在有 prefix 时生效。
 - dev 号由合成规则给出，不用宿主真实 `st_dev`（三宿主行为必须一致）。
 

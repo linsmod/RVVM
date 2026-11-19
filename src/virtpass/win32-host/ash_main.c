@@ -48,7 +48,7 @@ static void print_usage(const char* self)
     fprintf(stderr,
             "usage: %s --serve [--idle S] [--dlog <guest-path>] [--memfs]\n"
             "          [--cmdline <linux-args>] [--port N]\n"
-            "          [--rootfs <dir>]\n"
+            "          [--rootfs <dir>] [--allow-guest-hostfs]\n"
             "       %s --list\n"
             "\n"
             "  %s --serve          run the core: one run (one machine, one rootfs)\n"
@@ -64,6 +64,9 @@ static void print_usage(const char* self)
             "the idle core does not honour it. --serve --dlog <path> puts the\n"
             "legacy session server's log at that guest path. --serve --memfs runs\n"
             "the bundle from memory instead of <exe>\\runtime\\rootfs.\n"
+            "  --serve --allow-guest-hostfs lets the guest mount a host directory\n"
+            "          itself (`mount -t hostfs <host path> <guest path>`). Off by\n"
+            "          default: hostfs is a host capability, not a guest default.\n"
             "\n"
             "--cmdline <args> boots the core's machine with those Linux-style boot\n"
             "arguments, and is the only way to change what the run is made of:\n"
@@ -92,6 +95,7 @@ int main(int argc, char** argv)
     bool        serve   = false;
     bool        list    = false;
     bool        memfs   = false;
+    bool        allow_guest_hostfs = false;
     const char* dlog    = NULL;
     const char* cmdline = NULL;
     const char* rootfs  = NULL;
@@ -117,6 +121,10 @@ int main(int argc, char** argv)
              * busybox and the core programs are there; what is different is
              * where. */
             memfs = true;
+        } else if (!strcmp(a, "--allow-guest-hostfs")) {
+            /* A host grant, not a guest default: only a run whose owner asks for
+             * it may name a host directory in mount(2). */
+            allow_guest_hostfs = true;
         } else if (!strcmp(a, "--dlog") && i + 1 < argc) {
             dlog = argv[++i];
         } else if (!strncmp(a, "--dlog=", 7)) {
@@ -191,5 +199,8 @@ int main(int argc, char** argv)
      * from --cmdline on top, which has to be the later of the two or a run
      * asked to be loud would not be. */
     rvvm_set_loglevel(getenv("RVVM_VERBOSE") ? LOG_INFO : LOG_WARN);
+    /* Before ash_serve() builds the machine: the grant belongs to the run, and
+     * win32_host_start_guest() applies it to the fresh userland context. */
+    win32_host_allow_guest_hostfs(allow_guest_hostfs);
     return ash_serve(port, idle, dlog, cmdline, rootfs);
 }

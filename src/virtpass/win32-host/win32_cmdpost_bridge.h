@@ -114,6 +114,13 @@ void win32_host_set_volatile_rootfs(bool on);
 // Set before win32_host_start_guest().
 void win32_host_set_rootfs_dir(const char* dir);
 
+// Grant the guest the ability to mount a host directory itself with
+// `mount -t hostfs <host path> <guest path>`. Off by default: hostfs is a
+// host capability, not a consequence of being root in the guest. The host's
+// own mounts (rvvm_user_mount_hostfs) are unaffected. Set before
+// win32_host_start_guest().
+void win32_host_allow_guest_hostfs(bool on);
+
 /*
  * The next run is a core: a machine kept up for clients rather than a one-shot
  * command, serving a session per client (see vp_core.h). The control terminal a

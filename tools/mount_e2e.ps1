@@ -90,7 +90,9 @@ Get-Process -Name 'rvvm_ash_x86_64' -ErrorAction SilentlyContinue |
     Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300
 
-$core = Start-Process -FilePath $exe -ArgumentList '--serve', '--port', "$Port" `
+# This driver exercises the guest's own `mount -t hostfs`; that is a host grant
+# now (off by default, see rvvm_user_set_guest_hostfs), so the test core opts in.
+$core = Start-Process -FilePath $exe -ArgumentList '--serve', '--port', "$Port", '--allow-guest-hostfs' `
                       -WorkingDirectory $dir -PassThru `
                       -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow
 

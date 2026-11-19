@@ -235,6 +235,11 @@ static bool g_volatile_rootfs = false;
 static char g_rootfs_dir[MAX_PATH];
 static bool g_rootfs_dir_set = false;
 
+/* Whether the guest may name a host directory in mount(2) itself. Off by
+ * default: the host mounts what it wants visible with rvvm_user_mount_hostfs(),
+ * and a guest that can name C:\ is not a sandbox. */
+static bool g_allow_guest_hostfs = false;
+
 /* Host-side suspend/resume guards. The machine handle only exists while a guest
  * is booted, so every host control call goes through these instead of testing
  * g_guest_machine at each call site. */
@@ -1206,6 +1211,11 @@ void win32_host_set_rootfs_dir(const char* dir)
     } else {
         g_rootfs_dir_set = false;
     }
+}
+
+void win32_host_allow_guest_hostfs(bool on)
+{
+    g_allow_guest_hostfs = on;
 }
 
 void win32_host_set_cmdline(const char* str)
@@ -3299,6 +3309,10 @@ bool win32_host_start_guest(int argc, char** argv)
      * graceful unwind instead of rvvm_user.c's _Exit() fallback (see
      * host_guest_exit_cb). Same role as jni_bridge.c's on_guest_exit. */
     rvvm_user_set_exit_callback(g_guest_machine, host_guest_exit_cb);
+    /* Hostfs is a grant, not a guest default: a core started without
+     * --allow-guest-hostfs refuses `mount -t hostfs <host path>`. The host's
+     * own mounts below are not affected. */
+    rvvm_user_set_guest_hostfs(g_guest_machine, g_allow_guest_hostfs);
 
     /* Guest filesystem view: the run's own rootfs, provisioned from the bundle.
      * A guest named /data/app/<id>/... is also the request to boot that app and

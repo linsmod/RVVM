@@ -2100,6 +2100,10 @@ typedef struct rvvm_userland {
     // guest's syscall path here (VirtPass: its vp_cmdpost_t); the core only
     // hands it back through rvvm_user_host_ctx().
     void*                    host_ctx;
+    // Whether the guest may name a host directory in mount(2) itself. Default
+    // false: hostfs is a host-granted capability, not a guest default. The
+    // host's own rvvm_user_mount_hostfs() calls are unaffected by this.
+    bool                     guest_hostfs_allowed;
     const char*              prefix_path;
     // Prefix set through rvvm_user_set_prefix(): the string is owned here
     char*                    prefix_owned;
@@ -4390,6 +4394,15 @@ PUBLIC const char* rvvm_user_get_prefix(rvvm_machine_t* machine)
     return ctx ? ctx->prefix_path : NULL;
 }
 
+PUBLIC void rvvm_user_set_guest_hostfs(rvvm_machine_t* machine, bool allow)
+{
+    rvvm_userland_t* ctx = rvvm_userland_ctx(machine);
+
+    if (ctx) {
+        ctx->guest_hostfs_allowed = allow;
+    }
+}
+
 /*
  * The command line's arguments are scanned by rvvm_cmdline_get()/
  * rvvm_cmdline_has() in utils.c. They are not re-implemented here: the core, the
@@ -5297,13 +5310,19 @@ static rvvm_addr_t rvvm_user_mount(const char* source, const char* target,
         if (provider == RVVM_MOUNT_HOSTFS && !strcmp(fstype, "hostfs")) {
             /* A host directory mounted at a guest path, named by the source - which
              * is what mount(2)'s source argument is: host-side metadata about where
-             * the bytes are, not a path the guest resolves. A guest naming one is a
-             * guest asking to see part of the host, and that is a decision the run's
-             * owner makes by giving it a mount(2) at all - the same trust the /sys
-             * row already assumes, and the reason a sandboxed run is a run with a
-             * rootfs rather than a run with a mount table. */
+             * the bytes are, not a path the guest resolves. That is host
+             * information, and a guest naming it is asking to see part of the host.
+             * It is therefore a capability the host grants explicitly, not a
+             * default that comes with being root in the guest: a host that wants
+             * its own tree visible mounts it with rvvm_user_mount_hostfs(), which
+             * bypasses this check. */
             if (!source || !source[0]) {
                 return -UAPI_EINVAL;
+            }
+            if (!ctx->guest_hostfs_allowed) {
+                rvvm_info("mount(%s, %s, hostfs): guest hostfs is not granted by "
+                          "the host", source, abs);
+                return -UAPI_EPERM;
             }
         }
     }
@@ -9664,6 +9683,11 @@ static rvvm_userland_t* userland_child_create(rvvm_userland_t* parent, uint32_t 
     ctx->fake_gid     = parent->fake_gid;
     ctx->fake_egid    = parent->fake_egid;
     ctx->umask        = parent->umask;
+    /* A grant of the hostfs capability is part of the run, not of one process:
+     * a mount(2) is normally issued by a forked child (busybox mount is one),
+     * and a child that did not inherit the grant would see every hostfs mount
+     * refused even though its parent's host allowed it. */
+    ctx->guest_hostfs_allowed = parent->guest_hostfs_allowed;
     memcpy(ctx->rlim_cur, parent->rlim_cur, sizeof(ctx->rlim_cur));
     memcpy(ctx->rlim_max, parent->rlim_max, sizeof(ctx->rlim_max));
     if (parent->prefix_path) {
