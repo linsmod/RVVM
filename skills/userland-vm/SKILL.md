@@ -143,6 +143,11 @@ guest root 的自带权限。要测这个能力，直起 core 时加
 - 一个端口一个 core；同一个端口重复启动会被 daemon 拒绝（而不是覆盖）。
 - 改的是 `rvvm_user.c` 这类 core 代码时，**先重新构建 release 树**（`mingw32-make BUILDDIR=... bin`），
   再 `us start`；daemon 和 core 用的是 exe 本体，不会热更新。构建目录必须带 `bundle/` 才算可用。
+- daemon 的启动参数随源码演进（例如新增 `--run-dir`）：core/supervisor 改动后没重建时，
+  旧 exe 会以 `unexpected argument '--run-dir'` 立刻退出，`us start` 很快报
+  `core exited before sshd was ready`（不是 25 秒超时），实例日志里就是那条 usage。
+- 网页 UI 现在必须填 token（头部输入框，存在 localStorage）：值在
+  `<release>/runtime/supervisor/token`，和 `us` 自动读的是同一个。
 - 别用 `release.` 开头命名一次性的试验构建目录：daemon 会自动发现 `release.*`，
   不合格的会被跳过并写日志（能跑，但会让人以为选错了树）。
 - **`us` 返回 401 unauthorized**：daemon 现在强制 token。用
