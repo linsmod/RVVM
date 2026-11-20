@@ -59,7 +59,7 @@ Agent 侧的完整用法（起实例、`us` 各子命令、ssh 的两种拼法�
 | 脚本 | 内容 |
 |---|---|
 | `pack_apps.py` | 打 `apps.tar.gz`（`apps/<id>.vapp`） |
-| `pack_system.py` | 打 system 层（源 basename → guest 路径） |
+| `pack_system.py` | 打 system 层（源 basename → guest 路径）；`--pkgs curl,sqlite,python3` 按 Alpine 镜像的 APKINDEX 解析依赖并把发行版 riscv64 包铺进同一层（`--cache` 落盘，重打不必联网）。默认集合见 `project.mk` 的 `SYS_PKGS` |
 | `install_file.py` | `install -m MODE SRC DST` 的跨平台替代 |
 | `gen_gl_abi.py` | 生成 `include/virtpass/vp_gl.h`、`src/virtpass/vp_gl_stub.c` 与 win32 dispatch 表 |
 | `gen_stub_notimpl.py` | 生成 SDK 的「未实现」桩源码 |

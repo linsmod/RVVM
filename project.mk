@@ -764,6 +764,24 @@ fetch-rootfs:
 #
 override SYSTEM_PACKER    ?= python $(CURDIR)/tools/pack_system.py
 
+# Alpine packages laid into the system layer with their dependencies, resolved
+# from the same mirror the rootfs comes from (pack_system.py follows APKINDEX).
+# The guest is an Alpine minirootfs and its programs are dynamically linked
+# against musl, which the guest runs, so these are usable as distribution builds -
+# curl, sqlite and python3 are not cross-compiled here. Downloads are cached under
+# the bundle directory, so only the first build after a package change needs the
+# network. Comma separated because the value travels through a make recipe's
+# quoting unchanged. Set SYS_PKGS= to build a bundle with only the VirtPass
+# system programs.
+#
+# Only what the emulator can actually run belongs in the default: sqlite is
+# verified end to end (a database in /persist, journal_mode=DELETE). curl needs
+# eventfd2 (syscall 19) and python3 dies in musl's a_crash() during interpreter
+# init - both are emulator gaps registered in issues/INDEX.md, not packaging ones.
+# `make pack-system SYS_PKGS=sqlite,curl,python3` builds the fuller layer.
+override SYS_PKGS        ?= sqlite
+override SYS_PKG_CACHE   := $(BUNDLE_DIR)/.apkcache
+
 override APPS_PACKER     ?= python $(CURDIR)/tools/pack_apps.py
 override APPS_SRC_DIR    ?= $(GUEST_ASSETS_DIR)
 override APPS_ASSET_ROOT ?= $(ANDROID_ASSETS_DIR)
@@ -775,7 +793,9 @@ pack-system: system-assets
 	$(call create_dirs,$(BUNDLE_DIR))
 	$(call println,$(TEXT)[$(GREEN)PACK$(TEXT)] $(SYSTEM_TAR) $(RESET))
 	@$(call shell_esc,$(SYSTEM_PACKER) --src $(call path_shell,$(SYSTEM_ASSETS_DIR))\
-		--out $(call path_shell,$(SYSTEM_TAR)))
+		--out $(call path_shell,$(SYSTEM_TAR))\
+		$(if $(SYS_PKGS),--pkgs $(SYS_PKGS)\
+			--cache $(call path_shell,$(SYS_PKG_CACHE))))
 
 # No --exclude-from: the two packers read two different trees, so a system
 # program cannot appear in the app archive in the first place.
