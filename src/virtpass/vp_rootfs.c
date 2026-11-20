@@ -482,7 +482,7 @@ size_t vp_rootfs_count(const vp_rootfs_t* rootfs)
     return rootfs ? vp_shadow_count(rootfs->shadow) : 0;
 }
 
-bool vp_rootfs_extract_to(const vp_rootfs_t* rootfs, uint32_t idx, const char* dest_path)
+bool __attribute__((noinline)) vp_rootfs_extract_to(const vp_rootfs_t* rootfs, uint32_t idx, const char* dest_path)
 {
     if (!rootfs || !dest_path || idx >= rootfs->data_count) {
         return false;
@@ -534,7 +534,7 @@ bool vp_rootfs_extract_to(const vp_rootfs_t* rootfs, uint32_t idx, const char* d
  * such as /proc/mounts or /dev/ptmx) has nothing to link to and is left alone -
  * those are answered elsewhere (devices by the userland, directories by the
  * layer that owns them). */
-static bool rootfs_link_copy(const char* from, const char* to)
+static bool __attribute__((noinline)) rootfs_link_copy(const char* from, const char* to)
 {
     FILE*  in = fopen(from, "rb");
     FILE*  out;
@@ -560,7 +560,7 @@ static bool rootfs_link_copy(const char* from, const char* to)
     return fclose(out) == 0;
 }
 
-static bool rootfs_extract_link(const char* dest_dir, const vp_shadow_entry_t* entry)
+static bool __attribute__((noinline)) rootfs_extract_link(const char* dest_dir, const vp_shadow_entry_t* entry)
 {
     char        link_host[ROOTFS_MAX_PATH * 2];
     char        target_host[ROOTFS_MAX_PATH * 2];
