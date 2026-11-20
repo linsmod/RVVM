@@ -46,8 +46,13 @@ us stop <port>; POST /api/instances/<port>/start; sqlite3 /persist/d.db "select 
 
 ## 5. 两个模拟器缺口（阻塞 curl/python3，非打包问题）
 
-1. **`eventfd2`（syscall 19）未实现** → curl 任何请求都返回 `(27) Out of memory`；
-   core 日志有 `Unknown syscall 19!`。c-ares 用它做唤醒 fd。登记 `issues/INDEX.md`。
+1. **已修复：`eventfd2`（syscall 19）在非 Linux 宿主缺失** → 原来 curl 任何请求都是
+   `(27) Out of memory`（c-ares 用它做唤醒 fd）。`rvvm_user.c` 现在在非 Linux 分支用合成 fd
+   实现计数器（读消费/写相加、poll 就绪、fstat/lseek、close/dup/fork/F_SETFL 全套分派）；
+   Linux 分支仍走宿主 `eventfd()`。验证：`Unknown syscall 19!` 消失、OOM 消失、
+   `curl http://1.1.1.1/` 得 301。**残留**：c-ares 的域名解析失败
+   （`Could not contact DNS servers`），而 busybox wget 正常、按 IP 的 curl 正常；
+   另立 `issues/INDEX.md`，可用 `--resolve host:port:ip` 绕过。
 2. **`python3` 在解释器初始化阶段崩溃**：执行 `ebreak`/`c.ebreak`（musl 的 `a_crash()`），
    `-v` 显示崩溃发生在 `import encodings.utf_8` 之后；`-c ""`、`-E -S`、`PYTHONMALLOC=malloc|pymalloc` 都一样，
    `python3 -V` 正常。`-X faulthandler` 报 `sigaltstack` ENOSYS。登记 `issues/INDEX.md`。
@@ -62,4 +67,5 @@ us stop <port>; POST /api/instances/<port>/start; sqlite3 /persist/d.db "select 
 | `pack_system.py --pkgs`（依赖解析 + 缓存 + 成员类型） | 完成 |
 | `project.mk` 接线、默认只 sqlite | 完成 |
 | guest 内 sqlite 端到端（含跨重启） | 完成 |
-| eventfd2 / python3 a_crash | 未做，见 `issues/INDEX.md` |
+| eventfd2（非 Linux 合成 fd） | 完成；curl OOM 修复，按 IP 的 HTTP 通过 |
+| c-ares DNS / python3 a_crash | 未做，见 `issues/INDEX.md` |

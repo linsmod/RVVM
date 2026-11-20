@@ -1447,6 +1447,9 @@ static uint64_t userland_monotonic_ns(void);   // defined with the guest timers
 static bool userland_proc_is_fd(int fd);
 static void userland_proc_fd_ref(int fd);
 static void userland_proc_fd_release(int fd);
+/* The same question for an eventfd's counter object (see the eventfd section):
+ * the per-descriptor flag path is defined before it and has to recognise one. */
+static bool userland_eventfd_is_fd(int fd);
 static int64_t userland_proc_getdents(int fd, void* out, size_t size);
 static int64_t userland_proc_read(int fd, void* buf, size_t count);
 static int64_t userland_proc_lseek(int fd, int64_t off, int whence);
@@ -7780,6 +7783,9 @@ static bool userland_parent_alive(rvvm_process_t* proc)
 /* The non-blocking halves of those APIs are O_NONBLOCK - one bit, whatever the
  * call that sets it is called (Linux defines them as the same value). */
 #define UAPI_EFD_NONBLOCK  0x800
+/* EFD_SEMAPHORE: a read takes one, not the whole counter. The only flag of the
+ * three whose value is not shared with another API's. */
+#define UAPI_EFD_SEMAPHORE 0x001
 #define UAPI_SOCK_NONBLOCK 0x800
 /* The type bits the host socket() must not see: they are this ABI's, and the
  * host has no equivalent for either (see the socket/socketpair cases). */
@@ -8074,7 +8080,7 @@ static bool userland_fd_serves_own(rvvm_userland_t* ctx, int fd)
     int                  hfd = userland_fd_host(ctx, fd);
 
     if (userland_pty_by_fd(hfd, &pty, &master) || userland_dev_by_fd(hfd, &dev) ||
-        userland_proc_is_fd(hfd)) {
+        userland_proc_is_fd(hfd) || userland_eventfd_is_fd(hfd)) {
         return true;
     }
     /* A console is served here whatever number it is on. */
@@ -8927,6 +8933,246 @@ static void memfs_info_to_stat(rvvm_memfs_t* fs, const rvvm_memfs_info_t* info, 
     st->st_gid   = (unsigned)uctx()->fake_gid;
 }
 
+/* ============================================================
+ * eventfd: one counter a guest writes to and reads from
+ *
+ * eventfd(2) is the shape a library uses when it needs one descriptor that a
+ * writer can poke and a reader can sleep on - c-ares (libcurl's resolver) does
+ * exactly that. On a Linux host the syscall is passed straight through (see the
+ * dispatch), so this exists for the hosts that have no eventfd of their own:
+ * the object is a counter plus a wake event, and read()/write()/poll()/fstat()
+ * dispatch on its reserved number range like a pty end or a tmpfs file does.
+ *
+ * The two semantics worth spelling out, because they are what a caller relies
+ * on: a read returns the whole counter and zeroes it (or takes one and
+ * decrements, with EFD_SEMAPHORE), and a write adds to it. Both are 8-byte
+ * little-endian words and any other size is EINVAL - a guest that writes 4
+ * bytes to an eventfd gets an error, not half a poke.
+ * ============================================================ */
+#define RVVM_EVENTFD_BASE 0x7F000000   /* far above any host fd */
+#define RVVM_EVENTFD_MAX  64
+
+typedef struct {
+    int          fd;         /* RVVM_EVENTFD_BASE + slot; 0 = free             */
+    uint32_t     refs;       /* slots reaching it: the fd table's, one per dup */
+    uint64_t     counter;
+    bool         semaphore;  /* EFD_SEMAPHORE: a read takes 1, not everything  */
+    bool         nonblock;   /* EFD_NONBLOCK, as the guest last set it         */
+    spinlock_t   lock;
+    rvvm_event_t wake;       /* a reader parked with an empty counter          */
+} rvvm_eventfd_t;
+
+static rvvm_eventfd_t userland_eventfds[RVVM_EVENTFD_MAX];
+static spinlock_t     userland_eventfd_lock = RVVM_LOCK_INIT;
+
+/* Allocated further down; dup(2) and this file's own object kinds share it. */
+static int userland_fd_slot_alloc(rvvm_userland_t* ctx, int min_fd);
+
+static bool userland_eventfd_is_fd(int fd)
+{
+    return fd >= RVVM_EVENTFD_BASE &&
+           (uint32_t)(fd - RVVM_EVENTFD_BASE) < RVVM_EVENTFD_MAX;
+}
+
+static rvvm_eventfd_t* userland_eventfd_lookup(int fd)
+{
+    rvvm_eventfd_t* e;
+    if (!userland_eventfd_is_fd(fd)) {
+        return NULL;
+    }
+    e = &userland_eventfds[fd - RVVM_EVENTFD_BASE];
+    /* The slot is a number, not a promise: a closed one is free again. */
+    return e->fd ? e : NULL;
+}
+
+static void userland_eventfd_ref(int fd)
+{
+    rvvm_eventfd_t* e = userland_eventfd_lookup(fd);
+    if (!e) {
+        return;
+    }
+    spin_lock(&userland_eventfd_lock);
+    e->refs++;
+    spin_unlock(&userland_eventfd_lock);
+}
+
+static void userland_eventfd_release(int fd)
+{
+    rvvm_eventfd_t* e = userland_eventfd_lookup(fd);
+    if (!e) {
+        return;
+    }
+    spin_lock(&userland_eventfd_lock);
+    if (e->refs) {
+        e->refs--;
+    }
+    if (!e->refs) {
+        /* Last slot gone: the counter goes with it, like the inode of a file
+         * nobody holds. The wake event is not torn down - a waiter that was
+         * parked on it is already about to see the counter it came for. */
+        spin_lock(&e->lock);
+        e->counter = 0;
+        e->fd      = 0;
+        spin_unlock(&e->lock);
+    }
+    spin_unlock(&userland_eventfd_lock);
+}
+
+/* Ready right now: readable once the counter is nonzero, always writable. */
+static bool userland_eventfd_ready(int fd, bool write)
+{
+    rvvm_eventfd_t* e = userland_eventfd_lookup(fd);
+    bool            ready;
+
+    if (!e) {
+        return false;
+    }
+    if (write) {
+        return true;
+    }
+    spin_lock(&e->lock);
+    ready = e->counter != 0;
+    spin_unlock(&e->lock);
+    return ready;
+}
+
+/* F_SETFL lands here: the table keeps the guest's flag word, and the read path
+ * is this object's own, so the two have to be told the same thing. */
+static void userland_eventfd_set_nonblock(int fd, bool nonblock)
+{
+    rvvm_eventfd_t* e = userland_eventfd_lookup(fd);
+    if (!e) {
+        return;
+    }
+    spin_lock(&e->lock);
+    e->nonblock = nonblock;
+    spin_unlock(&e->lock);
+    if (!nonblock) {
+        /* A reader parked while the descriptor was blocking has to look again. */
+        rvvm_event_wake(&e->wake);
+    }
+}
+
+static int64_t userland_eventfd_read(int fd, void* buf, size_t count, bool block)
+{
+    rvvm_eventfd_t* e = userland_eventfd_lookup(fd);
+
+    if (!e) {
+        return -UAPI_EBADF;
+    }
+    if (!buf) {
+        return -UAPI_EFAULT;
+    }
+    if (count < sizeof(uint64_t)) {
+        return -UAPI_EINVAL;
+    }
+    for (;;) {
+        uint64_t value;
+        bool     nonblock;
+
+        spin_lock(&e->lock);
+        if (e->counter) {
+            if (e->semaphore) {
+                value = 1;
+                e->counter--;
+            } else {
+                value = e->counter;
+                e->counter = 0;
+            }
+            spin_unlock(&e->lock);
+            memcpy(buf, &value, sizeof(value));
+            return (int64_t)sizeof(value);
+        }
+        nonblock = e->nonblock;
+        spin_unlock(&e->lock);
+
+        if (!block || nonblock) {
+            return -UAPI_EAGAIN;
+        }
+        /* A signal or an ended thread has to be able to take this read back:
+         * the same rule the pty's parked read follows. */
+        if (atomic_load_uint32(&uctx()->sig_pending) || userland_thread_finished()) {
+            return -UAPI_EINTR;
+        }
+        rvvm_event_wait(&e->wake, 5000000ULL);
+    }
+}
+
+static int64_t userland_eventfd_write(int fd, const void* buf, size_t count)
+{
+    rvvm_eventfd_t* e = userland_eventfd_lookup(fd);
+    uint64_t        value;
+
+    if (!e) {
+        return -UAPI_EBADF;
+    }
+    if (!buf) {
+        return -UAPI_EFAULT;
+    }
+    if (count != sizeof(value)) {
+        return -UAPI_EINVAL;
+    }
+    memcpy(&value, buf, sizeof(value));
+    spin_lock(&e->lock);
+    /* The counter saturates one short of its type's maximum; a poke that would
+     * overflow is refused rather than wrapped, which is what a kernel does. */
+    if (value == UINT64_MAX || e->counter > UINT64_MAX - 1 - value) {
+        spin_unlock(&e->lock);
+        return -UAPI_EINVAL;
+    }
+    e->counter += value;
+    spin_unlock(&e->lock);
+    rvvm_event_wake(&e->wake);
+    return (int64_t)sizeof(value);
+}
+
+/* The synthetic eventfd of @initval with @flags, or a negative UAPI errno. The
+ * guest number is an ordinary fd-table slot whose payload is the reserved
+ * number above, so read()/write()/poll()/close() dispatch on it like any other
+ * object this layer serves. */
+static rvvm_addr_t rvvm_sys_eventfd2(uint32_t initval, int32_t flags)
+{
+    rvvm_userland_t* ctx   = uctx();
+    const int32_t    known = UAPI_EFD_SEMAPHORE | UAPI_EFD_NONBLOCK |
+                             UAPI_EFD_CLOEXEC;
+    rvvm_eventfd_t*  e     = NULL;
+    int              slot  = -1;
+
+    if (flags & ~known) {
+        return -UAPI_EINVAL;
+    }
+    spin_lock(&userland_eventfd_lock);
+    for (int i = 0; i < RVVM_EVENTFD_MAX; i++) {
+        if (!userland_eventfds[i].fd) {
+            e    = &userland_eventfds[i];
+            slot = i;
+            break;
+        }
+    }
+    if (e) {
+        e->fd        = RVVM_EVENTFD_BASE + slot;
+        e->refs      = 1;   /* the slot filed below */
+        e->counter   = initval;
+        e->semaphore = (flags & UAPI_EFD_SEMAPHORE) != 0;
+        e->nonblock  = (flags & UAPI_EFD_NONBLOCK) != 0;
+    }
+    spin_unlock(&userland_eventfd_lock);
+    if (!e) {
+        return -UAPI_ENFILE;
+    }
+
+    int guest_fd = userland_fd_slot_alloc(ctx, 0);
+    if (guest_fd < 0) {
+        userland_eventfd_release(e->fd);
+        return -UAPI_EMFILE;
+    }
+    userland_fds_write(ctx, guest_fd, true, e->fd,
+                       (flags & UAPI_EFD_CLOEXEC) != 0, FD_BACKEND_SIM,
+                       e->nonblock ? UAPI_O_NONBLOCK : 0, "eventfd");
+    ctx->fds[guest_fd].holds_anchor_ref = false;
+    return (rvvm_addr_t)guest_fd;
+}
+
 static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
 {
     if (!userland_fd_tracked(ctx, fd)) {
@@ -8974,6 +9220,10 @@ static bool userland_fd_close(rvvm_userland_t* ctx, int fd)
         /* A procfs descriptor rides on a generated object, not a host fd: the
          * object is released here rather than closed. */
         userland_proc_fd_release(ctx->fds[fd].fd);
+    } else if (userland_eventfd_is_fd(ctx->fds[fd].fd)) {
+        /* An eventfd is a counter this layer owns: the slot drops its reference,
+         * and the object goes when the last one does. */
+        userland_eventfd_release(ctx->fds[fd].fd);
     } else if (!userland_dev_by_fd(ctx->fds[fd].fd, NULL)) {
         /* A device descriptor is just a number: nothing was opened for it. */
         /* Anchor numbers live in their own range (WSOCK_ANCHOR_BASE), so
@@ -9424,6 +9674,18 @@ static int userland_own_fd_dup(rvvm_userland_t* ctx, int source_fd, int host_fd,
             return -1;
         }
         userland_proc_fd_ref(host_fd);
+        userland_fd_install(ctx, guest_fd, host_fd, cloexec);
+        userland_fd_set_flags(ctx, guest_fd, userland_fd_flags(ctx, source_fd));
+        return guest_fd;
+    }
+    if (userland_eventfd_is_fd(host_fd)) {
+        /* The same counter behind a second guest number: dup(2) of an eventfd
+         * gives a second name for one object, not a second object. */
+        int guest_fd = userland_fd_slot_alloc(ctx, min_fd);
+        if (guest_fd < 0) {
+            return -1;
+        }
+        userland_eventfd_ref(host_fd);
         userland_fd_install(ctx, guest_fd, host_fd, cloexec);
         userland_fd_set_flags(ctx, guest_fd, userland_fd_flags(ctx, source_fd));
         return guest_fd;
@@ -11378,7 +11640,8 @@ static bool userland_sim_fd(int host_fd)
     bool master = false;
     int dev = -1;
     return userland_pty_by_fd(host_fd, &pty, &master) || userland_dev_by_fd(host_fd, &dev) ||
-           userland_proc_is_fd(host_fd) || memfs_fd_number(host_fd);
+           userland_proc_is_fd(host_fd) || memfs_fd_number(host_fd) ||
+           userland_eventfd_is_fd(host_fd);
 }
 
 static bool userland_own_fd(int host_fd)
@@ -14543,6 +14806,9 @@ static int64_t userland_read_fd(struct rvvm_userland* ctx, int fd, void* buf,
     if (userland_proc_is_fd(host_fd)) {
         return userland_proc_read(host_fd, buf, count);
     }
+    if (userland_eventfd_is_fd(host_fd)) {
+        return userland_eventfd_read(host_fd, buf, count, block);
+    }
     if (userland_pty_by_fd(host_fd, &pty, &master)) {
         return userland_pty_read(pty, master, buf, count, block);
     }
@@ -14569,6 +14835,9 @@ static int64_t userland_write_fd(struct rvvm_userland* ctx, int fd, const void* 
 
     if (userland_proc_is_fd(host_fd)) {
         return -UAPI_EACCESS;   /* /proc is read-only */
+    }
+    if (userland_eventfd_is_fd(host_fd)) {
+        return userland_eventfd_write(host_fd, buf, count);
     }
     if (userland_pty_by_fd(host_fd, &pty, &master)) {
         return userland_pty_write(pty, master, buf, count, ctx, block);
@@ -17302,6 +17571,14 @@ static void* rvvm_user_thread_wrap(void* arg)
                         }
                     }
                     break;
+#else
+                case 19: // eventfd2
+                    /* No eventfd on this host, so the counter is ours (see the
+                     * eventfd section): same syscall, same semantics, a number
+                     * range this layer answers for. */
+                    rvvm_info("sys_eventfd2(%lx, %lx)", a0, a1);
+                    a0 = rvvm_sys_eventfd2((uint32_t)a0, (int32_t)a1);
+                    break;
 #endif
 #if defined(__linux__) || defined(_WIN32)
                 case 20: { // epoll_create1
@@ -17581,6 +17858,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                         userland_fd_set_flags(uctx(), guest_fd,
                                               (guest_flags & ~UAPI_SETFL_MASK) |
                                               ((uint32_t)a2 & UAPI_SETFL_MASK));
+                        if (userland_eventfd_is_fd(uctx()->fds[guest_fd].fd)) {
+                            /* An eventfd's blocking behaviour is decided by this
+                             * layer, so the object is told as well as the slot. */
+                            userland_eventfd_set_nonblock(uctx()->fds[guest_fd].fd,
+                                                          (a2 & UAPI_O_NONBLOCK) != 0);
+                        }
                         if (userland_fd_serves_own(uctx(), guest_fd)) {
                             /* A pty end, a /dev entry, the console: this side is
                              * the one that reads it, so the table has just said
@@ -18365,6 +18648,12 @@ static void* rvvm_user_thread_wrap(void* arg)
                         a0 = (rvvm_addr_t)userland_proc_lseek(lfd, (int64_t)a1, (int)a2);
                         break;
                     }
+                    if (userland_eventfd_is_fd(lfd)) {
+                        /* A counter has no offset: seeking one is ESPIPE, the
+                         * same answer a pipe gives. */
+                        a0 = -UAPI_ESPIPE;
+                        break;
+                    }
                     a0 = errno_ret(lseek(lfd, a1, a2));
                     /* Rewinding a directory restarts its listing, which has to
                      * replay the archive's links as well. */
@@ -19045,6 +19334,16 @@ static void* rvvm_user_thread_wrap(void* arg)
                         } else {
                             a0 = -UAPI_EBADF;
                         }
+                    } else if (userland_eventfd_is_fd(userland_fd_host(uctx(), (int)fd))) {
+                        /* anon_inode, as a kernel reports it: a regular file with
+                         * mode 0600 and no size. A guest that validates its
+                         * descriptors with fstat() has to see something sane. */
+                        memset(&st, 0, sizeof(st));
+                        st.st_mode  = S_IFREG | 0600;
+                        st.st_nlink = 1;
+                        st.st_uid   = (unsigned)uctx()->fake_uid;
+                        st.st_gid   = (unsigned)uctx()->fake_gid;
+                        a0 = 0;
                     } else if (userland_fd_is_console(uctx(), (int)fd) && uctx()->tty) {
                         /* The run's console: a character device, exactly what
                          * /dev/tty1 and /dev/console report, and with the same
