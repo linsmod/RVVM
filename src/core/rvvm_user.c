@@ -8080,7 +8080,14 @@ static bool userland_fd_serves_own(rvvm_userland_t* ctx, int fd)
     int                  hfd = userland_fd_host(ctx, fd);
 
     if (userland_pty_by_fd(hfd, &pty, &master) || userland_dev_by_fd(hfd, &dev) ||
-        userland_proc_is_fd(hfd) || userland_eventfd_is_fd(hfd)) {
+        userland_proc_is_fd(hfd) || userland_eventfd_is_fd(hfd) ||
+        win_socket_is_fd(hfd)) {
+        /* A Windows socket anchor is a host socket, but its number lives far
+         * above the CRT's fd range: handing F_SETFL to host fcntl() answers
+         * EBADF (see userland_connect_interruptible), which is what c-ares saw
+         * when it tried to make its UDP resolver socket non-blocking - it gave
+         * up with "Could not contact DNS servers". The guest flag word is the
+         * one that matters here; the host side is steered separately. */
         return true;
     }
     /* A console is served here whatever number it is on. */
@@ -17865,9 +17872,16 @@ static void* rvvm_user_thread_wrap(void* arg)
                                                           (a2 & UAPI_O_NONBLOCK) != 0);
                         }
                         if (userland_fd_serves_own(uctx(), guest_fd)) {
-                            /* A pty end, a /dev entry, the console: this side is
-                             * the one that reads it, so the table has just said
-                             * everything there is to say. */
+                            /* A pty end, a /dev entry, the console, an eventfd,
+                             * or a socket anchor: this side is the one that
+                             * reads it, so the table has just said everything
+                             * there is to say about the guest's flags. */
+                            if (win_socket_is_fd(uctx()->fds[guest_fd].fd)) {
+                                /* An anchor cannot be steered by host fcntl(),
+                                 * so its non-blocking state has its own call. */
+                                win_socket_set_nonblock(uctx()->fds[guest_fd].fd,
+                                                        (a2 & UAPI_O_NONBLOCK) != 0);
+                            }
                             a0 = 0;
                             break;
                         }
