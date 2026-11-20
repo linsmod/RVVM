@@ -1595,6 +1595,10 @@ typedef struct {
     uint32_t*       child_cleartid;
     uint32_t        tid;          // Guest-visible thread id
     uint32_t        finished;     // Set by userland shutdown to stop this vCPU
+    // What host call it is parked in, if any ("connect", "socket read", ...).
+    // Diagnostic only: it is what "fork: child threads linger" prints so a
+    // leaked machine names the call that would not come back.
+    const char*     wait_note;
 } rvvm_user_thread_t;
 
 /* ============================================================
@@ -8123,7 +8127,50 @@ static bool userland_fd_write_blocks(rvvm_userland_t* ctx, int fd)
  *
  * Returns 0 when the read may proceed, -EINTR when the guest has a signal to
  * deliver (or its thread was ended). */
-static int userland_wait_socket_readable(rvvm_userland_t* ctx, int fd, int host_fd)
+/* Is the host descriptor behind a guest fd a socket? On win32 every guest socket
+ * is an anchor (win_socket_is_fd); elsewhere it is an ordinary host socket, which
+ * fstat() names. */
+static bool userland_host_fd_is_socket(int host_fd)
+{
+    if (host_fd < 0) {
+        return false;
+    }
+#if defined(_WIN32)
+    return win_socket_is_fd(host_fd) != 0;
+#else
+    struct stat st;
+    return fstat(host_fd, &st) == 0 && S_ISSOCK(st.st_mode);
+#endif
+}
+
+/* Wait for @host_fd to be ready for @events in 50 ms slices, so that the guest
+ * thread parked on it can leave when it is asked to.
+ *
+ * This is the shared half of every host call that can park a thread inside the
+ * emulator: read(2)/recv(2)/accept(2) (POLLIN), write(2)/send(2) (POLLOUT) and
+ * connect(2) (POLLOUT - completion). Two reasons to slice:
+ *
+ *   - a signal must end the wait (ctx->sig_pending), so ^C and kill(2) reach a
+ *     thread parked on a socket - the shell that started the process has to get
+ *     its terminal back;
+ *   - a torn-down address space must not be kept alive by a parked thread. The
+ *     teardown marks every thread finished and destroys the space only once they
+ *     are all gone (userland_threads_gone()); a thread inside a host call cannot
+ *     be reached by riscv_hart_queue_pause(), and the space would be leaked with
+ *     "fork: child threads linger".
+ *
+ * Returns 1 ready, 0 timeout, -1 the thread is ending (caller answers -EINTR),
+ * -2 the probe failed (caller lets the real call report it). */
+#define USERLAND_HOST_WAIT_SLICE_MS 50
+
+static void userland_wait_note(const char* note)
+{
+    if (current_user_thread) {
+        current_user_thread->wait_note = note;
+    }
+}
+
+static int userland_wait_host_fd(rvvm_userland_t* ctx, int host_fd, short events, int timeout_ms)
 {
     /* Escape hatch for bisecting a guest that a sliced wait upsets: the same
      * shape as RVVM_USER_NO_THREADS. */
@@ -8131,28 +8178,122 @@ static int userland_wait_socket_readable(rvvm_userland_t* ctx, int fd, int host_
     if (disabled < 0) {
         disabled = getenv("RVVM_NO_SOCK_WAIT") != NULL;
     }
-    if (disabled) {
+    if (disabled || host_fd < 0) {
         return 0;
     }
-    if (!userland_fd_read_blocks(ctx, fd) || !win_socket_is_fd(host_fd)) {
+
+    int waited = 0;
+    for (;;) {
+        if (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished()) {
+            return -1;
+        }
+        int rc;
+#if defined(_WIN32)
+        rc = win_socket_is_fd(host_fd)
+           ? win_socket_wait(host_fd, events, USERLAND_HOST_WAIT_SLICE_MS)
+           : 0;
+#else
+        struct pollfd pfd;
+        pfd.fd      = host_fd;
+        pfd.events  = events;
+        pfd.revents = 0;
+        rc = poll(&pfd, 1, USERLAND_HOST_WAIT_SLICE_MS);
+        if (rc > 0 && !(pfd.revents & events)) {
+            rc = 1;   /* ready in some way: let the call report the details */
+        }
+#endif
+        if (rc > 0) {
+            return 1;
+        }
+        if (rc < 0) {
+            return -2;
+        }
+        waited += USERLAND_HOST_WAIT_SLICE_MS;
+        if (timeout_ms > 0 && waited >= timeout_ms) {
+            return 0;
+        }
+    }
+}
+
+static int userland_wait_socket_readable(rvvm_userland_t* ctx, int fd, int host_fd)
+{
+    if (!userland_fd_read_blocks(ctx, fd) || !userland_host_fd_is_socket(host_fd)) {
         /* Non-blocking guest descriptor, or not a socket: the host call either
          * does not block or returns at once, so there is nothing to slice. */
         return 0;
     }
-    for (;;) {
-        if (atomic_load_uint32(&ctx->sig_pending) || userland_thread_finished()) {
-            return -UAPI_EINTR;
-        }
-        int rc = win_socket_wait_readable(host_fd, 50);
-        if (rc > 0) {
-            return 0;
-        }
-        if (rc < 0) {
-            /* The probe failed (the peer is gone, the anchor is stale). Let the
-             * read itself report it rather than inventing an errno here. */
-            return 0;
+    userland_wait_note("socket read/accept");
+    int rc = userland_wait_host_fd(ctx, host_fd, POLLIN, 0);
+    userland_wait_note(NULL);
+    if (rc < 0) {
+        /* The thread is going away: EINTR. A probe failure (-2) is left to the
+         * read itself, which reports the real errno. */
+        return rc == -1 ? -UAPI_EINTR : 0;
+    }
+    return 0;
+}
+
+/* connect(2) with a sliced wait.
+ *
+ * A blocking host connect() parks for the host's TCP timeout - tens of seconds
+ * on win32 - and, like a parked recv(), cannot be interrupted by a teardown or a
+ * signal. Do the connect in non-blocking mode and wait for writability in
+ * slices; SO_ERROR says how it went. The guest's own blocking mode is restored
+ * on the way out. */
+static int userland_connect_interruptible(rvvm_userland_t* ctx, int host_fd,
+                                          const void* sa, socklen_t len,
+                                          bool may_block, const char* note)
+{
+    int old_flags, rc;
+
+    if (!may_block || !userland_host_fd_is_socket(host_fd)) {
+        return connect(host_fd, sa, len);
+    }
+
+    old_flags = fcntl(host_fd, F_GETFL, 0);
+    fcntl(host_fd, F_SETFL, old_flags | UAPI_O_NONBLOCK);
+    userland_wait_note(note);
+
+    rc = connect(host_fd, sa, len);
+    if (rc < 0 && (errno == EINPROGRESS || errno == EWOULDBLOCK || errno == EALREADY)) {
+        for (;;) {
+            int w = userland_wait_host_fd(ctx, host_fd, POLLOUT, 0);
+            if (w == 0) {
+                errno = ETIMEDOUT;
+                rc = -1;
+                break;
+            }
+            if (w == -1) {
+                errno = EINTR;
+                rc = -1;
+                break;
+            }
+            if (w == -2) {
+                /* Let the socket report its own state. */
+                rc = 0;
+                break;
+            }
+            {
+                int so_err = 0;
+                socklen_t so_len = sizeof so_err;
+                if (getsockopt(host_fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len) < 0) {
+                    rc = -1;
+                    break;
+                }
+                if (so_err) {
+                    errno = so_err;
+                    rc = -1;
+                } else {
+                    rc = 0;
+                }
+                break;
+            }
         }
     }
+
+    userland_wait_note(NULL);
+    fcntl(host_fd, F_SETFL, old_flags);
+    return rc;
 }
 
 /* close(2) for a tracked descriptor. Returns false when it is not one of ours,
@@ -10506,6 +10647,18 @@ static void* rvvm_user_child_main(void* arg)
         userland_destroy(machine);
     } else {
         rvvm_warn("fork: child threads linger, leaking the machine");
+        /* Name what they are parked in - that is the only clue the leak leaves,
+         * and it is what decides whether a wait still needs slicing. */
+        if (ctx) {
+            spin_lock(&ctx->userland_threads_lock);
+            vector_foreach (ctx->userland_threads, i) {
+                rvvm_user_thread_t* t = vector_at(ctx->userland_threads, i);
+                rvvm_warn("  tid=%u pid=%u parked in %s", t->tid,
+                          t->proc ? t->proc->pid : 0,
+                          t->wait_note ? t->wait_note : "(guest code)");
+            }
+            spin_unlock(&ctx->userland_threads_lock);
+        }
     }
     return NULL;
 }
@@ -18318,6 +18471,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                             ssize_t ret = uctx()->console_sink(host_fd, wbuf, a2);
                             a0 = errno_ret(ret);
                         } else {
+                            /* A blocking socket write parks while the send
+                             * buffer is full; wait for room in slices so a
+                             * signal or a teardown can end it. */
+                            if (userland_fd_write_blocks(uctx(), wfd) &&
+                                userland_host_fd_is_socket(host_fd)) {
+                                userland_wait_note("socket write");
+                                int ww = userland_wait_host_fd(uctx(), host_fd, POLLOUT, 0);
+                                userland_wait_note(NULL);
+                                if (ww == -1) {
+                                    a0 = (rvvm_addr_t)-UAPI_EINTR;
+                                    break;
+                                }
+                            }
                             a0 = errno_ret(write(host_fd, wbuf, a2));
                         }
                             RVVM_TRC(RVVM_TRC_SYS, "sys_write(guest fd=%d host=%d) = %ld (errno %d)",
@@ -19773,6 +19939,8 @@ case 179: // sysinfo
                         RVVM_TRC(RVVM_TRC_SYS, "connect fd %ld, %u byte(s): %s",
                                   (long)a0, len, desc);
                     }
+                    /* Sliced: a blocking connect() parks for the host's TCP
+                     * timeout and cannot be ended by a signal or a teardown. */
                     a0 = errno_ret(connect(userland_fd_host(uctx(), (int)a0), sa, (socklen_t)len));
                     break;
                 }

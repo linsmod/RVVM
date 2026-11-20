@@ -15,6 +15,7 @@
 | `design-userland-supervisor.md` | 设计 | **不是现状**：userland supervisor（实例管理 daemon + SQLite + CLI）的架构、事实源与 reconcile、API 面、验收线。冻结于 2026-11-18 |
 | `todo-userland-supervisor.md` | 待办 | S1 daemon / S2 CLI（已完成）/ S3 web 后台，含风险与全局验收 |
 | `task-userland-supervisor.md` | 执行 | supervisor 预览的执行记录：交付物、验收结果、过程坑与遗留 |
+| `task-interruptible-waits.md` | 执行 | 让 guest 线程能从宿主阻塞调用（accept/recv/write）里被收掉：现状盘点、统一等待原语、验证记录；connect 试过回退 |
 | `task-host-info-exposure.md` | 执行 | 宿主信息暴露审计与 8 次提交的批量修复：P0 hostfs/supervisor 鉴权、P1 元数据/构建路径，含恢复点与测试配方 |
 | `fix-host-info-exposure.md` | 修复史 | 上述修复的现象/根因/修法表/验证/遗留（C1–C8 commit） |
 | `fix-fcntl-record-locks.md` | 修复史 | SQLite unix VFS 的 `F_GETLK/F_SETLK/F_SETLKW`：emulator 锁表、fork/close/byte-range、`RVVM_TRACE=fd` 与 direct `rvvm_user` 探针 |
