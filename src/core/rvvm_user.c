@@ -166,6 +166,9 @@ int  win_socket_wait_readable(int fd, int timeout_ms);
  * of our own descriptors, so poll()/select() ask here instead of handing its
  * number to the host - anchor numbers are not CRT descriptors. */
 int  win_socket_wait(int fd, short events, int timeout_ms);
+/* Switch an anchor between blocking and non-blocking for the duration of one
+ * connect(2) (see userland_connect_interruptible). 0 on success, -1 otherwise. */
+int  win_socket_set_nonblock(int fd, int on);
 #else
 /* Not a WinSock build, so the anchors do not exist - and a guest socket here is
  * a real host socket, with no anchor table, no generation and no reference to
@@ -191,6 +194,7 @@ static inline void        win_socket_anchor_ref(int fd)  { (void)fd; }
 static inline void        win_socket_anchor_unref(int fd) { (void)fd; }
 static inline int         win_socket_close(int fd)       { (void)fd; return -1; }
 static inline int         win_socket_dup(int fd)         { (void)fd; return -1; }
+static inline int         win_socket_set_nonblock(int fd, int on) { (void)fd; (void)on; return -1; }
 #endif
 #include "elf_load.h"
 #include "mem_ops.h"
@@ -8244,14 +8248,38 @@ static int userland_connect_interruptible(rvvm_userland_t* ctx, int host_fd,
                                           const void* sa, socklen_t len,
                                           bool may_block, const char* note)
 {
-    int old_flags, rc;
+    int  old_flags = 0, rc;
+    bool restore_winsock = false, restore_fcntl = false;
 
     if (!may_block || !userland_host_fd_is_socket(host_fd)) {
         return connect(host_fd, sa, len);
     }
 
-    old_flags = fcntl(host_fd, F_GETFL, 0);
-    fcntl(host_fd, F_SETFL, old_flags | UAPI_O_NONBLOCK);
+    /* Two ways to make the socket non-blocking for the duration: a win32 anchor
+     * is not a descriptor the shim's fcntl() can steer (anchor numbers start at
+     * WSOCK_ANCHOR_BASE, far above SHIM_FD_MAX, so F_GETFL answers EBADF), while
+     * everywhere else the host fd is a real one and fcntl() is the way.
+     *
+     * A failed attempt at either means "ask for nothing": the plain blocking
+     * connect() is what the guest had before. What must never happen is leaving
+     * the attempt's errno behind - the caller reports it, and a connect() that
+     * failed with ENOENT was reported as EBADF because the F_GETFL probe set it,
+     * which is how an ssh session came to be refused. */
+#if defined(_WIN32)
+    if (win_socket_is_fd(host_fd)) {
+        if (win_socket_set_nonblock(host_fd, 1) < 0) {
+            return connect(host_fd, sa, len);
+        }
+        restore_winsock = true;
+    }
+#endif
+    if (!restore_winsock) {
+        old_flags = fcntl(host_fd, F_GETFL, 0);
+        if (old_flags < 0 || fcntl(host_fd, F_SETFL, old_flags | UAPI_O_NONBLOCK) < 0) {
+            return connect(host_fd, sa, len);
+        }
+        restore_fcntl = true;
+    }
     userland_wait_note(note);
 
     rc = connect(host_fd, sa, len);
@@ -8292,7 +8320,20 @@ static int userland_connect_interruptible(rvvm_userland_t* ctx, int host_fd,
     }
 
     userland_wait_note(NULL);
-    fcntl(host_fd, F_SETFL, old_flags);
+    /* Restoring the mode must not rewrite the verdict: these calls set errno on
+     * the way, and the caller reports whatever errno says when rc < 0. */
+    {
+        int saved = errno;
+#if defined(_WIN32)
+        if (restore_winsock) {
+            win_socket_set_nonblock(host_fd, 0);
+        }
+#endif
+        if (restore_fcntl) {
+            fcntl(host_fd, F_SETFL, old_flags);
+        }
+        errno = saved;
+    }
     return rc;
 }
 
@@ -19941,7 +19982,9 @@ case 179: // sysinfo
                     }
                     /* Sliced: a blocking connect() parks for the host's TCP
                      * timeout and cannot be ended by a signal or a teardown. */
-                    a0 = errno_ret(connect(userland_fd_host(uctx(), (int)a0), sa, (socklen_t)len));
+                    a0 = errno_ret(userland_connect_interruptible(
+                        uctx(), userland_fd_host(uctx(), (int)a0), sa, (socklen_t)len,
+                        userland_fd_write_blocks(uctx(), (int)a0), "connect"));
                     break;
                 }
                 case 204: { // getsockname

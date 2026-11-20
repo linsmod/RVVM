@@ -89,25 +89,39 @@
 - [x] write/send 接入（发送缓冲满时切片等待 POLLOUT）
 - [x] `child threads linger` 时打印每个残留线程的 `tid/pid/wait_note`
 - [x] 样例 `test_thread_exit`（accept/connect/recv 三例）+ 回归
-- [ ] **connect 切片：试过，回退**，原因见下
+- [x] connect 切片（含 win32 anchor），坑见下
 
-## connect 为什么没合入
+## connect 的坑：`errno` 被还原调用覆盖
 
-按计划实现的 `userland_connect_interruptible()`（临时置非阻塞 + 切片等待 POLLOUT +
-SO_ERROR + 还原 flags）一上线，guest 的 ssh 端点立刻坏掉：
+第一版 `userland_connect_interruptible()` 一上线，guest 的 ssh 端点立刻坏掉：
 
 ```
 ssh: root@127.0.0.1: Permission denied (publickey)
 tinysshd: fatal: unable to receive hello-string (connection aborted)
 ```
 
-关闭 write 切片后仍复现，单独回退 connect 后恢复，因此归因明确。未定位到根因：
-嫌疑在 win32 anchor 上做 `fcntl(F_SETFL)` —— anchor 号在 `WSOCK_ANCHOR_BASE` 之上、
-大于 `SHIM_FD_MAX`，shim 的 `fcntl()` 对它会直接 `EBADF`，于是"临时非阻塞"其实没生效，
-而还原调用同样失败；按推理行为应与改动前一致，但实测不是，需要单独一轮排查（建议先加
-`RVVM_TRC(FD)` 对比 connect 前后的 anchor 标志与 `SO_ERROR`）。
+关掉 write 切片仍复现、单独回退 connect 就恢复，归因明确。加临时日志后真相是：
 
-结论：connect 仍保持原来的阻塞调用；accept / recv / write 三条路径已切片。
+```
+[connect] guest=4 host=0x40000005 (anchor) may_block=1 sock=1
+[connect-helper] old=0xffffffff setrc=-1 errno=9    ← fcntl 对 anchor 返回 EBADF
+[connect-helper] connect rc=-1 errno=2              ← 真实错误是 ENOENT
+[connect] -> -9 errno=9                             ← 还原调用把 errno 改成 EBADF
+```
+
+win32 的 socket 是 anchor（号从 `WSOCK_ANCHOR_BASE` 起，远大于 `SHIM_FD_MAX`），
+shim 的 `fcntl()` 对它一律 `EBADF`，所以"临时非阻塞"根本没生效 —— 真正致命的是
+**还原 flags 的那次 `fcntl()` 覆盖了 `errno`**，把 `connect()` 的真实 `ENOENT` 报成
+`EBADF`，guest 走了错误分支。
+
+修法三点：
+
+1. win32 anchor 用 `win_socket_set_nonblock()` 直接置位（它能认 anchor），而不是 `fcntl`；
+2. 非 anchor 才用 `fcntl`，且任一探测/置位失败就**提前返回普通阻塞 connect**；
+3. 收尾还原时保存并恢复 `errno`，绝不让清理动作改写调用结果。
+
+修完后 `us exec`（publickey 认证）正常，`test_thread_exit` 三个用例全过，
+`test_jobctl` 仍是基线 8 项。
 
 ## 验证记录（本机）
 
@@ -124,7 +138,8 @@ tinysshd: fatal: unable to receive hello-string (connection aborted)
   说明：样例里的 `wait4` 只证明子进程退出很快，真正的 address-space 回收要看实例日志
   是否出现 `child threads linger`（本轮三次运行均未出现）。
 - 回归：`test_jobctl` 直接运行仍是基线 8 项 ctty FAIL，无新增。
-- 端点：改动后 `us exec`（publickey 认证 + pty/socket 路径）正常。
+- 端点：改动后 `us exec`（publickey 认证 + pty/socket 路径）正常；connect 切片启用后
+  仍是同一结果（这是上一轮回归的判据）。
 
 ## 恢复要点
 
