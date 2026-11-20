@@ -47,6 +47,9 @@ python tools/supervisor/us.py list
 - 一次安全/隔离自测：`python tools/supervisor/selftest.py --release <test tree>`；
   它会起临时 daemon/DB、两个实例，验证 token、API 去路径、per-instance run、
   hostfs 默认拒绝、statfs/inode/uptime、uname/mounts，再清理（约 34s）。
+  **它会调用 `prune --yes`**：该 release 树 `runtime/roots/` 下所有停止实例的
+  rootfs 目录（凡 DB 里没有活端口记录的）都会被删掉。用专门的试验树，别拿有
+  你要保留的停止实例的树去跑。
 
 ## 基本操作
 

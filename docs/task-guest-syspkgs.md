@@ -65,19 +65,18 @@ us stop <port>; POST /api/instances/<port>/start; sqlite3 /persist/d.db "select 
    `import sqlite3,ssl,json,urllib.request` 正常；python 在 `/persist/py.db` 建表/插入/读回
    `[(42,)]`；`test_std` 159 checks / 0 failed。
 
-4. **已修复：`sigaltstack` 缺失导致 `-X faulthandler` 用不了**。syscall **132**（不是 133）
-   现已实现：按 guest 的 `stack_t`（sp/flags/size）记录 per-context 备用栈，SS_DISABLE/SS_ONSTACK
-   语义与 ENOMEM/EPERM 边界齐全；`rt_sigaction` 原来把 `sigsetsize`(8) 当成整个结构体的拷贝长度，
-   只传了 handler、丢掉 flags/mask，现改为整份 24 字节 `uapi_sigaction`，于是 SA_ONSTACK 生效；
-   信号帧在 SA_ONSTACK 且备用栈可用时落在备用栈顶，`sigreturn` 清除 on-stack 状态；
-   guest 致命异常（SIGILL/SIGSEGV）先尝试投递给已注册的 guest handler，再走默认终止。
-   验证：`python3 -X faulthandler -c "print(7)"` → 7 / rc=0；构造 guest SIGILL 时 faulthandler
-   打印完整 Python traceback 并以 132（128+SIGILL）退出；`test_std` 159/0、selftest 0 failure。
-   另发现：`python3 -X faulthandler -c "import _ctypes"` 触发 SIGILL（故障处为全零字，PC 落在
-   未映射区），不带 faulthandler 时同一 import 正常。排查中修正了两个真实 bug：riscv64
-   `uapi_sigaction` 的字段顺序（handler/flags/restorer/mask，之前把 `SA_SIGINFO|SA_ONSTACK`
-   读成 mask）与 SA_SIGINFO handler 的 a1/a2（现填零初始化 siginfo/ucontext）；SIGILL 仍在，
-   与 atomics 无关（LR.W/SC.W 已实现），根因未定位，见 `issues/INDEX.md`。
+4. **已修复：`sigaltstack` 参数错位导致 `-X faulthandler` 下 `import _ctypes` SIGILL**。
+   syscall 132 原来从 a1/a2 取参，正确 ABI 是 a0/a1；faulthandler 的
+   `sigaltstack(&stack, NULL)` 因而没装栈，还把一份全零的 24 字节 `stack_t`
+   写到 stale 的 a2 指向的解释器 `.rodata`，零掉 musl `sysconf` 跳转表；
+   libffi dlopen 时 `sysconf(_SC_PAGESIZE)` 跳到表头数据。修法：按 ABI 读
+   a0/a1，`guest_vm_init()` 把备用栈重置为 `SS_DISABLE`（exec 丢栈）。
+   验证：C 探针的 `SA_SIGINFO|SA_ONSTACK` handler 确实在备用栈上运行；
+   `python3 -X faulthandler -c "import _ctypes"` 通过；faulthandler 真崩溃
+   仍打印 traceback（132）；`test_std` 159/1 基线/7、selftest PASS。
+   详见 `fix-userland-sigaltstack-args.md`。
+   （此前 c3d2f2d 声称的 sigaltstack/SA_ONSTACK 生效没有真正被测到：那次只验证了
+   syscall 返回 0，栈从未安装。）
 
 三个原模拟器缺口都已修好，默认 `SYS_PKGS` 恢复为 `sqlite,curl,python3`。
 
@@ -91,7 +90,7 @@ us stop <port>; POST /api/instances/<port>/start; sqlite3 /persist/d.db "select 
 | eventfd2（非 Linux 合成 fd） | 完成；curl OOM 修复 |
 | c-ares DNS（F_SETFL on socket anchor） | 完成；`curl http://example.com/` → 200 |
 | python3 a_crash（rt_sigprocmask 8→16 字节溢出） | 完成；python3 跑代码、import、/persist 上写库全通过 |
-| sigaltstack / SA_ONSTACK / faulthandler | 完成；`-X faulthandler` 打印 traceback；fatal 异常先投递 guest handler |
+| sigaltstack / SA_ONSTACK / faulthandler | 完成；C 探针确认 SA_ONSTACK 帧落在备用栈；`-X faulthandler` 下 `import _ctypes` 通过 |
 
 ## 6. 默认集合
 

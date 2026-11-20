@@ -4121,6 +4121,14 @@ static void guest_vm_init(void)
     ctx->guest_brk_end    = GUEST_MMAP_BASE;
     ctx->guest_brk_ptr    = 0;
     ctx->guest_free_num   = 0;
+
+    /* A fresh address space has no alternate signal stack: sigaltstack() must
+     * answer SS_DISABLE until the guest installs one, and execve() drops the
+     * old one along with the address space it lived in. */
+    ctx->altstack_sp    = 0;
+    ctx->altstack_size  = 0;
+    ctx->altstack_flags = UAPI_SS_DISABLE;
+    ctx->altstack_on    = false;
 }
 
 // Hand out @size bytes of guest address space, zeroed like a fresh mapping
@@ -19805,12 +19813,24 @@ static void* rvvm_user_thread_wrap(void* arg)
                     /* CPython's faulthandler calls this at startup and refuses
                      * to install its SIGSEGV handler when it answers ENOSYS.
                      * The stack is a guest address range: only a frame placement
-                     * decision is made here, no host stack is ever switched. */
+                     * decision is made here, no host stack is ever switched.
+                     *
+                     * The arguments are sigaltstack(ss, old_ss) in a0/a1, like
+                     * every other syscall. Reading them from a1/a2 made the
+                     * faulthandler call site - which passes (stack, NULL) -
+                     * store no stack at all, while the "old stack" record went
+                     * through a2, a register the caller never set on a 2-argument
+                     * call. That wrote sp/flags/size (all zero on the first
+                     * call) over whatever stale pointer a2 held; in practice one
+                     * 24-byte struct landed in the interpreter's .rodata and
+                     * zeroed five sysconf jump-table entries, the page-size one
+                     * among them, so the first sysconf(_SC_PAGESIZE) jumped into
+                     * the middle of that table. */
                     rvvm_userland_t* ctx = uctx();
-                    struct uapi_sigaltstack* ss = a1 ? to_ptr_sz(a1, sizeof(*ss)) : NULL;
-                    struct uapi_sigaltstack* old = a2 ? to_ptr_sz_wr(a2, sizeof(*old)) : NULL;
+                    struct uapi_sigaltstack* ss = a0 ? to_ptr_sz(a0, sizeof(*ss)) : NULL;
+                    struct uapi_sigaltstack* old = a1 ? to_ptr_sz_wr(a1, sizeof(*old)) : NULL;
                     rvvm_info("sys_sigaltstack(%lx, %lx)", a0, a1);
-                    if ((a1 && !ss) || (a2 && !old)) {
+                    if ((a0 && !ss) || (a1 && !old)) {
                         a0 = -UAPI_EFAULT;
                         break;
                     }
