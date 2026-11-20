@@ -60,7 +60,7 @@ bind 之前，把「还在启动」误报成「僵死」会让运维去杀健康
 |---|---|---|
 | 实例化 | `rvvm_ash --serve --port N --rootfs <dir> --run-dir <run>` | `ash_main.c`（端口即 ID）；`--rootfs`/`--run-dir` 为本次新增（rootfs 锁/mode-store 是 `<rootfs>.lock`/`<rootfs>.modes` sidecar，`/run/vpsessiond` 随实例目录） |
 | 实例清单 | `runtime/cores/*.core` | `ash_client.c`（自注册/自删/残回收） |
-| 日志 | `RVVM_LOG_FILE=<supervisor>/<port>.log`、`RVVM_LOG_RING_DUMP` 同目录 | utils.h log ring |
+| 日志 | `RVVM_LOG_FILE=<supervisor>/<port>.log`、`RVVM_LOG_RING_DUMP` 同目录 | utils.h log ring；每次启动重建（上一轮留存为 `<port>.log.prev`），`us logs` 只反映当前这一轮 |
 | 终端/命令 | `ssh -p N 127.0.0.1 "<cmd>"`（vpssh 链：vpshhd → tinysshnoneauthd） | 客户端任意 ssh |
 | 探活 | pid 活性 + tcp connect 端口 | |
 

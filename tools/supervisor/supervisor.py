@@ -709,7 +709,16 @@ class Supervisor:
             kwargs["stdin"] = subprocess.DEVNULL
         else:
             kwargs["start_new_session"] = True
-        logf = open(logp, "ab")
+        # Every run gets a fresh log: this file is what `us logs` shows, and
+        # appending means a restarted instance's output is buried under the
+        # previous run's - the reader cannot tell which lines are current.
+        # One previous run is kept beside it as <port>.log.prev.
+        if os.path.exists(logp) and os.path.getsize(logp) > 0:
+            try:
+                os.replace(logp, logp + ".prev")
+            except OSError:
+                pass
+        logf = open(logp, "wb")
         try:
             proc = subprocess.Popen(argv, cwd=self.release, env=env,
                                     stdout=logf, stderr=logf, **kwargs)
