@@ -65,7 +65,17 @@ us stop <port>; POST /api/instances/<port>/start; sqlite3 /persist/d.db "select 
    `import sqlite3,ssl,json,urllib.request` 正常；python 在 `/persist/py.db` 建表/插入/读回
    `[(42,)]`；`test_std` 159 checks / 0 failed。
 
-三个模拟器缺口都已修好，默认 `SYS_PKGS` 恢复为 `sqlite,curl,python3`。
+4. **已修复：`sigaltstack` 缺失导致 `-X faulthandler` 用不了**。syscall **132**（不是 133）
+   现已实现：按 guest 的 `stack_t`（sp/flags/size）记录 per-context 备用栈，SS_DISABLE/SS_ONSTACK
+   语义与 ENOMEM/EPERM 边界齐全；`rt_sigaction` 原来把 `sigsetsize`(8) 当成整个结构体的拷贝长度，
+   只传了 handler、丢掉 flags/mask，现改为整份 24 字节 `uapi_sigaction`，于是 SA_ONSTACK 生效；
+   信号帧在 SA_ONSTACK 且备用栈可用时落在备用栈顶，`sigreturn` 清除 on-stack 状态；
+   guest 致命异常（SIGILL/SIGSEGV）先尝试投递给已注册的 guest handler，再走默认终止。
+   验证：`python3 -X faulthandler -c "print(7)"` → 7 / rc=0；构造 guest SIGILL 时 faulthandler
+   打印完整 Python traceback 并以 132（128+SIGILL）退出；`test_std` 159/0、selftest 0 failure。
+   顺带发现 `ctypes` 导入触发 `lr.w` 非法指令，另立 `issues/INDEX.md`。
+
+三个原模拟器缺口都已修好，默认 `SYS_PKGS` 恢复为 `sqlite,curl,python3`。
 
 ## 6. 恢复点
 
@@ -77,6 +87,7 @@ us stop <port>; POST /api/instances/<port>/start; sqlite3 /persist/d.db "select 
 | eventfd2（非 Linux 合成 fd） | 完成；curl OOM 修复 |
 | c-ares DNS（F_SETFL on socket anchor） | 完成；`curl http://example.com/` → 200 |
 | python3 a_crash（rt_sigprocmask 8→16 字节溢出） | 完成；python3 跑代码、import、/persist 上写库全通过 |
+| sigaltstack / SA_ONSTACK / faulthandler | 完成；`-X faulthandler` 打印 traceback；fatal 异常先投递 guest handler |
 
 ## 6. 默认集合
 

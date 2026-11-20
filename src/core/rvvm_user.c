@@ -2437,6 +2437,13 @@ char*                    guest_root_path;
     // sigset_t is bigger here, which is why rt_sigprocmask must not hand the
     // guest's oldset buffer to the host: see that syscall's implementation.
     uint64_t sig_mask;
+    // The alternate signal stack, in the guest's own stack_t shape (see
+    // sigaltstack below). sigaltstack() is per-process in Linux, so these live
+    // on the address space rather than on one vCPU.
+    rvvm_addr_t altstack_sp;
+    uint64_t    altstack_size;
+    uint32_t    altstack_flags;
+    bool        altstack_on;      // a frame is currently running on it
 
     // --- Guest virtual TTY (libvterm, optional) ---
     // When tty_cb is set, guest writes to fd 1/2 are parsed by libvterm and the
@@ -3207,6 +3214,14 @@ static void* to_ptr_ioctl(rvvm_addr_t addr, uint64_t cmd)
 #define UAPI_SIG_BLOCK    0
 #define UAPI_SIG_UNBLOCK  1
 #define UAPI_SIG_SETMASK  2
+
+/* sigaltstack(2) and the one sigaction flag that decides where a frame lands.
+ * CPython's faulthandler installs an alternate stack precisely so it can run
+ * after a SIGSEGV; without the syscall it dies at initialization with ENOSYS. */
+#define UAPI_SS_DISABLE   0x00000002
+#define UAPI_SS_ONSTACK   0x00000001
+#define UAPI_SA_ONSTACK   0x08000000
+#define UAPI_MINSIGSTKSZ  2048
 
 /*
  * Termios bits the virtual TTY's input path acts on (asm-generic values, the
@@ -17320,6 +17335,21 @@ static void userland_siginject(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
 
     uint64_t sp = rvvm_read_cpu_reg(cpu, RVVM_REGID_X0 + 2);
     uint64_t frame_addr = (sp - sizeof(frame)) & ~(uint64_t)0xF;
+    /* SA_ONSTACK asks for the frame on the alternate stack. This is what makes
+     * a handler for a broken stack runnable at all, and CPython's faulthandler
+     * relies on it. Falling back to the interrupted stack when the registered
+     * range is unusable is safer than refusing delivery. */
+    if ((ctx->siga[sig].flags & UAPI_SA_ONSTACK) && ctx->altstack_sp &&
+        ctx->altstack_size && !ctx->altstack_on &&
+        !(ctx->altstack_flags & UAPI_SS_DISABLE)) {
+        uint64_t alt_frame = (ctx->altstack_sp + ctx->altstack_size -
+                              sizeof(frame)) & ~(uint64_t)0xF;
+        if (alt_frame >= ctx->altstack_sp &&
+            alt_frame + sizeof(frame) <= ctx->altstack_sp + ctx->altstack_size) {
+            frame_addr    = alt_frame;
+            ctx->altstack_on = true;
+        }
+    }
     struct vp_sigframe* host_frame = to_ptr_sz_wr(frame_addr, sizeof(frame));
     if (!host_frame) {
         // The stack is not in guest RAM (should not happen): drop the signal
@@ -17357,6 +17387,7 @@ static void userland_sigrestore(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
         rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 1 + r, frame->regs[r]);
     }
     rvvm_write_cpu_reg(cpu, RVVM_REGID_PC, frame->pc);
+    ctx->altstack_on = false;   // no frame on the alternate stack any more
     atomic_store_uint32(&ctx->sig_inflight, 0);
     atomic_store_uint32(&ctx->sig_inflight_sig, 0);
 }
@@ -19735,6 +19766,47 @@ static void* rvvm_user_thread_wrap(void* arg)
                     RVVM_TRC(RVVM_TRC_SIGNAL, "sys_tgkill(%lx, %lx, %ld)", a0, a1, a2);
                     a0 = userland_signal_pid(uctx(), thread, (int32_t)a0, (uint32_t)a2);
                     break;
+                case 132: { // sigaltstack
+                    /* CPython's faulthandler calls this at startup and refuses
+                     * to install its SIGSEGV handler when it answers ENOSYS.
+                     * The stack is a guest address range: only a frame placement
+                     * decision is made here, no host stack is ever switched. */
+                    rvvm_userland_t* ctx = uctx();
+                    struct uapi_sigaltstack* ss = a1 ? to_ptr_sz(a1, sizeof(*ss)) : NULL;
+                    struct uapi_sigaltstack* old = a2 ? to_ptr_sz_wr(a2, sizeof(*old)) : NULL;
+                    rvvm_info("sys_sigaltstack(%lx, %lx)", a0, a1);
+                    if ((a1 && !ss) || (a2 && !old)) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    if (old) {
+                        old->sp    = ctx->altstack_sp;
+                        old->size  = ctx->altstack_size;
+                        old->flags = ctx->altstack_flags |
+                                     (ctx->altstack_on ? UAPI_SS_ONSTACK : 0);
+                    }
+                    if (ss) {
+                        if (ctx->altstack_on) {
+                            a0 = -UAPI_EPERM;
+                            break;
+                        }
+                        if ((ss->flags & UAPI_SS_DISABLE) || !ss->sp || !ss->size) {
+                            ctx->altstack_sp    = 0;
+                            ctx->altstack_size  = 0;
+                            ctx->altstack_flags = UAPI_SS_DISABLE;
+                        } else if (ss->size < UAPI_MINSIGSTKSZ ||
+                                   !to_ptr_sz(ss->sp, ss->size)) {
+                            a0 = -UAPI_ENOMEM;
+                            break;
+                        } else {
+                            ctx->altstack_sp    = ss->sp;
+                            ctx->altstack_size  = ss->size;
+                            ctx->altstack_flags = ss->flags & ~UAPI_SS_ONSTACK;
+                        }
+                    }
+                    a0 = 0;
+                    break;
+                }
                 case 133: { // rt_sigsuspend
                     /* Wait for a signal, then return -EINTR so the vCPU reaches
                      * its delivery boundary and the handler runs.
@@ -19778,11 +19850,19 @@ static void* rvvm_user_thread_wrap(void* arg)
                     struct sigaction sa = {0};
                     rvvm_info("sys_rt_sigaction(%ld, %lx, %lx, %lx)", a0, a1, a2, a3);
                     if (a0 < STATIC_ARRAY_SIZE(ctx->siga)) {
-                        // a3 is the guest sigsetsize; the whole struct sigaction
-                        // must never spill past one siga[] slot
-                        size_t copy_len = a3 < sizeof(ctx->siga[0]) ? a3 : sizeof(ctx->siga[0]);
+                        /* a3 is the guest's *sigset* size (8 bytes), not the
+                         * size of struct sigaction. Using it as the copy length
+                         * used to transfer only the handler and leave flags and
+                         * mask zero - which is why SA_ONSTACK, SA_RESTART and
+                         * SA_SIGINFO never reached the guest's signal table.
+                         * The whole uapi struct is 24 bytes; copy all of it. */
+                        size_t copy_len = sizeof(ctx->siga[0]);
                         void* old = a2 ? to_ptr_sz_wr(a2, copy_len) : NULL;
                         const void* act = a1 ? to_ptr_sz(a1, copy_len) : NULL;
+                        if (a3 < sizeof(uint64_t)) {
+                            a0 = -UAPI_EINVAL;
+                            break;
+                        }
                         if ((a2 && !old) || (a1 && !act)) {
                             a0 = -UAPI_EFAULT;
                             break;
@@ -20913,6 +20993,23 @@ case 179: // sysinfo
             if (thread->proc) {
                 rvvm_addr_t cause = rvvm_read_cpu_reg(cpu, RVVM_REGID_CAUSE);
                 int fatal_sig = (cause == 2) ? UAPI_SIGILL : UAPI_SIGSEGV;
+                uint64_t handler = uctx()->siga[fatal_sig].handler;
+                /* A guest handler for this signal gets the first refusals:
+                 * faulthandler prints a traceback from its SIGSEGV handler, and
+                 * a real kernel does the same before the default disposition
+                 * would kill the process. Inject straight onto this hart - the
+                 * ordinary delivery boundary is unreachable once the trap has
+                 * killed the instruction. A handler that returns lands back at
+                 * the faulting PC, which faults again; that is the kernel's
+                 * behaviour too, and a crashing handler should terminate. */
+                if (handler != (uint64_t)SIG_DFL && handler != (uint64_t)SIG_IGN &&
+                    !atomic_load_uint32(&uctx()->sig_inflight)) {
+                    rvvm_warn(" * * * guest exception delivered as signal %d to handler %llx",
+                              fatal_sig, (unsigned long long)handler);
+                    atomic_store_uint32(&uctx()->sig_pending, (uint32_t)fatal_sig);
+                    userland_siginject(cpu, uctx());
+                    continue;
+                }
                 rvvm_warn(" * * * guest exception is fatal, ending the process (signal %d)",
                           fatal_sig);
                 userland_kill_process(uctx(), thread->proc, fatal_sig);
