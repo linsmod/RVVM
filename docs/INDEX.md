@@ -26,6 +26,7 @@
 | `fix-userland-tty-cc.md` | 修复史 | 空闲提示符 ^C 无反应、连按两次会话卡死：TCGETS 不报 `c_cc`（busybox lineedit 靠 VINTR 认键）+ 信号 handler 的 longjmp 让 `sig_inflight` 永久占住（poll 永远 EINTR） |
 | `fix-userland-sendfile-tmpfs.md` | 修复史 | `cp`/`cat` 到 `/tmp` 静默丢开头 32K：sendfile 不认 memfs fd，消耗一个 chunk 后失败、调用方从错位继续 |
 | `fix-userland-kill-family.md` | 修复史 | `kill(pid)` 只查自己的注册表 → 子进程杀不了父/祖先（`timeout` 看门狗失效）；reparent 后家族根丢失 |
+| `fix-userland-orphan-lifetime.md` | 修复史 | 孤儿进程从 `/proc` 消失且 `kill` 不可达（父 ctx 销毁时唯一记录被释放）；被杀孤儿永久 `Z`；异常 trap 只结束线程 → 父 `wait4` 永久阻塞、回溯无上限刷日志 |
 | `INDEX.md` | 索引 | 本文件 |
 
 ## 仓库根目录的文档（历史位置，未迁入 docs/）

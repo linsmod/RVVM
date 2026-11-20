@@ -3173,8 +3173,10 @@ static void* to_ptr_ioctl(rvvm_addr_t addr, uint64_t cmd)
 /* Signals whose disposition the emulator has to act on itself, because it
  * cannot run a host-installed handler for the guest. asm-generic numbering, the
  * guest ABI's. */
+#define UAPI_SIGILL      4
 #define UAPI_SIGINT      2
 #define UAPI_SIGKILL     9
+#define UAPI_SIGSEGV    11
 #define UAPI_SIGALRM    14
 #define UAPI_SIGTERM    15
 #define UAPI_SIGCHLD    17
@@ -12235,6 +12237,16 @@ static void userland_kill_process(rvvm_userland_t* ctx, rvvm_process_t* proc, in
      * and leave it running. */
     userland_finish_threads(proc->child_ctx ? proc->child_ctx : ctx, proc, NULL);
     userland_notify_parent(ctx, proc, UAPI_SIGCHLD);
+    /* A kill bypasses exit(2), so the auto-reap in userland_exit_process() never
+     * runs for the killed process. When nobody is left to wait for it (a
+     * reparented orphan, or a parent that already exited) the record would sit
+     * in the registry as a permanent zombie - /proc/<pid> stays, state Z, and
+     * the address space never goes away. Drop it here for the same reason. */
+    if (!proc->run_root && !userland_parent_alive(proc)) {
+        RVVM_TRC(RVVM_TRC_JOB, "reap killed orphan: pid=%u ppid=%u",
+                 proc->pid, proc->ppid);
+        userland_proc_forget(proc->parent_ctx ? proc->parent_ctx : ctx, proc);
+    }
 }
 
 /* ============================================================
@@ -20245,8 +20257,33 @@ case 179: // sysinfo
             rvvm_addr_t interp_frames[32];
             size_t elf_frames_count = 0;
             size_t interp_frames_count = 0;
+            /* The walk below only stops when the frame pointer stops advancing,
+             * which a corrupted chain does not promise: a crash inside a deeply
+             * stacked call printed the same frame thousands of times and grew
+             * the run log to 190 MB, burying the useful part. Bound it by frame
+             * count and by repetition - a backtrace that keeps returning to one
+             * PC has already told its story. */
+            #define USERLAND_BT_MAX_FRAMES 64
+            #define USERLAND_BT_MAX_REPEAT 3
+            size_t bt_frames = 0;
+            int    bt_repeat = 0;
+            rvvm_addr_t bt_last_pc = ~(rvvm_addr_t)0;
             do {
                 rvvm_warn(" PC %lx", pc);
+                if (pc == bt_last_pc) {
+                    if (++bt_repeat >= USERLAND_BT_MAX_REPEAT) {
+                        rvvm_warn(" * * * Backtrace repeats PC %lx, stopping", pc);
+                        break;
+                    }
+                } else {
+                    bt_repeat = 0;
+                    bt_last_pc = pc;
+                }
+                if (++bt_frames >= USERLAND_BT_MAX_FRAMES) {
+                    rvvm_warn(" * * * Backtrace truncated at %d frames",
+                              USERLAND_BT_MAX_FRAMES);
+                    break;
+                }
                 if (pc >= elf_base && pc < elf_base + uctx()->elf.buf_size) {
                     rvvm_warn("  @ Main binary, reloc: %lx", pc - elf_base);
                     if (elf_frames_count < STATIC_ARRAY_SIZE(elf_frames)) {
@@ -20273,15 +20310,22 @@ case 179: // sysinfo
 
             uint8_t* pc_host = to_ptr_sz(pc_al, 32);
             if (pc_host && proc_mem_readable(pc_host, 32)) {
-                rvvm_warn("Instruction bytes around PC:");
+                /* Through rvvm_warn like the rest of the dump: these two lines
+                 * used printf(), so they went to stdout while every other line
+                 * went to the run log, and the transcript read out of order. */
+                char hex[32 * 2 + 1];
+                char marks[32 * 2 + 1];
                 for (size_t i=0; i<32; ++i) {
-                    printf("%02x", pc_host[i]);
+                    static const char digits[] = "0123456789abcdef";
+                    hex[i * 2]     = digits[(pc_host[i] >> 4) & 0xF];
+                    hex[i * 2 + 1] = digits[pc_host[i] & 0xF];
+                    marks[i * 2]     = (pc_al + i == pc_fault) ? '^' : ' ';
+                    marks[i * 2 + 1] = ' ';
                 }
-                printf("\n");
-                for (size_t i=0; i<32; ++i) {
-                    printf("%s", (pc_al + i == pc_fault) ? "^ " : "  ");
-                }
-                printf("\n");
+                hex[32 * 2] = '\0';
+                marks[32 * 2] = '\0';
+                rvvm_warn("Instruction bytes around PC: %s", hex);
+                rvvm_warn("                            %s", marks);
             } else {
                 rvvm_warn(" * * * PC points to inaccessible memory!");
             }
@@ -20290,6 +20334,19 @@ case 179: // sysinfo
             proc_symbolize("Main binary", uctx()->main_elf_path, elf_frames, elf_frames_count);
             proc_symbolize("Interpreter", uctx()->interp_elf_path, interp_frames, interp_frames_count);
 
+            /* A trap the guest did not ask for is fatal to the *process*, not just
+             * to this thread: mark it exited and wake the parent's wait4. Breaking
+             * out alone left the record "running" and the shell that started the
+             * binary blocked in wait forever - `us exec` looked hung and only
+             * timed out, while /proc still listed a process that could never
+             * finish. The signal is what a real kernel would deliver. */
+            if (thread->proc) {
+                rvvm_addr_t cause = rvvm_read_cpu_reg(cpu, RVVM_REGID_CAUSE);
+                int fatal_sig = (cause == 2) ? UAPI_SIGILL : UAPI_SIGSEGV;
+                rvvm_warn(" * * * guest exception is fatal, ending the process (signal %d)",
+                          fatal_sig);
+                userland_kill_process(uctx(), thread->proc, fatal_sig);
+            }
             break;
         }
     }
@@ -21516,6 +21573,47 @@ static void userland_destroy(rvvm_machine_t* machine)
      * dropped while it is still known good: a parent that is already gone
      * cleared this pointer when it detached its children, so the branch is
      * simply skipped. */
+    /* Reparent still-running forked children to the family root, the way Linux
+     * reparents an orphan to init.
+     *
+     * A process with an address space of its own (setsid sleep &, sshd's
+     * workers, a daemon started from a shell that then exits) keeps running
+     * after its parent's space goes away, but the only record naming that space
+     * lived in this registry: the family walk in userland_proc_snapshot_walk()
+     * starts at the root and follows child_ctx, so once this registry is freed
+     * the process is still alive and yet neither ps nor /proc/<pid> nor kill can
+     * find it. Re-filing the record in the root's registry (and pointing its
+     * parent_ctx there) keeps it reachable. ppid is left as the dead parent on
+     * purpose: userland_parent_alive() then fails when it exits, which is what
+     * makes the exit auto-reap instead of leaking a zombie nobody can wait for.
+     *
+     * Must run before userland_detach_family(), which clears parent_ctx on the
+     * very records being moved here. */
+    {
+        rvvm_userland_t* root = userland_family_root(ctx);
+        if (root && root != ctx) {
+            rvvm_process_t* moved[64];
+            size_t nmoved = 0;
+
+            spin_lock(&ctx->proc_lock);
+            vector_foreach (ctx->procs, i) {
+                rvvm_process_t* p = vector_at(ctx->procs, i);
+                if (p->parent_ctx == ctx && p->child_ctx &&
+                    !atomic_load_uint32(&p->exited) && nmoved < STATIC_ARRAY_SIZE(moved)) {
+                    moved[nmoved++] = p;
+                }
+            }
+            spin_unlock(&ctx->proc_lock);
+
+            for (size_t i = 0; i < nmoved; i++) {
+                RVVM_TRC(RVVM_TRC_JOB, "reparent orphan: pid=%u child_ctx=%p",
+                         moved[i]->pid, (void*)moved[i]->child_ctx);
+                userland_proc_register(root, moved[i]);
+                moved[i]->parent_ctx = root;
+            }
+        }
+    }
+
     rvvm_userland_t* parent = ctx->parent_ctx;
     userland_detach_family(ctx);
     ctx->parent_ctx = NULL;
