@@ -5,7 +5,7 @@
 
 | 测试 | 环境 | 实测 | 备注 |
 |---|---|---|---|
-| `tools/supervisor/selftest.py` | Windows，独立测试 release + 7912 daemon + 7940/7941 实例 | 33.5 s | 两实例 + SSH 检查；结束清理 |
+| `tools/supervisor/selftest.py` | Windows，独立测试 release + 7912 daemon + 7940/7941 实例 | 46.2 s | 两实例 + SSH 检查 + 卷用例（`/persist`、`volumes`、`rm` 保留、`--purge` 删除，后者多起一个实例）；结束清理。早期版本 33.5 s |
 | `tools/fs_selftest.ps1` | Windows | 未计时（PASS） | 90 checks，0 failures |
 | `tools/hostfs_selftest.ps1` | Windows | 未计时（PASS） | 150 checks，0 failures |
 | `/data/app/test_std/bin/test_std.exe` | `rvvm_user -prefix <rootfs> /test_std`（直接，不 ssh） | < 30 s（PASS） | 159 checks，0 failed，7 skipped；times/tms 5 项 PASS，statx 在 Windows SKIP。之前经 SSH/pty 时出现的 dup(2) 基线 FAIL 在直接运行下不复现 |

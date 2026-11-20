@@ -44,8 +44,8 @@
 
 | 脚本 | 内容 |
 |---|---|
-| `supervisor/supervisor.py` | userland supervisor daemon：`rvvm_ash --serve` 实例的起停/清单/日志/审计，SQLite 状态机 + reconcile；含 ws 终端桥（stdlib RFC6455 → `ssh -tt`）与实例密钥管理。**仅标准库**。API/WS 始终要求 token（无则自动生成到 `runtime/supervisor/token`），API 不回绝对宿主路径。设计与用法见 `../docs/design-userland-supervisor.md` |
-| `supervisor/us.py` | 上面的 CLI：`us list/start/stop/rm/logs/exec/health`（thin HTTP client），token 从 flag/env/token 文件解析 |
+| `supervisor/supervisor.py` | userland supervisor daemon：`rvvm_ash --serve` 实例的起停/清单/日志/审计，SQLite 状态机 + reconcile；含 ws 终端桥（stdlib RFC6455 → `ssh -tt`）与实例密钥管理；**持久卷**（`<data-root>/volumes/<label>-<uuid>` → `--data-dir` → guest `/persist`，`<dir>.lock` 单写者，`--data-root` 默认 `%LOCALAPPDATA%\rvvm-supervisor`）。**仅标准库**。API/WS 始终要求 token（无则自动生成到 `runtime/supervisor/token`），API 不回绝对宿主路径。设计与用法见 `../docs/design-userland-supervisor.md` §4.3 |
+| `supervisor/us.py` | 上面的 CLI：`us list/start --data NAME/stop/rm --purge/logs/exec/volumes/health`（thin HTTP client），token 从 flag/env/token 文件解析 |
 | `supervisor/ws_smoke.py` | ws 终端桥冒烟：`python ws_smoke.py <实例端口> [token]`，握手 → 发命令 → 收 pty 回显 → `WS-BRIDGE-OK`；无 token 时退出 2 |
 | `supervisor/selftest.py` | supervisor 安全自测（独立测试 release + 临时 daemon/DB/端口）：无 token 401、有 token 200、API 无绝对宿主路径/endpoint、默认拒绝 guest hostfs；约 10s |
 | `supervisor/vm.py` | `vm`：像 `bash` 一样用实例——`vm` 进交互 shell，`vm -c "cmd"` 一次性执行（退出码透传），`vm --list` / `--port N` / `--start`；ssh 直连实例端点，token/key 与 `us.py` 同一套解析。`vm.cmd` 是挂 PATH 的包装（本机已装到 `C:\Users\linswin\.local\bin\vm.cmd`） |

@@ -68,6 +68,51 @@ def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
+VOLUMES_SUBDIR = "volumes"
+
+
+def default_data_root():
+    """Where durable guest data lives, outside every release tree.
+
+    A release tree is a build artifact that gets replaced (design §4.1), and its
+    runtime/ already goes with it - an instance's rootfs, run directory and
+    database are all per-release. Data a guest must find again after its core is
+    destroyed cannot live there, so it does not: it lives in the user's own data
+    directory, where a second host account cannot read it either."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "rvvm-supervisor")
+
+
+def volume_slug(label):
+    """The human half of a volume directory name, never the whole name.
+
+    A label is reusable the moment its instance is stopped (design §6.1), so a
+    directory named after the label alone would hand the next instance with that
+    name the previous one's database. The uuid in new_data_dir() is what makes
+    it a different directory; this is only the part a person reads."""
+    out = "".join(c if (c.isalnum() or c in "._-") else "-"
+                  for c in (label or "").strip())
+    return out.strip(".-")[:40] or "inst"
+
+
+def dir_size(path):
+    """Bytes under @path, for reporting occupancy. Not a quota: hostfs offers no
+    way to enforce one, so this is the number an operator gets instead of a
+    lie in `df` (which reports a fixed guest budget)."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
 BUNDLE_NEEDS = ("rootfs.tar.gz", "system.tar.gz", "apps.tar.gz")
 
 
@@ -344,6 +389,7 @@ class DB:
             actual     TEXT NOT NULL,   -- starting | running | failed |
                                         -- stopped | crashed | orphan
             rootfs     TEXT,            -- per-instance rootfs directory
+            data       TEXT,            -- this instance's /persist host directory
             pid        INTEGER,
             started_at TEXT,
             stopped_at TEXT,
@@ -362,6 +408,19 @@ class DB:
             value TEXT
         );
         """)
+        self._migrate()
+
+    def _migrate(self):
+        """Columns added after the first release. SQLite has no "add column if
+        missing", so the table is asked first: a database written by an older
+        daemon keeps every row and gains the column as NULL."""
+        have = {row["name"] for row in
+                self.conn.execute("PRAGMA table_info(instances)")}
+        for column, decl in (("data", "TEXT"),):
+            if column not in have:
+                self.conn.execute("ALTER TABLE instances ADD COLUMN %s %s"
+                                  % (column, decl))
+        self.conn.commit()
 
     def event(self, port, kind, detail=""):
         self.conn.execute(
@@ -411,13 +470,19 @@ class DB:
 # ---------------------------------------------------------------- supervisor
 
 class Supervisor:
-    def __init__(self, release, db, grace=STARTING_GRACE_S):
+    def __init__(self, release, db, grace=STARTING_GRACE_S, data_root=None):
         self.release = os.path.abspath(release)
         self.db = db
         self.grace = grace
         self.ash = exe_path(self.release, "rvvm_ash")
         self.sup_dir = os.path.join(self.release, "runtime", "supervisor")
         os.makedirs(self.sup_dir, exist_ok=True)
+        # Durable data is deliberately NOT under the release tree: see
+        # default_data_root(). An explicit --data-root overrides the location but
+        # not the reason.
+        self.data_root = os.path.abspath(data_root or default_data_root())
+        self.volumes_dir = os.path.join(self.data_root, VOLUMES_SUBDIR)
+        os.makedirs(self.volumes_dir, exist_ok=True)
         self.ssh_key, self.ssh_pub = self._ensure_ssh_key()
 
     def _ensure_ssh_key(self):
@@ -598,7 +663,7 @@ class Supervisor:
         the guest itself. The basenames keep them identifiable; the full paths
         stay in the database and the daemon's own log."""
         item = dict(item)
-        for key in ("rootfs", "log_path"):
+        for key in ("rootfs", "log_path", "data"):
             if item.get(key):
                 item[key] = os.path.basename(item[key])
         item["registry"] = public_core(item.get("registry"))
@@ -644,6 +709,77 @@ class Supervisor:
                 return port
             port += 1
 
+    # -- durable data ------------------------------------------------------
+
+    def new_data_dir(self, label):
+        """<data-root>/volumes/<label>-<uuid8>: one directory per instance.
+
+        The label is the part a person reads in a listing; the uuid is what makes
+        it a *new* directory. A label becomes reusable as soon as its instance is
+        stopped, so a directory named after the label alone would hand the next
+        instance with that name the previous owner's database - which is exactly
+        the confusion this naming avoids."""
+        d = os.path.join(self.volumes_dir,
+                         "%s-%s" % (volume_slug(label), uuid.uuid4().hex[:8]))
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def claim_data_dir(self, data_dir):
+        """Take the sidecar lock beside a durable directory.
+
+        Two cores must never write one directory: SQLite's record locks are
+        emulator-owned and do not travel between core processes
+        (docs/fix-fcntl-record-locks.md), so a second writer would corrupt what
+        the first is writing without either noticing. The lock lives beside the
+        directory rather than inside it, where a guest could delete its own.
+
+        The lock names the daemon, not the core: the daemon is what knows which
+        instance holds the directory, and one daemon serves all instances. A
+        lock left by a daemon that is gone is taken over."""
+        lock = data_dir + ".lock"
+        holder = 0
+        try:
+            with open(lock, "r", encoding="utf-8") as f:
+                holder = int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            holder = 0
+        if holder and holder != os.getpid() and pid_alive(holder):
+            raise ApiError(409, "data directory %s is in use by pid %d"
+                           % (os.path.basename(data_dir), holder))
+        with open(lock, "w", encoding="utf-8", newline="\n") as f:
+            f.write(str(os.getpid()))
+        return lock
+
+    def release_data_dir(self, data_dir):
+        if data_dir:
+            try:
+                os.remove(data_dir + ".lock")
+            except OSError:
+                pass
+
+    def volumes(self):
+        """Every directory under the data root: name, occupancy, and the port
+        currently attached to it. Names only - a client may be the guest, and
+        host paths are not its business."""
+        owner = {}
+        for row in self.db.instances():
+            if row["data"]:
+                owner[os.path.basename(row["data"])] = row["port"]
+        try:
+            names = sorted(os.listdir(self.volumes_dir))
+        except OSError:
+            names = []
+        out = []
+        for name in names:
+            full = os.path.join(self.volumes_dir, name)
+            if not os.path.isdir(full):
+                continue
+            out.append({"name": name,
+                        "bytes": dir_size(full),
+                        "port": owner.get(name),
+                        "locked": os.path.isfile(full + ".lock")})
+        return out
+
     # -- lifecycle ---------------------------------------------------------
 
     def new_rootfs_dir(self, port):
@@ -655,7 +791,7 @@ class Supervisor:
         os.makedirs(d, exist_ok=True)
         return d
 
-    def start(self, port, label=None, memfs=False):
+    def start(self, port, label=None, memfs=False, data=None):
         if memfs:
             raise ApiError(400, "memfs mode is broken (guest exits 1); "
                            "see issues/INDEX.md")
@@ -678,6 +814,16 @@ class Supervisor:
                                    % (label, row["port"]))
         logp = self.log_path(port)
         rootfs = self.new_rootfs_dir(port)
+        # The durable directory. A restart of this instance (same port, row
+        # already there) keeps the directory its row names - that is what makes
+        # stop/start a restart rather than a new machine. A new instance gets a
+        # fresh <label>-<uuid>, so reusing a label is not reusing its data.
+        previous = self.db.instance(port)
+        data_dir = previous["data"] if previous and previous["data"] else None
+        if not data_dir and data:
+            data_dir = self.new_data_dir(data)
+        if data_dir:
+            self.claim_data_dir(data_dir)
         # One run directory per instance: auth.pub, the readiness marker and the
         # guest's vpshhd/tinysshd logs go here and are mounted at
         # /run/vpsessiond. A shared directory let one guest read or overwrite
@@ -699,6 +845,10 @@ class Supervisor:
             env["RVVM_HOSTNAME"] = guest_name
         argv = [self.ash, "--serve", "--port", str(port),
                 "--rootfs", rootfs, "--run-dir", run_dir]
+        if data_dir:
+            # Mounted by the core at /persist; the guest's / is rebuilt from the
+            # bundle every start, so this is the only path that survives it.
+            argv += ["--data-dir", data_dir]
         flags = 0
         kwargs = {}
         if os.name == "nt":
@@ -724,12 +874,23 @@ class Supervisor:
                                     stdout=logf, stderr=logf, **kwargs)
         except OSError as e:
             logf.close()
+            # Nothing is running, so nothing holds the directory.
+            self.release_data_dir(data_dir)
             raise ApiError(500, "could not spawn %s: %s"
                            % (os.path.basename(self.ash), e))
         try:
-            self.db.insert(port=port, label=label, desired="running",
-                           actual="starting", rootfs=rootfs,
-                           pid=None, started_at=now_iso(), log_path=logp)
+            if previous is None:
+                self.db.insert(port=port, label=label, desired="running",
+                               actual="starting", rootfs=rootfs, data=data_dir,
+                               pid=None, started_at=now_iso(), log_path=logp)
+            else:
+                # A restart of a row that is already there: an INSERT would
+                # collide on the primary key and the handler below would
+                # terminate a core that had just started fine.
+                self.db.set(port, label=label, desired="running",
+                            actual="starting", rootfs=rootfs, data=data_dir,
+                            pid=None, started_at=now_iso(), log_path=logp,
+                            stopped_at=None, note=None)
         except Exception:
             # The core is already running; a bookkeeping failure must not
             # orphan it - it would hold the port and its rootfs lock with
@@ -745,7 +906,9 @@ class Supervisor:
             logf.close()
             raise ApiError(500, "core started but could not be recorded; "
                            "it was terminated to avoid an orphan")
-        self.db.event(port, "start", os.path.basename(rootfs))
+        self.db.event(port, "start", "rootfs=%s data=%s" % (
+            os.path.basename(rootfs),
+            os.path.basename(data_dir) if data_dir else "-"))
         started_at = time.time()
         outcome, pid = self.wait_ready(port, started_at, proc.pid)
         if outcome == "ready":
@@ -757,11 +920,13 @@ class Supervisor:
                         note="core exited before sshd was ready - see %s"
                              % os.path.basename(logp))
             self.db.event(port, "failed", "core exited before sshd was ready")
+            self.release_data_dir(data_dir)
             return {"port": port, "actual": "failed"}
         self.db.set(port, actual="failed", stopped_at=now_iso(),
                     note="sshd not ready within %ds - see %s"
                          % (self.grace, os.path.basename(logp)))
         self.db.event(port, "failed", "sshd not ready within %ds" % self.grace)
+        self.release_data_dir(data_dir)
         return {"port": port, "actual": "failed"}
 
     def stop(self, port):
@@ -795,6 +960,9 @@ class Supervisor:
         if row:
             self.db.set(port, desired="stopped", actual="stopped", pid=None,
                         stopped_at=now_iso())
+            # The directory stays; the claim on it does not. A stopped instance
+            # must not look like a live writer to the next daemon.
+            self.release_data_dir(row["data"])
         self.db.event(port, "stopped", "")
         self.drop_ready(port)
 
@@ -978,6 +1146,8 @@ def make_handler(sup, token):
                     })
                 if path == "/api/instances":
                     return self._send(200, {"instances": sup.reconcile()})
+                if path == "/api/volumes":
+                    return self._send(200, {"volumes": sup.volumes()})
                 if len(parts) == 4 and parts[0] == "api" and \
                         parts[1] == "instances" and parts[3] == "log":
                     port = int(parts[2])
@@ -999,16 +1169,20 @@ def make_handler(sup, token):
                     port = sup.alloc_port(body.get("port"))
                     return self._send(200, sup.start(
                         port, label=body.get("label"),
-                        memfs=bool(body.get("memfs", False))))
+                        memfs=bool(body.get("memfs", False)),
+                        data=body.get("data")))
                 if parts[:2] == ["api", "instances"] and len(parts) == 4:
                     port = int(parts[2])
                     if parts[3] == "start":
                         row = sup.db.instance(port)
                         if row:
                             sup.db.set(port, desired="running")
+                        # No `data` here on purpose: start() reuses the directory
+                        # the row already names, which is what makes this a
+                        # restart of the same instance rather than a new one
+                        # under the same label.
                         return self._send(200, sup.start(
-                            port, label=row["label"] if row else None,
-                            memfs=bool(row["memfs"]) if row else True))
+                            port, label=row["label"] if row else None))
                     if parts[3] == "stop":
                         sup.stop(port)
                         return self._send(200, {"port": port,
@@ -1027,12 +1201,16 @@ def make_handler(sup, token):
         def do_DELETE(self):
             if not self._authed():
                 return self._send(401, {"error": "unauthorized"})
-            parts = urllib.parse.urlparse(self.path).path.strip("/").split("/")
+            parsed = urllib.parse.urlparse(self.path)
+            parts = parsed.path.strip("/").split("/")
+            qs = urllib.parse.parse_qs(parsed.query)
+            purge = qs.get("purge", ["0"])[0].lower() not in ("0", "", "no", "false")
             try:
                 if parts[:2] == ["api", "instances"] and len(parts) == 3:
                     port = int(parts[2])
                     sup.stop(port)
                     row = sup.db.instance(port)
+                    kept = None
                     if row and row["rootfs"]:
                         # The rootfs, plus the sidecars that live beside it:
                         # <rootfs>.modes and <rootfs>.lock (host state, not
@@ -1043,10 +1221,22 @@ def make_handler(sup, token):
                                 os.remove(row["rootfs"] + suffix)
                             except OSError:
                                 pass
+                    if row and row["data"]:
+                        # Deleting the instance is not deleting its data: the
+                        # directory holds the guest's database, and a `rm` that
+                        # took it away would be unrecoverable. --purge says it
+                        # out loud.
+                        if purge:
+                            shutil.rmtree(row["data"], ignore_errors=True)
+                            sup.release_data_dir(row["data"])
+                        else:
+                            kept = os.path.basename(row["data"])
                     shutil.rmtree(sup.run_dir(port), ignore_errors=True)
                     sup.db.delete(port)
-                    sup.db.event(port, "deleted", "")
-                    return self._send(200, {"port": port, "deleted": True})
+                    sup.db.event(port, "deleted",
+                                 "data=%s" % ("purged" if purge else (kept or "-")))
+                    return self._send(200, {"port": port, "deleted": True,
+                                            "data": kept, "purged": purge})
                 return self._send(404, {"error": "not found"})
             except (ValueError, IndexError):
                 return self._send(400, {"error": "bad request"})
@@ -1131,13 +1321,16 @@ def main():
                     help="daemon listen address (default 127.0.0.1:7911)")
     ap.add_argument("--token", default=os.environ.get(TOKEN_ENV, ""),
                     help="API bearer token (or %s)" % TOKEN_ENV)
+    ap.add_argument("--data-root", default=None,
+                    help="where durable guest data lives "
+                         "(default %s)" % default_data_root())
     args = ap.parse_args()
 
     release = find_release_dir(args.release)
     db_path = args.db or os.path.join(release, "runtime", "supervisor",
                                       "supervisor.db")
     db = DB(db_path)
-    sup = Supervisor(release, db)
+    sup = Supervisor(release, db, data_root=args.data_root)
     sup.reconcile()
 
     host, _, port = args.bind.rpartition(":")
@@ -1162,9 +1355,10 @@ def main():
         token_src = "file %s%s" % (token_file, " (generated)" if generated else "")
     httpd = ThreadingHTTPServer((host, int(port)),
                                 make_handler(sup, token))
-    log_line("supervisor %s: release=%s db=%s bind=%s token=%s"
+    log_line("supervisor %s: release=%s db=%s bind=%s token=%s data=%s"
              % (DAEMON_VERSION, os.path.basename(release),
-                os.path.basename(db_path), args.bind, token_src))
+                os.path.basename(db_path), args.bind, token_src,
+                sup.data_root))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

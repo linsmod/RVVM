@@ -19,6 +19,7 @@
 | `task-host-info-exposure.md` | 执行 | 宿主信息暴露审计与 8 次提交的批量修复：P0 hostfs/supervisor 鉴权、P1 元数据/构建路径，含恢复点与测试配方 |
 | `fix-host-info-exposure.md` | 修复史 | 上述修复的现象/根因/修法表/验证/遗留（C1–C8 commit） |
 | `task-mmap-shared-wal.md` | 执行 | 让 `MAP_SHARED` 真正跨 guest 进程共享（SQLite WAL 可用）：P0 可写共享映射明确失败、P1 接线 `cow_pgt` 页表、P2 共享页 + 区域注册表；含探针设计与恢复点 |
+| `task-guest-persist.md` | 执行 | guest 持久目录 `/persist`（`rvvm_ash --data-dir`）+ supervisor 数据卷（`<label>-<uuid>`、单写者锁、`rm` 保留 / `--purge` 删除、`us volumes`）：改动清单、手测与 selftest 记录、踩坑 |
 | `fix-fcntl-record-locks.md` | 修复史 | SQLite unix VFS 的 `F_GETLK/F_SETLK/F_SETLKW`：emulator 锁表、fork/close/byte-range、`RVVM_TRACE=fd` 与 direct `rvvm_user` 探针 |
 | `test-timing.md` | 测试 | 关键测试的实测耗时（supervisor selftest 33.5s；fs/hostfs selftest PASS） |
 | `arch-virtpass.md` | 现状 | 宿主侧：VirtPass 抽象层与 ABI 跟随规则、代码位置、bundle `--app` 启动面、console attach、vpsessiond 日志、日志 sink + ring。最后核对 2026-11-17（源自原根目录 `DEV.md`） |

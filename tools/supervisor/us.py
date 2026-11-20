@@ -5,11 +5,12 @@ Talks only to the daemon's HTTP API (see docs/design-userland-supervisor.md):
 never touches the database, never spawns a core itself. Standard library only.
 
     us list
-    us start [--port N] [label]
+    us start [--port N] [--data NAME] [label]
     us stop <port>
-    us rm <port>
+    us rm <port> [--purge]
     us logs <port> [-n N]
     us exec <port> <command...>
+    us volumes
     us health
 
 Endpoint/token: --url/--token/--token-file flags, then US_URL / US_TOKEN /
@@ -138,23 +139,28 @@ def cmd_list(_):
     if not inst:
         print("no instances")
         return
-    print("%-6s %-9s %-8s %-4s %-20s %s" %
-          ("PORT", "ACTUAL", "DESIRED", "TCP", "STARTED", "LABEL"))
+    print("%-6s %-9s %-8s %-4s %-20s %-12s %s" %
+          ("PORT", "ACTUAL", "DESIRED", "TCP", "STARTED", "LABEL", "DATA"))
     for i in inst:
-        print("%-6d %-9s %-8s %-4s %-20s %s" % (
+        print("%-6d %-9s %-8s %-4s %-20s %-12s %s" % (
             i["port"], i["actual"], i["desired"],
             "yes" if i.get("tcp") else "no",
             i.get("started_at") or "-",
-            i.get("label") or "-"))
+            i.get("label") or "-",
+            i.get("data") or "-"))
 
 
 def cmd_start(rest):
     p = argparse.ArgumentParser(prog="us start", add_help=False)
     p.add_argument("--port", type=int)
+    p.add_argument("--data", metavar="NAME",
+                   help="give this instance a durable directory "
+                        "(<data-root>/volumes/<NAME>-<uuid>), mounted at /persist")
     p.add_argument("label", nargs="*")
     a = p.parse_args(rest)
     _, data = call("POST", "/api/instances",
-                   {"label": " ".join(a.label) or None, "port": a.port})
+                   {"label": " ".join(a.label) or None, "port": a.port,
+                    "data": a.data})
     if data.get("actual") == "running":
         print("instance up: port=%d pid=%s" % (data["port"], data.get("pid")))
     else:
@@ -174,9 +180,34 @@ def cmd_stop(rest):
 def cmd_rm(rest):
     p = argparse.ArgumentParser(prog="us rm", add_help=False)
     p.add_argument("port", type=int)
+    p.add_argument("--purge", action="store_true",
+                   help="also delete the instance's durable directory "
+                        "(the default is to keep it)")
     a = p.parse_args(rest)
-    call("DELETE", "/api/instances/%d" % a.port)
-    print("removed: port=%d" % a.port)
+    path = "/api/instances/%d" % a.port + ("?purge=1" if a.purge else "")
+    _, data = call("DELETE", path)
+    kept = data.get("data")
+    if a.purge:
+        print("removed: port=%d (data purged)" % a.port)
+    elif kept:
+        print("removed: port=%d (data kept: %s; `us rm %d --purge` deletes it)"
+              % (a.port, kept, a.port))
+    else:
+        print("removed: port=%d" % a.port)
+
+
+def cmd_volumes(_):
+    _, data = call("GET", "/api/volumes")
+    vols = data.get("volumes", [])
+    if not vols:
+        print("no volumes")
+        return
+    print("%-40s %-10s %-6s %s" % ("NAME", "BYTES", "PORT", "STATE"))
+    for v in vols:
+        print("%-40s %-10d %-6s %s" % (
+            v["name"], v.get("bytes", 0),
+            v.get("port") if v.get("port") is not None else "-",
+            "locked" if v.get("locked") else "idle"))
 
 
 def cmd_logs(rest):
@@ -226,6 +257,7 @@ COMMANDS = {
     "rm": cmd_rm,
     "logs": cmd_logs,
     "exec": cmd_exec,
+    "volumes": cmd_volumes,
     "health": cmd_health,
 }
 

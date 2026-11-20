@@ -51,6 +51,10 @@
   出现在 guest 里。mode store 只持久化 prefix 内的路径，hostfs chmod 的宿主路径不写入。
   默认（无 `--rootfs`）仍是 `runtime/rootfs.modes` / `runtime/ash-core.lock`。
 - `root=` 是 **guest 路径**，与 prefix 组合（等价 chroot），不是宿主路径；只在有 prefix 时生效。
+- **`/persist` 不是内建行**：只有 core 带 `--data-dir` 时，宿主才用 `rvvm_user_mount_hostfs()` 挂一行；
+  不带该参数时路径不存在（不是空目录）。它是 guest 唯一能写、且活过 core 生命周期的目录——
+  `/` 每次启动从 bundle 重建，`/tmp` 是内存。挂载失败会拒绝启动（`win32_host_start_guest()`），
+  避免 guest 把数据写进修完即弃的位置。`chmod` 在它上面不持久（hostfs 语义），`df` 仍是合成预算。
 - dev 号由合成规则给出，不用宿主真实 `st_dev`（三宿主行为必须一致）。
 
 ## 3. `/proc`（procfs）

@@ -48,6 +48,18 @@ design §8 六条验收线全绿。
   页面路由与 vendor 资源全 200。过程中修掉两个 RVVM 既有缺陷
   （见 `fix-userland-pty-req.md`）：ioctl 请求号符号扩展、pty fd 的 stat 身份。
 
+## S4 持久目录与数据卷
+
+**优先级：高。** **已完成（2026-11-20）**：core `--data-dir` → guest `/persist`；supervisor
+数据卷 `<data-root>/volumes/<label>-<uuid8>`（`--data-root` 默认 `%LOCALAPPDATA%\rvvm-supervisor`）、
+`<dir>.lock` 单写者、`rm` 保留 / `--purge` 删除、`us start --data` / `us volumes`；
+顺带修好 `POST /api/instances/{port}/start`（原来引用不存在的 `memfs` 列 + `INSERT` 主键冲突，
+重启必失败）。selftest 增 8 项，46.2 s PASS。执行记录 `task-guest-persist.md`，
+设计 `design-userland-supervisor.md` §4.3。
+
+不做/遗留：硬配额（只报告占用）、`/persist` 上的 chmod 持久化、跨 core 共用一个库、
+`us prune` 清理无主卷。
+
 ## 全局验收
 
 - design §8 五条全绿

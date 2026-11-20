@@ -109,6 +109,27 @@ guest 还没 boot，第一次 ssh 仍可能被拒。现在由**真正监听的�
 实测（2026-11-19，本机）：`us start` 1.35 s 返回，返回后**立即** `us exec` 成功；
 旧行为是 1.8 s 返回但 2.3 s 才连得上。杀掉 core 后 1 秒内即判 `failed` 并给出正确 note。
 
+### 4.3 持久目录（`/persist`，2026-11-20 落地）
+
+core 会被定期销毁，而 guest 的 `/` 每次启动都由 bundle 重建、`/tmp` 是内存——一个需要活过重启的
+数据库没有落脚处。解法是**每实例一个宿主目录，挂在 `/persist`**：
+
+| 项 | 决定 |
+|---|---|
+| 位置 | `<data-root>/volumes/<label>-<uuid8>`；`--data-root` 默认 `%LOCALAPPDATA%\rvvm-supervisor`（POSIX `$XDG_DATA_HOME` / `~/.local/share`） |
+| 为什么不在 release 树里 | §4.1：release 树会被替换，换树等于换一套实例状态；持久数据必须活在树外 |
+| 为什么带 uuid | label 在实例停止后即可复用；只按 label 命名会让同名重建拿到上一个实例的库。label 给人读，uuid 保证是**新**目录 |
+| core 侧 | `rvvm_ash --serve --data-dir <dir>` → `win32_host_set_data_dir()` → `rvvm_user_mount_hostfs(machine, "/persist", dir)`；挂不上就拒绝启动，不留"以为有"的空目录 |
+| 生命周期 | 新实例新建；**同端口的 restart 复用 row 里的目录**；`us stop` 保留；`us rm` 默认保留、`--purge` 删除；`us volumes` 列出占用与锁状态 |
+| 单写者 | `<dir>.lock` sidecar（写 daemon pid，pid 已死可接管）。两个 core 同写一个库会静默损坏：SQLite 记录锁是 emulator-owned，不跨 core（`fix-fcntl-record-locks.md`） |
+| 边界 | `/persist` 上的 `chmod` 不持久（hostfs 语义）；**没有硬配额**，`df` 仍是合成的 64 MiB 预算，真实占用看 `us volumes`；跨 core 共享同一个库不支持 |
+
+API：`POST /api/instances {label, port, data}`（`data` 是名字，不是路径）、`GET /api/volumes`、
+`DELETE /api/instances/{port}?purge=1`。`data` 字段在响应里只出现 basename，与 rootfs/log_path 同一规则。
+
+WAL 仍不可用（`mmap(MAP_SHARED)` 返回 `ENODEV`），库请用 `journal_mode=DELETE`；
+共享页的修复见 `task-mmap-shared-wal.md`。
+
 ## 5. API 面（v1 + v2 终端，CLI 与 web 共用）
 
 | 方法 | 路径 | 语义 |

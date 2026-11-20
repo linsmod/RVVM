@@ -48,7 +48,7 @@ static void print_usage(const char* self)
     fprintf(stderr,
             "usage: %s --serve [--idle S] [--dlog <guest-path>] [--memfs]\n"
             "          [--cmdline <linux-args>] [--port N]\n"
-            "          [--rootfs <dir>] [--run-dir <dir>]\n"
+            "          [--rootfs <dir>] [--run-dir <dir>] [--data-dir <dir>]\n"
             "          [--allow-guest-hostfs]\n"
             "       %s --list\n"
             "\n"
@@ -69,6 +69,12 @@ static void print_usage(const char* self)
             "          /run/vpsessiond instead of <exe>\\runtime\\run. One core per\n"
             "          instance names its own, so ready markers, auth.pub and logs\n"
             "          are not shared between guests.\n"
+            "  --serve --data-dir <dir> mounts <dir> at the guest's /persist: the\n"
+            "          one directory a run may write that outlives it. The guest's /\n"
+            "          is rebuilt from the bundle on every start, so a database kept\n"
+            "          anywhere else is gone by the next one. Without it /persist\n"
+            "          does not exist. A <dir> that cannot be mounted refuses the\n"
+            "          boot rather than letting the guest lose its data quietly.\n"
             "  --serve --allow-guest-hostfs lets the guest mount a host directory\n"
             "          itself (`mount -t hostfs <host path> <guest path>`). Off by\n"
             "          default: hostfs is a host capability, not a guest default.\n"
@@ -105,6 +111,7 @@ int main(int argc, char** argv)
     const char* cmdline = NULL;
     const char* rootfs  = NULL;
     const char* run_dir = NULL;
+    const char* data_dir = NULL;
     int         idle    = 0;
     int         port    = ash_port();
     int         i       = 1;
@@ -155,6 +162,10 @@ int main(int argc, char** argv)
             run_dir = argv[++i];
         } else if (!strncmp(a, "--run-dir=", 10)) {
             run_dir = a + 10;
+        } else if (!strcmp(a, "--data-dir") && i + 1 < argc) {
+            data_dir = argv[++i];
+        } else if (!strncmp(a, "--data-dir=", 11)) {
+            data_dir = a + 11;
         } else if (!strcmp(a, "--shutdown") || !strcmp(a, "--sock-path") ||
                    !strcmp(a, "--no-autostart")) {
             /* Verbs (and a flag) of the client era. The AF_UNIX endpoint and
@@ -212,5 +223,5 @@ int main(int argc, char** argv)
     /* Before ash_serve() builds the machine: the grant belongs to the run, and
      * win32_host_start_guest() applies it to the fresh userland context. */
     win32_host_allow_guest_hostfs(allow_guest_hostfs);
-    return ash_serve(port, idle, dlog, cmdline, rootfs, run_dir);
+    return ash_serve(port, idle, dlog, cmdline, rootfs, run_dir, data_dir);
 }

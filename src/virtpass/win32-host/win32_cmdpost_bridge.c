@@ -246,6 +246,16 @@ static bool g_allow_guest_hostfs = false;
 static char g_run_dir[MAX_PATH];
 static bool g_run_dir_set = false;
 
+/* Where this run's /persist lives on the host, or empty for a run with no
+ * persistent directory. The directory is the guest's only durable surface: the
+ * rootfs is re-materialized from the bundle on every start, and /tmp dies with
+ * the process, so anything a guest must find again after the core is destroyed
+ * has to be under here. Named by the caller (the supervisor makes it
+ * <data-root>/volumes/<label>-<uuid>), never derived here: where durable data
+ * lives is an orchestration decision, not a property of the emulator. */
+static char g_data_dir[MAX_PATH];
+static bool g_data_dir_set = false;
+
 /* Host-side suspend/resume guards. The machine handle only exists while a guest
  * is booted, so every host control call goes through these instead of testing
  * g_guest_machine at each call site. */
@@ -1232,6 +1242,17 @@ void win32_host_set_run_dir(const char* dir)
     } else {
         g_run_dir_set = false;
         g_run_dir[0] = '\0';
+    }
+}
+
+void win32_host_set_data_dir(const char* dir)
+{
+    if (dir && dir[0]) {
+        DWORD n = GetFullPathNameA(dir, sizeof(g_data_dir), g_data_dir, NULL);
+        g_data_dir_set = n > 0 && n < sizeof(g_data_dir);
+    } else {
+        g_data_dir_set = false;
+        g_data_dir[0] = '\0';
     }
 }
 
@@ -3382,6 +3403,42 @@ bool win32_host_start_guest(int argc, char** argv)
                 if (rvvm_user_mount_hostfs(g_guest_machine, "/run/vpsessiond",
                                            run_dir) != 0) {
                     winhost_log("could not mount %s at /run/vpsessiond", run_dir);
+                }
+            }
+        }
+
+        /* The durable directory, when this run was given one (--data-dir): the
+         * only place a guest may write that outlives the core. Everything else it
+         * sees is the bundle's image, materialized fresh per run, or memory.
+         *
+         * A directory that is not there refuses the boot instead of being
+         * skipped: a guest that believes it has /persist and does not would write
+         * its database somewhere that dies with the process, and the loss would
+         * only show up as an empty database after the next restart. The parent is
+         * the caller's to create (the supervisor makes
+         * <data-root>/volumes/<label>-<uuid>); the leaf is created here so a
+         * hand-run core can name a directory it has not made yet. */
+        if (g_data_dir_set) {
+            CreateDirectoryA(g_data_dir, NULL);
+            if (rvvm_user_mount_hostfs(g_guest_machine, "/persist", g_data_dir) != 0) {
+                winhost_log("could not mount %s at /persist; refusing to start a"
+                            " run that was promised a durable directory", g_data_dir);
+                rvvm_user_free(g_guest_machine);
+                g_guest_machine = NULL;
+                return false;
+            }
+            winhost_log("data: %s at /persist", g_data_dir);
+
+            /* A mount row is a path, not a directory entry: without a directory
+             * of that name in the rootfs tree, `ls /` would not mention /persist
+             * at all and the guest would have to be told it exists. The empty
+             * directory gives it the name; every lookup under it still resolves
+             * to the row, because the longest match wins. */
+            if (g_rootfs_dir_set) {
+                char persist[MAX_PATH];
+                if (snprintf(persist, sizeof(persist), "%s\\persist", g_rootfs_dir) <
+                    (int)sizeof(persist)) {
+                    CreateDirectoryA(persist, NULL);
                 }
             }
         }

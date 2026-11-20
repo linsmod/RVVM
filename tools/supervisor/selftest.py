@@ -115,6 +115,10 @@ def main():
 
     tmp = tempfile.mkdtemp(prefix="rvvm-sup-selftest-")
     db = os.path.join(tmp, "sup.db")
+    # Durable data of a test daemon is test data: pointed at the scratch tree so
+    # a selftest never creates <user data>/rvvm-supervisor/volumes on the host it
+    # runs on.
+    data_root = os.path.join(tmp, "data")
     out = os.path.join(tmp, "daemon.out")
     err = os.path.join(tmp, "daemon.err")
     hostdir = os.path.join(tmp, "hostdir")
@@ -129,7 +133,8 @@ def main():
         errf = open(err, "wb")
         proc = subprocess.Popen(
             [sys.executable, SUPERVISOR, "--release", release, "--db", db,
-             "--bind", "127.0.0.1:%d" % args.daemon_port],
+             "--bind", "127.0.0.1:%d" % args.daemon_port,
+             "--data-root", data_root],
             cwd=HERE, stdout=logf, stderr=errf)
         if not wait_up(args.daemon_port, proc):
             print("FAIL daemon did not answer")
@@ -164,8 +169,10 @@ def main():
         started = []
         for port, label in ((args.instance_port, "selftest"),
                             (second_port, "selftest-2")):
+            # Each instance asks for a durable directory: the selftest is also
+            # what pins /persist and the naming rule down (data=<label>-<uuid>).
             code, body = api(token, "POST", "/api/instances",
-                             {"label": label, "port": port},
+                             {"label": label, "port": port, "data": label},
                              port=args.daemon_port)
             fails += check(code == 200 and body.get("actual") == "running",
                            "instance %d starts (got %s %s)"
@@ -213,6 +220,28 @@ def main():
                            "instance %d cannot see %d's ready marker" % (p1, p2))
             fails += check("AUTH=0" in r.stdout,
                            "instance %d has its own auth.pub" % p1)
+
+            # The durable directory: a hostfs mount at /persist, writable, and
+            # named <label>-<uuid> so a reused label cannot inherit it.
+            r = run_ssh(key, p1,
+                        "mount | grep ' on /persist '; echo hello > /persist/probe; "
+                        "cat /persist/probe")
+            fails += check(" on /persist " in r.stdout,
+                           "instance %d has a /persist mount" % p1)
+            fails += check("hello" in r.stdout,
+                           "instance %d writes its durable directory" % p1)
+            dname = insts.get(p1, {}).get("data") or ""
+            fails += check(bool(dname) and not any(sep in dname
+                                                   for sep in ("/", "\\")),
+                           "data %d is a name, not a host path (%s)" % (p1, dname))
+            fails += check(dname.startswith("selftest-") and
+                           len(dname) > len("selftest-"),
+                           "data directory is label-uuid (%s)" % dname)
+            code, vols = api(token, "GET", "/api/volumes", port=args.daemon_port)
+            vol = {v["name"]: v for v in (vols.get("volumes") or [])}.get(dname)
+            fails += check(code == 200 and vol is not None and
+                           vol.get("port") == p1 and vol.get("locked"),
+                           "volumes lists %d's directory as locked" % p1)
 
             # C4: the mode store and rootfs lock are host-side sidecars, not
             # files under the guest's /. A rootfs chmod is persisted; a hostfs
@@ -330,6 +359,34 @@ def main():
             for suffix in (".modes", ".lock"):
                 fails += check(not os.path.exists(base + suffix),
                                "rm removed %s%s" % (name, suffix))
+
+        # rm above was called without --purge, which is the default: deleting an
+        # instance is not deleting its data.
+        for port in started:
+            dname = insts.get(port, {}).get("data") or ""
+            if not dname:
+                continue
+            fails += check(os.path.isdir(os.path.join(data_root, "volumes", dname)),
+                           "rm kept the durable directory %s" % dname)
+
+        # And --purge is the only thing that deletes it.
+        purge_port = args.instance_port + 2
+        code, body = api(token, "POST", "/api/instances",
+                         {"label": "selftest-3", "port": purge_port,
+                          "data": "selftest-3"}, port=args.daemon_port)
+        if code == 200 and body.get("actual") == "running":
+            code, listing = api(token, "GET", "/api/instances",
+                                port=args.daemon_port)
+            dname = {i["port"]: i.get("data")
+                     for i in (listing.get("instances") or [])}.get(purge_port) or ""
+            api(token, "DELETE", "/api/instances/%d?purge=1" % purge_port,
+                port=args.daemon_port)
+            fails += check(bool(dname) and
+                           not os.path.exists(os.path.join(data_root, "volumes", dname)),
+                           "rm --purge deleted the durable directory %s" % dname)
+        else:
+            fails += check(False, "instance %d starts for the purge check (got %s %s)"
+                           % (purge_port, code, body))
     finally:
         if proc and proc.poll() is None:
             proc.terminate()

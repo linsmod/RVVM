@@ -127,6 +127,15 @@ void win32_host_allow_guest_hostfs(bool on);
 // auth.pub or logs. Set before win32_host_start_guest().
 void win32_host_set_run_dir(const char* dir);
 
+// The host directory mounted at the guest's /persist: the one directory a run
+// may write that outlives it. Everything else the guest sees is either the
+// bundle's image (materialized fresh per run) or memory. NULL means the run has
+// no persistent directory at all, and /persist does not exist - which is what
+// every run without an explicit --data-dir keeps getting. A directory that
+// cannot be mounted refuses the boot rather than leaving a guest to write its
+// data somewhere that disappears with it. Set before win32_host_start_guest().
+void win32_host_set_data_dir(const char* dir);
+
 /*
  * The next run is a core: a machine kept up for clients rather than a one-shot
  * command, serving a session per client (see vp_core.h). The control terminal a

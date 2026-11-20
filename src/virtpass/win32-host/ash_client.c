@@ -160,6 +160,14 @@ static bool ash_core_file(int port, char* out, size_t size)
 static char ash_run_dir_override[MAX_PATH];
 static bool ash_run_dir_set = false;
 
+/* The host directory the guest's /persist is mounted from (see
+ * win32_cmdpost_bridge.c). NULL is a run with no durable directory: the guest's
+ * / is rebuilt from the bundle on every start, so without this nothing a guest
+ * writes survives the core. A supervisor names <data-root>/volumes/<label>-<uuid>
+ * per instance; the core only mounts what it was handed. */
+static char ash_data_dir_override[MAX_PATH];
+static bool ash_data_dir_set = false;
+
 static bool ash_runtime_run_dir(char* out, size_t size)
 {
     char exe_dir[MAX_PATH];
@@ -655,7 +663,7 @@ void ash_install_termination_handler(void)
 }
 
 int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline,
-              const char* rootfs_dir, const char* run_dir)
+              const char* rootfs_dir, const char* run_dir, const char* data_dir)
 {
     if (rootfs_dir && rootfs_dir[0]) {
         /* The bundle is materialized here instead of the release's own
@@ -670,6 +678,14 @@ int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline,
          * shared cross-instance surface. */
         snprintf(ash_run_dir_override, sizeof(ash_run_dir_override), "%s", run_dir);
         ash_run_dir_set = true;
+    }
+    if (data_dir && data_dir[0]) {
+        /* This core's /persist: the caller's durable directory, mounted as-is.
+         * Named by the caller and never derived here - a name this process
+         * invented would be a second answer to "where does this instance's data
+         * live", and the supervisor's database is the one that must have it. */
+        snprintf(ash_data_dir_override, sizeof(ash_data_dir_override), "%s", data_dir);
+        ash_data_dir_set = true;
     }
     const char* shell = ash_default_core_shell();
     const char* init_arg;
@@ -768,6 +784,7 @@ int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline,
      * round. */
     win32_host_set_rootfs_dir(ash_rootfs_dir_set ? ash_rootfs_dir : NULL);
     win32_host_set_run_dir(ash_run_dir_set ? ash_run_dir_override : NULL);
+    win32_host_set_data_dir(ash_data_dir_set ? ash_data_dir_override : NULL);
     win32_host_set_cmdline(cmdline);
 
     /* The guest's permission bits outlive this process: the host filesystem

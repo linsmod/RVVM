@@ -70,6 +70,13 @@ void ash_install_termination_handler(void);
  * release's shared runtime\run. A core per instance names its own, so a guest
  * cannot see another instance's ready marker, auth.pub or logs.
  *
+ * @data_dir is this run's host directory for /persist, or NULL for a run with
+ * no durable directory. The guest's / is re-materialized from the bundle on
+ * every start and /tmp dies with the process, so this is the only place a
+ * database the guest writes can be found again after the core is destroyed. The
+ * caller names it; the core only mounts it, and refuses to boot when it cannot
+ * (see win32_host_set_data_dir).
+ *
  * @cmdline is the run's boot arguments (`root= init= loglevel= debug`), or NULL.
  * It is applied here rather than by the caller because two of its arguments are
  * this function's to apply and not the caller's to: init= names the core program,
@@ -78,7 +85,7 @@ void ash_install_termination_handler(void);
  * it earlier. root= is passed on to the machine.
  */
 int ash_serve(int port, int idle_s, const char* dlog, const char* cmdline,
-              const char* rootfs_dir, const char* run_dir);
+              const char* rootfs_dir, const char* run_dir, const char* data_dir);
 int ash_client(int port, const char* one_cmd, bool autostart);
 int ash_list(void);
 int ash_shutdown(int port);
