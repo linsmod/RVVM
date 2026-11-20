@@ -70,4 +70,11 @@ supervisor（独立测试 daemon：7913、临时 db/data-root）：
 - `/persist` 上的 `chmod` 不持久（hostfs 语义，`arch-userland.md` §2）。
 - WAL 仍不可用：`mmap(MAP_SHARED)` 返回 `ENODEV`，见 `task-mmap-shared-wal.md`（P1 页表 / P2 共享页）。
 - 跨 core 共用一个库仍不支持（SQLite 记录锁不跨 core）。
-- 配额巡检、`us prune`（清理无 DB 行的卷）尚未实现。
+
+## 7. 收尾：`us prune`（同日补）
+
+`rm` 默认保留数据，长期会积累无主目录。补 `POST /api/prune` + `us prune [--yes]`：
+清掉**没有 DB 行**的 `runtime/roots/<port>-*`、`runtime/run/<port>`、`volumes/<name>`；
+默认 dry run，`--yes` 才删；`<name>.lock` 属于活着的 daemon 时跳过（数据根按用户共享，
+可能属于另一棵 release 树的 daemon）。selftest 增 2 项（dry run 列出恰好是被保留的卷；
+`--yes` 后目录消失）。

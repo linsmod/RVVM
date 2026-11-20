@@ -11,6 +11,7 @@ never touches the database, never spawns a core itself. Standard library only.
     us logs <port> [-n N]
     us exec <port> <command...>
     us volumes
+    us prune [--yes]
     us health
 
 Endpoint/token: --url/--token/--token-file flags, then US_URL / US_TOKEN /
@@ -238,6 +239,32 @@ def cmd_exec(rest):
     sys.exit(data.get("exit", 0))
 
 
+def cmd_prune(rest):
+    p = argparse.ArgumentParser(prog="us prune", add_help=False)
+    p.add_argument("--yes", action="store_true",
+                   help="delete what is listed (default is a dry run)")
+    a = p.parse_args(rest)
+    _, data = call("POST", "/api/prune", {"yes": a.yes})
+    roots = data.get("roots") or []
+    runs = data.get("runs") or []
+    vols = data.get("volumes") or []
+    if not (roots or runs or vols):
+        print("nothing to prune")
+        return
+    for name in roots:
+        print("rootfs  %s" % name)
+    for name in runs:
+        print("run     %s" % name)
+    for name in vols:
+        print("volume  %s" % name)
+    if a.yes:
+        print("pruned: %d rootfs, %d run, %d volume(s)"
+              % (len(roots), len(runs), len(vols)))
+    else:
+        print("dry run; nothing was deleted. `us prune --yes` removes the"
+              " volumes above, which are guest data.")
+
+
 def cmd_health(_):
     _, data = call("GET", "/api/health")
     print("daemon  : %s" % data.get("version"))
@@ -258,6 +285,7 @@ COMMANDS = {
     "logs": cmd_logs,
     "exec": cmd_exec,
     "volumes": cmd_volumes,
+    "prune": cmd_prune,
     "health": cmd_health,
 }
 

@@ -387,6 +387,23 @@ def main():
         else:
             fails += check(False, "instance %d starts for the purge check (got %s %s)"
                            % (purge_port, code, body))
+
+        # `us prune` is the other half of keeping data on rm: a dry run by
+        # default, listing exactly the directories no row refers to, and
+        # deleting them only when the caller says yes.
+        kept_names = {insts.get(p, {}).get("data") for p in started} - {None, ""}
+        code, dry = api(token, "POST", "/api/prune", {"yes": False},
+                        port=args.daemon_port)
+        fails += check(code == 200 and
+                       set(dry.get("volumes") or []) == kept_names,
+                       "prune (dry run) lists the kept volumes (%s)"
+                       % (sorted(dry.get("volumes") or []),))
+        code, done = api(token, "POST", "/api/prune", {"yes": True},
+                         port=args.daemon_port)
+        left = [n for n in kept_names
+                if os.path.exists(os.path.join(data_root, "volumes", n))]
+        fails += check(code == 200 and not left,
+                       "prune --yes deleted them (%s)" % (left,))
     finally:
         if proc and proc.poll() is None:
             proc.terminate()

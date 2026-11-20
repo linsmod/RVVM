@@ -780,6 +780,97 @@ class Supervisor:
                         "locked": os.path.isfile(full + ".lock")})
         return out
 
+    def prune(self, yes=False):
+        """Remove what no instance record refers to.
+
+        Three kinds accumulate on their own: a rootfs directory after a crash
+        (the row may have been deleted, or the daemon restarted between the two
+        steps), a run directory whose instance is gone, and a durable volume that
+        `rm` deliberately kept. The first two are build/run debris and cost
+        nothing to delete; the third is guest data, which is why `rm` keeps it in
+        the first place - so `yes` is the caller saying it out loud, and the dry
+        run is the default.
+
+        Answers names, never host paths (same rule as everything else the API
+        returns)."""
+        rows = self.db.instances()
+        live_ports = {row["port"] for row in rows}
+        kept_volumes = {os.path.basename(row["data"]) for row in rows if row["data"]}
+
+        stale_roots = []
+        roots_dir = os.path.join(self.release, "runtime", "roots")
+        try:
+            for name in sorted(os.listdir(roots_dir)):
+                full = os.path.join(roots_dir, name)
+                if not os.path.isdir(full):
+                    continue
+                # "<port>-<uuid8>": the port half says which row it belonged to.
+                try:
+                    port = int(name.split("-", 1)[0])
+                except ValueError:
+                    continue
+                if port not in live_ports:
+                    stale_roots.append((name, full))
+        except OSError:
+            pass
+
+        stale_runs = []
+        run_root = os.path.join(self.release, "runtime", "run")
+        try:
+            for name in sorted(os.listdir(run_root)):
+                full = os.path.join(run_root, name)
+                if not os.path.isdir(full) or not name.isdigit():
+                    continue
+                if int(name) not in live_ports:
+                    stale_runs.append((name, full))
+        except OSError:
+            pass
+
+        stale_volumes = []
+        try:
+            for name in sorted(os.listdir(self.volumes_dir)):
+                full = os.path.join(self.volumes_dir, name)
+                if not os.path.isdir(full) or name in kept_volumes:
+                    continue
+                # A lock held by a live daemon means another release tree's
+                # daemon is serving this directory (data root is per user, not
+                # per release). Its row is not in this database, so this one has
+                # no business deleting it.
+                holder = 0
+                try:
+                    with open(full + ".lock", "r", encoding="utf-8") as f:
+                        holder = int(f.read().strip() or 0)
+                except (OSError, ValueError):
+                    holder = 0
+                if holder and holder != os.getpid() and pid_alive(holder):
+                    continue
+                stale_volumes.append((name, full))
+        except OSError:
+            pass
+
+        result = {"roots": [n for n, _ in stale_roots],
+                  "runs": [n for n, _ in stale_runs],
+                  "volumes": [n for n, _ in stale_volumes],
+                  "removed": False}
+        if not yes:
+            return result
+        for _name, full in stale_roots:
+            shutil.rmtree(full, ignore_errors=True)
+            for suffix in (".modes", ".lock"):
+                try:
+                    os.remove(full + suffix)
+                except OSError:
+                    pass
+        for _name, full in stale_runs:
+            shutil.rmtree(full, ignore_errors=True)
+        for _name, full in stale_volumes:
+            shutil.rmtree(full, ignore_errors=True)
+            self.release_data_dir(full)
+        result["removed"] = True
+        self.db.event(None, "prune", "roots=%d runs=%d volumes=%d"
+                      % (len(stale_roots), len(stale_runs), len(stale_volumes)))
+        return result
+
     # -- lifecycle ---------------------------------------------------------
 
     def new_rootfs_dir(self, port):
@@ -1165,6 +1256,12 @@ def make_handler(sup, token):
             parts = urllib.parse.urlparse(self.path).path.strip("/").split("/")
             body = self._body()
             try:
+                if parts[:2] == ["api", "prune"] and len(parts) == 2:
+                    # Dry by default: the volumes it would remove are guest data
+                    # that `rm` kept on purpose, so deleting them is an explicit
+                    # "yes", never an accident of running a cleanup command.
+                    return self._send(200, sup.prune(
+                        yes=bool(body.get("yes", False))))
                 if parts[:2] == ["api", "instances"] and len(parts) == 2:
                     port = sup.alloc_port(body.get("port"))
                     return self._send(200, sup.start(

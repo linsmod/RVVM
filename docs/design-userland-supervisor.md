@@ -120,7 +120,7 @@ core 会被定期销毁，而 guest 的 `/` 每次启动都由 bundle 重建、`
 | 为什么不在 release 树里 | §4.1：release 树会被替换，换树等于换一套实例状态；持久数据必须活在树外 |
 | 为什么带 uuid | label 在实例停止后即可复用；只按 label 命名会让同名重建拿到上一个实例的库。label 给人读，uuid 保证是**新**目录 |
 | core 侧 | `rvvm_ash --serve --data-dir <dir>` → `win32_host_set_data_dir()` → `rvvm_user_mount_hostfs(machine, "/persist", dir)`；挂不上就拒绝启动，不留"以为有"的空目录 |
-| 生命周期 | 新实例新建；**同端口的 restart 复用 row 里的目录**；`us stop` 保留；`us rm` 默认保留、`--purge` 删除；`us volumes` 列出占用与锁状态 |
+| 生命周期 | 新实例新建；**同端口的 restart 复用 row 里的目录**；`us stop` 保留；`us rm` 默认保留、`--purge` 删除；`us volumes` 列出占用与锁状态；`us prune` 清掉**没有 DB 行**的 rootfs/run/卷目录（默认 dry run，`--yes` 才删；锁被活着的 daemon 持有时跳过，因为数据根按用户共享、可能属于另一棵 release 树的 daemon） |
 | 单写者 | `<dir>.lock` sidecar（写 daemon pid，pid 已死可接管）。两个 core 同写一个库会静默损坏：SQLite 记录锁是 emulator-owned，不跨 core（`fix-fcntl-record-locks.md`） |
 | 边界 | `/persist` 上的 `chmod` 不持久（hostfs 语义）；**没有硬配额**，`df` 仍是合成的 64 MiB 预算，真实占用看 `us volumes`；跨 core 共享同一个库不支持 |
 

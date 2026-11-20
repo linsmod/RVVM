@@ -57,8 +57,10 @@ design §8 六条验收线全绿。
 重启必失败）。selftest 增 8 项，46.2 s PASS。执行记录 `task-guest-persist.md`，
 设计 `design-userland-supervisor.md` §4.3。
 
-不做/遗留：硬配额（只报告占用）、`/persist` 上的 chmod 持久化、跨 core 共用一个库、
-`us prune` 清理无主卷。
+收尾补充（2026-11-20）：`us prune` 已落地（`POST /api/prune`，默认 dry run，
+清无 DB 行的 rootfs/run/卷；活锁跳过），selftest 增 2 项。
+
+不做/遗留：硬配额（只报告占用）、`/persist` 上的 chmod 持久化、跨 core 共用一个库。
 
 ## 全局验收
 
