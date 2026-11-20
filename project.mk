@@ -774,12 +774,11 @@ override SYSTEM_PACKER    ?= python $(CURDIR)/tools/pack_system.py
 # quoting unchanged. Set SYS_PKGS= to build a bundle with only the VirtPass
 # system programs.
 #
-# Only what the emulator can actually run belongs in the default: sqlite is
-# verified end to end (a database in /persist, journal_mode=DELETE). curl needs
-# eventfd2 (syscall 19) and python3 dies in musl's a_crash() during interpreter
-# init - both are emulator gaps registered in issues/INDEX.md, not packaging ones.
-# `make pack-system SYS_PKGS=sqlite,curl,python3` builds the fuller layer.
-override SYS_PKGS        ?= sqlite
+# All three are verified in the guest: sqlite on /persist with journal_mode=DELETE,
+# curl by hostname (eventfd2 + F_SETFL on socket anchors were fixed for it), and
+# python3 running code and importing sqlite3/ssl (rt_sigprocmask used to overflow
+# its 8-byte oldset into the guest stack canary). See docs/task-guest-syspkgs.md.
+override SYS_PKGS        ?= sqlite,curl,python3
 override SYS_PKG_CACHE   := $(BUNDLE_DIR)/.apkcache
 
 override APPS_PACKER     ?= python $(CURDIR)/tools/pack_apps.py

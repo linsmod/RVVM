@@ -56,12 +56,16 @@ us stop <port>; POST /api/instances/<port>/start; sqlite3 /persist/d.db "select 
    宿主 CRT fd，不能交给宿主 `fcntl()`。`userland_fd_serves_own()` 现在把 anchor 算作本层对象，
    F_SETFL 从 guest 标志字回答，宿主侧用 `win_socket_set_nonblock()`。
    验证：`curl http://example.com/` → **200**。
-3. **`python3` 在解释器初始化阶段崩溃**：执行 `ebreak`/`c.ebreak`（musl 的 `a_crash()`），
-   `-v` 显示崩溃发生在 `import encodings.utf_8` 之后；`-c ""`、`-E -S`、`PYTHONMALLOC=malloc|pymalloc` 都一样，
-   `python3 -V` 正常。`-X faulthandler` 报 `sigaltstack` ENOSYS。登记 `issues/INDEX.md`。
+3. **已修复：`python3` 在解释器初始化阶段 `a_crash()`**。`reloc: 1ae06` → ld-musl 的
+   `__stack_chk_fail`；mmap trace 给出 libpython 基址 `0x84a0000`，返回地址 `0x867c4f6` →
+   `PyOS_getsig+0x42`，即栈保护金丝雀校验失败。根因：`rt_sigprocmask`（syscall 135）把 guest 的
+   8 字节 `oldset` 交给宿主 `sigprocmask()`（宿主 `sigset_t` 为 16 字节），多写的 8 字节打坏
+   相邻 canary。改为 guest 形状的 `uint64_t sig_mask` 自己实现 BLOCK/UNBLOCK/SETMASK，
+   `oldset` 只写 8 字节。验证：`python3 -c "print(1+1)"` → 2 / rc=0；
+   `import sqlite3,ssl,json,urllib.request` 正常；python 在 `/persist/py.db` 建表/插入/读回
+   `[(42,)]`；`test_std` 159 checks / 0 failed。
 
-所以默认 `SYS_PKGS` 只留 `sqlite`（已端到端验证）；curl/python3 用
-`make pack-system SYS_PKGS=sqlite,curl,python3` 显式打进去，等上面两条修好再进默认。
+三个模拟器缺口都已修好，默认 `SYS_PKGS` 恢复为 `sqlite,curl,python3`。
 
 ## 6. 恢复点
 
@@ -72,4 +76,9 @@ us stop <port>; POST /api/instances/<port>/start; sqlite3 /persist/d.db "select 
 | guest 内 sqlite 端到端（含跨重启） | 完成 |
 | eventfd2（非 Linux 合成 fd） | 完成；curl OOM 修复 |
 | c-ares DNS（F_SETFL on socket anchor） | 完成；`curl http://example.com/` → 200 |
-| python3 a_crash | 未做，见 `issues/INDEX.md` |
+| python3 a_crash（rt_sigprocmask 8→16 字节溢出） | 完成；python3 跑代码、import、/persist 上写库全通过 |
+
+## 6. 默认集合
+
+`project.mk` 的 `SYS_PKGS ?= sqlite,curl,python3`；`--pkgs` 依赖解析与缓存见 §3。
+`make pack-system SYS_PKGS=sqlite` 可只打最小集合。

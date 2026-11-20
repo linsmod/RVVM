@@ -2433,6 +2433,10 @@ char*                    guest_root_path;
     volatile uint32_t sig_inflight;   // handler on the stack (same-number re-entry queues instead)
     volatile uint32_t sig_inflight_sig; // which signal that handler is for, 0 = none
     volatile uint64_t sig_frame;      // guest address of the in-flight frame
+    // The guest's signal mask, in the guest's own 64-bit sigset shape. The host
+    // sigset_t is bigger here, which is why rt_sigprocmask must not hand the
+    // guest's oldset buffer to the host: see that syscall's implementation.
+    uint64_t sig_mask;
 
     // --- Guest virtual TTY (libvterm, optional) ---
     // When tty_cb is set, guest writes to fd 1/2 are parsed by libvterm and the
@@ -19819,9 +19823,33 @@ static void* rvvm_user_thread_wrap(void* arg)
                     rvvm_userland_t* ctx = uctx();
                     int how = (int)a0;
                     const uint64_t* set = (a1 && a3 >= sizeof(uint64_t)) ? to_ptr(a1) : NULL;
+                    uint64_t*       old = (a2 && a3 >= sizeof(uint64_t)) ? to_ptr_wr(a2) : NULL;
                     rvvm_info("sys_rt_sigprocmask(%ld, %lx, %lx, %lx)", (long)a0, (unsigned long)a1,
                               (unsigned long)a2, (unsigned long)a3);
-                    int host_ret = sigprocmask(how, to_ptr(a1), to_ptr_wr(a2));
+                    /* Never give the guest's oldset to the host sigprocmask:
+                     * this host's sigset_t is 16 bytes (include/mingw_compat/
+                     * signal.h) where the guest's is 8, so a sigaction() query
+                     * would write eight bytes past a stack buffer. CPython's
+                     * PyOS_getsig() did exactly that at startup and died in
+                     * __stack_chk_fail with a corrupted canary. The mask is not
+                     * modelled anyway (see the comment above), so keep it in
+                     * the guest's own shape and answer from here. */
+                    if ((a1 && !set) || (a2 && !old)) {
+                        a0 = -UAPI_EFAULT;
+                        break;
+                    }
+                    if (old) {
+                        *old = ctx->sig_mask;
+                    }
+                    if (set) {
+                        if (how == UAPI_SIG_BLOCK || how == SIG_BLOCK) {
+                            ctx->sig_mask |= *set;
+                        } else if (how == UAPI_SIG_UNBLOCK || how == SIG_UNBLOCK) {
+                            ctx->sig_mask &= ~*set;
+                        } else if (how == UAPI_SIG_SETMASK || how == SIG_SETMASK) {
+                            ctx->sig_mask = *set;
+                        }
+                    }
                     if (set && atomic_load_uint32(&ctx->sig_inflight)) {
                         uint32_t inflight = atomic_load_uint32(&ctx->sig_inflight_sig);
                         if (inflight) {
@@ -19837,7 +19865,7 @@ static void* rvvm_user_thread_wrap(void* arg)
                             }
                         }
                     }
-                    a0 = errno_ret(host_ret);
+                    a0 = 0;
                     break;
                 }
                 case 137: { // rt_sigtimedwait_time32
