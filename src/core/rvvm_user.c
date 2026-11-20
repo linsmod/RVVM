@@ -4134,6 +4134,10 @@ static bool guest_range_alloc(rvvm_addr_t* out, rvvm_addr_t hint, size_t size, b
         if (hint < GUEST_PAGE_SIZE || hint + size > ctx->guest_mmap_end) {
             return false;
         }
+        RVVM_TRC(RVVM_TRC_MMAP, "DBG fixed map: %llx..%llx (bump %llx, %u hole(s))",
+                 (unsigned long long)hint, (unsigned long long)(hint + size),
+                 (unsigned long long)ctx->guest_bump,
+                 (unsigned)ctx->guest_free_num);
         memset(to_ptr_wr(hint), 0, size);
         *out = hint;
         return true;
