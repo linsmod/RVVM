@@ -11,3 +11,4 @@
 | `/data/app/test_std/bin/test_std.exe` | `rvvm_user -prefix <rootfs> /test_std`（直接，不 ssh） | < 30 s（PASS） | 159 checks，0 failed，7 skipped；times/tms 5 项 PASS，statx 在 Windows SKIP。之前经 SSH/pty 时出现的 dup(2) 基线 FAIL 在直接运行下不复现 |
 | `rvvm_user -prefix <rootfs> /probe_fcntl_lock` | Windows 宿主，直接 userland | < 1 s（PASS） | fork/F_GETLK/F_SETLK/F_SETLKW/byte range/close 释放；`RVVM_TRACE=fd` 可见锁表 trace |
 | `rvvm_user -prefix <rootfs> /probe_fcntl_simple` | 同上 | < 1 s（PASS） | 单进程 open/lock/getlk/unlock/close |
+| `rvvm_user -prefix <rootfs> /probe_mmap_shared` | 同上 | 0.04 s（PASS） | P0：可写 `MAP_SHARED` 答 `ENODEV`、只读共享快照、私有映射不回写；P2 落地后同一探针会跑共享页用例 |

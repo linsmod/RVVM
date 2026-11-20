@@ -11875,6 +11875,24 @@ static rvvm_addr_t rvvm_sys_mmap(rvvm_addr_t addr, size_t size, int prot, int fl
     if (!size) {
         return -UAPI_EINVAL;
     }
+    if ((flags & UAPI_MAP_SHARED) && !(flags & UAPI_MAP_ANON) && (prot & UAPI_PROT_WRITE)) {
+        /* A writable shared file mapping is not emulated, and answering success
+         * with a private copy is worse than answering no: every guest process
+         * has its own RAM, so the bytes written here would be visible to nobody
+         * else that maps the same file. SQLite's WAL wal-index (-shm) is exactly
+         * this mapping, and a silent private copy is how it ends up reporting
+         * "disk I/O error" over a database two processes were both writing.
+         *
+         * ENODEV is what a kernel answers for a filesystem that cannot do mmap,
+         * so the caller takes its documented fallback (SQLite: rollback journal,
+         * or exclusive locking when WAL is asked for) instead of believing it
+         * shares something. Read-only shared mappings are still a snapshot, which
+         * is wrong only about later changes and corrupts nothing.
+         *
+         * The real fix is a page table with a shared page kind - not a write-back
+         * at unmap - see docs/task-mmap-shared-wal.md. */
+        return -UAPI_ENODEV;
+    }
 
     spin_lock(&uctx()->guest_lock);
     rvvm_addr_t ret = 0;
