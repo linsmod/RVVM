@@ -74,8 +74,10 @@ us stop <port>; POST /api/instances/<port>/start; sqlite3 /persist/d.db "select 
    验证：`python3 -X faulthandler -c "print(7)"` → 7 / rc=0；构造 guest SIGILL 时 faulthandler
    打印完整 Python traceback 并以 132（128+SIGILL）退出；`test_std` 159/0、selftest 0 failure。
    另发现：`python3 -X faulthandler -c "import _ctypes"` 触发 SIGILL（故障处为全零字，PC 落在
-   未映射区），不带 faulthandler 时同一 import 正常；与 atomics 无关（LR.W/SC.W 已实现），
-   根因未定位，见 `issues/INDEX.md`。
+   未映射区），不带 faulthandler 时同一 import 正常。排查中修正了两个真实 bug：riscv64
+   `uapi_sigaction` 的字段顺序（handler/flags/restorer/mask，之前把 `SA_SIGINFO|SA_ONSTACK`
+   读成 mask）与 SA_SIGINFO handler 的 a1/a2（现填零初始化 siginfo/ucontext）；SIGILL 仍在，
+   与 atomics 无关（LR.W/SC.W 已实现），根因未定位，见 `issues/INDEX.md`。
 
 三个原模拟器缺口都已修好，默认 `SYS_PKGS` 恢复为 `sqlite,curl,python3`。
 

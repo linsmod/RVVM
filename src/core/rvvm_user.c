@@ -474,10 +474,16 @@ struct uapi_sysinfo {
     uint32_t     mem_unit;    /* totalram/freeram are multiples of this */
 };
 
+/* asm-generic sigaction layout, which is what this guest ABI uses: handler,
+ * flags, restorer, mask. The generic musl header lists sa_mask before
+ * sa_flags, but riscv64 takes the kernel's order - verified against a live
+ * faulthandler registration: SA_SIGINFO|SA_ONSTACK (0x48000000) was seen at
+ * offset 8, which the previous field order mistook for the signal mask. */
 struct uapi_sigaction {
     uapi_size_t  handler;
-    uapi_ulong_t mask;
     uapi_ulong_t flags;
+    uapi_size_t  restorer;
+    uapi_ulong_t mask;
 };
 
 struct uapi_sigaltstack {
@@ -3221,6 +3227,7 @@ static void* to_ptr_ioctl(rvvm_addr_t addr, uint64_t cmd)
 #define UAPI_SS_DISABLE   0x00000002
 #define UAPI_SS_ONSTACK   0x00000001
 #define UAPI_SA_ONSTACK   0x08000000
+#define UAPI_SA_SIGINFO   0x00000004
 #define UAPI_MINSIGSTKSZ  2048
 
 /*
@@ -17365,13 +17372,37 @@ static void userland_siginject(rvvm_hart_t* cpu, rvvm_userland_t* ctx)
     }
     memcpy(host_frame, &frame, sizeof(frame));
     atomic_store_uint64(&ctx->sig_frame, frame_addr);
-    RVVM_TRC(RVVM_TRC_SIGNAL, "sig: inject %u, handler %llx, frame %llx",
-              sig, (unsigned long long)handler, (unsigned long long)frame_addr);
+
+    /* SA_SIGINFO handlers take (sig, siginfo_t*, ucontext_t*). CPython's
+     * faulthandler is one: handing it a stale a1/a2 from the interrupted code
+     * made it dereference garbage and jump into an unmapped page. The block is
+     * zeroed (si_code etc. read as SI_USER) and carries only si_signo; enough
+     * for a handler that wants to know which signal fired. */
+    uint64_t siginfo_addr = 0;
+    uint64_t ucontext_addr = 0;
+    if (ctx->siga[sig].flags & UAPI_SA_SIGINFO) {
+        const uint64_t aux_size = 256;
+        uint64_t aux_addr = (frame_addr - aux_size) & ~(uint64_t)0xF;
+        uint8_t* aux = to_ptr_sz_wr(aux_addr, aux_size);
+        if (aux) {
+            memset(aux, 0, aux_size);
+            write_uint32_le(aux, sig);   // si_signo
+            siginfo_addr  = aux_addr;
+            ucontext_addr = aux_addr + 128;
+        }
+    }
+    RVVM_TRC(RVVM_TRC_SIGNAL, "sig: inject %u, handler %llx, frame %llx siginfo %llx",
+              sig, (unsigned long long)handler, (unsigned long long)frame_addr,
+              (unsigned long long)siginfo_addr);
 
     // Handler context: SP on the frame, the signal number as its first
     // argument, RA on the return trampoline.
     rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 2,  frame_addr);
     rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 10, sig);
+    if (siginfo_addr) {
+        rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 11, siginfo_addr);
+        rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 12, ucontext_addr);
+    }
     rvvm_write_cpu_reg(cpu, RVVM_REGID_X0 + 1,  frame_addr + sizeof(frame) - sizeof(frame.retcode));
     rvvm_write_cpu_reg(cpu, RVVM_REGID_PC,      handler);
 }
@@ -19874,6 +19905,10 @@ static void* rvvm_user_thread_wrap(void* arg)
                         if (old) memcpy(old, &ctx->siga[a0], copy_len);
                         if (act) {
                             memcpy(&ctx->siga[a0], act, copy_len);
+                            rvvm_info("rt_sigaction sig=%ld handler=%llx flags=%lx mask=%lx",
+                                      a0, (unsigned long long)ctx->siga[a0].handler,
+                                      (unsigned long)ctx->siga[a0].flags,
+                                      (unsigned long)ctx->siga[a0].mask);
 
                             // Register a shim signal handler
                             if (a0 != 11) {
