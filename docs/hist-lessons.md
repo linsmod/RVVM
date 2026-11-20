@@ -110,3 +110,27 @@
 5. 顺序：先证明「有泄漏」（churn 单调）→ 再对照定位资源 → 最后读代码找释放路径。
 
 该轮查出的具体缺陷与修法：`fix-userland-hart-registration.md`。
+
+## 9. guest 内存被谁写坏：从字节图案倒推
+
+案例：`python3 -X faulthandler -c "import _ctypes"` 在 `interp+0x93508`（`.rodata`）
+执行全零字。定位顺序（细节见 `fix-userland-sigaltstack-args.md`）：
+
+1. **先和磁盘文件逐字节比**。崩溃转储的 32 字节窗口与 rootfs 里的同一文件对比，
+   看出「哪些字节变了、哪些没变」。本例变了的是 20 个零，**中间 4 字节 padding
+   原样保留**——这是 C 结构体逐字段赋值的指纹（padding 不写），宽度 8+4+8 直接
+   对上 `struct uapi_sigaltstack`。
+2. **算出 guest 地址对应的宿主地址**。每个 userland 进程的 RAM 是一块私有
+   `vma_alloc`（`RVVM_TRACE=mmap` 的 `alloc ... size=536866816 anon`），
+   `guest = mem.addr(0x1000) + offset`，故 `host = block + (guest - 0x1000)`。
+   让 guest 先 sleep，用 gdb 在那之前读这块内存，就能区分「早就坏了」还是
+   「跑到一半坏的」。
+3. **谁跳过去的**：`RVVM_NOJIT=1` 下在 `jalr` / `c.jr` / `c.jalr` 里记一个
+   **THREAD_LOCAL** 的 `(from, to, insn)` 环，trap 时 dump。共享环会被其他 hart
+   冲掉（guest hart 与宿主线程 1:1）；本例得到 `84170e4 -> 8493508 (insn c.jr a5)`，
+   反查就是 `sysconf` 的跳转表分发。
+4. **区分 guest 写与宿主写**：在 `riscv_store_u{8,16,32,64}` 加一个范围监视。
+   「没有任何 guest store」说明是 emulator 通过 `to_ptr` 写的——按 syscall 参数
+   方向找，不要继续猜 guest 代码。本例即 syscall 132 的参数错位。
+5. 崩溃地址固定不代表确定性：本例写进去的值来自调用者没设置的 `a2`，恰好是
+   libc `.rodata` 指针，所以每次落在同一处。
